@@ -83,6 +83,13 @@ function statusTone(value: string): "success" | "warning" | "destructive" | "out
 
 type PaneLine = { label: string; value: string };
 
+type LearningPhaseCard = {
+  title: string;
+  subtitle: string;
+  tone: "success" | "warning" | "destructive" | "outline";
+  lines: readonly PaneLine[];
+};
+
 function StatusPaneCard({
   title,
   subtitle,
@@ -120,6 +127,129 @@ function StatusPaneCard({
         ))}
       </CardContent>
     </Card>
+  );
+}
+
+function LearningPhaseCardView({
+  title,
+  subtitle,
+  tone,
+  lines,
+}: LearningPhaseCard) {
+  return (
+    <Card className="min-w-0 max-w-full overflow-hidden border-border/80 bg-background-base/50">
+      <CardHeader className="min-w-0 pb-3">
+        <div className="flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <CardTitle className="min-w-0 truncate text-sm uppercase tracking-[0.12em]">
+              {title}
+            </CardTitle>
+            <p className="mt-1 text-xs text-text-tertiary">{subtitle}</p>
+          </div>
+          <Badge tone={tone} className="shrink-0 text-xs uppercase tracking-[0.08em]">
+            {tone}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="grid min-w-0 gap-2">
+        {lines.map((line) => (
+          <div key={line.label} className="flex min-w-0 items-start justify-between gap-3 border-t border-border/60 pt-2 first:border-t-0 first:pt-0">
+            <span className="text-xs text-text-tertiary">{line.label}</span>
+            <span className="max-w-[68%] truncate text-right text-xs text-text-secondary">
+              {line.value}
+            </span>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+const OPERATIONAL_LEARNING_PHASES: readonly LearningPhaseCard[] = [
+  {
+    title: "PHASE 1",
+    subtitle: "stale checkout and failed payment recovery",
+    tone: "warning",
+    lines: [
+      { label: "TripTracker detection", value: "abandoned checkouts, failed payments, contact availability" },
+      { label: "TripTracker queues", value: "recovery queue, followup queue, unresolved attempts" },
+      { label: "TripTracker nightly summary", value: "recurring failure categories" },
+      { label: "Orion detection", value: "abandoned onboarding, incomplete conversions, funnel drop points" },
+      { label: "Required outputs", value: "retry candidates, unresolved recovery queues, escalation candidates" },
+    ],
+  },
+  {
+    title: "PHASE 2",
+    subtitle: "inbox triage and draft replies",
+    tone: "outline",
+    lines: [
+      { label: "Workers", value: "InboxTriage_Worker, DraftReply_Worker, FollowupReminder_Worker, SupportEscalation_Worker" },
+      { label: "Workflow", value: "classify → summarize → draft → escalate if uncertain" },
+      { label: "Classify", value: "support issues, urgent operational problems, customer dissatisfaction" },
+      { label: "Draft policy", value: "draft replies only; no unrestricted autonomous replies" },
+      { label: "Queue policy", value: "uncertain responses stay queued for review" },
+    ],
+  },
+  {
+    title: "PHASE 3",
+    subtitle: "unresolved issue aging",
+    tone: "warning",
+    lines: [
+      { label: "Tracked items", value: "payment failures, support requests, onboarding failures, deployment issues" },
+      { label: "Persistence", value: "nightly LifeWiki record of unresolved queues" },
+      { label: "Aging controls", value: "thresholds, duplicate suppression, recurring issue detection" },
+      { label: "Escalation signal", value: "unresolved escalations and drift" },
+      { label: "Visibility", value: "aging and backlog pressure stay visible" },
+    ],
+  },
+  {
+    title: "PHASE 4",
+    subtitle: "nightly operational intelligence summaries",
+    tone: "success",
+    lines: [
+      { label: "LifeWiki records", value: "recurring payment failures, onboarding bottlenecks, drift, stale queues" },
+      { label: "Additional captures", value: "deployment anomalies, escalation trends, workload compression" },
+      { label: "Outcome", value: "raw telemetry becomes durable operational memory" },
+      { label: "Eligibility", value: "nightly summary state stays eligible" },
+      { label: "Fallback", value: "suppress or escalate only" },
+    ],
+  },
+  {
+    title: "PHASE 5",
+    subtitle: "operational pattern detection",
+    tone: "outline",
+    lines: [
+      { label: "Detect", value: "customer objections, Stripe failures, weak funnel stages, noisy alerts" },
+      { label: "Also detect", value: "stale workflows, unresolved bottlenecks, deployment drift patterns" },
+      { label: "Goal", value: "recurring operational fatigue points become visible" },
+      { label: "Scope", value: "supervised learning only; no autonomy expansion" },
+      { label: "Next use", value: "trend analysis and supervised refinement" },
+    ],
+  },
+];
+
+function OperationalLearningGrid() {
+  return (
+    <section className="flex min-w-0 flex-col gap-3">
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="font-mondwest text-sm uppercase tracking-[0.14em] text-text-secondary">
+            SUPERVISED OPERATIONAL LEARNING
+          </h3>
+          <p className="mt-1 text-xs text-text-tertiary">
+            Convert telemetry into recovery queues, draft intelligence, aging visibility, nightly memory, and pattern detection.
+          </p>
+        </div>
+        <Badge tone="secondary" className="shrink-0 text-xs uppercase tracking-[0.08em]">
+          supervised
+        </Badge>
+      </div>
+      <div className="grid min-w-0 gap-4 xl:grid-cols-2">
+        {OPERATIONAL_LEARNING_PHASES.map((phase) => (
+          <LearningPhaseCardView key={phase.title} {...phase} />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -845,6 +975,8 @@ export default function SessionsPage() {
           />
         ))}
       </div>
+
+      <OperationalLearningGrid />
 
       {activeAction && (
         <div className="border border-border bg-background-base/50">

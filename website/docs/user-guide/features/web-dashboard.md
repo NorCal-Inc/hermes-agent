@@ -75,6 +75,16 @@ The status page still includes the usual top-level indicators:
 
 The status page auto-refreshes every 5 seconds.
 
+Operational intelligence now layers on top of the status page as a supervised learning cycle:
+
+- Phase 1 covers stale checkout and failed payment recovery queues for TripTracker and Orion.
+- Phase 2 covers inbox triage and draft reply generation with uncertainty gating.
+- Phase 3 tracks unresolved issue aging, duplicate suppression, and escalation thresholds.
+- Phase 4 writes nightly operational intelligence into LifeWiki for durable memory.
+- Phase 5 detects recurring operational patterns, fatigue points, and drift.
+
+The dashboard presents these as read-only learning panes; it does not grant autonomous customer communication or broaden worker authority.
+
 ### Chat
 
 The **Chat** tab embeds the full Hermes TUI (the same interface you get from `hermes --tui`) directly in the browser. Everything you can do in the terminal TUI — slash commands, model picker, tool-call cards, markdown streaming, clarify/sudo/approval prompts, skin theming — works identically here, because the dashboard is running the real TUI binary and rendering its ANSI output through [xterm.js](https://xtermjs.org/) with its WebGL renderer for pixel-perfect cell layout.

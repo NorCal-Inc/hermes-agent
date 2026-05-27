@@ -12,7 +12,7 @@ The Hermes web dashboard (`hermes dashboard`) is built to be reskinned and exten
 2. **UI plugins** — a directory with `manifest.json` + a JavaScript bundle that registers a tab, replaces a built-in page, augments one via page-scoped slots, or injects components into named shell slots.
 3. **Backend plugins** — a Python file inside that plugin directory that exposes a FastAPI `router`; routes are mounted under `/api/plugins/<name>/` and called from the plugin's UI.
 
-The built-in dashboard now also ships with a split operational status surface: shared infrastructure, TripTracker, Orion, Erika, and LifeWiki are separated into distinct panes so cross-company telemetry stays contained and escalation-only traffic remains obvious.
+The built-in dashboard now also ships with a split operational status surface: shared infrastructure, TripTracker, Orion, Erika, and LifeWiki are separated into distinct panes so cross-company telemetry stays contained and escalation-only traffic remains obvious. Those panes now include a supervised operational learning layer for recovery queues, inbox triage, unresolved issue aging, nightly LifeWiki summaries, and pattern detection.
 
 All three are **drop-in at runtime**: no repo clone, no `npm run build`, no patching the dashboard source. This page is the canonical reference for all three.
 
