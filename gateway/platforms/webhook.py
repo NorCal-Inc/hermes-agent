@@ -436,6 +436,24 @@ class WebhookAdapter(BasePlatformAdapter):
             or payload.get("type", "")
             or "unknown"
         )
+
+        validation = route_config.get("validation", {})
+        validation_error = self._validate_route_payload(
+            route_name=route_name,
+            payload=payload,
+            validation=validation,
+        )
+        if validation_error:
+            logger.warning(
+                "[webhook] Validation failed for route %s: %s",
+                route_name,
+                validation_error,
+            )
+            return web.json_response(
+                {"error": validation_error, "route": route_name},
+                status=422,
+            )
+
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
@@ -792,6 +810,39 @@ class WebhookAdapter(BasePlatformAdapter):
             else:
                 rendered[key] = value
         return rendered
+
+    def _validate_route_payload(
+        self,
+        route_name: str,
+        payload: dict,
+        validation: dict,
+    ) -> Optional[str]:
+        """Validate payload fields declared by a webhook route.
+
+        Validation is intentionally small and schema-free so preset routes can
+        express operational guards without introducing a new plugin layer.
+        Supported checks:
+        - required_fields: every named key must be present and non-empty
+        - allowed_companies: payload[company] must match one of these values
+        """
+        required_fields = validation.get("required_fields", []) or []
+        missing = [field for field in required_fields if not payload.get(field)]
+        if missing:
+            return (
+                f"Route '{route_name}' missing required field(s): "
+                f"{', '.join(missing)}"
+            )
+
+        allowed_companies = validation.get("allowed_companies", []) or []
+        if allowed_companies:
+            company = payload.get("company")
+            if company not in allowed_companies:
+                return (
+                    f"Route '{route_name}' rejected company '{company}'. "
+                    f"Allowed companies: {', '.join(map(str, allowed_companies))}"
+                )
+
+        return None
 
     # ------------------------------------------------------------------
     # Response delivery

@@ -12061,6 +12061,11 @@ def main():
         "--secret", default="", help="HMAC secret (auto-generated if omitted)"
     )
     wh_sub.add_argument(
+        "--preset",
+        default="",
+        help="Apply a preset subscription template (lifewiki-nightly, stripe-payment-success, stripe-payment-failure, stripe-checkout-abandonment, stripe-subscription-cancellation, stripe-dispute-opened, stripe-refund-issued)",
+    )
+    wh_sub.add_argument(
         "--deliver-only",
         action="store_true",
         help="Skip the agent — deliver the rendered prompt directly as the "

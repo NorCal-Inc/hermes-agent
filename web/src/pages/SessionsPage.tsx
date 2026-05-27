@@ -61,6 +61,68 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     cron: { icon: Clock, color: "text-warning" },
   };
 
+function formatScalar(value: string | number | boolean | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "boolean") return value ? "yes" : "no";
+  return String(value);
+}
+
+function statusTone(value: string): "success" | "warning" | "destructive" | "outline" {
+  const lower = value.toLowerCase();
+  if (["running", "healthy", "online", "clean", "ready", "ok"].some((t) => lower.includes(t))) {
+    return "success";
+  }
+  if (["stopped", "failed", "fatal", "disconnected", "error", "drift", "stale"].some((t) => lower.includes(t))) {
+    return "destructive";
+  }
+  if (["pending", "waiting", "unknown", "degraded", "unconfigured"].some((t) => lower.includes(t))) {
+    return "warning";
+  }
+  return "outline";
+}
+
+type PaneLine = { label: string; value: string };
+
+function StatusPaneCard({
+  title,
+  subtitle,
+  tone,
+  lines,
+}: {
+  title: string;
+  subtitle?: string;
+  tone: "success" | "warning" | "destructive" | "outline";
+  lines: readonly PaneLine[];
+}) {
+  return (
+    <Card className="min-w-0 max-w-full overflow-hidden">
+      <CardHeader className="min-w-0 pb-3">
+        <div className="flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <CardTitle className="min-w-0 truncate text-base">{title}</CardTitle>
+            {subtitle ? (
+              <p className="mt-1 text-xs text-text-tertiary">{subtitle}</p>
+            ) : null}
+          </div>
+          <Badge tone={tone} className="shrink-0 text-xs uppercase tracking-[0.08em]">
+            {tone}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="grid min-w-0 gap-2">
+        {lines.map((line) => (
+          <div key={line.label} className="flex min-w-0 items-start justify-between gap-3 border-t border-border/60 pt-2 first:border-t-0 first:pt-0">
+            <span className="text-xs text-text-tertiary">{line.label}</span>
+            <span className="max-w-[65%] truncate text-right text-xs text-text-secondary">
+              {line.value}
+            </span>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
 /** Render an FTS5 snippet with highlighted matches.
  *  The backend wraps matches in >>> and <<< delimiters. */
 function SnippetHighlight({ snippet }: { snippet: string }) {
@@ -655,6 +717,75 @@ export default function SessionsPage() {
     }
   }
 
+  const dashboardPanes = [
+    {
+      title: "SHARED INFRA",
+      subtitle: "vps, dr, scheduler, deployment drift",
+      tone: statusTone(
+        [status?.gateway_state, status?.gateway_running ? "running" : "stopped", status?.gateway_exit_reason].filter(Boolean).join(" "),
+      ),
+      lines: [
+        { label: "VPS health", value: status ? formatScalar(status.gateway_running) : "—" },
+        { label: "DR health", value: formatScalar(status?.gateway_health_url) },
+        { label: "Scheduler health", value: formatScalar(status?.gateway_state) },
+        { label: "Deployment drift", value: status?.gateway_updated_at ? timeAgo(Date.parse(status.gateway_updated_at)) : "—" },
+        { label: "Unresolved infra incidents", value: String(alerts.length) },
+      ],
+    },
+    {
+      title: "TRIPTRACKER",
+      subtitle: "payments, checkout recovery, subscriptions",
+      tone: statusTone(
+        (status?.gateway_platforms?.discord?.state ?? "") + " " + (status?.gateway_platforms?.discord?.error_message ?? ""),
+      ),
+      lines: [
+        { label: "Payment failures", value: "#triptracker-ops" },
+        { label: "Stale checkout queues", value: "TripTracker_Lead" },
+        { label: "Unresolved customer recovery", value: "TripTracker_Lead" },
+        { label: "Subscription churn", value: "TripTracker_Lead → Erika if unresolved" },
+        { label: "Operational alerts", value: status?.gateway_platforms?.discord?.state ?? "suppressed" },
+      ],
+    },
+    {
+      title: "ORION",
+      subtitle: "onboarding, leads, payment anomalies",
+      tone: statusTone(
+        (status?.gateway_platforms?.telegram?.state ?? "") + " " + (status?.gateway_platforms?.telegram?.error_message ?? ""),
+      ),
+      lines: [
+        { label: "Onboarding bottlenecks", value: "#orion-ops" },
+        { label: "Abandoned lead queues", value: "Orion_Formation_Services_Lead" },
+        { label: "Payment anomalies", value: "Orion_Formation_Services_Lead" },
+        { label: "Operational alerts", value: status?.gateway_platforms?.telegram?.state ?? "suppressed" },
+        { label: "Fallback containment", value: "Escalate to Erika; never shared ops" },
+      ],
+    },
+    {
+      title: "ERIKA",
+      subtitle: "escalations, cross-company anomalies, governance",
+      tone: statusTone(alerts.length > 0 ? "warning" : "clean"),
+      lines: [
+        { label: "Unresolved escalations", value: String(alerts.length) },
+        { label: "Cross-company operational anomalies", value: String(Math.max(0, alerts.length - 1)) },
+        { label: "Unresolved drift", value: status?.gateway_exit_reason ?? "none" },
+        { label: "Governance-level summaries", value: "eligible" },
+        { label: "Routine telemetry", value: "blocked" },
+      ],
+    },
+    {
+      title: "LIFEWIKI",
+      subtitle: "nightly summary + memory ingestion",
+      tone: statusTone(status?.gateway_state ?? "unknown"),
+      lines: [
+        { label: "Nightly summary state", value: "eligible" },
+        { label: "Unresolved issue persistence", value: "tracked" },
+        { label: "Operational memory ingestion", value: "agent_state → POST /api/ingest" },
+        { label: "Recurring operational patterns", value: "eligible" },
+        { label: "Fallback containment", value: "suppress or escalate only" },
+      ],
+    },
+  ] as const;
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -702,6 +833,18 @@ export default function SessionsPage() {
           </div>
         </div>
       )}
+
+      <div className="grid min-w-0 gap-4 xl:grid-cols-2">
+        {dashboardPanes.map((pane) => (
+          <StatusPaneCard
+            key={pane.title}
+            title={pane.title}
+            subtitle={pane.subtitle}
+            tone={pane.tone}
+            lines={pane.lines}
+          />
+        ))}
+      </div>
 
       {activeAction && (
         <div className="border border-border bg-background-base/50">

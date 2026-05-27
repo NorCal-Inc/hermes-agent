@@ -136,6 +136,246 @@ def _require_webhook_enabled() -> bool:
     return False
 
 
+_ROUTE_PRESETS = {
+    "lifewiki-nightly": {
+        "description": "Nightly LifeWiki operational summary ingest",
+        "events": ["nightly_summary"],
+        "owner_company": "LifeWiki",
+        "supervising_team_leader": "LifeWiki_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "LifeWiki nightly operational summary\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "summary_date: {summary_date}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n\n"
+            "compressed_summary:\n{summary}\n\n"
+            "unresolved_incidents:\n{unresolved_incidents}\n\n"
+            "repeated_failures:\n{repeated_failures}\n\n"
+            "stripe_anomalies:\n{stripe_anomalies}\n\n"
+            "routing_violations:\n{routing_violations}\n\n"
+            "escalation_summaries:\n{escalation_summaries}\n\n"
+            "deployment_failures:\n{deployment_failures}\n\n"
+            "monitoring_anomalies:\n{monitoring_anomalies}\n\n"
+            "worker_noise_patterns:\n{worker_noise_patterns}\n\n"
+            "operational_bottlenecks:\n{operational_bottlenecks}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "summary_date",
+                "summary",
+                "unresolved_incidents",
+                "repeated_failures",
+                "stripe_anomalies",
+                "routing_violations",
+                "escalation_summaries",
+                "deployment_failures",
+                "monitoring_anomalies",
+                "worker_noise_patterns",
+                "operational_bottlenecks",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+            "allowed_companies": ["LifeWiki"],
+        },
+    },
+    "stripe-payment-success": {
+        "description": "TripTracker/Orion payment success telemetry",
+        "events": ["payment_intent.succeeded", "checkout.session.completed"],
+        "owner_company": "variable",
+        "supervising_team_leader": "TripTracker_Lead|Orion_Formation_Services_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "Stripe payment success\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "customer_identifier: {customer_identifier}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n"
+            "event_id: {event_id}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "event_id",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+        },
+    },
+    "stripe-payment-failure": {
+        "description": "TripTracker/Orion payment failure telemetry",
+        "events": ["payment_intent.payment_failed", "invoice.payment_failed"],
+        "owner_company": "variable",
+        "supervising_team_leader": "TripTracker_Lead|Orion_Formation_Services_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "Stripe payment failure\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "customer_identifier: {customer_identifier}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n"
+            "retry_state: {retry_state}\n"
+            "event_id: {event_id}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "event_id",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+        },
+    },
+    "stripe-checkout-abandonment": {
+        "description": "Checkout abandonment telemetry",
+        "events": ["checkout.session.expired"],
+        "owner_company": "variable",
+        "supervising_team_leader": "TripTracker_Lead|Orion_Formation_Services_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "Stripe checkout abandonment\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "customer_identifier: {customer_identifier}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n"
+            "event_id: {event_id}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "event_id",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+        },
+    },
+    "stripe-subscription-cancellation": {
+        "description": "Subscription cancellation telemetry",
+        "events": ["customer.subscription.deleted"],
+        "owner_company": "variable",
+        "supervising_team_leader": "TripTracker_Lead|Orion_Formation_Services_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "Stripe subscription cancellation\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "customer_identifier: {customer_identifier}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n"
+            "event_id: {event_id}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "event_id",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+        },
+    },
+    "stripe-dispute-opened": {
+        "description": "Dispute opened telemetry",
+        "events": ["charge.dispute.created"],
+        "owner_company": "variable",
+        "supervising_team_leader": "TripTracker_Lead|Orion_Formation_Services_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "Stripe dispute opened\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "customer_identifier: {customer_identifier}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n"
+            "event_id: {event_id}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "event_id",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+        },
+    },
+    "stripe-refund-issued": {
+        "description": "Refund issued telemetry",
+        "events": ["charge.refunded", "refund.created"],
+        "owner_company": "variable",
+        "supervising_team_leader": "TripTracker_Lead|Orion_Formation_Services_Lead",
+        "routing_class": "company-private",
+        "fallback_behavior": "suppress-or-escalate",
+        "prompt": (
+            "Stripe refund issued\n"
+            "source: {source}\n"
+            "company: {company}\n"
+            "customer_identifier: {customer_identifier}\n"
+            "severity: {severity}\n"
+            "required_action: {required_action}\n"
+            "escalation_state: {escalation_state}\n"
+            "event_id: {event_id}\n"
+        ),
+        "validation": {
+            "required_fields": [
+                "source",
+                "company",
+                "event_id",
+                "severity",
+                "required_action",
+                "escalation_state",
+            ],
+        },
+    },
+}
+
+def _preset_route(preset: str) -> dict:
+    spec = _ROUTE_PRESETS.get(preset)
+    if not spec:
+        raise KeyError(preset)
+    route = {
+        "description": spec["description"],
+        "events": list(spec.get("events", [])),
+        "prompt": spec.get("prompt", ""),
+        "skills": list(spec.get("skills", [])),
+        "deliver": spec.get("deliver", "log"),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "validation": spec.get("validation", {}),
+    }
+    if spec.get("deliver_only"):
+        route["deliver_only"] = True
+    if spec.get("deliver_extra"):
+        route["deliver_extra"] = dict(spec["deliver_extra"])
+    return route
+
+
 def webhook_command(args):
     """Entry point for 'hermes webhook' subcommand."""
     sub = getattr(args, "webhook_action", None)
@@ -168,17 +408,39 @@ def _cmd_subscribe(args):
     is_update = name in subs
 
     secret = args.secret or secrets.token_urlsafe(32)
-    events = [e.strip() for e in args.events.split(",")] if args.events else []
+    preset = getattr(args, "preset", "") or ""
+    events: list[str] = []
 
-    route = {
-        "description": args.description or f"Agent-created subscription: {name}",
-        "events": events,
-        "secret": secret,
-        "prompt": args.prompt or "",
-        "skills": [s.strip() for s in args.skills.split(",")] if args.skills else [],
-        "deliver": args.deliver or "log",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
+    if preset:
+        try:
+            route = _preset_route(preset)
+        except KeyError:
+            print(f"Error: Unknown preset '{preset}'.")
+            return
+    else:
+        events = [e.strip() for e in args.events.split(",") if e.strip()] if args.events else []
+        route = {
+            "description": args.description or f"Agent-created subscription: {name}",
+            "events": events,
+            "prompt": args.prompt or "",
+            "skills": [s.strip() for s in args.skills.split(",") if s.strip()] if args.skills else [],
+            "deliver": args.deliver or "log",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    route["secret"] = secret
+    route["description"] = args.description or route.get("description", f"Agent-created subscription: {name}")
+
+    if args.prompt:
+        route["prompt"] = args.prompt
+    if args.events and not preset:
+        route["events"] = [e.strip() for e in args.events.split(",") if e.strip()]
+    if args.skills and not preset:
+        route["skills"] = [s.strip() for s in args.skills.split(",") if s.strip()]
+    if args.deliver and not preset:
+        route["deliver"] = args.deliver or route.get("deliver", "log")
+    if preset:
+        route["preset"] = preset
 
     if getattr(args, "deliver_only", False):
         if route["deliver"] == "log":

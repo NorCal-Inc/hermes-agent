@@ -261,6 +261,49 @@ async def test_no_thread_channels_csv_parsing(adapter, monkeypatch):
         message = make_message(channel=FakeTextChannel(channel_id=ch_id), content="hello")
         await adapter._handle_message(message)
         adapter._auto_create_thread.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_named_discord_channels_resolve_for_allow_and_no_thread(adapter, monkeypatch):
+    """Human-friendly Discord channel names should resolve through the directory."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "#erika-routing,#northcaledonia-ops")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "#northcaledonia-ops")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    def _resolve(platform_name, name):
+        if platform_name == "discord" and name in {"#erika-routing", "erika-routing"}:
+            return "123"
+        if platform_name == "discord" and name in {"#northcaledonia-ops", "northcaledonia-ops"}:
+            return "456"
+        return None
+
+    monkeypatch.setattr("gateway.channel_directory.resolve_channel_name", _resolve)
+
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
+
+    allowed_message = make_message(channel=FakeTextChannel(channel_id=123), content="allowed")
+    await adapter._handle_message(allowed_message)
+    adapter.handle_message.assert_awaited_once()
+    first_event = adapter.handle_message.await_args.args[0]
+    assert first_event.source.chat_type == "thread"
+    assert first_event.source.chat_id == "999"
+
+    adapter.handle_message.reset_mock()
+    blocked_message = make_message(channel=FakeTextChannel(channel_id=999), content="blocked")
+    await adapter._handle_message(blocked_message)
+    adapter.handle_message.assert_not_awaited()
+
+    adapter.handle_message.reset_mock()
+    adapter._auto_create_thread.reset_mock()
+    no_thread_message = make_message(channel=FakeTextChannel(channel_id=456), content="no thread")
+    await adapter._handle_message(no_thread_message)
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].source.chat_id == "456"
 
 
 @pytest.mark.asyncio

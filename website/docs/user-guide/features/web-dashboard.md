@@ -58,7 +58,15 @@ The Chat tab is intentionally off for a plain `hermes dashboard` launch. Start t
 
 ### Status
 
-The landing page shows a live overview of your installation:
+The landing page shows a live overview of your installation. It is split into operational panes so shared infrastructure, company-specific telemetry, escalation handling, and LifeWiki memory ingestion stay separated:
+
+- **SHARED INFRA** — VPS health, DR health, scheduler health, deployment drift, unresolved infra incidents
+- **TRIPTRACKER** — payment failures, stale checkout queues, unresolved customer recovery, subscription churn, operational alerts
+- **ORION** — onboarding bottlenecks, abandoned lead queues, payment anomalies, operational alerts
+- **ERIKA** — unresolved escalations, cross-company operational anomalies, unresolved drift, governance-level summaries
+- **LIFEWIKI** — nightly summary state, unresolved issue persistence, operational memory ingestion, recurring operational patterns
+
+The status page still includes the usual top-level indicators:
 
 - **Agent version** and release date
 - **Gateway status** — running/stopped, PID, connected platforms and their state

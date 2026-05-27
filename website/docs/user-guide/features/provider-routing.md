@@ -93,6 +93,8 @@ provider_routing:
 
 Controls whether providers can use your prompts for training. Options are `"allow"` or `"deny"`.
 
+For operational split workflows, keep company-private telemetry on the appropriate lane: TripTracker routes to TripTracker_Lead / #triptracker-ops, Orion routes to Orion_Formation_Services_Lead / #orion-ops, and Erika only receives escalations, cross-company anomalies, and governance summaries.
+
 ```yaml
 provider_routing:
   data_collection: "deny"

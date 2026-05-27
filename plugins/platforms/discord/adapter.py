@@ -3647,21 +3647,70 @@ class DiscordAdapter(BasePlatformAdapter):
         string) is preserved in the returned set so callers can short-circuit
         on wildcard membership, consistent with ``allowed_channels``.
         """
-        raw = self.config.extra.get("free_response_channels")
+        return self._discord_resolve_channel_tokens(
+            self.config.extra.get("free_response_channels"),
+            "DISCORD_FREE_RESPONSE_CHANNELS",
+        )
+
+    def _discord_allowed_channels(self) -> set:
+        """Return Discord channel IDs allowed to receive messages."""
+        return self._discord_resolve_channel_tokens(
+            self.config.extra.get("allowed_channels"),
+            "DISCORD_ALLOWED_CHANNELS",
+        )
+
+    def _discord_ignored_channels(self) -> set:
+        """Return Discord channel IDs that should always be ignored."""
+        return self._discord_resolve_channel_tokens(
+            self.config.extra.get("ignored_channels"),
+            "DISCORD_IGNORED_CHANNELS",
+        )
+
+    def _discord_no_thread_channels(self) -> set:
+        """Return Discord channel IDs that should skip auto-threading."""
+        return self._discord_resolve_channel_tokens(
+            self.config.extra.get("no_thread_channels"),
+            "DISCORD_NO_THREAD_CHANNELS",
+        )
+
+    def _discord_resolve_channel_tokens(self, raw: Any, env_var: str) -> set:
+        """Return a set of Discord channel tokens, resolving names to IDs.
+
+        Accepts YAML lists, comma-separated strings, and bare scalars.  Each
+        token is preserved as-is and also looked up in the channel directory,
+        so configs can use human-friendly names like ``#erika-routing`` or
+        ``Guild / #northcaledonia-ops`` while still matching numeric IDs at
+        runtime once the channel directory is available.
+        """
         if raw is None:
-            raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
+            raw = os.getenv(env_var, "")
+
         if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        # Coerce non-list scalars (str/int/float) to str before splitting.
-        # YAML parses a bare numeric value such as
-        # `free_response_channels: 1491973769726791812` as int, which was
-        # previously falling through the isinstance(str) branch and silently
-        # returning an empty set.  str() here accepts whatever scalar the YAML
-        # loader hands us without changing existing string/CSV semantics.
-        s = str(raw).strip() if raw is not None else ""
-        if s:
-            return {part.strip() for part in s.split(",") if part.strip()}
-        return set()
+            tokens = [str(part).strip() for part in raw if str(part).strip()]
+        else:
+            # Coerce non-list scalars (str/int/float) to str before splitting.
+            # YAML parses a bare numeric value as int, which would otherwise
+            # fall through and behave like an empty set.
+            s = str(raw).strip() if raw is not None else ""
+            tokens = [part.strip() for part in s.split(",") if part.strip()]
+
+        if not tokens:
+            return set()
+
+        resolved: set[str] = set()
+        for token in tokens:
+            resolved.add(token)
+            if token == "*":
+                continue
+            try:
+                from gateway.channel_directory import resolve_channel_name
+
+                channel_id = resolve_channel_name("discord", token)
+            except Exception:
+                channel_id = None
+            if channel_id:
+                resolved.add(str(channel_id))
+        return resolved
 
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
@@ -4499,17 +4548,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            # Check allowed channels - if set, only respond in these channels
-            allowed_channels_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
-            if allowed_channels_raw:
-                allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
-                if "*" not in allowed_channels and not (channel_ids & allowed_channels):
-                    logger.debug("[%s] Ignoring message in non-allowed channel: %s", self.name, channel_ids)
-                    return
+            # Check allowed channels - if set, only respond in these channels.
+            allowed_channels = self._discord_allowed_channels()
+            if allowed_channels and "*" not in allowed_channels and not (channel_ids & allowed_channels):
+                logger.debug("[%s] Ignoring message in non-allowed channel: %s", self.name, channel_ids)
+                return
 
             # Check ignored channels - never respond even when mentioned
-            ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
-            ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
+            ignored_channels = self._discord_ignored_channels()
             if "*" in ignored_channels or (channel_ids & ignored_channels):
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_ids)
                 return
@@ -4550,8 +4596,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
-            no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
-            no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
+            no_thread_channels = self._discord_no_thread_channels()
             skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply

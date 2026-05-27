@@ -10,6 +10,7 @@ from pathlib import Path
 from hermes_cli.webhook import (
     webhook_command,
     _load_subscriptions,
+    _preset_route,
     _save_subscriptions,
     _subscriptions_path,
     _is_webhook_enabled,
@@ -67,6 +68,23 @@ class TestSubscribe:
         assert route["prompt"] == "Issue: {issue.title}"
         assert route["deliver"] == "telegram"
         assert route["deliver_extra"] == {"chat_id": "12345"}
+
+    def test_presets_include_required_scheduler_metadata(self):
+        for preset in (
+            "lifewiki-nightly",
+            "stripe-payment-success",
+            "stripe-payment-failure",
+            "stripe-checkout-abandonment",
+            "stripe-subscription-cancellation",
+            "stripe-dispute-opened",
+            "stripe-refund-issued",
+        ):
+            route = _preset_route(preset)
+            assert route["description"]
+            assert route["prompt"]
+            assert route["validation"]["required_fields"]
+            if preset == "lifewiki-nightly":
+                assert route["validation"]["allowed_companies"] == ["LifeWiki"]
 
     def test_custom_secret(self):
         webhook_command(_make_args(
