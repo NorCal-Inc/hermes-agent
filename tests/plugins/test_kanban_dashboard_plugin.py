@@ -1486,6 +1486,58 @@ def test_create_task_probe_error_does_not_break_create(client, monkeypatch):
 
 
 
+def test_presence_snapshot_exposes_authority_and_task_layers(client):
+    r = client.get("/api/plugins/kanban/presence")
+    assert r.status_code == 200
+    data = r.json()
+
+    assert data["erika"]["name"] == "Erika"
+    assert data["erika"]["status"] == "operational"
+    assert data["erika"]["current_operational_mode"] in {"idle", "operational"}
+    assert data["erika"]["queue_pressure_summary"]
+    assert data["erika"]["governance_summary_eligibility"] in {True, False}
+    assert data["erika"]["unresolved_anomaly_count"] >= 0
+    assert data["authority_presence"]["erika"]["name"] == "Erika"
+    assert [leader["name"] for leader in data["authority_presence"]["team_leaders"]] == [
+        "Erika",
+        "NorthCaledonia_Lead",
+        "Logos_Covenant_Lead",
+        "Orion_Formation_Services_Lead",
+        "TripTracker_Lead",
+        "CLHubbard_Lead",
+        "LifeWiki_Lead",
+    ]
+    assert data["orchestration_hierarchy"]["root"]["name"] == "Erika"
+    assert data["orchestration_hierarchy"]["root_children"] == [
+        "NorthCaledonia_Lead",
+        "Logos_Covenant_Lead",
+        "Orion_Formation_Services_Lead",
+        "TripTracker_Lead",
+        "CLHubbard_Lead",
+        "LifeWiki_Lead",
+    ]
+    assert data["task_presence"]["visible_workers"] == []
+    assert data["task_presence"]["hidden_idle_worker_count"] >= 1
+    assert all(worker["runtime_state"] == "IDLE" for worker in data["task_presence"]["workers"])
+
+
+def test_presence_snapshot_includes_heartbeats_and_status_separation(client):
+    data = client.get("/api/plugins/kanban/presence").json()
+    erika = data["erika"]
+    leader = next(item for item in data["leaders"] if item["name"] == "LifeWiki_Lead")
+
+    assert "heartbeat_state" in erika
+    assert "last_heartbeat_at" in erika
+    assert erika["status"] in {"operational", "degraded", "blocked"}
+    assert erika["current_operational_mode"] in {"idle", "operational"}
+    assert leader["status"] in {"operational", "degraded", "blocked", "idle"}
+    assert leader["runtime_state"] in {"READY", "ACTIVE", "BLOCKED", "DEGRADED", "IDLE"}
+    assert leader["worker_count"] == len(leader["assigned_workers"])
+    assert leader["routing_health"] in {"healthy", "degraded"}
+    assert "unresolved_anomaly_count" in leader
+    assert "governance_summary_eligibility" in erika
+
+
 # ---------------------------------------------------------------------------
 # Home-channel subscription endpoints (#19534 follow-up: GUI opt-in)
 # ---------------------------------------------------------------------------

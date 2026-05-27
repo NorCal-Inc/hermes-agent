@@ -990,6 +990,10 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
+        h(OperationalPresencePanel, {
+          boardSlug: board,
+          onOpenLeader: setSelectedTaskId,
+        }),
         h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,
@@ -1469,6 +1473,203 @@
       title: "Open Hermes Kanban docs in a new tab",
       "aria-label": "Hermes Kanban documentation",
     }, "?");
+  }
+
+  function OperationalPresencePanel(props) {
+    const [presence, setPresence] = useState(null);
+    const [error, setError] = useState(null);
+    const [expandedLeaders, setExpandedLeaders] = useState(function () { return ({ Erika: true }); });
+    const loadPresence = useCallback(function () {
+      return SDK.fetchJSON(withBoard(`${API}/presence`, props.boardSlug)).then(function (data) {
+        setPresence(data || null);
+        setError(null);
+      }).catch(function (err) {
+        setError(String(err && err.message ? err.message : err));
+      });
+    }, [props.boardSlug]);
+    useEffect(function () {
+      loadPresence();
+    }, [loadPresence]);
+    if (!presence) {
+      return h(Card, { className: "p-3" },
+        h(CardContent, { className: "p-2 text-xs text-muted-foreground" },
+          error ? `Operational presence unavailable: ${error}` : "Loading operational presence…"));
+    }
+    const authority = (presence && presence.authority_presence) || {};
+    const taskPresence = (presence && presence.task_presence) || {};
+    const hierarchy = presence.orchestration_hierarchy || authority.orchestration_hierarchy || {};
+    const leaders = (hierarchy.children || authority.team_leaders || presence.leaders) || [];
+    const erika = hierarchy.root || authority.erika || (presence && presence.erika);
+    const allWorkers = taskPresence.workers || presence.workers || [];
+    const visibleWorkers = taskPresence.visible_workers || allWorkers.filter(function (worker) {
+      return (worker.runtime_state || worker.status || "IDLE") !== "IDLE";
+    });
+    const hiddenIdleWorkers = typeof taskPresence.hidden_idle_worker_count === "number"
+      ? taskPresence.hidden_idle_worker_count
+      : Math.max(0, allWorkers.length - visibleWorkers.length);
+    const heartbeatSummary = function (item) {
+      if (!item) return "unknown";
+      if (item.last_heartbeat_at === null || item.last_heartbeat_at === undefined) return "idle";
+      if (item.heartbeat_state) return item.heartbeat_state;
+      return "fresh";
+    };
+    const statusPillClass = function (state) {
+      if (state === "blocked") return "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300";
+      if (state === "degraded") return "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+      if (state === "idle") return "border-muted-foreground/30 bg-muted/30 text-muted-foreground";
+      return "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    };
+    const toggleLeader = function (name) {
+      setExpandedLeaders(function (prev) {
+        const next = Object.assign({}, prev);
+        next[name] = !next[name];
+        return next;
+      });
+    };
+    const activeWorkersForLeader = function (leaderName) {
+      return allWorkers.filter(function (worker) {
+        const workerLeader = worker.team_leader || worker.telemetry_ownership || "Erika";
+        if (workerLeader !== leaderName) return false;
+        return (worker.runtime_state || worker.status || "IDLE") !== "IDLE";
+      });
+    };
+    const leaderSummary = function (leader) {
+      return h("div", { className: "grid gap-1 sm:grid-cols-2 xl:grid-cols-3" },
+        h("div", null, `Company scope: ${leader.company_scope || "unknown"}`),
+        h("div", null, `Operational state: ${leader.status || leader.runtime_state || "idle"}`),
+        h("div", null, `Worker count: ${leader.worker_count || (leader.assigned_workers || []).length || 0}`),
+        h("div", null, `Unresolved workload: ${leader.unresolved_workload_count || 0}`),
+        h("div", null, `Escalation count: ${leader.escalation_count || leader.active_escalations || 0}`),
+        h("div", null, `Cron-linked activity: ${(leader.cron_ownership || []).length ? leader.cron_ownership.join(", ") : "none"}`),
+        h("div", null, `Last heartbeat: ${heartbeatSummary(leader)} · ${leader.last_heartbeat_at || "—"}`),
+        h("div", null, `Last operational activity: ${leader.last_operational_activity || leader.last_activity_at || "—"}`),
+        h("div", null, `Operational health: ${leader.operational_health || leader.health_state || "HEALTHY"}`),
+      );
+    };
+    const leaderWorkers = function (leader) {
+      const active = activeWorkersForLeader(leader.name);
+      if (!active.length) {
+        return h("div", { className: "mt-2 text-muted-foreground" }, "Worker presence hidden unless active or escalated.");
+      }
+      return h("div", { className: "mt-2 grid gap-2" },
+        active.map(function (worker) {
+          return h("div", {
+            key: worker.name,
+            className: "rounded-md border border-border bg-background/80 p-2",
+          },
+            h("div", { className: "flex items-center justify-between gap-2" },
+              h("span", { className: "font-semibold" }, worker.name),
+              h("span", { className: `rounded-full border px-2 py-0.5 text-[10px] ${statusPillClass((worker.status || worker.runtime_state || "idle").toLowerCase())}` }, worker.status || worker.runtime_state || "IDLE"),
+            ),
+            h("div", null, `Scope: ${worker.company_scope || "unknown"}`),
+            h("div", null, `Heartbeat: ${heartbeatSummary(worker)} · Last: ${worker.last_heartbeat_at || "—"}`),
+            h("div", null, `Unresolved: ${worker.unresolved_workload_count || 0} · Escalations: ${worker.escalation_count || 0}`),
+          );
+        }),
+      );
+    };
+    return h(Card, { className: "p-3" },
+      h(CardContent, { className: "p-2 flex flex-col gap-4" },
+        h("div", { className: "flex items-center justify-between" },
+          h("div", { className: "text-sm font-medium" }, "Operational presence"),
+          h("button", { type: "button", onClick: loadPresence, className: "text-xs underline text-muted-foreground" }, "Refresh"),
+        ),
+        h("div", { className: "rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs" },
+          h("div", { className: "mb-2 flex items-center justify-between gap-2 text-[11px] uppercase tracking-wide text-muted-foreground" },
+            h("span", null, "Root operational node"),
+            h("span", { className: `rounded-full border px-2 py-0.5 text-[10px] ${statusPillClass((erika.status || erika.runtime_state || "idle").toLowerCase())}` }, erika.status || erika.runtime_state || "IDLE"),
+          ),
+          h("div", { className: "flex flex-col gap-2" },
+            h("div", { className: "text-sm font-semibold" }, "Erika"),
+            h("div", { className: "grid gap-1 sm:grid-cols-2 xl:grid-cols-3" },
+              h("div", null, `Operational state: ${erika.status || erika.runtime_state || "idle"}`),
+              h("div", null, `Heartbeat: ${heartbeatSummary(erika)} · ${erika.last_heartbeat_at || "—"}`),
+              h("div", null, `Unresolved escalations: ${erika.active_escalations || erika.escalation_count || 0}`),
+              h("div", null, `Supervised Team Leader count: ${(erika.supervised_team_leaders || []).length}`),
+              h("div", null, `Unresolved anomaly count: ${erika.unresolved_anomaly_count || 0}`),
+              h("div", null, `Routing health: ${erika.routing_health || "healthy"}`),
+              h("div", null, `Governance summary eligibility: ${erika.governance_summary_eligibility ? "eligible" : "not eligible"}`),
+              h("div", null, `Queue pressure summary: ${erika.queue_pressure_summary || "0 blocked · 0 running · 0 unresolved"}`),
+              h("div", null, `Last operational activity: ${erika.last_operational_activity || erika.last_activity_at || "—"}`),
+            ),
+            h("div", { className: "rounded-md border border-border bg-background/60 p-3" },
+              h("div", { className: "mb-2 text-[11px] uppercase tracking-wide text-muted-foreground" }, "Supervised Team Leaders"),
+              h("div", { className: "grid gap-2" },
+                leaders.map(function (leader) {
+                  const expanded = expandedLeaders[leader.name] !== false;
+                  const state = (leader.status || leader.runtime_state || "idle").toLowerCase();
+                  const activeWorkers = activeWorkersForLeader(leader.name);
+                  return h("div", {
+                    key: leader.name,
+                    className: "rounded-md border border-border bg-background/80 p-2",
+                  },
+                    h("button", {
+                      type: "button",
+                      onClick: function () { return toggleLeader(leader.name); },
+                      className: "flex w-full items-center justify-between gap-2 text-left",
+                    },
+                      h("div", { className: "flex items-center gap-2" },
+                        h("span", { className: "font-semibold" }, leader.name),
+                        h("span", { className: `rounded-full border px-2 py-0.5 text-[10px] ${statusPillClass(state)}` }, leader.status || leader.runtime_state || "IDLE"),
+                        leader.name === "Erika" ? h("span", { className: "rounded-full border px-2 py-0.5 text-[10px] border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" }, "pinned") : null,
+                      ),
+                      h("span", { className: "text-[11px] text-muted-foreground" }, expanded ? "Collapse" : "Expand"),
+                    ),
+                    h("div", { className: "mt-2" }, leaderSummary(leader)),
+                    expanded ? h("div", { className: "mt-3 rounded-md border border-dashed border-border/60 p-2" },
+                      h("div", { className: "mb-2 text-[11px] uppercase tracking-wide text-muted-foreground" }, "Expanded runtime detail"),
+                      h("div", { className: "grid gap-1 sm:grid-cols-2 xl:grid-cols-3" },
+                        h("div", null, `Cron-linked activity: ${(leader.cron_ownership || []).length ? leader.cron_ownership.join(", ") : "none"}`),
+                        h("div", null, `Heartbeat: ${heartbeatSummary(leader)} · Last: ${leader.last_heartbeat_at || "—"}`),
+                        h("div", null, `Operational health: ${leader.operational_health || leader.health_state || "HEALTHY"}`),
+                        h("div", null, `Telemetry ownership: ${leader.telemetry_awareness || "IDLE"}`),
+                        h("div", null, `Runtime state: ${leader.runtime_state || "IDLE"}`),
+                        h("div", null, `Routing state: ${leader.routing_state || "READY"}`),
+                      ),
+                      h("div", { className: "mt-2" },
+                        h("div", { className: "mb-1 text-[11px] uppercase tracking-wide text-muted-foreground" }, "Active workers"),
+                        leaderWorkers(leader),
+                      ),
+                    ) : null,
+                    !expanded ? h("div", { className: "mt-2 text-muted-foreground" }, "Collapsed to reduce operational noise.") : null,
+                  );
+                }),
+              ),
+            ),
+          ),
+        ),
+        h("div", { className: "grid gap-3 lg:grid-cols-2" },
+          h("div", { className: "rounded-md border border-border bg-background/60 p-3 text-xs" },
+            h("div", { className: "mb-2 text-[11px] uppercase tracking-wide text-muted-foreground" }, "Task presence"),
+            h("div", null, `Active workers: ${visibleWorkers.length}`),
+            h("div", null, `Hidden idle workers: ${hiddenIdleWorkers}`),
+            hiddenIdleWorkers > 0 ? h("div", { className: "text-muted-foreground" }, "Idle workers remain hidden until active.") : null,
+            visibleWorkers.length > 0 ? h("div", { className: "mt-2 grid gap-2" },
+              visibleWorkers.map(function (worker) {
+                return h("div", {
+                  key: worker.name,
+                  className: "rounded-md border border-border bg-background/80 p-2",
+                },
+                  h("div", { className: "flex items-center justify-between gap-2" },
+                    h("span", { className: "font-semibold" }, worker.name),
+                    h("span", { className: `rounded-full border px-2 py-0.5 text-[10px] ${statusPillClass((worker.status || worker.runtime_state || "idle").toLowerCase())}` }, worker.status || worker.runtime_state || "IDLE"),
+                  ),
+                  h("div", null, `Scope: ${worker.company_scope || "unknown"}`),
+                  h("div", null, `Heartbeat: ${heartbeatSummary(worker)} · Last: ${worker.last_heartbeat_at || "—"}`),
+                  h("div", null, `Unresolved: ${worker.unresolved_workload_count || 0} · Escalations: ${worker.escalation_count || 0}`),
+                );
+              }),
+            ) : h("div", { className: "mt-2 text-muted-foreground" }, "No active worker presence.")
+          ),
+          h("div", { className: "rounded-md border border-border bg-background/60 p-3 text-xs" },
+            h("div", { className: "mb-2 text-[11px] uppercase tracking-wide text-muted-foreground" }, "Hierarchy note"),
+            h("div", null, "Authority hierarchy is rendered separately from task orchestration."),
+            h("div", null, "Erika remains visible even when idle; child leaders collapse to reduce noise."),
+          ),
+        ),
+        error ? h("div", { className: "text-xs text-destructive" }, error) : null,
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------

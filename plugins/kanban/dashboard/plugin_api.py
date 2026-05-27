@@ -43,6 +43,8 @@ import os
 import sqlite3
 import time
 from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
@@ -55,8 +57,455 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+PRESENCE_LEADER_WORKERS: dict[str, list[str]] = {
+    "Erika": [
+        "northcaledonia_lead",
+        "logos_covenant_lead",
+        "orion_formation_services_lead",
+        "triptracker_lead",
+        "clhubbard_lead",
+        "lifewiki_lead",
+    ],
+    "NorthCaledonia_Lead": ["finance_agent"],
+    "Logos_Covenant_Lead": ["ad_agent", "marketing_agent"],
+    "Orion_Formation_Services_Lead": [],
+    "TripTracker_Lead": [
+        "customerfollowup_worker",
+        "stalepurchase_worker",
+        "stripe_worker",
+        "subscription_worker",
+        "support_worker",
+    ],
+    "CLHubbard_Lead": ["compliance_worker", "financesupport_worker", "operations_worker", "reminder_worker"],
+    "LifeWiki_Lead": ["governancerecall_worker", "knowledgegrounding_worker", "memorycurator_worker", "nightlydigest_worker", "summary_worker"],
+}
+
+PRESENCE_LEADER_SCOPE: dict[str, str] = {
+    "Erika": "Cross-company / operational coordinator",
+    "NorthCaledonia_Lead": "North Caledonia only",
+    "Logos_Covenant_Lead": "Logos Covenant only",
+    "Orion_Formation_Services_Lead": "Orion Formation Services only",
+    "TripTracker_Lead": "TripTracker only",
+    "CLHubbard_Lead": "CLHubbard only",
+    "LifeWiki_Lead": "LifeWiki only",
+}
+
+PRESENCE_LEADER_CRON: dict[str, list[str]] = {
+    "Erika": ["stripe-monitor", "stripe-daily-summary", "overall_manager_monitor", "repo-build-watch"],
+    "NorthCaledonia_Lead": ["nuclear_backup", "nuclear-backup-drive-validation", "uptime-check"],
+    "Logos_Covenant_Lead": ["ad_agent_monitor", "marketing_agent_monitor"],
+    "Orion_Formation_Services_Lead": ["norcalops-takeover"],
+    "TripTracker_Lead": ["stripe-monitor", "stripe-daily-summary"],
+    "CLHubbard_Lead": [],
+    "LifeWiki_Lead": ["daily-life-wiki-status", "life-wiki-github-sync"],
+}
+
+PRESENCE_WORKER_TELEMETRY: dict[str, str] = {
+    "finance_agent": "NorthCaledonia_Lead",
+    "ad_agent": "Logos_Covenant_Lead",
+    "marketing_agent": "Logos_Covenant_Lead",
+    "governancerecall_worker": "LifeWiki_Lead",
+    "knowledgegrounding_worker": "LifeWiki_Lead",
+    "memorycurator_worker": "LifeWiki_Lead",
+    "nightlydigest_worker": "LifeWiki_Lead",
+    "summary_worker": "LifeWiki_Lead",
+    "customerfollowup_worker": "TripTracker_Lead",
+    "stalepurchase_worker": "TripTracker_Lead",
+    "stripe_worker": "TripTracker_Lead",
+    "subscription_worker": "TripTracker_Lead",
+    "support_worker": "TripTracker_Lead",
+    "compliance_worker": "CLHubbard_Lead",
+    "financesupport_worker": "CLHubbard_Lead",
+    "operations_worker": "CLHubbard_Lead",
+    "reminder_worker": "CLHubbard_Lead",
+}
+
+PRESENCE_WORKER_SCOPE: dict[str, str] = {
+    "finance_agent": "North Caledonia only",
+    "ad_agent": "Logos Covenant only",
+    "marketing_agent": "Logos Covenant only",
+    "governancerecall_worker": "LifeWiki only",
+    "knowledgegrounding_worker": "LifeWiki only",
+    "memorycurator_worker": "LifeWiki only",
+    "nightlydigest_worker": "LifeWiki only",
+    "summary_worker": "LifeWiki only",
+    "customerfollowup_worker": "TripTracker only",
+    "stalepurchase_worker": "TripTracker only",
+    "stripe_worker": "TripTracker only",
+    "subscription_worker": "TripTracker only",
+    "support_worker": "TripTracker only",
+    "compliance_worker": "CLHubbard only",
+    "financesupport_worker": "CLHubbard only",
+    "operations_worker": "CLHubbard only",
+    "reminder_worker": "CLHubbard only",
+}
+
+
+def _parse_iso_epoch(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def _load_all_cron_jobs() -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    try:
+        from hermes_cli import profiles as profiles_mod
+        profiles = profiles_mod.list_profiles()
+    except Exception:
+        profiles = []
+    for profile in profiles:
+        jobs_file = Path(profile.path) / "cron" / "jobs.json"
+        if not jobs_file.is_file():
+            continue
+        try:
+            data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for job in data.get("jobs", []) or []:
+            if isinstance(job, dict):
+                record = dict(job)
+                record["_profile"] = profile.name
+                jobs.append(record)
+    return jobs
+
+
+def _load_task_presence(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT assignee, status, COUNT(*) AS n, MAX(created_at) AS latest_created, "
+        "MAX(COALESCE(started_at, created_at, completed_at)) AS latest_activity "
+        "FROM tasks WHERE status != 'archived' AND assignee IS NOT NULL "
+        "GROUP BY assignee, status"
+    ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        assignee = str(row["assignee"])
+        bucket = out.setdefault(assignee, {"counts": {}, "latest_activity": None})
+        bucket["counts"][str(row["status"])] = int(row["n"])
+        latest = _parse_iso_epoch(row["latest_activity"])
+        if latest is None:
+            latest = _parse_iso_epoch(row["latest_created"])
+        if latest is not None:
+            bucket["latest_activity"] = max(bucket["latest_activity"] or 0, latest)
+    return out
+
+
+def _summarise_runtime_state(unresolved: int, blocked: int, running: int, paused: int, errored: int, *, idle_is_ready: bool = False) -> str:
+    if errored > 0:
+        return "DEGRADED"
+    if blocked > 0:
+        return "BLOCKED"
+    if running > 0 or unresolved > 0:
+        return "ACTIVE"
+    if paused > 0:
+        return "IDLE"
+    return "READY" if idle_is_ready else "IDLE"
+
+
+def _presence_status_label(runtime_state: str, *, mode: str = "entity") -> str:
+    """Map internal runtime states to dashboard-facing labels."""
+    if mode == "heartbeat":
+        return {
+            "DEGRADED": "stale",
+            "BLOCKED": "blocked",
+            "ACTIVE": "fresh",
+            "READY": "fresh",
+            "IDLE": "idle",
+        }.get(runtime_state, "idle")
+    return {
+        "DEGRADED": "degraded",
+        "BLOCKED": "blocked",
+        "ACTIVE": "operational",
+        "READY": "operational",
+        "IDLE": "idle",
+    }.get(runtime_state, runtime_state.lower() if runtime_state else "idle")
+
+
+def _heartbeat_snapshot(latest_activity: Optional[int]) -> dict[str, Any]:
+    now = int(time.time())
+    if latest_activity is None:
+        return {"state": "idle", "last_heartbeat_at": None, "age_seconds": None, "updated_at": now}
+    age = max(0, now - int(latest_activity))
+    if age <= 900:
+        state = "fresh"
+    elif age <= 3600:
+        state = "stale"
+    else:
+        state = "cold"
+    return {"state": state, "last_heartbeat_at": int(latest_activity), "age_seconds": age, "updated_at": now}
+
+
+def _presence_snapshot(conn: sqlite3.Connection, board: Optional[str] = None) -> dict[str, Any]:
+    task_presence = _load_task_presence(conn)
+    cron_jobs = _load_all_cron_jobs()
+
+    jobs_by_name: dict[str, list[dict[str, Any]]] = {}
+    for job in cron_jobs:
+        name = str(job.get("name") or job.get("id") or "")
+        if not name:
+            continue
+        jobs_by_name.setdefault(name, []).append(job)
+
+    def job_state(job: dict[str, Any]) -> str:
+        if not bool(job.get("enabled", True)) or str(job.get("state") or "").lower() == "paused":
+            return "PAUSED"
+        last = str(job.get("last_status") or "").lower()
+        if last and last not in {"ok", "success", "completed", "done", "scheduled"}:
+            return "DEGRADED"
+        return "READY"
+
+    def latest_job_activity(names: list[str]) -> Optional[int]:
+        latest = None
+        for name in names:
+            for job in jobs_by_name.get(name, []):
+                for key in ("last_run_at", "next_run_at", "created_at"):
+                    ts = _parse_iso_epoch(job.get(key))
+                    if ts is not None:
+                        latest = ts if latest is None else max(latest, ts)
+        return latest
+
+    leaders: list[dict[str, Any]] = []
+    workers: list[dict[str, Any]] = []
+    visible_workers: list[dict[str, Any]] = []
+    all_worker_names = sorted({w for ws in PRESENCE_LEADER_WORKERS.values() for w in ws})
+    leader_names = ["Erika", "NorthCaledonia_Lead", "Logos_Covenant_Lead", "Orion_Formation_Services_Lead", "TripTracker_Lead", "CLHubbard_Lead", "LifeWiki_Lead"]
+
+    for leader in leader_names:
+        assigned_workers = PRESENCE_LEADER_WORKERS.get(leader, [])
+        leader_jobs = PRESENCE_LEADER_CRON.get(leader, [])
+        leader_task_counts: list[int] = []
+        blocked = running = unresolved = 0
+        latest_activity = latest_job_activity(leader_jobs)
+        active_workers: list[str] = []
+        idle_workers: list[str] = []
+        for worker in assigned_workers:
+            counts = (task_presence.get(worker) or {}).get("counts", {})
+            worker_unresolved = sum(int(counts.get(status, 0)) for status in ("todo", "scheduled", "ready", "running", "blocked", "review"))
+            worker_blocked = int(counts.get("blocked", 0))
+            worker_running = int(counts.get("running", 0))
+            worker_state = "IDLE"
+            if worker_blocked > 0:
+                worker_state = "BLOCKED"
+            elif worker_running > 0 or worker_unresolved > 0:
+                worker_state = "ACTIVE"
+            worker_latest = (task_presence.get(worker) or {}).get("latest_activity")
+            if worker_latest is not None:
+                latest_activity = worker_latest if latest_activity is None else max(latest_activity, worker_latest)
+            if worker_state == "IDLE":
+                idle_workers.append(worker)
+            else:
+                active_workers.append(worker)
+            worker_heartbeat = _heartbeat_snapshot(worker_latest)
+            worker_record = {
+                "name": worker,
+                "team_leader": leader,
+                "company_scope": PRESENCE_WORKER_SCOPE.get(worker, "Unknown"),
+                "runtime_state": worker_state,
+                "status": _presence_status_label(worker_state),
+                "queue_state": counts,
+                "unresolved_workload_count": worker_unresolved,
+                "escalation_count": 1 if worker_blocked > 0 else 0,
+                "escalation_state": "ESCALATED" if worker_blocked > 0 else "NONE",
+                "last_activity_at": worker_latest,
+                "telemetry_ownership": PRESENCE_WORKER_TELEMETRY.get(worker, leader),
+                "heartbeat_state": worker_heartbeat["state"],
+                "last_heartbeat_at": worker_heartbeat["last_heartbeat_at"],
+                "heartbeat_age_seconds": worker_heartbeat["age_seconds"],
+            }
+            workers.append(worker_record)
+            if worker_state != "IDLE":
+                visible_workers.append(worker_record)
+            unresolved += worker_unresolved
+            blocked += worker_blocked
+            running += worker_running
+            leader_task_counts.append(worker_unresolved)
+
+        job_records = [job for name in leader_jobs for job in jobs_by_name.get(name, [])]
+        paused_jobs = sum(1 for job in job_records if job_state(job) == "PAUSED")
+        errored_jobs = sum(1 for job in job_records if job_state(job) == "DEGRADED")
+        for job in job_records:
+            ts = max((_parse_iso_epoch(job.get(k)) or 0) for k in ("last_run_at", "next_run_at", "created_at"))
+            latest_activity = ts if latest_activity is None else max(latest_activity, ts)
+
+        runtime_state = _summarise_runtime_state(unresolved, blocked, running, paused_jobs, errored_jobs, idle_is_ready=(leader == "Erika"))
+        if leader == "Erika" and runtime_state == "IDLE":
+            runtime_state = "READY"
+        operational_mode = "operational" if (unresolved > 0 or blocked > 0 or running > 0 or paused_jobs > 0 or errored_jobs > 0 or latest_activity is not None) else "idle"
+        health_state = "DEGRADED" if (paused_jobs > 0 or errored_jobs > 0 or blocked > 0) else "HEALTHY"
+        telemetry_state = "ACTIVE" if leader_jobs or unresolved > 0 else "IDLE"
+        heartbeat = _heartbeat_snapshot(latest_activity)
+        leader_worker_count = len(assigned_workers)
+        unresolved_anomaly_count = blocked + errored_jobs
+        governance_summary_eligibility = leader == "Erika" and health_state == "HEALTHY" and unresolved_anomaly_count == 0
+        leader_queue_pressure = {
+            "blocked": blocked,
+            "running": running,
+            "unresolved": unresolved,
+            "paused_jobs": paused_jobs,
+            "errored_jobs": errored_jobs,
+        }
+        leaders.append({
+            "name": leader,
+            "status": _presence_status_label(runtime_state),
+            "status_detail": runtime_state,
+            "health_state": health_state,
+            "operational_health": health_state,
+            "company_scope": PRESENCE_LEADER_SCOPE.get(leader, "Unknown"),
+            "escalation_target": "Christopher" if leader != "Erika" else "Christopher",
+            "supervised_team_leaders": [
+                "NorthCaledonia_Lead",
+                "Logos_Covenant_Lead",
+                "Orion_Formation_Services_Lead",
+                "TripTracker_Lead",
+                "CLHubbard_Lead",
+                "LifeWiki_Lead",
+            ] if leader == "Erika" else [],
+            "assigned_workers": assigned_workers,
+            "worker_count": leader_worker_count,
+            "active_workers": active_workers,
+            "idle_workers": idle_workers,
+            "unresolved_workload_count": unresolved,
+            "unresolved_anomaly_count": unresolved_anomaly_count,
+            "escalation_count": blocked + paused_jobs + errored_jobs,
+            "active_escalations": blocked + paused_jobs + errored_jobs,
+            "runtime_state": runtime_state,
+            "telemetry_awareness": telemetry_state,
+            "routing_state": "READY" if runtime_state in {"READY", "IDLE"} else "ACTIVE",
+            "routing_health": "healthy" if runtime_state in {"READY", "IDLE"} and blocked == 0 and paused_jobs == 0 and errored_jobs == 0 else "degraded",
+            "last_operational_activity": latest_activity,
+            "last_activity_at": latest_activity,
+            "last_heartbeat_at": heartbeat["last_heartbeat_at"],
+            "heartbeat_state": heartbeat["state"],
+            "heartbeat_age_seconds": heartbeat["age_seconds"],
+            "cron_ownership": leader_jobs,
+            "queue_state": leader_queue_pressure,
+            "queue_pressure_summary": f"{blocked} blocked · {running} running · {unresolved} unresolved",
+            "operational_mode": operational_mode,
+            "current_operational_mode": operational_mode,
+            "governance_summary_eligibility": governance_summary_eligibility,
+        })
+
+    for worker in all_worker_names:
+        counts = (task_presence.get(worker) or {}).get("counts", {})
+        unresolved_worker = sum(int(counts.get(status, 0)) for status in ("todo", "scheduled", "ready", "running", "blocked", "review"))
+        blocked_worker = int(counts.get("blocked", 0))
+        running_worker = int(counts.get("running", 0))
+        state = "IDLE"
+        if blocked_worker > 0:
+            state = "BLOCKED"
+        elif running_worker > 0 or unresolved_worker > 0:
+            state = "ACTIVE"
+        latest_activity = (task_presence.get(worker) or {}).get("latest_activity")
+        heartbeat = _heartbeat_snapshot(latest_activity)
+        workers.append({
+            "name": worker,
+            "team_leader": PRESENCE_WORKER_TELEMETRY.get(worker, "Erika"),
+            "company_scope": PRESENCE_WORKER_SCOPE.get(worker, "Unknown"),
+            "runtime_state": state,
+            "status": _presence_status_label(state),
+            "queue_state": counts,
+            "unresolved_workload_count": unresolved_worker,
+            "escalation_count": 1 if blocked_worker > 0 else 0,
+            "escalation_state": "ESCALATED" if blocked_worker > 0 else ("BLOCKED" if blocked_worker > 0 else "NONE"),
+            "last_activity_at": latest_activity,
+            "telemetry_ownership": PRESENCE_WORKER_TELEMETRY.get(worker, "Erika"),
+            "heartbeat_state": heartbeat["state"],
+            "last_heartbeat_at": heartbeat["last_heartbeat_at"],
+            "heartbeat_age_seconds": heartbeat["age_seconds"],
+        })
+
+    erika = next((item for item in leaders if item["name"] == "Erika"), None)
+    erika = erika or {
+        "name": "Erika",
+        "status": "operational",
+        "status_detail": "READY",
+        "health_state": "HEALTHY",
+        "operational_health": "HEALTHY",
+        "company_scope": PRESENCE_LEADER_SCOPE.get("Erika", "Unknown"),
+        "escalation_target": "Christopher",
+        "supervised_team_leaders": PRESENCE_LEADER_WORKERS["Erika"],
+        "assigned_workers": PRESENCE_LEADER_WORKERS["Erika"],
+        "worker_count": len(PRESENCE_LEADER_WORKERS["Erika"]),
+        "active_workers": [],
+        "idle_workers": PRESENCE_LEADER_WORKERS["Erika"],
+        "unresolved_workload_count": 0,
+        "escalation_count": 0,
+        "active_escalations": 0,
+        "runtime_state": "READY",
+        "telemetry_awareness": "IDLE",
+        "routing_state": "READY",
+        "routing_health": "healthy",
+        "last_operational_activity": None,
+        "last_activity_at": None,
+        "last_heartbeat_at": None,
+        "heartbeat_state": "idle",
+        "heartbeat_age_seconds": None,
+        "cron_ownership": PRESENCE_LEADER_CRON.get("Erika", []),
+        "queue_state": {"blocked": 0, "running": 0, "unresolved": 0, "paused_jobs": 0, "errored_jobs": 0},
+        "queue_pressure_summary": "0 blocked · 0 running · 0 unresolved",
+        "operational_mode": "idle",
+        "current_operational_mode": "idle",
+    }
+    orchestration_hierarchy = {
+        "root": erika,
+        "children": leaders,
+        "root_children": erika.get("supervised_team_leaders", []),
+    }
+    authority_presence = {
+        "erika": erika,
+        "team_leaders": leaders,
+        "heartbeat_layer": {
+            "erika": {
+                "state": erika.get("heartbeat_state"),
+                "last_heartbeat_at": erika.get("last_heartbeat_at"),
+                "age_seconds": erika.get("heartbeat_age_seconds"),
+            },
+            "team_leaders": [
+                {
+                    "name": leader["name"],
+                    "state": leader.get("heartbeat_state"),
+                    "last_heartbeat_at": leader.get("last_heartbeat_at"),
+                    "age_seconds": leader.get("heartbeat_age_seconds"),
+                }
+                for leader in leaders
+            ],
+        },
+        "orchestration_hierarchy": orchestration_hierarchy,
+    }
+    task_presence_layer = {
+        "workers": workers,
+        "visible_workers": visible_workers,
+        "hidden_idle_worker_count": max(0, len(workers) - len(visible_workers)),
+    }
+    return {
+        "board": board or "default",
+        "updated_at": int(time.time()),
+        "authority_presence": authority_presence,
+        "task_presence": task_presence_layer,
+        "orchestration_hierarchy": orchestration_hierarchy,
+        "leaders": leaders,
+        "workers": workers,
+        "visible_workers": visible_workers,
+        "erika": erika,
+    }
+
 
 # ---------------------------------------------------------------------------
+# Auth helper# ---------------------------------------------------------------------------
 # Auth helper — WebSocket only (HTTP routes live behind the dashboard's
 # existing plugin-bypass; this is documented above).
 # ---------------------------------------------------------------------------
@@ -1634,6 +2083,16 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
 # ---------------------------------------------------------------------------
 # Stats (per-profile / per-status counts + oldest-ready age)
 # ---------------------------------------------------------------------------
+
+@router.get("/presence")
+def get_presence(board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return _presence_snapshot(conn, board=board)
+    finally:
+        conn.close()
+
 
 @router.get("/stats")
 def get_stats(board: Optional[str] = Query(None)):
