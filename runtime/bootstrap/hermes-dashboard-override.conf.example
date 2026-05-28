@@ -1,0 +1,5 @@
+[Service]
+EnvironmentFile=%h/.hermes/secrets/op-service-account.env
+
+ExecStart=
+ExecStart=/bin/bash -lc 'source %h/.hermes/bootstrap/erika-init.sh && exec %h/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main dashboard --port 9119'
