@@ -74,3 +74,11 @@ Bootstrap, check/repair, systemd override, credential architecture, and this inc
 - `~/.hermes/docs/credential_architecture.md`
 - Provider alias enforcement in model routing (hermes-agent/agent/provider_router.py etc.)
 - 1Password service account setup in NorCalOps vaults.
+
+**Additional note on config.yaml (added 2026-05-28):** ~/.hermes/config.yaml is protected and was not mutated by tools. It still contains scattered dated model IDs. Protected-file change request created at ~/.hermes/docs/protected-config-change-request-2026-05-28.md with:
+- Exact current lines (default, delegation.model, x_search.model, engineering.model, fallback keys using grok-4.20-reasoning and grok-build-0.1)
+- Exact replacements using only aliases (grok_reasoning_primary, grok_builder)
+- Reason: enforce single source of truth per directive and aliases.yaml
+- Validation: ~/.hermes/bootstrap/check-credentials.sh
+Manual approval and patch required. Once applied, definition of done is met (no unauthorized hardcoded IDs, check passes with GROK_OK). Updated runtime/ copy and git commit recommended post-patch.
+
