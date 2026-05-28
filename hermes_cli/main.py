@@ -10744,6 +10744,8 @@ def cmd_dashboard(args):
         from agent.config_validator import validate_routing_config
         get_governance_metadata()
         validate_routing_config()
+        from agent.recovery_manager import recovery_manager
+        recovery_manager.emit_diagnostics()
     except Exception as e:
         print("GOV_BOOT_CALL_ERROR:", str(e))
 
