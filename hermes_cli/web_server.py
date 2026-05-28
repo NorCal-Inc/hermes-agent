@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import hmac
 import importlib.util
 import json
@@ -23,6 +24,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -80,6 +82,74 @@ _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
 
+from agent.observability import observability
+from agent.boundary_enforcer import boundary_enforcer
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer
+
+def observational_only():
+    """Explicit observational-only route group. Backend enforcement authoritative."""
+    try:
+        boundary_enforcer.enforce("dashboard", "observational")
+        return True
+    except PermissionError as e:
+        rejection = {
+            "event": "dashboard_mutation_rejected",
+            "requested_action": "any_mutation",
+            "reason": "dashboard_observational_only",
+            "status": "rejected"
+        }
+        logging.getLogger("boundary_enforcer").info(json.dumps(rejection))
+        raise HTTPException(status_code=403, detail=json.dumps(rejection))
+
+# Read-only observability endpoints (polling does not block orchestration/routing threads; async where possible)
+@app.get("/api/observability/audit")
+async def get_audit(observational: bool = Depends(observational_only)):
+    return observability.get_audit_viewer(limit=50)
+
+@app.get("/api/observability/telemetry")
+async def get_telemetry(observational: bool = Depends(observational_only)):
+    return observability.get_routing_telemetry()
+
+@app.get("/api/observability/provider_health")
+async def get_provider_health(observational: bool = Depends(observational_only)):
+    return observability.get_provider_health()
+
+@app.get("/api/observability/queue")
+async def get_queue(observational: bool = Depends(observational_only)):
+    return observability.get_queue_visibility()
+
+@app.get("/api/observability/trace")
+async def get_trace(observational: bool = Depends(observational_only)):
+    return observability.get_execution_trace()
+
+@app.get("/api/observability/metrics")
+async def get_metrics(observational: bool = Depends(observational_only)):
+    return observability.get_workload_timing_metrics()
+
+@app.get("/api/observability/approvals")
+async def get_approvals(observational: bool = Depends(observational_only)):
+    return observability.get_operator_approval_workflows()
+
+@app.get("/api/observability/diagnostics")
+async def get_diagnostics(observational: bool = Depends(observational_only)):
+    return observability.emit_diagnostics()  # returns the event payload
+
+@app.get("/api/observability/lifecycle")
+async def get_lifecycle(observational: bool = Depends(observational_only)):
+    return observability.get_task_lifecycle_visibility()
+
+@app.get("/api/observability/validation")
+async def get_validation(observational: bool = Depends(observational_only)):
+    return observability.get_non_authoritative_analytics()
+
+# Test mutation rejection from dashboard context
+@app.post("/api/observability/mutation_test")
+async def mutation_test(observational: bool = Depends(observational_only)):
+    # Should not reach here due to dependency
+    raise HTTPException(403, "dashboard_observational_only")
+
+
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
 # Generated fresh on every server start — dies when the process exits.
@@ -95,6 +165,13 @@ _DASHBOARD_EMBEDDED_CHAT_ENABLED = False
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
+_REVEAL_WINDOW_SECONDS = 30
+
+# Governance lock boot reference (PRIORITY 1). Runs on import for hermes-dashboard.service visibility.
+try:
+    import agent.governance_boot
+except Exception as e:
+    print("GOV_BOOT_IMPORT_ERROR:", str(e))
 _REVEAL_WINDOW_SECONDS = 30
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
@@ -245,6 +322,56 @@ async def auth_middleware(request: Request, call_next):
                 content={"detail": "Unauthorized"},
             )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def request_observability_middleware(request: Request, call_next):
+    """Attach request ids, normalize API errors, and emit structured request logs."""
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    request.state.request_started_at = time.time()
+    try:
+        response = await call_next(request)
+    except HTTPException as exc:
+        _log.info(
+            "api_request method=%s path=%s status=%s request_id=%s detail=%s",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            request_id,
+            exc.detail,
+        )
+        raise
+    except ValueError as exc:
+        _log.warning(
+            "api_request method=%s path=%s status=400 request_id=%s error=%s",
+            request.method,
+            request.url.path,
+            request_id,
+            exc,
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _log.exception(
+            "api_request method=%s path=%s status=500 request_id=%s",
+            request.method,
+            request.url.path,
+            request_id,
+        )
+        raise
+
+    response.headers.setdefault("X-Request-ID", request_id)
+    duration_ms = (time.time() - request.state.request_started_at) * 1000.0
+    if request.url.path.startswith("/api/"):
+        _log.info(
+            "api_request method=%s path=%s status=%s request_id=%s duration_ms=%.2f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            request_id,
+            duration_ms,
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +600,29 @@ class ModelAssignment(BaseModel):
     provider: str
     model: str
     task: str = ""
+
+
+class ErikaSessionCreate(BaseModel):
+    authority: str
+    mode: str = ""
+    title: str = ""
+
+
+class ErikaMessageCreate(BaseModel):
+    role: str
+    content: str = ""
+    authority: str = ""
+
+
+class ErikaDelegateCreate(BaseModel):
+    task: str
+    instruction: str
+    authority: str = ""
+
+
+class ErikaModeUpdate(BaseModel):
+    mode: str
+    authority: str = ""
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -2383,6 +2533,214 @@ async def cancel_oauth_session(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _erika_authority_chain() -> tuple[str, str, str, str]:
+    """Return the canonical authority chain used by Erika routes."""
+    return ("Christopher", "Erika", "Team", "Worker")
+
+
+
+def _build_erika_session_metadata(
+    session_id: str,
+    authority: str,
+    mode: str = "",
+    title: str = "",
+) -> Dict[str, Any]:
+    """Construct the metadata payload used when creating or updating Erika sessions."""
+    chain = _erika_authority_chain()
+    return {
+        "session_id": session_id,
+        "authority": authority,
+        "authority_chain": " -> ".join(chain),
+        "mode": mode,
+        "title": title,
+    }
+
+
+
+def _validate_erika_authority_or_raise(
+    authority: str,
+    session_state: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Fail closed when an Erika authority chain is invalid."""
+    expected = " -> ".join(_erika_authority_chain())
+    if not authority or authority != expected:
+        raise HTTPException(status_code=403, detail="Invalid Erika authority chain")
+    if session_state is not None:
+        current_authority = str(session_state.get("session_authority") or "")
+        if current_authority and current_authority != authority:
+            raise HTTPException(status_code=403, detail="Erika session authority mismatch")
+
+
+
+def _validate_session_exists_or_raise(session_id: str) -> Dict[str, Any]:
+    """Resolve a session id and return the row, or fail closed with 404."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        resolved = db.resolve_session_id(session_id)
+        session = db.get_session(resolved) if resolved else None
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return session
+    finally:
+        db.close()
+
+
+ERIKA_IDEMPOTENCY_TTL_SECONDS = 300
+ERIKA_STALE_SESSION_SECONDS = 300
+
+
+def _erika_canonical_body(body: Optional[Dict[str, Any]] = None) -> str:
+    """Return a stable JSON encoding for hashing only."""
+    return json.dumps(body or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _erika_request_fingerprint(
+    request: Request,
+    action: str,
+    session_id: str = "",
+    body: Optional[Dict[str, Any]] = None,
+) -> tuple[str, str, str]:
+    """Return the external key, body digest, and replay digest.
+
+    Duplicate replay behavior is defined by the external key + body digest pair
+    inside the TTL window:
+    - same key + same body digest => cached response is replayed
+    - same key + different body digest => HTTP 409
+    - expired entries are ignored and treated as new requests
+    """
+    external_key = (request.headers.get("x-idempotency-key") or "").strip()
+    body_digest = hashlib.sha256(_erika_canonical_body(body).encode("utf-8")).hexdigest()
+    replay_material = json.dumps(
+        {
+            "action": action,
+            "session_id": session_id,
+            "external_key": external_key,
+            "body_digest": body_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    replay_digest = hashlib.sha256(replay_material).hexdigest()
+    return external_key, body_digest, replay_digest
+
+
+def _erika_replay_meta_key(action: str, replay_digest: str) -> str:
+    return f"erika:idempotency:{action}:{replay_digest}"
+
+
+def _erika_replay_alias_key(action: str, external_key: str) -> str:
+    return f"erika:idempotency-alias:{action}:{external_key}"
+
+
+def _erika_idempotent_lookup(action: str, external_key: str, body_digest: str, replay_digest: str) -> Optional[Dict[str, Any]]:
+    """Return a cached Erika write response if one exists and is fresh."""
+    from hermes_state import SessionDB
+
+    now = time.time()
+    db = SessionDB()
+    try:
+        if external_key:
+            alias_raw = db.get_meta(_erika_replay_alias_key(action, external_key))
+            if alias_raw:
+                alias = json.loads(alias_raw)
+                alias_expires = float(alias.get("expires_at") or 0)
+                alias_body_digest = str(alias.get("body_digest") or "")
+                alias_replay_digest = str(alias.get("replay_digest") or "")
+                if alias_expires and alias_expires < now:
+                    return None
+                if alias_body_digest and alias_body_digest != body_digest:
+                    raise HTTPException(status_code=409, detail="Idempotency key reuse with different payload")
+                if alias_replay_digest and alias_replay_digest != replay_digest:
+                    raise HTTPException(status_code=409, detail="Idempotency key reuse with different payload")
+
+        raw = db.get_meta(_erika_replay_meta_key(action, replay_digest))
+        if not raw:
+            return None
+        envelope = json.loads(raw)
+        expires_at = float(envelope.get("expires_at") or 0)
+        if expires_at and expires_at < now:
+            return None
+        return envelope.get("response")
+    except HTTPException:
+        raise
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+def _erika_idempotent_store(
+    action: str,
+    external_key: str,
+    body_digest: str,
+    replay_digest: str,
+    payload: Dict[str, Any],
+) -> None:
+    """Cache an Erika write response for duplicate-request suppression."""
+    from hermes_state import SessionDB
+
+    now = time.time()
+    expires_at = now + ERIKA_IDEMPOTENCY_TTL_SECONDS
+    envelope = {
+        "replay_digest": replay_digest,
+        "body_digest": body_digest,
+        "created_at": now,
+        "expires_at": expires_at,
+        "response": payload,
+    }
+    db = SessionDB()
+    try:
+        db.set_meta(_erika_replay_meta_key(action, replay_digest), json.dumps(envelope, sort_keys=True))
+        if external_key:
+            db.set_meta(
+                _erika_replay_alias_key(action, external_key),
+                json.dumps(
+                    {
+                        "replay_digest": replay_digest,
+                        "body_digest": body_digest,
+                        "expires_at": expires_at,
+                    },
+                    sort_keys=True,
+                ),
+            )
+    finally:
+        db.close()
+
+
+def _erika_request_key(
+    request: Request,
+    action: str,
+    session_id: str = "",
+    body: Optional[Dict[str, Any]] = None,
+) -> tuple[str, str, str]:
+    """Resolve the replay identity for Erika duplicate suppression."""
+    return _erika_request_fingerprint(request, action, session_id, body)
+
+
+def _session_transition_allowed(session: Dict[str, Any], target: str) -> bool:
+    """Return True when the transition is legal for the current session state."""
+    ended = session.get("ended_at") is not None
+    if ended:
+        return False
+    current_mode = str(session.get("session_mode") or "orchestrated")
+    if current_mode not in {"orchestrated", "direct", "hermes"}:
+        return False
+    if target == "mode":
+        return current_mode in {"orchestrated", "direct", "hermes"}
+    return target in {"close", "message", "delegate"}
+
+
+def _session_heartbeat_ok(session: Dict[str, Any], stale_seconds: int = ERIKA_STALE_SESSION_SECONDS) -> bool:
+    """Treat a session as stale when its last activity is too old."""
+    try:
+        last_active = float(session.get("updated_at") or session.get("started_at") or 0)
+    except Exception:
+        last_active = 0.0
+    return (time.time() - last_active) < stale_seconds
+
 
 def _session_latest_descendant(session_id: str):
     """Resolve a session id to the newest child leaf session.
@@ -2460,6 +2818,51 @@ def _session_latest_descendant(session_id: str):
     finally:
         db.close()
 
+
+def _update_erika_session_mode(session_id: str, mode: str):
+    """Update Erika session mode via the existing SessionDB write helper only."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        resolved = db.resolve_session_id(session_id)
+        session = db.get_session(resolved) if resolved else None
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session.get("ended_at") is not None:
+            raise HTTPException(status_code=409, detail="Session is closed")
+
+        previous_mode = str(session.get("session_mode") or "orchestrated")
+
+        def _do(conn):
+            columns = {
+                row[1]
+                for row in conn.execute('PRAGMA table_info("sessions")').fetchall()
+            }
+            if "updated_at" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN updated_at REAL")
+            updated_at = time.time()
+            conn.execute(
+                "UPDATE sessions SET session_mode = ?, updated_at = ? "
+                "WHERE id = ? AND ended_at IS NULL",
+                (mode, updated_at, resolved),
+            )
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (resolved,),
+            ).fetchone()
+            return dict(row) if row else None
+
+        current = db._execute_write(_do) or session
+        return {
+            "session_id": resolved or session_id,
+            "previous_mode": previous_mode,
+            "current_mode": str(current.get("session_mode") or mode),
+            "updated_at": current.get("updated_at"),
+        }
+    finally:
+        db.close()
+
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str):
     from hermes_state import SessionDB
@@ -2497,6 +2900,260 @@ async def get_session_messages(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
         messages = db.get_messages(sid)
         return {"session_id": sid, "messages": messages}
+    finally:
+        db.close()
+
+
+@app.post("/api/erika/sessions")
+async def create_erika_session(body: ErikaSessionCreate, request: Request):
+    _require_token(request)
+    from hermes_state import SessionDB
+
+    external_key, body_digest, replay_digest = _erika_request_key(request, "create")
+    cached = _erika_idempotent_lookup("create", external_key, body_digest, replay_digest)
+    if cached:
+        return cached
+
+    session_id = secrets.token_urlsafe(16)
+    owner = "Erika"
+    mode = (body.mode or "orchestrated").strip() or "orchestrated"
+    authority = (body.authority or "erika").strip() or "erika"
+    source = "dashboard"
+    title = (body.title or "").strip() or "Erika"
+
+    db = SessionDB()
+    try:
+        db.create_session(
+            session_id,
+            source=source,
+            session_owner=owner,
+            session_mode=mode,
+            session_authority=authority,
+            session_source=source,
+        )
+        if title:
+            db.set_session_title(session_id, title)
+        session = db.get_session(session_id) or {}
+        payload = {
+            "session_id": session_id,
+            "owner": session.get("session_owner") or owner,
+            "mode": session.get("session_mode") or mode,
+            "authority": session.get("session_authority") or authority,
+            "source": session.get("source") or source,
+            "created_at": session.get("started_at"),
+            "request_id": getattr(request.state, "request_id", None),
+        }
+        _erika_idempotent_store("create", external_key, body_digest, replay_digest, payload)
+        return payload
+    finally:
+        db.close()
+
+
+@app.get("/api/erika/sessions/{session_id}")
+async def get_erika_session(session_id: str):
+    session = _validate_session_exists_or_raise(session_id)
+    metadata = _build_erika_session_metadata(
+        session_id=session.get("id") or session_id,
+        authority=str(session.get("session_authority") or "erika"),
+        mode=str(session.get("session_mode") or "orchestrated"),
+        title=str(session.get("title") or ""),
+    )
+    return {
+        "session_id": session.get("id") or session_id,
+        "owner": session.get("session_owner") or "Erika",
+        "mode": metadata["mode"],
+        "authority": metadata["authority"],
+        "source": session.get("source") or "dashboard",
+        "created_at": session.get("started_at"),
+        "updated_at": session.get("updated_at"),
+        "status": session.get("ended_at") is None and "active" or "closed",
+    }
+
+
+@app.post("/api/erika/sessions/{session_id}/messages")
+async def post_erika_session_message(session_id: str, body: ErikaMessageCreate, request: Request):
+    _require_token(request)
+    session = _validate_session_exists_or_raise(session_id)
+
+    if not _session_transition_allowed(session, "message"):
+        raise HTTPException(status_code=409, detail="Session is closed")
+    if not _session_heartbeat_ok(session):
+        raise HTTPException(status_code=409, detail="Session is stale")
+
+    role = (body.role or "").strip()
+    content = body.content if body.content is not None else ""
+    if not role:
+        raise HTTPException(status_code=400, detail="role is required")
+
+    session_authority = str(session.get("session_authority") or "erika").strip() or "erika"
+    if body.authority and str(body.authority).strip() and str(body.authority).strip() != session_authority:
+        raise HTTPException(status_code=403, detail="Erika session authority mismatch")
+
+    external_key, body_digest, replay_digest = _erika_request_key(
+        request,
+        "message",
+        session.get("id") or session_id,
+        {"role": role, "content": content, "authority": body.authority or ""},
+    )
+    cached = _erika_idempotent_lookup("message", external_key, body_digest, replay_digest)
+    if cached:
+        return cached
+
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        message_id = db.append_message(
+            session_id=session.get("id") or session_id,
+            role=role,
+            content=content,
+        )
+        persisted_ts = time.time()
+        session_after = db.get_session(session.get("id") or session_id) or session
+        result = {
+            "message_id": message_id,
+            "session_id": session.get("id") or session_id,
+            "persisted": True,
+            "timestamp": persisted_ts,
+            "authority": session_after.get("session_authority") or session_authority,
+        }
+        _erika_idempotent_store("message", external_key, body_digest, replay_digest, result)
+        return result
+    finally:
+        db.close()
+
+
+
+@app.post("/api/erika/sessions/{session_id}/delegate")
+async def post_erika_session_delegate(session_id: str, body: ErikaDelegateCreate, request: Request):
+    _require_token(request)
+    session = _validate_session_exists_or_raise(session_id)
+
+    if not _session_transition_allowed(session, "delegate"):
+        raise HTTPException(status_code=409, detail="Session is closed")
+    if not _session_heartbeat_ok(session):
+        raise HTTPException(status_code=409, detail="Session is stale")
+    if not str(session.get("session_mode") or "").strip():
+        raise HTTPException(status_code=409, detail="Session mode is required")
+
+    authority_chain = " -> ".join(_erika_authority_chain())
+    provided_authority = (body.authority or "").strip() or authority_chain
+    _validate_erika_authority_or_raise(provided_authority)
+
+    task_title = (body.task or "").strip()
+    summary = (body.instruction or "").strip()
+    if not task_title and not summary:
+        raise HTTPException(status_code=400, detail="task or instruction is required")
+
+    delegated_by = "Erika"
+    assigned_team = "Team"
+    assigned_worker = ""
+    external_key, body_digest, replay_digest = _erika_request_key(
+        request,
+        "delegate",
+        session.get("id") or session_id,
+        {"task": task_title, "instruction": summary, "authority": provided_authority},
+    )
+    cached = _erika_idempotent_lookup("delegate", external_key, body_digest, replay_digest)
+    if cached:
+        return cached
+
+    payload = {
+        "session_id": session.get("id") or session_id,
+        "delegated_by": delegated_by,
+        "authority_chain": authority_chain,
+        "assigned_team": assigned_team,
+        "assigned_worker": assigned_worker or None,
+        "task_title": task_title or summary,
+        "summary": summary,
+        "created_by": "Christopher",
+    }
+
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect()
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title=task_title or summary,
+            body=json.dumps(payload, sort_keys=True),
+            assignee=assigned_worker or assigned_team,
+            created_by="Christopher",
+            tenant=session.get("id") or session_id,
+            session_id=session.get("id") or session_id,
+            workspace_kind="scratch",
+            initial_status="running",
+            idempotency_key=external_key or replay_digest,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        result = {
+            "task_id": task_id,
+            "session_id": session.get("id") or session_id,
+            "delegated_by": delegated_by,
+            "authority_chain": authority_chain,
+            "assigned_team": assigned_team,
+            "assigned_worker": assigned_worker or None,
+            "task_title": task.title if task else (task_title or summary),
+            "created_by": task.created_by if task else "Christopher",
+            "persisted": True,
+        }
+        _erika_idempotent_store("delegate", external_key, body_digest, replay_digest, result)
+        return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/erika/sessions/{session_id}/mode")
+async def set_erika_session_mode(session_id: str, body: ErikaModeUpdate, request: Request):
+    _require_token(request)
+    mode = (body.mode or "").strip()
+    if mode not in {"orchestrated", "direct", "hermes"}:
+        raise HTTPException(status_code=400, detail="Invalid Erika session mode")
+
+    session = _validate_session_exists_or_raise(session_id)
+    if not str(session.get("session_mode") or "").strip():
+        raise HTTPException(status_code=409, detail="Session mode is required")
+    if not _session_transition_allowed(session, "mode"):
+        raise HTTPException(status_code=409, detail="Session is closed")
+    if not _session_heartbeat_ok(session):
+        raise HTTPException(status_code=409, detail="Session is stale")
+    if body.authority and str(body.authority).strip() and str(body.authority).strip() != str(session.get("session_authority") or "erika"):
+        raise HTTPException(status_code=403, detail="Erika session authority mismatch")
+
+    external_key, body_digest, replay_digest = _erika_request_key(request, "mode", session_id, {"mode": mode, "authority": body.authority or ""})
+    cached = _erika_idempotent_lookup("mode", external_key, body_digest, replay_digest)
+    if cached:
+        return cached
+
+    result = _update_erika_session_mode(session_id, mode)
+    result = {**result, "request_id": getattr(request.state, "request_id", None)}
+    _erika_idempotent_store("mode", external_key, body_digest, replay_digest, result)
+    return result
+
+
+@app.post("/api/erika/sessions/{session_id}/close")
+async def close_erika_session(session_id: str, request: Request):
+    _require_token(request)
+    session = _validate_session_exists_or_raise(session_id)
+
+    if not _session_transition_allowed(session, "close"):
+        raise HTTPException(status_code=409, detail="Session is closed")
+    if not _session_heartbeat_ok(session):
+        raise HTTPException(status_code=409, detail="Session is stale")
+
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        resolved_session_id = session.get("id") or session_id
+        db.end_session(resolved_session_id, "erika_closed")
+        closed = db.get_session(resolved_session_id) or session
+        return {
+            "session_id": closed.get("id") or resolved_session_id,
+            "status": "closed",
+            "closed_at": closed.get("ended_at"),
+            "request_id": getattr(request.state, "request_id", None),
+        }
     finally:
         db.close()
 
