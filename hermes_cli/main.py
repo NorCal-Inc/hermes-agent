@@ -10738,6 +10738,13 @@ def _report_dashboard_status() -> int:
 
 
 def cmd_dashboard(args):
+    # Governance lock boot reference (PRIORITY 1). Emits routing_governance_loaded on dashboard startup.
+    try:
+        from agent.governance_boot import load_governance_lock
+        load_governance_lock()
+    except Exception as e:
+        print("GOV_BOOT_CALL_ERROR:", str(e))
+
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
     if getattr(args, "status", False):
