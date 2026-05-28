@@ -10741,7 +10741,9 @@ def cmd_dashboard(args):
     # Governance lock boot reference (PRIORITY 1). Minimal loader, structured JSON, after config, before orchestration.
     try:
         from agent.governance_loader import get_governance_metadata
+        from agent.config_validator import validate_routing_config
         get_governance_metadata()
+        validate_routing_config()
     except Exception as e:
         print("GOV_BOOT_CALL_ERROR:", str(e))
 
