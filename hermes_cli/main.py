@@ -10738,10 +10738,10 @@ def _report_dashboard_status() -> int:
 
 
 def cmd_dashboard(args):
-    # Governance lock boot reference (PRIORITY 1). Emits routing_governance_loaded on dashboard startup.
+    # Governance lock boot reference (PRIORITY 1). Minimal loader, structured JSON, after config, before orchestration.
     try:
-        from agent.governance_boot import load_governance_lock
-        load_governance_lock()
+        from agent.governance_loader import get_governance_metadata
+        get_governance_metadata()
     except Exception as e:
         print("GOV_BOOT_CALL_ERROR:", str(e))
 
