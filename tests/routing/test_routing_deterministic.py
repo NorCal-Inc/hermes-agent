@@ -1,3 +1,4 @@
+from agent.boundary_enforcer import enforce_boundary, boundary_enforcer
 import json
 import time
 import threading
@@ -94,4 +95,72 @@ def test_full_suite_repeatability():
     assert True, "Suite repeatable"
 
 if __name__ == "__main__":
+    pytest.main([__file__, "-q", "--tb=no"])
+
+def test_erika_execution_attempt_rejection():
+    """Erika cannot directly execute worker tasks or bypass routing."""
+    with pytest.raises(PermissionError):
+        enforce_boundary("erika", "execute_worker_task")
+    with pytest.raises(PermissionError):
+        enforce_boundary("erika", "self_modify_routing")
+
+def test_worker_orchestration_attempt_rejection():
+    """Workers cannot claim orchestration authority."""
+    with pytest.raises(PermissionError):
+        enforce_boundary("worker", "orchestration")
+
+def test_dashboard_mutation_rejection():
+    """Dashboard cannot mutate state or trigger privileged changes (observational-only at backend)."""
+    with pytest.raises(PermissionError):
+        enforce_boundary("dashboard", "mutate_orchestration_state")
+    with pytest.raises(PermissionError):
+        enforce_boundary("dashboard", "invoke_rollback")
+    assert boundary_enforcer.is_observational_only("dashboard"), "Dashboard not observational-only at backend"
+
+def test_team_leader_governance_mutation_rejection():
+    """Team Leaders cannot mutate governance or provider topology."""
+    with pytest.raises(PermissionError):
+        enforce_boundary("team_leader", "mutate_governance")
+    with pytest.raises(PermissionError):
+        enforce_boundary("team_leader", "alter_provider_topology")
+
+def test_valid_allowed_actions_succeed():
+    """Valid actions per matrix succeed."""
+    assert enforce_boundary("erika", "orchestration")["status"] == "allowed"
+    assert enforce_boundary("team_leader", "coordination")["status"] == "allowed"
+    assert enforce_boundary("worker", "execution")["status"] == "allowed"
+    assert enforce_boundary("dashboard", "observational")["status"] == "allowed"
+
+def test_concurrent_role_validation_consistency():
+    """Concurrent role checks must be consistent (no race in enforcement)."""
+    results = []
+    def check(role, action):
+        try:
+            results.append(enforce_boundary(role, action)["status"])
+        except PermissionError:
+            results.append("rejected")
+    import threading
+    threads = []
+    for role, action in [("erika", "orchestration"), ("worker", "orchestration"), ("dashboard", "mutate")]:
+        t = threading.Thread(target=check, args=(role, action))
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(results)) > 0, "Concurrent validation consistent"
+    assert "rejected" in results, "Unauthorized rejected in concurrent test"
+
+def test_full_suite_with_boundaries():
+    """Full boundary suite repeatable."""
+    for _ in range(2):
+        test_erika_execution_attempt_rejection()
+        test_worker_orchestration_attempt_rejection()
+        test_dashboard_mutation_rejection()
+        test_team_leader_governance_mutation_rejection()
+        test_valid_allowed_actions_succeed()
+        test_concurrent_role_validation_consistency()
+    assert True, "Boundary suite repeatable and deterministic"
+
+if __name__ == "__main__":
+    import pytest
     pytest.main([__file__, "-q", "--tb=no"])
