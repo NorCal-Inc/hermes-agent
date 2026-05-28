@@ -1,0 +1,5738 @@
+{
+  "components": {
+    "schemas": {
+      "BulkTaskBody": {
+        "properties": {
+          "archive": {
+            "default": false,
+            "title": "Archive",
+            "type": "boolean"
+          },
+          "assignee": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignee"
+          },
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Ids",
+            "type": "array"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "reclaim_first": {
+            "default": false,
+            "title": "Reclaim First",
+            "type": "boolean"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          }
+        },
+        "required": [
+          "ids"
+        ],
+        "title": "BulkTaskBody",
+        "type": "object"
+      },
+      "CommentBody": {
+        "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "dashboard",
+            "title": "Author"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "CommentBody",
+        "type": "object"
+      },
+      "ConfigUpdate": {
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "title": "ConfigUpdate",
+        "type": "object"
+      },
+      "CreateBoardBody": {
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "switch": {
+            "default": false,
+            "title": "Switch",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "slug"
+        ],
+        "title": "CreateBoardBody",
+        "type": "object"
+      },
+      "CreateTaskBody": {
+        "properties": {
+          "assignee": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignee"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "max_runtime_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Runtime Seconds"
+          },
+          "parents": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Parents",
+            "type": "array"
+          },
+          "priority": {
+            "default": 0,
+            "title": "Priority",
+            "type": "integer"
+          },
+          "skills": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skills"
+          },
+          "tenant": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "triage": {
+            "default": false,
+            "title": "Triage",
+            "type": "boolean"
+          },
+          "workspace_kind": {
+            "default": "scratch",
+            "title": "Workspace Kind",
+            "type": "string"
+          },
+          "workspace_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Path"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "CreateTaskBody",
+        "type": "object"
+      },
+      "CronJobCreate": {
+        "properties": {
+          "deliver": {
+            "default": "local",
+            "title": "Deliver",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "schedule": {
+            "title": "Schedule",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "schedule"
+        ],
+        "title": "CronJobCreate",
+        "type": "object"
+      },
+      "CronJobUpdate": {
+        "properties": {
+          "updates": {
+            "additionalProperties": true,
+            "title": "Updates",
+            "type": "object"
+          }
+        },
+        "required": [
+          "updates"
+        ],
+        "title": "CronJobUpdate",
+        "type": "object"
+      },
+      "DecomposeBody": {
+        "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          }
+        },
+        "title": "DecomposeBody",
+        "type": "object"
+      },
+      "DescribeAutoBody": {
+        "properties": {
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          }
+        },
+        "title": "DescribeAutoBody",
+        "type": "object"
+      },
+      "DescribeBody": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "title": "DescribeBody",
+        "type": "object"
+      },
+      "EnvVarDelete": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "EnvVarDelete",
+        "type": "object"
+      },
+      "EnvVarReveal": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "EnvVarReveal",
+        "type": "object"
+      },
+      "EnvVarUpdate": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "EnvVarUpdate",
+        "type": "object"
+      },
+      "ErikaDelegateCreate": {
+        "properties": {
+          "authority": {
+            "default": "",
+            "title": "Authority",
+            "type": "string"
+          },
+          "instruction": {
+            "title": "Instruction",
+            "type": "string"
+          },
+          "task": {
+            "title": "Task",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task",
+          "instruction"
+        ],
+        "title": "ErikaDelegateCreate",
+        "type": "object"
+      },
+      "ErikaMessageCreate": {
+        "properties": {
+          "authority": {
+            "default": "",
+            "title": "Authority",
+            "type": "string"
+          },
+          "content": {
+            "default": "",
+            "title": "Content",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "ErikaMessageCreate",
+        "type": "object"
+      },
+      "ErikaModeUpdate": {
+        "properties": {
+          "authority": {
+            "default": "",
+            "title": "Authority",
+            "type": "string"
+          },
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "ErikaModeUpdate",
+        "type": "object"
+      },
+      "ErikaSessionCreate": {
+        "properties": {
+          "authority": {
+            "title": "Authority",
+            "type": "string"
+          },
+          "mode": {
+            "default": "",
+            "title": "Mode",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "authority"
+        ],
+        "title": "ErikaSessionCreate",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "LinkBody": {
+        "properties": {
+          "child_id": {
+            "title": "Child Id",
+            "type": "string"
+          },
+          "parent_id": {
+            "title": "Parent Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "parent_id",
+          "child_id"
+        ],
+        "title": "LinkBody",
+        "type": "object"
+      },
+      "ModelAssignment": {
+        "description": "Payload for POST /api/model/set \u2014 assign a provider/model to a slot.\n\nscope=\"main\"        \u2192 writes model.provider + model.default\nscope=\"auxiliary\"   \u2192 writes auxiliary.<task>.provider + auxiliary.<task>.model\nscope=\"auxiliary\" with task=\"\"  \u2192 applied to every auxiliary.* slot\nscope=\"auxiliary\" with task=\"__reset__\"  \u2192 resets every slot to provider=\"auto\"",
+        "properties": {
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "scope": {
+            "title": "Scope",
+            "type": "string"
+          },
+          "task": {
+            "default": "",
+            "title": "Task",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "provider",
+          "model"
+        ],
+        "title": "ModelAssignment",
+        "type": "object"
+      },
+      "OAuthSubmitBody": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "code"
+        ],
+        "title": "OAuthSubmitBody",
+        "type": "object"
+      },
+      "OrchestrationSettingsBody": {
+        "properties": {
+          "auto_decompose": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Decompose"
+          },
+          "auto_promote_children": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Promote Children"
+          },
+          "default_assignee": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Assignee"
+          },
+          "orchestrator_profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Orchestrator Profile"
+          }
+        },
+        "title": "OrchestrationSettingsBody",
+        "type": "object"
+      },
+      "ProfileCreate": {
+        "properties": {
+          "clone_from_default": {
+            "default": false,
+            "title": "Clone From Default",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "no_skills": {
+            "default": false,
+            "title": "No Skills",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ProfileCreate",
+        "type": "object"
+      },
+      "ProfileRename": {
+        "properties": {
+          "new_name": {
+            "title": "New Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_name"
+        ],
+        "title": "ProfileRename",
+        "type": "object"
+      },
+      "ProfileSoulUpdate": {
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "ProfileSoulUpdate",
+        "type": "object"
+      },
+      "RawConfigUpdate": {
+        "properties": {
+          "yaml_text": {
+            "title": "Yaml Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "yaml_text"
+        ],
+        "title": "RawConfigUpdate",
+        "type": "object"
+      },
+      "ReassignBody": {
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "reclaim_first": {
+            "default": false,
+            "title": "Reclaim First",
+            "type": "boolean"
+          }
+        },
+        "title": "ReassignBody",
+        "type": "object"
+      },
+      "ReclaimBody": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "ReclaimBody",
+        "type": "object"
+      },
+      "RenameBoardBody": {
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "RenameBoardBody",
+        "type": "object"
+      },
+      "SkillToggle": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "enabled"
+        ],
+        "title": "SkillToggle",
+        "type": "object"
+      },
+      "SpecifyBody": {
+        "description": "Optional author override. Nothing else is configurable from the\ndashboard \u2014 model + prompt come from ``auxiliary.triage_specifier``\nin config.yaml, same as the CLI.",
+        "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          }
+        },
+        "title": "SpecifyBody",
+        "type": "object"
+      },
+      "ThemeSetBody": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ThemeSetBody",
+        "type": "object"
+      },
+      "UpdateTaskBody": {
+        "properties": {
+          "assignee": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignee"
+          },
+          "block_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Block Reason"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "title": "UpdateTaskBody",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "_AgentPluginInstallBody": {
+        "properties": {
+          "enable": {
+            "default": true,
+            "title": "Enable",
+            "type": "boolean"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "identifier": {
+            "title": "Identifier",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identifier"
+        ],
+        "title": "_AgentPluginInstallBody",
+        "type": "object"
+      },
+      "_PluginProvidersPutBody": {
+        "properties": {
+          "context_engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Engine"
+          },
+          "memory_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Provider"
+          }
+        },
+        "title": "_PluginProvidersPutBody",
+        "type": "object"
+      },
+      "_PluginVisibilityBody": {
+        "properties": {
+          "hidden": {
+            "title": "Hidden",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "hidden"
+        ],
+        "title": "_PluginVisibilityBody",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Hermes Agent",
+    "version": "0.14.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/actions/{name}/status": {
+      "get": {
+        "description": "Tail an action log and report whether the process is still running.",
+        "operationId": "get_action_status_api_actions__name__status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "lines",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "title": "Lines",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Action Status"
+      }
+    },
+    "/api/analytics/models": {
+      "get": {
+        "description": "Rich per-model analytics for the Models dashboard page.\n\nReturns token/cost/session breakdown per model plus capability metadata\nfrom models.dev (context window, vision, tools, reasoning, etc.).",
+        "operationId": "get_models_analytics_api_analytics_models_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Models Analytics"
+      }
+    },
+    "/api/analytics/usage": {
+      "get": {
+        "operationId": "get_usage_analytics_api_analytics_usage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Usage Analytics"
+      }
+    },
+    "/api/config": {
+      "get": {
+        "operationId": "get_config_api_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Config"
+      },
+      "put": {
+        "operationId": "update_config_api_config_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Config"
+      }
+    },
+    "/api/config/defaults": {
+      "get": {
+        "operationId": "get_defaults_api_config_defaults_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Defaults"
+      }
+    },
+    "/api/config/raw": {
+      "get": {
+        "operationId": "get_config_raw_api_config_raw_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Config Raw"
+      },
+      "put": {
+        "operationId": "update_config_raw_api_config_raw_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RawConfigUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Config Raw"
+      }
+    },
+    "/api/config/schema": {
+      "get": {
+        "operationId": "get_schema_api_config_schema_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Schema"
+      }
+    },
+    "/api/cron/jobs": {
+      "get": {
+        "operationId": "list_cron_jobs_api_cron_jobs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "title": "Profile",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Cron Jobs"
+      },
+      "post": {
+        "operationId": "create_cron_job_api_cron_jobs_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Profile",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CronJobCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Cron Job"
+      }
+    },
+    "/api/cron/jobs/{job_id}": {
+      "delete": {
+        "operationId": "delete_cron_job_api_cron_jobs__job_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Cron Job"
+      },
+      "get": {
+        "operationId": "get_cron_job_api_cron_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cron Job"
+      },
+      "put": {
+        "operationId": "update_cron_job_api_cron_jobs__job_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CronJobUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Cron Job"
+      }
+    },
+    "/api/cron/jobs/{job_id}/pause": {
+      "post": {
+        "operationId": "pause_cron_job_api_cron_jobs__job_id__pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pause Cron Job"
+      }
+    },
+    "/api/cron/jobs/{job_id}/resume": {
+      "post": {
+        "operationId": "resume_cron_job_api_cron_jobs__job_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Cron Job"
+      }
+    },
+    "/api/cron/jobs/{job_id}/trigger": {
+      "post": {
+        "operationId": "trigger_cron_job_api_cron_jobs__job_id__trigger_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Cron Job"
+      }
+    },
+    "/api/dashboard/agent-plugins/install": {
+      "post": {
+        "operationId": "post_agent_plugin_install_api_dashboard_agent_plugins_install_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_AgentPluginInstallBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Agent Plugin Install"
+      }
+    },
+    "/api/dashboard/agent-plugins/{name}": {
+      "delete": {
+        "operationId": "delete_agent_plugin_api_dashboard_agent_plugins__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Agent Plugin"
+      }
+    },
+    "/api/dashboard/agent-plugins/{name}/disable": {
+      "post": {
+        "operationId": "post_agent_plugin_disable_api_dashboard_agent_plugins__name__disable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Agent Plugin Disable"
+      }
+    },
+    "/api/dashboard/agent-plugins/{name}/enable": {
+      "post": {
+        "operationId": "post_agent_plugin_enable_api_dashboard_agent_plugins__name__enable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Agent Plugin Enable"
+      }
+    },
+    "/api/dashboard/agent-plugins/{name}/update": {
+      "post": {
+        "operationId": "post_agent_plugin_update_api_dashboard_agent_plugins__name__update_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Agent Plugin Update"
+      }
+    },
+    "/api/dashboard/plugin-providers": {
+      "put": {
+        "description": "Persist memory provider / context engine selection (writes config.yaml).",
+        "operationId": "put_plugin_providers_api_dashboard_plugin_providers_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_PluginProvidersPutBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Plugin Providers"
+      }
+    },
+    "/api/dashboard/plugins": {
+      "get": {
+        "description": "Return discovered dashboard plugins (excludes user-hidden ones).",
+        "operationId": "get_dashboard_plugins_api_dashboard_plugins_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Dashboard Plugins"
+      }
+    },
+    "/api/dashboard/plugins/hub": {
+      "get": {
+        "description": "Unified agent plugins + dashboard extension metadata (session protected).",
+        "operationId": "get_plugins_hub_api_dashboard_plugins_hub_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Plugins Hub"
+      }
+    },
+    "/api/dashboard/plugins/rescan": {
+      "get": {
+        "description": "Force re-scan of dashboard plugins.",
+        "operationId": "rescan_dashboard_plugins_api_dashboard_plugins_rescan_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Rescan Dashboard Plugins"
+      }
+    },
+    "/api/dashboard/plugins/{name}/visibility": {
+      "post": {
+        "description": "Toggle a plugin's sidebar visibility (persists to config.yaml dashboard.hidden_plugins).",
+        "operationId": "post_plugin_visibility_api_dashboard_plugins__name__visibility_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_PluginVisibilityBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Plugin Visibility"
+      }
+    },
+    "/api/dashboard/theme": {
+      "put": {
+        "description": "Set the active dashboard theme (persists to config.yaml).",
+        "operationId": "set_dashboard_theme_api_dashboard_theme_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThemeSetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Dashboard Theme"
+      }
+    },
+    "/api/dashboard/themes": {
+      "get": {
+        "description": "Return available themes and the currently active one.\n\nBuilt-in entries ship name/label/description only (the frontend owns\ntheir full definitions in `web/src/themes/presets.ts`).  User themes\nfrom `~/.hermes/dashboard-themes/*.yaml` ship with their full\nnormalised definition under `definition`, so the client can apply\nthem without a stub.",
+        "operationId": "get_dashboard_themes_api_dashboard_themes_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Dashboard Themes"
+      }
+    },
+    "/api/env": {
+      "delete": {
+        "operationId": "remove_env_var_api_env_delete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvVarDelete"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Env Var"
+      },
+      "get": {
+        "operationId": "get_env_vars_api_env_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Env Vars"
+      },
+      "put": {
+        "operationId": "set_env_var_api_env_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvVarUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Env Var"
+      }
+    },
+    "/api/env/reveal": {
+      "post": {
+        "description": "Return the real (unredacted) value of a single env var.\n\nProtected by:\n- Ephemeral session token (generated per server start, injected into SPA)\n- Rate limiting (max 5 reveals per 30s window)\n- Audit logging",
+        "operationId": "reveal_env_var_api_env_reveal_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvVarReveal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reveal Env Var"
+      }
+    },
+    "/api/erika/sessions": {
+      "post": {
+        "operationId": "create_erika_session_api_erika_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErikaSessionCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Erika Session"
+      }
+    },
+    "/api/erika/sessions/{session_id}": {
+      "get": {
+        "operationId": "get_erika_session_api_erika_sessions__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Erika Session"
+      }
+    },
+    "/api/erika/sessions/{session_id}/close": {
+      "post": {
+        "operationId": "close_erika_session_api_erika_sessions__session_id__close_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Close Erika Session"
+      }
+    },
+    "/api/erika/sessions/{session_id}/delegate": {
+      "post": {
+        "operationId": "post_erika_session_delegate_api_erika_sessions__session_id__delegate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErikaDelegateCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Erika Session Delegate"
+      }
+    },
+    "/api/erika/sessions/{session_id}/messages": {
+      "post": {
+        "operationId": "post_erika_session_message_api_erika_sessions__session_id__messages_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErikaMessageCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Erika Session Message"
+      }
+    },
+    "/api/erika/sessions/{session_id}/mode": {
+      "post": {
+        "operationId": "set_erika_session_mode_api_erika_sessions__session_id__mode_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErikaModeUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Erika Session Mode"
+      }
+    },
+    "/api/gateway/restart": {
+      "post": {
+        "description": "Kick off a ``hermes gateway restart`` in the background.",
+        "operationId": "restart_gateway_api_gateway_restart_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Restart Gateway"
+      }
+    },
+    "/api/hermes/update": {
+      "post": {
+        "description": "Kick off ``hermes update`` in the background.",
+        "operationId": "update_hermes_api_hermes_update_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Update Hermes"
+      }
+    },
+    "/api/logs": {
+      "get": {
+        "operationId": "get_logs_api_logs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "file",
+            "required": false,
+            "schema": {
+              "default": "agent",
+              "title": "File",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "lines",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Lines",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Level"
+            }
+          },
+          {
+            "in": "query",
+            "name": "component",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Component"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Search"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Logs"
+      }
+    },
+    "/api/model/auxiliary": {
+      "get": {
+        "description": "Return current auxiliary task assignments.\n\nShape:\n  {\n    \"tasks\": [\n      {\"task\": \"vision\", \"provider\": \"auto\", \"model\": \"\", \"base_url\": \"\"},\n      ...\n    ],\n    \"main\": {\"provider\": \"openrouter\", \"model\": \"anthropic/claude-opus-4.7\"},\n  }",
+        "operationId": "get_auxiliary_models_api_model_auxiliary_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Auxiliary Models"
+      }
+    },
+    "/api/model/info": {
+      "get": {
+        "description": "Return resolved model metadata for the currently configured model.\n\nCalls the same context-length resolution chain the agent uses, so the\nfrontend can display \"Auto-detected: 200K\" alongside the override field.\nAlso returns model capabilities (vision, reasoning, tools) when available.",
+        "operationId": "get_model_info_api_model_info_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Model Info"
+      }
+    },
+    "/api/model/options": {
+      "get": {
+        "description": "Return authenticated providers + their curated model lists.\n\nREST equivalent of the ``model.options`` JSON-RPC on tui_gateway, so the\ndashboard Models page can render the picker without a live chat session.\nThe response shape matches ``model.options`` 1:1 so ``ModelPickerDialog``\ncan share the same types.",
+        "operationId": "get_model_options_api_model_options_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Model Options"
+      }
+    },
+    "/api/model/set": {
+      "post": {
+        "description": "Assign a model to the main slot or an auxiliary task slot.\n\nWrites to ``~/.hermes/config.yaml`` \u2014 applies to **new** sessions only.\nThe currently running chat PTY (if any) is not affected; use the\n``/model`` slash command inside a chat to hot-swap that specific session.",
+        "operationId": "set_model_assignment_api_model_set_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelAssignment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Model Assignment"
+      }
+    },
+    "/api/plugins/example/hello": {
+      "get": {
+        "description": "Simple greeting endpoint to demonstrate plugin API routes.",
+        "operationId": "hello_api_plugins_example_hello_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Hello"
+      }
+    },
+    "/api/plugins/hermes-achievements/achievements": {
+      "get": {
+        "operationId": "achievements_api_plugins_hermes_achievements_achievements_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Achievements"
+      }
+    },
+    "/api/plugins/hermes-achievements/recent-unlocks": {
+      "get": {
+        "operationId": "recent_unlocks_api_plugins_hermes_achievements_recent_unlocks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Recent Unlocks"
+      }
+    },
+    "/api/plugins/hermes-achievements/rescan": {
+      "post": {
+        "operationId": "rescan_api_plugins_hermes_achievements_rescan_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Rescan"
+      }
+    },
+    "/api/plugins/hermes-achievements/reset-state": {
+      "post": {
+        "operationId": "reset_state_api_plugins_hermes_achievements_reset_state_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Reset State"
+      }
+    },
+    "/api/plugins/hermes-achievements/scan-status": {
+      "get": {
+        "operationId": "scan_status_api_plugins_hermes_achievements_scan_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Scan Status"
+      }
+    },
+    "/api/plugins/hermes-achievements/sessions/{session_id}/badges": {
+      "get": {
+        "operationId": "session_badges_api_plugins_hermes_achievements_sessions__session_id__badges_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Badges"
+      }
+    },
+    "/api/plugins/kanban/assignees": {
+      "get": {
+        "description": "Known profiles + per-profile task counts.\n\nReturns the union of ``~/.hermes/profiles/*`` on disk and every\ndistinct assignee currently used on the board. The dashboard uses\nthis to populate its assignee dropdown so a freshly-created profile\nappears in the picker before it's been given any task.",
+        "operationId": "get_assignees_api_plugins_kanban_assignees_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Assignees"
+      }
+    },
+    "/api/plugins/kanban/board": {
+      "get": {
+        "description": "Return the full board grouped by status column.\n\n``_conn()`` auto-initializes ``kanban.db`` on first call so a fresh\ninstall doesn't surface a \"failed to load\" error on the plugin tab.\n\n``board`` selects which board to read from. Omitting it falls\nthrough to the active board (``HERMES_KANBAN_BOARD`` env \u2192 on-disk\n``current`` pointer \u2192 ``default``).",
+        "operationId": "get_board_api_plugins_kanban_board_get",
+        "parameters": [
+          {
+            "description": "Filter to a single tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to a single tenant",
+              "title": "Tenant"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Kanban board slug (omit for current)",
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Kanban board slug (omit for current)",
+              "title": "Board"
+            }
+          },
+          {
+            "description": "Restrict to tasks using this workflow template id",
+            "in": "query",
+            "name": "workflow_template_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Restrict to tasks using this workflow template id",
+              "title": "Workflow Template Id"
+            }
+          },
+          {
+            "description": "Restrict to tasks at this workflow step key",
+            "in": "query",
+            "name": "current_step_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Restrict to tasks at this workflow step key",
+              "title": "Current Step Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Board"
+      }
+    },
+    "/api/plugins/kanban/boards": {
+      "get": {
+        "description": "Return every board on disk with task counts and the active slug.",
+        "operationId": "list_boards_api_plugins_kanban_boards_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Boards"
+      },
+      "post": {
+        "description": "Create a new board. Idempotent \u2014 ``slug`` collision returns existing.",
+        "operationId": "create_board_endpoint_api_plugins_kanban_boards_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBoardBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Board Endpoint"
+      }
+    },
+    "/api/plugins/kanban/boards/{slug}": {
+      "delete": {
+        "description": "Archive (default) or hard-delete a board.",
+        "operationId": "delete_board_api_plugins_kanban_boards__slug__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Hard-delete instead of archive",
+            "in": "query",
+            "name": "delete",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Hard-delete instead of archive",
+              "title": "Delete",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Board"
+      },
+      "patch": {
+        "description": "Update a board's display metadata (slug is immutable \u2014 create a new one to rename the directory).",
+        "operationId": "rename_board_api_plugins_kanban_boards__slug__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameBoardBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Board"
+      }
+    },
+    "/api/plugins/kanban/boards/{slug}/switch": {
+      "post": {
+        "description": "Persist ``slug`` as the active board for subsequent CLI / slash calls.\n\nDashboard users pick boards via a client-side ``localStorage`` \u2014 this\nendpoint is for ``/kanban boards switch`` parity so gateway slash\ncommands and the CLI share the same current-board pointer.",
+        "operationId": "switch_board_api_plugins_kanban_boards__slug__switch_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Switch Board"
+      }
+    },
+    "/api/plugins/kanban/config": {
+      "get": {
+        "description": "Return kanban dashboard preferences from ~/.hermes/config.yaml.\n\nReads the ``dashboard.kanban`` section if present; defaults otherwise.\nUsed by the UI to pre-select tenant filters, toggle markdown rendering,\nor set column-width preferences without a round-trip per page load.",
+        "operationId": "get_config_api_plugins_kanban_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Config"
+      }
+    },
+    "/api/plugins/kanban/diagnostics": {
+      "get": {
+        "description": "Return ``[{task_id, task_title, task_status, task_assignee,\ndiagnostics: [...]}, ...]`` for every task on the board with at\nleast one active diagnostic.\n\nSeverity-filterable so the UI can render \"just the critical ones\"\nor the CLI can grep. Useful for the board-header attention strip\nAND for ``hermes kanban diagnostics`` which shells to this\nendpoint when the dashboard's running, or invokes the engine\ndirectly when it isn't.",
+        "operationId": "list_diagnostics_api_plugins_kanban_diagnostics_get",
+        "parameters": [
+          {
+            "description": "Kanban board slug (omit for current)",
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Kanban board slug (omit for current)",
+              "title": "Board"
+            }
+          },
+          {
+            "description": "Filter by severity: warning|error|critical",
+            "in": "query",
+            "name": "severity",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by severity: warning|error|critical",
+              "title": "Severity"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Diagnostics"
+      }
+    },
+    "/api/plugins/kanban/dispatch": {
+      "post": {
+        "operationId": "dispatch_api_plugins_kanban_dispatch_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dry Run",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max",
+            "required": false,
+            "schema": {
+              "default": 8,
+              "title": "Max",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch"
+      }
+    },
+    "/api/plugins/kanban/home-channels": {
+      "get": {
+        "description": "List every platform with a home channel, plus whether *task_id*\n(if given) is currently subscribed to that home.\n\nWhen ``task_id`` is omitted, every entry's ``subscribed`` is ``false``\n\u2014 useful for the \"no task selected\" state of the UI.",
+        "operationId": "get_home_channels_api_plugins_kanban_home_channels_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "task_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Home Channels"
+      }
+    },
+    "/api/plugins/kanban/links": {
+      "delete": {
+        "operationId": "delete_link_api_plugins_kanban_links_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "parent_id",
+            "required": true,
+            "schema": {
+              "title": "Parent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "child_id",
+            "required": true,
+            "schema": {
+              "title": "Child Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Link"
+      },
+      "post": {
+        "operationId": "add_link_api_plugins_kanban_links_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Link"
+      }
+    },
+    "/api/plugins/kanban/orchestration": {
+      "get": {
+        "description": "Return the current kanban orchestration knobs from config.yaml\nplus the resolved effective values (filling in fallbacks).",
+        "operationId": "get_orchestration_settings_api_plugins_kanban_orchestration_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Orchestration Settings"
+      },
+      "put": {
+        "description": "Update the kanban orchestration knobs in ~/.hermes/config.yaml.\n\nEach field is optional \u2014 only fields explicitly passed are\nwritten. ``orchestrator_profile`` / ``default_assignee`` accept\nempty strings to clear the override and fall back to the default\nprofile.",
+        "operationId": "set_orchestration_settings_api_plugins_kanban_orchestration_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrchestrationSettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Orchestration Settings"
+      }
+    },
+    "/api/plugins/kanban/presence": {
+      "get": {
+        "operationId": "get_presence_api_plugins_kanban_presence_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Presence"
+      }
+    },
+    "/api/plugins/kanban/profiles": {
+      "get": {
+        "description": "Return every installed profile with its description.\n\nConsumed by the dashboard's settings panel (orchestrator picker)\nand the profile-description editing UI. Profiles without a\ndescription still appear here \u2014 they're routable on name alone,\njust less precisely.",
+        "operationId": "list_profile_roster_api_plugins_kanban_profiles_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Profile Roster"
+      }
+    },
+    "/api/plugins/kanban/profiles/{profile_name}": {
+      "patch": {
+        "description": "Set or clear the description of a profile.\n\nEmpty string clears the description; non-empty stores it as a\nuser-authored description (``description_auto: false``) so the\nauto-describer won't overwrite it on a sweep without\n``--overwrite``.",
+        "operationId": "update_profile_description_api_plugins_kanban_profiles__profile_name__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "profile_name",
+            "required": true,
+            "schema": {
+              "title": "Profile Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DescribeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Profile Description"
+      }
+    },
+    "/api/plugins/kanban/profiles/{profile_name}/describe-auto": {
+      "post": {
+        "description": "Generate a description for the named profile via the auxiliary\nLLM (``auxiliary.profile_describer``). Persists with\n``description_auto: true`` so the dashboard can surface a \"review\"\nbadge.\n\nMaps 1:1 to ``hermes profile describe <name> --auto``. Non-OK\noutcomes are NOT HTTP errors \u2014 the UI renders the reason inline\n(e.g. \"no auxiliary client configured\") so the operator can fix\nconfig and retry without a page reload.",
+        "operationId": "auto_describe_profile_api_plugins_kanban_profiles__profile_name__describe_auto_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "profile_name",
+            "required": true,
+            "schema": {
+              "title": "Profile Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DescribeAutoBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auto Describe Profile"
+      }
+    },
+    "/api/plugins/kanban/runs/{run_id}": {
+      "get": {
+        "description": "Direct lookup of a ``task_runs`` row by its integer id.\n\nReturns ``{run: {...}}`` using the same serialisation as the\nper-task run history embedded in ``GET /tasks/{task_id}``.\n404 when no such run exists.",
+        "operationId": "get_run_endpoint_api_plugins_kanban_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Kanban board slug (omit for current)",
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Kanban board slug (omit for current)",
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run Endpoint"
+      }
+    },
+    "/api/plugins/kanban/runs/{run_id}/inspect": {
+      "get": {
+        "description": "Live PID stats for a run's worker process via psutil.\n\nIf the run has already ended, or has no recorded ``worker_pid``,\nreturns ``{alive: false}`` with a human-readable ``reason``.\n\nWhen the process is live, returns CPU, memory, thread count, fd count,\nstatus, create_time, and cmdline.  ``access_denied`` is set when the\nOS refuses inspection rather than raising a 500.\n\npsutil availability: if psutil is not installed the endpoint still\nworks but ``alive`` is always returned as ``false`` with\n``reason=\"psutil not available\"``.",
+        "operationId": "inspect_run_endpoint_api_plugins_kanban_runs__run_id__inspect_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Kanban board slug (omit for current)",
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Kanban board slug (omit for current)",
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Inspect Run Endpoint"
+      }
+    },
+    "/api/plugins/kanban/stats": {
+      "get": {
+        "description": "Per-status + per-assignee counts + oldest-ready age.\n\nDesigned for the dashboard HUD and for router profiles that need to\nanswer \"is this specialist overloaded?\" without scanning the whole\nboard themselves.",
+        "operationId": "get_stats_api_plugins_kanban_stats_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Stats"
+      }
+    },
+    "/api/plugins/kanban/tasks": {
+      "post": {
+        "operationId": "create_task_api_plugins_kanban_tasks_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTaskBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Task"
+      }
+    },
+    "/api/plugins/kanban/tasks/bulk": {
+      "post": {
+        "description": "Apply the same patch to every id in ``payload.ids``.\n\nThis is an *independent* iteration \u2014 per-task failures don't abort\nsiblings. Returns per-id outcome so the UI can surface partials.",
+        "operationId": "bulk_update_api_plugins_kanban_tasks_bulk_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTaskBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Bulk Update"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}": {
+      "delete": {
+        "operationId": "delete_task_api_plugins_kanban_tasks__task_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Task"
+      },
+      "get": {
+        "operationId": "get_task_api_plugins_kanban_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          },
+          {
+            "description": "With run_state_name: filter runs by column 'status' or 'outcome'",
+            "in": "query",
+            "name": "run_state_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "With run_state_name: filter runs by column 'status' or 'outcome'",
+              "title": "Run State Type"
+            }
+          },
+          {
+            "description": "With run_state_type: exact value for that run column",
+            "in": "query",
+            "name": "run_state_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "With run_state_type: exact value for that run column",
+              "title": "Run State Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task"
+      },
+      "patch": {
+        "operationId": "update_task_api_plugins_kanban_tasks__task_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTaskBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Task"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/comments": {
+      "post": {
+        "operationId": "add_comment_api_plugins_kanban_tasks__task_id__comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Comment"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/decompose": {
+      "post": {
+        "description": "Fan a triage-column task out into a graph of child tasks via the\nauxiliary LLM, routed to specialist profiles by description. Maps\n1:1 to ``hermes kanban decompose <task_id>``.\n\nReturns the outcome shape used by the CLI: ``{ok, task_id, reason,\nfanout, child_ids, new_title}``. A non-OK outcome is NOT an HTTP\nerror \u2014 the UI renders the reason inline.\n\nRuns in FastAPI's threadpool (sync ``def``) because the LLM call\ncan take minutes on reasoning models.",
+        "operationId": "decompose_task_endpoint_api_plugins_kanban_tasks__task_id__decompose_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecomposeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Decompose Task Endpoint"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/home-subscribe/{platform}": {
+      "delete": {
+        "description": "Remove any notify subscription on *task_id* that matches *platform*'s home.",
+        "operationId": "unsubscribe_home_api_plugins_kanban_tasks__task_id__home_subscribe__platform__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "platform",
+            "required": true,
+            "schema": {
+              "title": "Platform",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unsubscribe Home"
+      },
+      "post": {
+        "description": "Subscribe *task_id* to notifications routed to *platform*'s home channel.\n\nIdempotent \u2014 re-subscribing is a no-op at the DB layer. 404 if the\nplatform has no home channel configured. 404 if the task doesn't exist.",
+        "operationId": "subscribe_home_api_plugins_kanban_tasks__task_id__home_subscribe__platform__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "platform",
+            "required": true,
+            "schema": {
+              "title": "Platform",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Subscribe Home"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/log": {
+      "get": {
+        "description": "Return the worker's stdout/stderr log.\n\n``tail`` caps the response size (bytes) so the dashboard drawer\ndoesn't paginate megabytes into the browser. Returns 404 if the task\nhas never spawned. The on-disk log is rotated at 2 MiB per\n``_rotate_worker_log`` \u2014 a single ``.log.1`` is kept, no further\ngenerations, so disk usage per task is bounded at ~4 MiB.",
+        "operationId": "get_task_log_api_plugins_kanban_tasks__task_id__log_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 2000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tail"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task Log"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/reassign": {
+      "post": {
+        "description": "Reassign a task to a different profile, optionally reclaiming first.\n\nUsed by the dashboard recovery popover when an operator wants to\nretry a task with a different worker profile (e.g. switch to a\nsmarter model after the assigned profile keeps hallucinating).\nMaps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.",
+        "operationId": "reassign_task_endpoint_api_plugins_kanban_tasks__task_id__reassign_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReassignBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reassign Task Endpoint"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/reclaim": {
+      "post": {
+        "description": "Release an active worker claim on a running task.\n\nUsed by the dashboard recovery popover when an operator wants to\nabort a stuck worker (e.g. one that keeps hallucinating card ids)\nwithout waiting for the claim TTL. Maps 1:1 to\n``hermes kanban reclaim <task_id> --reason ...``.",
+        "operationId": "reclaim_task_endpoint_api_plugins_kanban_tasks__task_id__reclaim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReclaimBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reclaim Task Endpoint"
+      }
+    },
+    "/api/plugins/kanban/tasks/{task_id}/specify": {
+      "post": {
+        "description": "Flesh out a triage-column task via the auxiliary LLM and promote\nit to ``todo``. Maps 1:1 to ``hermes kanban specify <task_id>``.\n\nReturns the outcome shape used by the CLI: ``{ok, task_id, reason,\nnew_title}``. A non-OK outcome is NOT an HTTP error \u2014 the UI renders\nthe reason inline (e.g. \"no auxiliary client configured\") so the\noperator knows what to fix, and retries without a page reload.\n\nThis endpoint runs in FastAPI's threadpool (sync ``def``) because\nthe underlying LLM call can take tens of seconds to minutes on\nreasoning models, which would block the event loop if we used\n``async def`` without an explicit ``run_in_executor``.",
+        "operationId": "specify_task_endpoint_api_plugins_kanban_tasks__task_id__specify_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpecifyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Specify Task Endpoint"
+      }
+    },
+    "/api/plugins/kanban/workers/active": {
+      "get": {
+        "description": "Return every currently-running worker on the board.\n\nA worker is a ``task_runs`` row whose ``ended_at`` is NULL and whose\n``worker_pid`` is non-NULL, belonging to a task with ``status='running'``.\n\nReturns ``{workers: [...], count: N, checked_at: <epoch>}``.  Each\nworker entry carries enough context for the dashboard to link back to\nits task without a second round-trip.",
+        "operationId": "list_active_workers_api_plugins_kanban_workers_active_get",
+        "parameters": [
+          {
+            "description": "Kanban board slug (omit for current)",
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Kanban board slug (omit for current)",
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Active Workers"
+      }
+    },
+    "/api/profiles": {
+      "get": {
+        "operationId": "list_profiles_endpoint_api_profiles_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Profiles Endpoint"
+      },
+      "post": {
+        "operationId": "create_profile_endpoint_api_profiles_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Profile Endpoint"
+      }
+    },
+    "/api/profiles/{name}": {
+      "delete": {
+        "description": "Delete a profile. The dashboard collects the user's confirmation in\nits own dialog before this request, so we always pass ``yes=True`` to\nskip the CLI's interactive prompt.",
+        "operationId": "delete_profile_endpoint_api_profiles__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Profile Endpoint"
+      },
+      "patch": {
+        "operationId": "rename_profile_endpoint_api_profiles__name__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileRename"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Profile Endpoint"
+      }
+    },
+    "/api/profiles/{name}/open-terminal": {
+      "post": {
+        "operationId": "open_profile_terminal_endpoint_api_profiles__name__open_terminal_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open Profile Terminal Endpoint"
+      }
+    },
+    "/api/profiles/{name}/setup-command": {
+      "get": {
+        "operationId": "get_profile_setup_command_api_profiles__name__setup_command_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Profile Setup Command"
+      }
+    },
+    "/api/profiles/{name}/soul": {
+      "get": {
+        "operationId": "get_profile_soul_api_profiles__name__soul_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Profile Soul"
+      },
+      "put": {
+        "operationId": "update_profile_soul_api_profiles__name__soul_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileSoulUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Profile Soul"
+      }
+    },
+    "/api/providers/oauth": {
+      "get": {
+        "description": "Enumerate every OAuth-capable LLM provider with current status.\n\nResponse shape (per provider):\n    id              stable identifier (used in DELETE path)\n    name            human label\n    flow            \"pkce\" | \"device_code\" | \"external\"\n    cli_command     fallback CLI command for users to run manually\n    docs_url        external docs/portal link for the \"Learn more\" link\n    status:\n      logged_in        bool \u2014 currently has usable creds\n      source           short slug (\"hermes_pkce\", \"claude_code\", ...)\n      source_label     human-readable origin (file path, env var name)\n      token_preview    last N chars of the token, never the full token\n      expires_at       ISO timestamp string or null\n      has_refresh_token bool",
+        "operationId": "list_oauth_providers_api_providers_oauth_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Oauth Providers"
+      }
+    },
+    "/api/providers/oauth/sessions/{session_id}": {
+      "delete": {
+        "description": "Cancel a pending OAuth session. Token-protected.",
+        "operationId": "cancel_oauth_session_api_providers_oauth_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Oauth Session"
+      }
+    },
+    "/api/providers/oauth/{provider_id}": {
+      "delete": {
+        "description": "Disconnect an OAuth provider. Token-protected (matches /env/reveal).",
+        "operationId": "disconnect_oauth_provider_api_providers_oauth__provider_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "title": "Provider Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disconnect Oauth Provider"
+      }
+    },
+    "/api/providers/oauth/{provider_id}/poll/{session_id}": {
+      "get": {
+        "description": "Poll a device-code session's status (no auth \u2014 read-only state).",
+        "operationId": "poll_oauth_session_api_providers_oauth__provider_id__poll__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "title": "Provider Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Poll Oauth Session"
+      }
+    },
+    "/api/providers/oauth/{provider_id}/start": {
+      "post": {
+        "description": "Initiate an OAuth login flow. Token-protected.",
+        "operationId": "start_oauth_login_api_providers_oauth__provider_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "title": "Provider Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Oauth Login"
+      }
+    },
+    "/api/providers/oauth/{provider_id}/submit": {
+      "post": {
+        "description": "Submit the auth code for PKCE flows. Token-protected.",
+        "operationId": "submit_oauth_code_api_providers_oauth__provider_id__submit_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "title": "Provider Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthSubmitBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Oauth Code"
+      }
+    },
+    "/api/sessions": {
+      "get": {
+        "operationId": "get_sessions_api_sessions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Sessions"
+      }
+    },
+    "/api/sessions/search": {
+      "get": {
+        "description": "Full-text search across session message content using FTS5.",
+        "operationId": "search_sessions_api_sessions_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Sessions"
+      }
+    },
+    "/api/sessions/{session_id}": {
+      "delete": {
+        "operationId": "delete_session_endpoint_api_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Session Endpoint"
+      },
+      "get": {
+        "operationId": "get_session_detail_api_sessions__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Detail"
+      }
+    },
+    "/api/sessions/{session_id}/latest-descendant": {
+      "get": {
+        "operationId": "get_session_latest_descendant_api_sessions__session_id__latest_descendant_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Latest Descendant"
+      }
+    },
+    "/api/sessions/{session_id}/messages": {
+      "get": {
+        "operationId": "get_session_messages_api_sessions__session_id__messages_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Messages"
+      }
+    },
+    "/api/skills": {
+      "get": {
+        "operationId": "get_skills_api_skills_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Skills"
+      }
+    },
+    "/api/skills/toggle": {
+      "put": {
+        "operationId": "toggle_skill_api_skills_toggle_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Toggle Skill"
+      }
+    },
+    "/api/status": {
+      "get": {
+        "operationId": "get_status_api_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Status"
+      }
+    },
+    "/api/tools/toolsets": {
+      "get": {
+        "operationId": "get_toolsets_api_tools_toolsets_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Toolsets"
+      }
+    },
+    "/assets/{filename}.css": {
+      "get": {
+        "operationId": "serve_css_assets__filename__css_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "filename",
+            "required": true,
+            "schema": {
+              "title": "Filename",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Serve Css"
+      }
+    },
+    "/dashboard-plugins/{plugin_name}/{file_path}": {
+      "get": {
+        "description": "Serve static assets from a dashboard plugin directory.\n\nOnly serves files from the plugin's ``dashboard/`` subdirectory.\nPath traversal is blocked by checking ``resolve().is_relative_to()``.\n\nRestricted to a browser-fetchable suffix allowlist (JS/CSS/JSON/HTML/\nSVG/PNG/JPG/WOFF). The dashboard loads plugin JS via ``<script src>``\nand CSS via ``<link href>``, neither of which can attach a custom\nauth header \u2014 so this route stays unauthenticated to keep the SPA\nworking. But user-installed plugins ship a ``plugin_api.py``\nbackend module that the browser never fetches; it's only imported\nby :func:`_mount_plugin_api_routes` at startup. Without a suffix\nallowlist, anyone on the loopback port can curl the ``.py`` source\nof a private third-party plugin. Reject everything outside the\nbrowser-asset set.",
+        "operationId": "serve_plugin_asset_dashboard_plugins__plugin_name___file_path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plugin_name",
+            "required": true,
+            "schema": {
+              "title": "Plugin Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_path",
+            "required": true,
+            "schema": {
+              "title": "File Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Serve Plugin Asset"
+      }
+    },
+    "/{full_path}": {
+      "get": {
+        "operationId": "serve_spa__full_path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "full_path",
+            "required": true,
+            "schema": {
+              "title": "Full Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Serve Spa"
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "erika_routes": {
+    "/api/erika/sessions": [
+      "post"
+    ],
+    "/api/erika/sessions/{session_id}": [
+      "get"
+    ],
+    "/api/erika/sessions/{session_id}/close": [
+      "post"
+    ],
+    "/api/erika/sessions/{session_id}/delegate": [
+      "post"
+    ],
+    "/api/erika/sessions/{session_id}/messages": [
+      "post"
+    ],
+    "/api/erika/sessions/{session_id}/mode": [
+      "post"
+    ]
+  }
+}

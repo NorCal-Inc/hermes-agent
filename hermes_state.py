@@ -191,11 +191,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     user_id TEXT,
+    session_owner TEXT,
+    session_mode TEXT,
+    session_authority TEXT,
+    session_source TEXT,
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
+    updated_at REAL,
     ended_at REAL,
     end_reason TEXT,
     message_count INTEGER DEFAULT 0,
@@ -705,17 +710,26 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        session_owner: str = None,
+        session_mode: str = None,
+        session_authority: str = None,
+        session_source: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
             conn.execute(
-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                """INSERT OR IGNORE INTO sessions (id, source, user_id, session_owner,
+                   session_mode, session_authority, session_source, model, model_config,
                    system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
                     user_id,
+                    session_owner,
+                    session_mode,
+                    session_authority,
+                    session_source,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
@@ -2650,6 +2664,12 @@ class SessionDB:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+        self._execute_write(_do)
+
+    def delete_meta(self, key: str) -> None:
+        """Delete a value from the state_meta key/value store."""
+        def _do(conn):
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (key,))
         self._execute_write(_do)
 
     def apply_telegram_topic_migration(self) -> None:

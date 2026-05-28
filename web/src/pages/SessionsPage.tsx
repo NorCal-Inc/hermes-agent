@@ -95,37 +95,53 @@ function StatusPaneCard({
   subtitle,
   tone,
   lines,
+  collapsed,
+  onToggle,
 }: {
   title: string;
   subtitle?: string;
   tone: "success" | "warning" | "destructive" | "outline";
   lines: readonly PaneLine[];
+  collapsed: boolean;
+  onToggle: () => void;
 }) {
   return (
     <Card className="min-w-0 max-w-full overflow-hidden">
       <CardHeader className="min-w-0 pb-3">
         <div className="flex min-w-0 items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <CardTitle className="min-w-0 truncate text-base">{title}</CardTitle>
-            {subtitle ? (
-              <p className="mt-1 text-xs text-text-tertiary">{subtitle}</p>
-            ) : null}
-          </div>
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-expanded={!collapsed}
+            className="flex min-w-0 flex-1 items-start gap-2 text-left"
+          >
+            <div className="mt-0.5 text-muted-foreground">
+              {collapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+            </div>
+            <div className="min-w-0 flex-1">
+              <CardTitle className="min-w-0 truncate text-base">{title}</CardTitle>
+              {subtitle ? (
+                <p className="mt-1 text-xs text-text-tertiary">{subtitle}</p>
+              ) : null}
+            </div>
+          </button>
           <Badge tone={tone} className="shrink-0 text-xs uppercase tracking-[0.08em]">
             {tone}
           </Badge>
         </div>
       </CardHeader>
-      <CardContent className="grid min-w-0 gap-2">
-        {lines.map((line) => (
-          <div key={line.label} className="flex min-w-0 items-start justify-between gap-3 border-t border-border/60 pt-2 first:border-t-0 first:pt-0">
-            <span className="text-xs text-text-tertiary">{line.label}</span>
-            <span className="max-w-[65%] truncate text-right text-xs text-text-secondary">
-              {line.value}
-            </span>
-          </div>
-        ))}
-      </CardContent>
+      {!collapsed && (
+        <CardContent className="grid min-w-0 gap-2">
+          {lines.map((line) => (
+            <div key={line.label} className="flex min-w-0 items-start justify-between gap-3 border-t border-border/60 pt-2 first:border-t-0 first:pt-0">
+              <span className="text-xs text-text-tertiary">{line.label}</span>
+              <span className="max-w-[65%] truncate text-right text-xs text-text-secondary">
+                {line.value}
+              </span>
+            </div>
+          ))}
+        </CardContent>
+      )}
     </Card>
   );
 }
@@ -679,6 +695,7 @@ export default function SessionsPage() {
     SessionSearchResult[] | null
   >(null);
   const [searching, setSearching] = useState(false);
+  const [collapsedPanes, setCollapsedPanes] = useState<Record<string, boolean>>({});
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -863,6 +880,24 @@ export default function SessionsPage() {
       ],
     },
     {
+      title: "ERIKA",
+      subtitle: "session-scoped orchestration",
+      tone: statusTone(
+        [
+          status?.db_connected ? "connected" : "disconnected",
+          status?.erika_enforcement_active ? "active" : "inactive",
+          status?.degraded_state ? "degraded" : "healthy",
+        ].join(" "),
+      ),
+      lines: [
+        { label: "DB Connected", value: status ? formatScalar(status.db_connected) : "—" },
+        { label: "Erika Enforcement Active", value: status ? formatScalar(status.erika_enforcement_active) : "—" },
+        { label: "Persistence Active", value: status ? formatScalar(status.persistence_active) : "—" },
+        { label: "Degraded State", value: status ? formatScalar(status.degraded_state) : "—" },
+        { label: "Fallback Locked", value: status ? formatScalar(status.fallback_locked) : "—" },
+      ],
+    },
+    {
       title: "TRIPTRACKER",
       subtitle: "payments, checkout recovery, subscriptions",
       tone: statusTone(
@@ -888,18 +923,6 @@ export default function SessionsPage() {
         { label: "Payment anomalies", value: "Orion_Formation_Services_Lead" },
         { label: "Operational alerts", value: status?.gateway_platforms?.telegram?.state ?? "suppressed" },
         { label: "Fallback containment", value: "Escalate to Erika; never shared ops" },
-      ],
-    },
-    {
-      title: "ERIKA",
-      subtitle: "escalations, cross-company anomalies, governance",
-      tone: statusTone(alerts.length > 0 ? "warning" : "clean"),
-      lines: [
-        { label: "Unresolved escalations", value: String(alerts.length) },
-        { label: "Cross-company operational anomalies", value: String(Math.max(0, alerts.length - 1)) },
-        { label: "Unresolved drift", value: status?.gateway_exit_reason ?? "none" },
-        { label: "Governance-level summaries", value: "eligible" },
-        { label: "Routine telemetry", value: "blocked" },
       ],
     },
     {
@@ -972,6 +995,13 @@ export default function SessionsPage() {
             subtitle={pane.subtitle}
             tone={pane.tone}
             lines={pane.lines}
+            collapsed={collapsedPanes[pane.title] ?? false}
+            onToggle={() =>
+              setCollapsedPanes((current) => ({
+                ...current,
+                [pane.title]: !(current[pane.title] ?? false),
+              }))
+            }
           />
         ))}
       </div>

@@ -125,6 +125,190 @@ class TestWebServerEndpoints:
         assert "hermes_home" in data
         assert "active_sessions" in data
 
+    def test_openapi_includes_erika_close_route(self):
+        resp = self.client.get("/openapi.json")
+        assert resp.status_code == 200
+        paths = resp.json()["paths"]
+        assert "/api/erika/sessions/{session_id}/close" in paths
+        assert "post" in paths["/api/erika/sessions/{session_id}/close"]
+
+    def test_erika_session_lifecycle_contract(self):
+        from hermes_state import SessionDB
+
+        verify_db = SessionDB()
+        try:
+            create_headers = {"x-idempotency-key": "erika-create-proof"}
+            create_body = {"authority": "erika", "mode": "orchestrated", "title": "Erika"}
+            create_resp = self.client.post(
+                "/api/erika/sessions",
+                headers=create_headers,
+                json=create_body,
+            )
+            assert create_resp.status_code == 200
+            create_data = create_resp.json()
+            created_session_id = create_data["session_id"]
+            assert create_data["authority"] == "erika"
+            assert create_data["mode"] == "orchestrated"
+            assert create_data["source"] == "dashboard"
+            assert create_data["created_at"] is not None
+            assert create_data["request_id"]
+
+            duplicate_create_resp = self.client.post(
+                "/api/erika/sessions",
+                headers=create_headers,
+                json=create_body,
+            )
+            assert duplicate_create_resp.status_code == 200
+            duplicate_create_data = duplicate_create_resp.json()
+            assert duplicate_create_data["session_id"] == created_session_id
+
+            session_after_create = verify_db.get_session(created_session_id)
+            assert session_after_create is not None
+            assert session_after_create["session_authority"] == "erika"
+            assert session_after_create["session_mode"] == "orchestrated"
+            assert session_after_create["ended_at"] is None
+
+            message_headers = {"x-idempotency-key": "erika-message-proof"}
+            message_body = {"role": "user", "content": "hello Erika", "authority": "erika"}
+            message_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/messages",
+                headers=message_headers,
+                json=message_body,
+            )
+            assert message_resp.status_code == 200
+            message_data = message_resp.json()
+            assert message_data["persisted"] is True
+            assert message_data["message_id"] is not None
+
+            duplicate_message_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/messages",
+                headers=message_headers,
+                json=message_body,
+            )
+            assert duplicate_message_resp.status_code == 200
+            duplicate_message_data = duplicate_message_resp.json()
+            assert duplicate_message_data["message_id"] == message_data["message_id"]
+
+            message_round_trip = verify_db.get_messages(created_session_id)
+            assert message_round_trip
+            assert message_round_trip[-1]["content"] == "hello Erika"
+
+            delegate_headers = {"x-idempotency-key": "erika-delegate-proof"}
+            delegate_body = {
+                "task": "Lifecycle proof task",
+                "instruction": "Validate authority chain",
+                "authority": "Christopher -> Erika -> Team -> Worker",
+            }
+            delegate_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/delegate",
+                headers=delegate_headers,
+                json=delegate_body,
+            )
+            assert delegate_resp.status_code == 200
+            delegate_data = delegate_resp.json()
+            assert delegate_data["persisted"] is True
+            assert delegate_data["authority_chain"] == "Christopher -> Erika -> Team -> Worker"
+            assert delegate_data["delegated_by"] == "Erika"
+            assert delegate_data["assigned_team"] == "Team"
+
+            duplicate_delegate_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/delegate",
+                headers=delegate_headers,
+                json=delegate_body,
+            )
+            assert duplicate_delegate_resp.status_code == 200
+            duplicate_delegate_data = duplicate_delegate_resp.json()
+            assert duplicate_delegate_data["task_id"] == delegate_data["task_id"]
+
+            mode_headers = {"x-idempotency-key": "erika-mode-proof"}
+            mode_body = {"mode": "direct", "authority": "erika"}
+            mode_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/mode",
+                headers=mode_headers,
+                json=mode_body,
+            )
+            assert mode_resp.status_code == 200
+            mode_data = mode_resp.json()
+            assert mode_data["previous_mode"] == "orchestrated"
+            assert mode_data["current_mode"] == "direct"
+            assert mode_data["updated_at"] is not None
+            assert mode_data["request_id"]
+
+            duplicate_mode_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/mode",
+                headers=mode_headers,
+                json=mode_body,
+            )
+            assert duplicate_mode_resp.status_code == 200
+            duplicate_mode_data = duplicate_mode_resp.json()
+            assert duplicate_mode_data["updated_at"] == mode_data["updated_at"]
+
+            session_after_mode = verify_db.get_session(created_session_id)
+            assert session_after_mode is not None
+            assert session_after_mode["session_mode"] == "direct"
+            assert session_after_mode["updated_at"] == mode_data["updated_at"]
+
+            get_resp = self.client.get(f"/api/erika/sessions/{created_session_id}")
+            assert get_resp.status_code == 200
+            get_data = get_resp.json()
+            assert get_data["mode"] == "direct"
+            assert get_data["authority"] == "erika"
+            assert get_data["status"] == "active"
+            assert get_data["updated_at"] == mode_data["updated_at"]
+
+            close_resp = self.client.post(f"/api/erika/sessions/{created_session_id}/close")
+            assert close_resp.status_code == 200
+            close_data = close_resp.json()
+            assert close_data["session_id"] == created_session_id
+            assert close_data["status"] == "closed"
+            assert close_data["closed_at"] is not None
+            assert close_data["request_id"]
+
+            session_after_close = verify_db.get_session(created_session_id)
+            assert session_after_close is not None
+            assert session_after_close["ended_at"] is not None
+            assert session_after_close["end_reason"] == "erika_closed"
+
+            closed_mode_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/mode",
+                headers={"x-idempotency-key": "erika-mode-after-close"},
+                json={"mode": "hermes", "authority": "erika"},
+            )
+            assert closed_mode_resp.status_code == 409
+
+            closed_delegate_resp = self.client.post(
+                f"/api/erika/sessions/{created_session_id}/delegate",
+                headers={"x-idempotency-key": "erika-delegate-after-close"},
+                json=delegate_body,
+            )
+            assert closed_delegate_resp.status_code == 409
+
+            stale_session_id = "stale-erika-session"
+            verify_db.create_session(
+                stale_session_id,
+                source="dashboard",
+                session_owner="Erika",
+                session_mode="orchestrated",
+                session_authority="erika",
+                session_source="dashboard",
+            )
+            import time
+            stale_ts = time.time() - 400
+            verify_db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (stale_ts, stale_session_id),
+                )
+            )
+            stale_mode_resp = self.client.post(
+                f"/api/erika/sessions/{stale_session_id}/mode",
+                headers={"x-idempotency-key": "erika-stale-mode"},
+                json=mode_body,
+            )
+            assert stale_mode_resp.status_code == 409
+        finally:
+            verify_db.close()
+
     def test_get_status_filters_unconfigured_gateway_platforms(self, monkeypatch):
         import gateway.config as gateway_config
         import hermes_cli.web_server as web_server

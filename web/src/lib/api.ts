@@ -373,7 +373,11 @@ export interface StatusResponse {
   active_sessions: number;
   config_path: string;
   config_version: number;
+  db_connected: boolean;
+  degraded_state: boolean;
   env_path: string;
+  erika_enforcement_active: boolean;
+  fallback_locked: boolean;
   gateway_exit_reason: string | null;
   gateway_health_url: string | null;
   gateway_pid: number | null;
@@ -383,6 +387,7 @@ export interface StatusResponse {
   gateway_updated_at: string | null;
   hermes_home: string;
   latest_config_version: number;
+  persistence_active: boolean;
   release_date: string;
   version: string;
 }
