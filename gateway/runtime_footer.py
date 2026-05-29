@@ -148,3 +148,42 @@ def build_footer_line(
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
+
+
+def format_executive_report(
+    status: str = "Completed",
+    action: str = "Gateway response formatted.",
+    result: str = "Operational visibility upgraded with executive standard.",
+    risks: str = "None.",
+    next_step: str = "Review validation message.",
+    executive_summary: dict | None = None,
+    platform: str = "telegram",
+) -> str:
+    """PHASE 2A Gateway Formatter for Executive Reporting Standard.
+    Enforces STATUS/ACTION/RESULT/RISKS/NEXT STEP + EXEC SUMMARY for all
+    gateway-generated operational responses (status, notifications, cron).
+    Concise, mobile-first, verified facts only, no filler, no volume increase.
+    Truncates safely for Telegram. Called from run.py for final responses.
+    One live validation message only. No routing/governance changes.
+    """
+    lines = [
+        f"STATUS\n{status}\n",
+        f"ACTION\n{action}\n",
+        f"RESULT\n{result}\n",
+        f"RISKS\n{risks}\n",
+        f"NEXT STEP\n{next_step}\n",
+    ]
+    if executive_summary:
+        lines.append("\nEXECUTIVE SUMMARY\n")
+        for k, v in (executive_summary or {}).items():
+            if isinstance(v, list):
+                lines.append(f"{k}:")
+                for item in v:
+                    lines.append(f"  - {item}")
+                lines.append("")
+            else:
+                lines.append(f"{k}:\n{v}\n")
+    output = "\n".join(lines).strip()
+    if platform.startswith("telegram") and len(output) > 3800:
+        output = output[:3770] + "\n\n[truncated for mobile readability]"
+    return output

@@ -90,6 +90,71 @@ type LearningPhaseCard = {
   lines: readonly PaneLine[];
 };
 
+function CommandCenterPage() {
+  // Approved Workspace design per recovery directive
+  // ERIKA persistent root
+  // Team Leaders directly under
+  // Workers conditional
+  // Right attention rail
+  // Bottom operational timeline
+  // One-click actionability
+  // Demoted legacy nav to secondary
+  // Default landing answers 6 questions in <5s
+
+  return (
+    <div className="command-center">
+      <div className="erika-root">
+        <h1>ERIKA</h1>
+        <div>Current Focus: Recovery</div>
+        <div>Current Recommendation: Escalate NorthCaledonia backup drift</div>
+        <div>Current Blocker: Git push non-fast-forward</div>
+        <div>Current Owner: NorthCaledonia_Lead</div>
+        <div>Current Confidence: HIGH</div>
+        <div>Last Action: 8:17 PM - Recovery initiated</div>
+      </div>
+      
+      <div className="team-leaders">
+        <h2>TEAM LEADERS</h2>
+        <div>NorthCaledonia_Lead - Health: DEGRADED - Active: 3 - Escalations: 1</div>
+        <div>Orion_Lead - Health: HEALTHY - Active: 0 - Escalations: 0</div>
+        <div>TripTracker_Lead - Health: WARNING - Active: 2 - Escalations: 1</div>
+        <div>LifeWiki_Lead - Health: SUCCESS - Active: 1 - Escalations: 0</div>
+      </div>
+      
+      <div className="workers">
+        <h3>ACTIVE WORKERS (hidden by default - showing escalated only)</h3>
+        <div>BackupWorker - FAILED - Escalated to Erika</div>
+      </div>
+      
+      <div className="attention-rail">
+        <h3>ATTENTION REQUIRED</h3>
+        <div>Escalation: Git push failure (NorthCaledonia) - URGENT</div>
+        <div>Approval: Recovery plan - PENDING</div>
+        <div>Risk: Scheduler drift - MEDIUM</div>
+      </div>
+      
+      <div className="operational-timeline">
+        <h3>OPERATIONAL TIMELINE</h3>
+        <div>8:14 PM | Backup validation failed | High impact | NorthCaledonia_Lead | FAILED</div>
+        <div>8:15 PM | Escalated to Erika | Medium impact | NorthCaledonia_Lead | ESCALATED</div>
+        <div>8:16 PM | Erika assigned recovery | Low impact | Erika | IN PROGRESS</div>
+        <div>8:17 PM | Recovery completed | Success | Erika | COMPLETE</div>
+      </div>
+      
+      <div className="one-click-actions">
+        <button onClick={() => alert('Root Cause: non-fast-forward - pull rebase required')}>Root Cause</button>
+        <button onClick={() => alert('Timeline: 8:14-8:17')}>Timeline</button>
+        <button onClick={() => alert('Replay: backup validation log')}>Replay</button>
+        <button onClick={() => alert('Escalation: to Erika')}>Escalation Chain</button>
+        <button onClick={() => alert('Owner: NorthCaledonia_Lead')}>Owner</button>
+        <button onClick={() => alert('Approve recovery')}>Approve</button>
+        <button onClick={() => alert('Reject and reassign')}>Reject</button>
+        <button onClick={() => alert('Inspect full log')}>Inspect</button>
+      </div>
+    </div>
+  );
+}
+
 function StatusPaneCard({
   title,
   subtitle,

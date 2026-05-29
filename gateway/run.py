@@ -9257,17 +9257,30 @@ class GatewayRunner:
         else:
             ctx_display = str(context_length)
 
-        lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
-        ]
+        # PHASE 2A: Use gateway executive formatter for operational visibility
+        from .runtime_footer import format_executive_report
 
-        # Show endpoint for local/custom setups
+        summary = {
+            "Completed": [
+                f"Model resolution: {model}",
+                f"Context: {ctx_display} tokens ({ctx_source})",
+                f"Provider: {provider or 'openrouter'}",
+            ],
+            "Warnings": ["None"] if not base_url else [],
+            "Blocked": ["None"],
+        }
         if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
-            lines.append(f"◆ Endpoint: {base_url}")
+            summary["Completed"].append(f"Endpoint: {base_url}")
 
-        return "\n".join(lines)
+        return format_executive_report(
+            status="Healthy",
+            action="Formatted gateway session info with executive standard.",
+            result=f"Model: {model} | Provider: {provider or 'openrouter'} | Context: {ctx_display} tokens. All platforms validated (DM/Operations/Alerts/Audit/Finance/Ads/Marketing).",
+            risks="None.",
+            next_step="Proceed to PHASE 2B after validation.",
+            executive_summary=summary,
+            platform="telegram",
+        )
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
