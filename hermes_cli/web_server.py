@@ -3784,6 +3784,7 @@ def mount_spa(application: FastAPI):
         return Response(content=css, media_type="text/css")
 
     application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    application.mount("/dashboard/assets", StaticFiles(directory=WEB_DIST / "assets"), name="dashboard-assets")
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
