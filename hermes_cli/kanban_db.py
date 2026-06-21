@@ -4652,9 +4652,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
-                protocol_violation = True
+                # ``kanban_complete`` / ``kanban_block``.
+                # Retry allowed: prompt mandates terminal call; max_attempts prevents loops.
+                protocol_violation = False  # retry; strengthened prompt mandates terminal call
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
                     "kanban_complete or kanban_block — protocol violation"

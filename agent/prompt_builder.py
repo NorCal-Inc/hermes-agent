@@ -174,6 +174,12 @@ SKILLS_GUIDANCE = (
 
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
+    "TERMINATION REQUIREMENT: You MUST call `kanban_complete` or "
+    "`kanban_block` before this process exits. Exiting with only a text "
+    "response (no tool call) is a protocol violation: the dispatcher "
+    "detects clean-exit-without-terminal-tool and auto-blocks the task on "
+    "the first occurrence with no retry. This applies even after you have "
+    "written your final answer in text.\n\n"
     "You have been assigned ONE task from "
     "the shared board at `~/.hermes/kanban.db`. Your task id is in "
     "`$HERMES_KANBAN_TASK`; your workspace is `$HERMES_KANBAN_WORKSPACE`. "
@@ -240,7 +246,14 @@ KANBAN_GUIDANCE = (
     "specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is "
     "for short reasoning subtasks inside your own run; board tasks are for "
-    "cross-agent handoffs that outlive one API loop."
+    "cross-agent handoffs that outlive one API loop.\n"
+    "\n"
+    "## MANDATORY EXIT (not optional)\n"
+    "\n"
+    "You MUST end this session by calling `kanban_complete` or `kanban_block`. "
+    "There is no other valid exit. If you have completed the work, call "
+    "`kanban_complete` now. If you cannot proceed, call `kanban_block`. "
+    "Do not stop or return without making one of these calls."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
