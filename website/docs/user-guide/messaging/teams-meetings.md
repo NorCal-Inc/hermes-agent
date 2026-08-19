@@ -8,6 +8,10 @@ description: "Set up the Microsoft Teams meeting summary pipeline with Microsoft
 
 Use the Teams meeting pipeline when you want Hermes to ingest Microsoft Graph meeting events, fetch transcripts first, fall back to recordings plus STT when needed, and deliver a structured summary to downstream sinks.
 
+Prerequisites: see [Microsoft Teams](./teams.md) for the underlying bot/credential setup.
+
+> Run `hermes gateway setup` and pick **Teams Meetings** for a guided walk-through.
+
 This page focuses on setup and enablement:
 - Graph credentials
 - webhook listener configuration
@@ -70,6 +74,8 @@ MSGRAPH_WEBHOOK_CLIENT_STATE=<random-shared-secret>
 MSGRAPH_WEBHOOK_ACCEPTED_RESOURCES=communications/onlineMeetings
 ```
 
+The bind host is read from the platform's `extra.host` in `config.yaml` (there is no `MSGRAPH_WEBHOOK_HOST` env var — see the [webhook listener reference](msgraph-webhook.md)).
+
 The listener exposes:
 - `/msgraph/webhook` for Graph notifications
 - `/health` for a simple health check
@@ -91,6 +97,7 @@ platforms:
   msgraph_webhook:
     enabled: true
     extra:
+      host: 127.0.0.1
       port: 8646
       client_state: "replace-me"
       accepted_resources:
@@ -119,6 +126,8 @@ platforms:
         linear:
           enabled: false
 ```
+
+If you bind the listener to a non-loopback host such as `0.0.0.0`, you must also set `allowed_source_cidrs` to Microsoft's webhook egress ranges. Loopback binds (`127.0.0.1` / `::1`) are the intended dev-tunnel and local reverse-proxy setup.
 
 ## Teams Delivery Modes
 
