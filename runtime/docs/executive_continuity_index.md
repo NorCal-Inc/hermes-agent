@@ -1,0 +1,1 @@
+[Mirrored from ~/.hermes/docs/executive_continuity_index.md — authoritative copy lives in docs/. Do not edit here; sync via governance process.]

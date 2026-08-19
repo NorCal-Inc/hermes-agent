@@ -56,6 +56,7 @@ def _make_adapter(extra=None):
     config = PlatformConfig(enabled=True, token="test-token", extra=extra or {})
     adapter = TelegramAdapter(config)
     adapter._bot = AsyncMock()
+    adapter._bot.username = "hermesbot"
     adapter._app = MagicMock()
     return adapter
 
@@ -238,6 +239,97 @@ class TestTelegramExecApproval:
 
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
+
+    @pytest.mark.asyncio
+    async def test_executive_menu_keyboard_renders_four_buttons(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 7
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        result = await adapter._send_executive_menu("12345")
+
+        assert result.success is True
+        kwargs = adapter._bot.send_message.call_args[1]
+        assert kwargs["chat_id"] == 12345
+        markup = kwargs["reply_markup"]
+        assert markup is not None
+        text = kwargs["text"]
+        assert "Hermes Executive Panel" in text
+        assert "Ask Erika" in text
+
+    @pytest.mark.asyncio
+    async def test_executive_menu_start_command_routes_to_menu(self):
+        adapter = _make_adapter()
+        adapter._send_executive_menu = AsyncMock(return_value=SimpleNamespace(success=True, message_id="99"))
+        msg = MagicMock()
+        msg.text = "/start"
+        msg.chat = MagicMock(id=12345)
+        msg.message_thread_id = None
+        msg.message_id = 44
+        update = MagicMock()
+        update.update_id = 1
+        update.message = msg
+        update.effective_message = msg
+        context = MagicMock()
+
+        with patch.object(adapter, "_should_process_message", return_value=True), patch.object(adapter, "_ensure_forum_commands", AsyncMock()):
+            await adapter._handle_command(update, context)
+
+        adapter._send_executive_menu.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_executive_snapshot_uses_live_task_and_health_sources(self):
+        adapter = _make_adapter()
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running", "dashboard_state": "ok", "life_wiki_state": "ok", "github_sync_state": "ok", "telegram_state": "ok"}):
+            snapshot = adapter._telegram_executive_snapshot()
+        assert "status" in snapshot
+        assert "tasks" in snapshot
+        assert "health" in snapshot
+        assert isinstance(snapshot["status"].get("open_tasks"), int)
+        assert snapshot["health"].get("gateway") == "running"
+
+    @pytest.mark.asyncio
+    async def test_ask_erika_invokes_llm_path(self):
+        adapter = _make_adapter()
+        adapter._run_ask_erika = MagicMock(return_value="LLM response")
+        adapter._telegram_executive_snapshot = MagicMock(return_value={"status": {}, "tasks": [], "health": {}})
+        query = AsyncMock()
+        query.data = "ep:ask"
+        query.message = MagicMock(chat_id=12345, chat=MagicMock(id=12345))
+        query.from_user = MagicMock(first_name="Christopher")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.object(adapter, "_is_callback_user_authorized", return_value=True):
+            await adapter._handle_callback_query(update, context)
+
+        adapter._run_ask_erika.assert_called_once()
+        adapter._telegram_executive_snapshot.assert_called_once()
+        query.edit_message_text.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_open_tasks_button_uses_live_snapshot(self):
+        adapter = _make_adapter()
+        adapter._telegram_executive_snapshot = MagicMock(return_value={"status": {}, "tasks": [], "health": {}})
+        query = AsyncMock()
+        query.data = "ep:tasks"
+        query.message = MagicMock(chat_id=12345, chat=MagicMock(id=12345))
+        query.from_user = MagicMock(first_name="Christopher")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.object(adapter, "_is_callback_user_authorized", return_value=True):
+            await adapter._handle_callback_query(update, context)
+
+        adapter._telegram_executive_snapshot.assert_called_once()
+        query.edit_message_text.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_resolves_approval_on_click(self):

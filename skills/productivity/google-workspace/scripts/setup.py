@@ -61,6 +61,28 @@ REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google
 REDIRECT_URI = "http://localhost:1"
 
 
+def _is_web_client_secret() -> bool:
+    try:
+        data = json.loads(CLIENT_SECRET_PATH.read_text())
+    except Exception:
+        return False
+    return isinstance(data, dict) and "web" in data and "installed" not in data
+
+
+def _get_web_redirect_uri() -> str | None:
+    try:
+        data = json.loads(CLIENT_SECRET_PATH.read_text())
+    except Exception:
+        return None
+    web = data.get("web") if isinstance(data, dict) else None
+    if not isinstance(web, dict):
+        return None
+    redirects = web.get("redirect_uris")
+    if isinstance(redirects, list) and redirects:
+        return str(redirects[0])
+    return None
+
+
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
     if not normalized.get("type"):
@@ -312,7 +334,7 @@ def get_auth_url():
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
+        redirect_uri=_get_web_redirect_uri() or REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
     auth_url, state = flow.authorization_url(
@@ -352,7 +374,7 @@ def exchange_auth_code(code: str):
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
         scopes=granted_scopes,
-        redirect_uri=pending_auth.get("redirect_uri", REDIRECT_URI),
+        redirect_uri=_get_web_redirect_uri() or pending_auth.get("redirect_uri", REDIRECT_URI),
         state=pending_auth["state"],
         code_verifier=pending_auth["code_verifier"],
     )

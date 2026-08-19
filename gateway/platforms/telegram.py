@@ -3114,6 +3114,219 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
+        # --- Executive panel callbacks (ep:status|tasks|health|ask) ---
+        if data.startswith("ep:"):
+            if not query_message or query_chat_id is None:
+                await query.answer(text="Missing menu context.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to use the executive panel.")
+                return
+
+            try:
+                snapshot = self._telegram_executive_snapshot()
+            except Exception as exc:
+                logger.exception("[%s] Executive snapshot failed: %s", self.name, exc)
+                await query.answer(text="Executive panel is temporarily unavailable.")
+                return
+
+            menu_text = self.format_message("*Hermes Executive Panel*\n\nUse the buttons below for live operational state.\nOnly Ask Erika invokes AI.")
+            action, _, arg = data.partition(":")
+            subaction, _, subarg = arg.partition(":") if arg else ("", "", "")
+            if data == "ep:status":
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        text=self._format_executive_status(snapshot["status"]),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Refresh", callback_data="ep:status")],
+                            [InlineKeyboardButton("📋 Open Tasks", callback_data="ep:tasks:0")],
+                            [InlineKeyboardButton("🚨 Incidents", callback_data="ep:incidents")],
+                            [InlineKeyboardButton("⬅️ Main Menu", callback_data="ep:menu")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if action == "ep" and subaction == "tasks":
+                page = 0
+                if subarg:
+                    try:
+                        page = max(0, int(subarg))
+                    except ValueError:
+                        page = 0
+                page_size = 10
+                tasks = snapshot["tasks"]
+                total_pages = max(1, (len(tasks) + page_size - 1) // page_size)
+                page = min(page, total_pages - 1)
+                text = self._format_open_tasks(tasks, page=page, page_size=page_size)
+                nav_row = []
+                if page > 0:
+                    nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"ep:tasks:{page - 1}"))
+                if page < total_pages - 1:
+                    nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"ep:tasks:{page + 1}"))
+                keyboard_rows = [nav_row] if nav_row else []
+                keyboard_rows.extend([
+                    [InlineKeyboardButton("🧾 First Task", callback_data="ep:tasks:view:0")],
+                    [InlineKeyboardButton("🔄 Refresh", callback_data=f"ep:tasks:{page}"), InlineKeyboardButton("📋 Status", callback_data="ep:status")],
+                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="ep:menu")],
+                ])
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if data == "ep:health":
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        text=self._format_hermes_health(snapshot["health"]),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Refresh", callback_data="ep:health")],
+                            [InlineKeyboardButton("📜 Logs", callback_data="ep:logs")],
+                            [InlineKeyboardButton("🚨 Alerts", callback_data="ep:alerts")],
+                            [InlineKeyboardButton("🚨 Incidents", callback_data="ep:incidents")],
+                            [InlineKeyboardButton("⬅️ Back", callback_data="ep:menu")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if data == "ep:logs":
+                await query.answer()
+                try:
+                    from hermes_cli.debug import _capture_log_snapshot
+                    logs = _capture_log_snapshot("gateway", tail_lines=25, redact=False).tail_text or "No gateway log lines available"
+                    await query.edit_message_text(
+                        text=self.format_message("📜 Logs\n\n" + logs),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⬅️ Back", callback_data="ep:health")],
+                            [InlineKeyboardButton("🏠 Main Menu", callback_data="ep:menu")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if data == "ep:alerts":
+                await query.answer()
+                try:
+                    from hermes_cli.debug import _capture_log_snapshot
+                    alerts = _capture_log_snapshot("errors", tail_lines=25, redact=False).tail_text or "No alerts available"
+                    await query.edit_message_text(
+                        text=self.format_message("🚨 Alerts\n\n" + alerts),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⬅️ Back", callback_data="ep:health")],
+                            [InlineKeyboardButton("🏠 Main Menu", callback_data="ep:menu")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if data == "ep:incidents":
+                await query.answer()
+                blocked = snapshot["status"].get("blocked_tasks", 0)
+                text = self.format_message(f"🚨 Incidents\n\nBlocked tasks: {blocked}\n\nUse the dashboard for incident drill-down.")
+                try:
+                    await query.edit_message_text(
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Refresh", callback_data="ep:incidents")],
+                            [InlineKeyboardButton("⚙️ Hermes Health", callback_data="ep:health")],
+                            [InlineKeyboardButton("⬅️ Main Menu", callback_data="ep:menu")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if action == "ep" and subaction == "tasks" and subarg and subarg.isdigit() and snapshot["tasks"]:
+                await query.answer()
+                idx = min(int(subarg), len(snapshot["tasks"]) - 1)
+                task = snapshot["tasks"][idx]
+                lines = [
+                    "🧾 Task Detail",
+                    f"• ID: {getattr(task, 'id', '?')}",
+                    f"• Title: {getattr(task, 'title', '?')}",
+                    f"• Assignee: {getattr(task, 'assignee', None) or 'Unassigned'}",
+                    f"• Status: {getattr(task, 'status', '?')}",
+                    f"• Priority: P{getattr(task, 'priority', '?')}",
+                ]
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message("\n".join(lines)),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⬅️ Back to Tasks", callback_data="ep:tasks:0")],
+                            [InlineKeyboardButton("⬅️ Main Menu", callback_data="ep:menu")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+            if data == "ep:ask":
+                await query.answer()
+                try:
+                    response = self._run_ask_erika(
+                        chat_id=str(query_chat_id),
+                        prompt="Ask Erika: respond with a concise executive question asking what should be analyzed next.",
+                    )
+                    text = response or "🤖 Ask Erika\n\nWhat would you like me to analyze?"
+                except Exception as exc:
+                    logger.exception("[%s] Ask Erika AI invocation failed: %s", self.name, exc)
+                    text = "🤖 Ask Erika\n\nWhat would you like me to analyze?"
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(text),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main Menu", callback_data="ep:menu")]]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                logger.info("[%s] Telegram executive panel callback=%s llm_call=%s", self.name, data, True)
+                return
+            if data == "ep:menu":
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        text=menu_text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("📊 Executive Status", callback_data="ep:status")],
+                            [InlineKeyboardButton("📋 Open Tasks", callback_data="ep:tasks:0")],
+                            [InlineKeyboardButton("⚙️ Hermes Health", callback_data="ep:health")],
+                            [InlineKeyboardButton("🤖 Ask Erika", callback_data="ep:ask")],
+                        ]),
+                    )
+                except Exception as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
+                return
+
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
@@ -4977,10 +5190,160 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(msg)
 
+        cmd_text = self._clean_bot_trigger_text(msg.text) or ""
+        cmd = cmd_text.lstrip("/").split(None, 1)[0].lower() if cmd_text else ""
+        if cmd in {"start", "menu"}:
+            if msg.chat and getattr(msg.chat, "id", None) is not None:
+                thread_id = str(msg.message_thread_id) if getattr(msg, "message_thread_id", None) else None
+                reply_to_id = getattr(msg, "message_id", None)
+                await self._send_executive_menu(str(msg.chat.id), thread_id=thread_id, reply_to_message_id=reply_to_id)
+                return
+
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
+
+    async def _send_executive_menu(self, chat_id: str, *, thread_id: Optional[str] = None, reply_to_message_id: Optional[int] = None) -> SendResult:
+        """Render the permanent Telegram executive menu.
+
+        This is intentionally transport-only: the callback buttons are fixed,
+        and the downstream handlers resolve live data or AI only when needed.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Executive Status", callback_data="ep:status")],
+            [InlineKeyboardButton("📋 Open Tasks", callback_data="ep:tasks")],
+            [InlineKeyboardButton("⚙️ Hermes Health", callback_data="ep:health")],
+            [InlineKeyboardButton("🤖 Ask Erika", callback_data="ep:ask")],
+        ])
+        text = self.format_message(
+            "*Hermes Executive Panel*\n\n"
+            "Use the buttons below for live operational state.\n"
+            "Only Ask Erika invokes AI."
+        )
+
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "text": text,
+            "parse_mode": ParseMode.MARKDOWN_V2,
+            "reply_markup": keyboard,
+            **self._link_preview_kwargs(),
+        }
+        if reply_to_message_id is not None:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        if thread_id is not None:
+            kwargs.update(self._thread_kwargs_for_send(chat_id, thread_id, None, reply_to_message_id=reply_to_message_id, reply_to_mode=self._reply_to_mode))
+
+        msg = await self._send_message_with_thread_fallback(**kwargs)
+        return SendResult(success=True, message_id=str(msg.message_id))
+
+    def _telegram_live_task_source(self):
+        """Return live task, presence, and health sources for menu rendering."""
+        from hermes_cli import kanban_db
+        from hermes_cli.web_server import get_status
+        from plugins.kanban.dashboard import plugin_api
+        return kanban_db, get_status, plugin_api
+
+    def _format_executive_status(self, status: dict[str, Any]) -> str:
+        open_tasks = status.get("open_tasks")
+        blocked_tasks = status.get("blocked_tasks")
+        completed_today = status.get("completed_today")
+        pending_approvals = status.get("pending_approvals")
+        incidents = status.get("active_incidents")
+        lines = [
+            "📊 Executive Status",
+            f"• Open Tasks: {open_tasks if open_tasks is not None else 'Not Yet Available'}",
+            f"• Blocked Tasks: {blocked_tasks if blocked_tasks is not None else 'Not Yet Available'}",
+            f"• Completed Today: {completed_today if completed_today is not None else 'Not Yet Available'}",
+            f"• Pending Approvals: {pending_approvals if pending_approvals is not None else 'Not Yet Available'}",
+            f"• Active Incidents: {incidents if incidents is not None else 'Not Yet Available'}",
+        ]
+        return self.format_message("\n".join(lines))
+
+    def _format_open_tasks(self, tasks: list[Any], page: int = 0, page_size: int = 10) -> str:
+        start = page * page_size
+        page_tasks = tasks[start:start + page_size]
+        if not page_tasks:
+            return self.format_message("📋 Open Tasks\n\nNo open tasks found.")
+        lines = ["📋 Open Tasks", ""]
+        for task in page_tasks:
+            lines.append(f"• {getattr(task, 'id', '?')} | {getattr(task, 'title', '?')} | {getattr(task, 'assignee', None) or 'Unassigned'} | {getattr(task, 'status', '?')} | P{getattr(task, 'priority', '?')}")
+        return self.format_message("\n".join(lines))
+
+    def _format_hermes_health(self, health: dict[str, Any]) -> str:
+        lines = [
+            "⚙️ Hermes Health",
+            f"• Gateway: {health.get('gateway', 'Pending Implementation')}",
+            f"• Dashboard: {health.get('dashboard', 'Pending Implementation')}",
+            f"• Life Wiki: {health.get('life_wiki', 'Pending Implementation')}",
+            f"• GitHub Sync: {health.get('github_sync', 'Pending Implementation')}",
+            f"• Telegram: {health.get('telegram', 'Pending Implementation')}",
+        ]
+        return self.format_message("\n".join(lines))
+
+    def _run_ask_erika(self, chat_id: str, prompt: str) -> str:
+        """Invoke the live LLM path for Ask Erika."""
+        from run_agent import AIAgent
+        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
+        from hermes_cli.tools_config import _get_platform_tools
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(_get_platform_tools(user_config, "telegram"))
+        reasoning_config = GatewayRunner._load_reasoning_config() or {}
+        agent = AIAgent(
+            model=model,
+            **runtime_kwargs,
+            quiet_mode=True,
+            verbose_logging=False,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=8,
+            enabled_toolsets=enabled_toolsets,
+            platform="telegram",
+            reasoning_config=reasoning_config,
+        )
+        result = agent.run_conversation(prompt, task_id=f"telegram-ask-{chat_id}")
+        return (result.get("final_response") or "").strip()
+
+    def _telegram_executive_snapshot(self) -> dict[str, Any]:
+        from datetime import datetime, timezone
+        from hermes_cli import kanban_db
+        from hermes_cli.web_server import get_status
+
+        snapshot: dict[str, Any] = {"status": {}, "tasks": [], "health": {}}
+        with kanban_db.connect() as conn:
+            stats = kanban_db.board_stats(conn)
+            by_status = stats.get("by_status", {}) or {}
+            tasks = kanban_db.list_tasks(conn, limit=2000)
+            snapshot["status"] = {
+                "open_tasks": sum(int(by_status.get(s, 0)) for s in ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")),
+                "blocked_tasks": int(by_status.get("blocked", 0)),
+                "completed_today": sum(
+                    1 for task in tasks
+                    if task.completed_at is not None and datetime.fromtimestamp(int(task.completed_at), tz=timezone.utc).date() == datetime.now(timezone.utc).date()
+                ),
+                "pending_approvals": int(by_status.get("review", 0)),
+                "active_incidents": int(by_status.get("blocked", 0)),
+            }
+            snapshot["tasks"] = [task for task in tasks if task.status not in {"done", "archived"}]
+        try:
+            from gateway.status import read_runtime_status
+            runtime = read_runtime_status() or {}
+        except Exception:
+            runtime = {}
+        snapshot["health"] = {
+            "gateway": runtime.get("gateway_state") or ("running" if runtime.get("gateway_running") else "stopped"),
+            "dashboard": runtime.get("dashboard_state") or "Pending Implementation",
+            "life_wiki": runtime.get("life_wiki_state") or "Pending Implementation",
+            "github_sync": runtime.get("github_sync_state") or "Pending Implementation",
+            "telegram": runtime.get("telegram_state") or ("connected" if runtime.get("gateway_running") else "Pending Implementation"),
+        }
+        return snapshot
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
