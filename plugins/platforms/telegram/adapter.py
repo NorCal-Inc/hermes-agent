@@ -9758,6 +9758,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(msg)
 
+        cmd_text = self._clean_bot_trigger_text(msg.text) or ""
+        cmd = cmd_text.lstrip("/").split(None, 1)[0].lower() if cmd_text else ""
+        if cmd in {"start", "menu"}:
+            if msg.chat and getattr(msg.chat, "id", None) is not None:
+                thread_id = str(msg.message_thread_id) if getattr(msg, "message_thread_id", None) else None
+                reply_to_id = getattr(msg, "message_id", None)
+                await self._send_executive_menu(str(msg.chat.id), thread_id=thread_id, reply_to_message_id=reply_to_id)
+                return
+
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
@@ -10828,14 +10837,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
 
-        cmd_text = self._clean_bot_trigger_text(msg.text) or ""
-        cmd = cmd_text.lstrip("/").split(None, 1)[0].lower() if cmd_text else ""
-        if cmd in {"start", "menu"}:
-            if msg.chat and getattr(msg.chat, "id", None) is not None:
-                thread_id = str(msg.message_thread_id) if getattr(msg, "message_thread_id", None) else None
-                reply_to_id = getattr(msg, "message_id", None)
-                await self._send_executive_menu(str(msg.chat.id), thread_id=thread_id, reply_to_message_id=reply_to_id)
-                return
 
     async def _send_executive_menu(self, chat_id: str, *, thread_id: Optional[str] = None, reply_to_message_id: Optional[int] = None) -> SendResult:
         """Render the permanent Telegram executive menu.
