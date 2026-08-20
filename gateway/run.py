@@ -38,6 +38,7 @@ import shlex
 import site
 import sys
 import signal
+import subprocess
 import threading
 import time
 import traceback
@@ -5603,7 +5604,34 @@ class TurnRunner:
                     pass
 
         if agent is None:
-            # Config changed or first message — create fresh agent
+            # Config changed or first message — create fresh agent.
+            # NorCal shared boot: Erika/Hermes and Claude consume the same live
+            # doctrine/vault starting line while retaining separate role files.
+            # Fail closed in prompt space rather than taking the gateway down.
+            try:
+                _shared_boot_proc = subprocess.run(
+                    ["/home/chris/.local/bin/hermes-shared-boot-context"],
+                    capture_output=True, text=True, timeout=45, check=False,
+                )
+                _shared_boot_prompt = (_shared_boot_proc.stdout or _shared_boot_proc.stderr or "").strip()
+                if _shared_boot_proc.returncode != 0 or not _shared_boot_prompt:
+                    _shared_boot_prompt = (
+                        "<shared-boot-state>\n"
+                        "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
+                        f"Shared boot generator failed rc={_shared_boot_proc.returncode}.\n"
+                        "</shared-boot-state>"
+                    )
+            except Exception as _shared_boot_exc:
+                _shared_boot_prompt = (
+                    "<shared-boot-state>\n"
+                    "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
+                    f"Shared boot generator exception: {_shared_boot_exc}\n"
+                    "</shared-boot-state>"
+                )
+            _agent_ephemeral = (
+                (_shared_boot_prompt + "\n\n" + combined_ephemeral).strip()
+                if combined_ephemeral else _shared_boot_prompt
+            )
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -5613,7 +5641,7 @@ class TurnRunner:
                 verbose_logging=False,
                 enabled_toolsets=ctx.enabled_toolsets,
                 disabled_toolsets=ctx.disabled_toolsets,
-                ephemeral_system_prompt=combined_ephemeral or None,
+                ephemeral_system_prompt=_agent_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
                 service_tier=self._runner._service_tier,
