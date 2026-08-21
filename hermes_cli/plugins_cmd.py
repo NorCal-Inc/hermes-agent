@@ -966,6 +966,9 @@ def cmd_install(
     from rich.console import Console
 
     console = Console()
+    if Path("/home/chris/.hermes/security/skill-trust/DENY_UPSTREAM_MUTATION").exists():
+        console.print("[red]Blocked by local supply-chain policy:[/red] plugin installation requires separate source review and a frozen local copy.")
+        sys.exit(1)
 
     if _looks_like_bare_index_name(identifier):
         identifier, index_ref = _resolve_index_name(identifier, console)
@@ -1085,6 +1088,9 @@ def cmd_update(name: str) -> None:
     from rich.markup import escape
 
     console = Console()
+    if Path("/home/chris/.hermes/security/skill-trust/DENY_UPSTREAM_MUTATION").exists():
+        console.print("[red]Blocked by local supply-chain policy:[/red] cleared plugins never update from upstream.")
+        sys.exit(1)
     plugins_dir = _plugins_dir()
 
     try:

@@ -558,6 +558,9 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     from tools.skills_guard import scan_skill_cached, should_allow_install, format_scan_report
 
     c = console or _console
+    if Path("/home/chris/.hermes/security/skill-trust/DENY_UPSTREAM_MUTATION").exists():
+        c.print("[bold red]Blocked by local supply-chain policy:[/] skill installation is review-only. Upstream discovery does not authorize adoption.\n")
+        return
     ensure_hub_dirs()
 
     # Resolve which source adapter handles this identifier
@@ -1117,6 +1120,9 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None,
     from tools.skills_guard import content_hash
 
     c = console or _console
+    if Path("/home/chris/.hermes/security/skill-trust/DENY_UPSTREAM_MUTATION").exists():
+        c.print("[bold red]Blocked by local supply-chain policy:[/] cleared skills never update from upstream. Review a candidate change separately and build from the frozen baseline.\n")
+        return
     lock = HubLockFile()
     updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
     if not updates:
@@ -1816,6 +1822,9 @@ def skills_command(args) -> None:
         do_search(args.query, source=args.source, limit=args.limit,
                   as_json=getattr(args, "json", False))
     elif action == "install":
+        if Path("/home/chris/.hermes/security/skill-trust/DENY_UPSTREAM_MUTATION").exists():
+            _console.print("[bold red]Blocked by local supply-chain policy:[/] skill installation is review-only. Upstream discovery does not authorize adoption.\n")
+            raise SystemExit(13)
         do_install(args.identifier, category=args.category, force=args.force,
                    skip_confirm=getattr(args, "yes", False),
                    name_override=getattr(args, "name", "") or "")
@@ -1829,6 +1838,9 @@ def skills_command(args) -> None:
     elif action == "check":
         do_check(name=getattr(args, "name", None))
     elif action == "update":
+        if Path("/home/chris/.hermes/security/skill-trust/DENY_UPSTREAM_MUTATION").exists():
+            _console.print("[bold red]Blocked by local supply-chain policy:[/] cleared skills never update from upstream.\n")
+            raise SystemExit(13)
         do_update(name=getattr(args, "name", None),
                   force=getattr(args, "force", False))
     elif action == "audit":
