@@ -1,0 +1,10 @@
+{
+  "name": "Hermes Mobile",
+  "short_name": "Hermes",
+  "description": "You / Claude / Hermes — mobile messaging front end for Hermes Agent.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0d",
+  "theme_color": "#0a0a0d",
+  "icons": []
+}

@@ -85,6 +85,7 @@ hermes_cli/web_dist/
 .web_ui_build.lock
 apps/desktop/build/
 apps/desktop/dist/
+apps/mobile/dist/
 
 # tsc-emitted artifacts (a stray `tsc -b` compiles into src/, and vite then
 # resolves the stale .js OVER the .tsx — never track these)
@@ -100,6 +101,10 @@ apps/desktop/src/**/*.d.ts
 apps/shared/src/**/*.js
 apps/shared/src/**/*.js.map
 apps/shared/src/**/*.d.ts
+apps/mobile/src/**/*.js
+apps/mobile/src/**/*.js.map
+apps/mobile/src/**/*.d.ts
+!apps/mobile/src/vite-env.d.ts
 apps/desktop/release/
 *.tsbuildinfo
 
