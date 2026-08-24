@@ -16,8 +16,8 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
-      '@hermes/shared': path.resolve(__dirname, '../shared/src')
+      '@': path.resolve(import.meta.dirname, './src'),
+      '@hermes/shared': path.resolve(import.meta.dirname, '../shared/src')
     },
     dedupe: ['react', 'react-dom']
   },

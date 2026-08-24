@@ -45,6 +45,7 @@ interface ChatStoreValue {
   openChat: (target: ChatTarget) => Promise<string>;
   getSession: (cacheKey: string) => CachedSession | undefined;
   sendMessage: (cacheKey: string, text: string) => Promise<void>;
+  logout: () => Promise<void>;
 }
 
 const ChatStoreContext = createContext<ChatStoreValue | null>(null);
@@ -182,10 +183,13 @@ export function ChatStoreProvider({ children }: { children: ReactNode }) {
     [transport, bump],
   );
 
+  const logout = useCallback(() => transport.logout(), [transport]);
+
   const value = useMemo<ChatStoreValue>(
     () => ({
       connectionState,
       getSession,
+      logout,
       openChat,
       refreshRoster: loadRoster,
       roster,
@@ -193,7 +197,7 @@ export function ChatStoreProvider({ children }: { children: ReactNode }) {
       rosterLoading,
       sendMessage,
     }),
-    [connectionState, getSession, openChat, loadRoster, roster, rosterError, rosterLoading, sendMessage],
+    [connectionState, getSession, logout, openChat, loadRoster, roster, rosterError, rosterLoading, sendMessage],
   );
 
   return <ChatStoreContext.Provider value={value}>{children}</ChatStoreContext.Provider>;

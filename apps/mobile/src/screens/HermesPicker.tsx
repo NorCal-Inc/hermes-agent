@@ -1,6 +1,6 @@
 import { useNavigate } from "react-router";
 
-import { AlertTriangle, ArrowLeft } from "@/icons";
+import { AlertTriangle, ArrowLeft, LogOut } from "@/icons";
 import type { RosterTile } from "@/lib/roster";
 import { timeAgo } from "@/lib/time";
 import { useChatStore } from "@/store/chat-store";
@@ -9,7 +9,7 @@ import { useChatStore } from "@/store/chat-store";
  *  always present as direct tiles. */
 export function HermesPicker() {
   const navigate = useNavigate();
-  const { roster, rosterLoading, rosterError, refreshRoster, openChat, connectionState } = useChatStore();
+  const { roster, rosterLoading, rosterError, refreshRoster, openChat, connectionState, logout } = useChatStore();
 
   const openProfile = (tile: RosterTile) => {
     void openChat({ key: tile.name, kind: "profile", label: tile.displayName }).then((cacheKey) => {
@@ -28,12 +28,20 @@ export function HermesPicker() {
         >
           <ArrowLeft size={20} />
         </button>
-        <div>
+        <div className="flex-1">
           <h1 className="text-base font-semibold text-neutral-50">Hermes</h1>
           <p className="text-xs text-neutral-500">
             {connectionState === "connected" ? "Connected" : connectionState === "connecting" ? "Connecting…" : connectionState}
           </p>
         </div>
+        <button
+          aria-label="Sign out"
+          className="flex h-9 w-9 items-center justify-center rounded-full text-neutral-300 active:bg-neutral-800"
+          onClick={() => void logout()}
+          type="button"
+        >
+          <LogOut size={18} />
+        </button>
       </header>
 
       {rosterError && (

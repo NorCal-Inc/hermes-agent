@@ -5,6 +5,7 @@ import type { HermesTransport } from "./types";
 export { GatewayTransport } from "./gateway-transport";
 export { MockTransport } from "./mock-transport";
 export type {
+  AuthProviderInfo,
   ChatMessage,
   ChatRole,
   HermesTransport,

@@ -1,4 +1,5 @@
 import type {
+  AuthProviderInfo,
   ChatMessage,
   HermesTransport,
   OpenSessionResult,
@@ -232,6 +233,24 @@ export class MockTransport implements HermesTransport {
     this.streamHandlers.add(handler);
 
     return () => this.streamHandlers.delete(handler);
+  }
+
+  // Auth surface: the mock backend never gates — it's never used to test the
+  // login screen, only to keep the app fully explorable with zero backend.
+  async listAuthProviders(): Promise<AuthProviderInfo[]> {
+    return [];
+  }
+
+  async loginWithPassword(): Promise<void> {
+    // no-op — MockTransport's connectionState never becomes "unauthenticated".
+  }
+
+  oauthLoginUrl(): string {
+    return "";
+  }
+
+  async logout(): Promise<void> {
+    this.setState("idle");
   }
 
   private emit(event: TransportStreamEvent): void {

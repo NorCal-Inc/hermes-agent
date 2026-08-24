@@ -56,7 +56,19 @@ export type TransportStreamEvent =
   | { type: "message.complete"; sessionId: string; message: ChatMessage }
   | { type: "status"; sessionId: string; status: "idle" | "streaming" };
 
-export type TransportConnectionState = "connected" | "connecting" | "error" | "idle";
+/**
+ * "unauthenticated" means the backend is in gated mode and this transport
+ * holds no valid session — connect() will not proceed until a caller signs
+ * in via `loginWithPassword` / `oauthLoginUrl` and connect() is retried.
+ */
+export type TransportConnectionState = "connected" | "connecting" | "error" | "idle" | "unauthenticated";
+
+/** One entry from `GET /api/auth/providers` — the login screen's bootstrap. */
+export interface AuthProviderInfo {
+  name: string;
+  displayName: string;
+  supportsPassword: boolean;
+}
 
 export interface HermesTransport {
   readonly kind: "gateway" | "mock";
@@ -74,4 +86,15 @@ export interface HermesTransport {
   openSession(profile: null | string, preferredSessionId: null | string): Promise<OpenSessionResult>;
   sendMessage(sessionId: string, profile: null | string, text: string): Promise<void>;
   onStreamEvent(handler: (event: TransportStreamEvent) => void): () => void;
+  /**
+   * Auth surface — a no-op for MockTransport (kind "mock" never requires
+   * login). GatewayTransport backs these with the SAME cookie/ws-ticket
+   * dashboard-auth routes the web dashboard already uses
+   * (hermes_cli/dashboard_auth/routes.py): no new backend auth system.
+   */
+  listAuthProviders(): Promise<AuthProviderInfo[]>;
+  loginWithPassword(provider: string, username: string, password: string): Promise<void>;
+  /** URL to full-page-navigate the browser to for an OAuth provider's sign-in. */
+  oauthLoginUrl(provider: string): string;
+  logout(): Promise<void>;
 }
