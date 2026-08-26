@@ -1,0 +1,317 @@
+"""Claude-first recovery lane for explicitly marked Kanban recovery tasks.
+
+This module is the mechanical bypass for a task created with
+``executor_lane=EXECUTOR_LANE_CLAUDE_RECOVERY`` (see ``hermes_cli.kanban_db``).
+It is invoked from ``cli.py`` BEFORE the normal Hermes worker path builds an
+agent, a system prompt, or a tool-calling loop — nothing here calls a Hermes
+model or a Hermes tool (``kanban_show``, ``read_file``, ``terminal``, ...).
+
+Sequence, each step plain deterministic Python:
+
+1. Invoke Claude Code exactly once, bounded by a timeout ("one bounded
+   repair attempt").
+2. Mechanically run the task's ``recovery_gate_cmd`` and check its exit
+   code — never trust Claude's own report of success.
+3. Gate green -> complete the task directly via ``kanban_db.complete_task``
+   (which promotes dependents via its own ``recompute_ready`` call). Done.
+4. Gate still red -> invoke Codex exactly once with the original failure
+   plus Claude's evidence, bounded by the same timeout.
+5. Re-run the same gate command mechanically.
+6. Gate green -> complete the task, noting both attempts.
+7. Gate still red -> block the task once (kind="needs_input") with both
+   attempts' evidence recorded as a comment. One escalation, no retry loop.
+"""
+
+from __future__ import annotations
+
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from hermes_cli import kanban_db as kb
+
+# Bound on each of the Claude and Codex attempts when the task doesn't set
+# its own max_runtime_seconds. Deliberately generous — this is one shot, not
+# a loop, so there's no compounding cost to a long-ish bound.
+DEFAULT_ATTEMPT_TIMEOUT_SECONDS = 1800
+# Separate (short) bound for the gate command itself — a test suite or CI
+# gate should never legitimately run as long as an agentic repair attempt.
+DEFAULT_GATE_TIMEOUT_SECONDS = 600
+# How much of each CLI's stdout/stderr is kept as evidence in comments/
+# metadata. Full transcripts belong in the CLI's own session logs.
+EVIDENCE_MAX_CHARS = 4000
+
+
+@dataclass
+class AttemptResult:
+    executor: str
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    error: Optional[str] = None
+
+    @property
+    def evidence(self) -> str:
+        if self.error:
+            return f"[{self.executor}] invocation error: {self.error}"
+        if self.timed_out:
+            return f"[{self.executor}] timed out (rc=None)"
+        parts = [f"[{self.executor}] rc={self.returncode}"]
+        if self.stdout.strip():
+            parts.append(f"stdout:\n{_truncate(self.stdout)}")
+        if self.stderr.strip():
+            parts.append(f"stderr:\n{_truncate(self.stderr)}")
+        return "\n".join(parts)
+
+
+@dataclass
+class GateResult:
+    ok: bool
+    returncode: Optional[int]
+    output: str
+    timed_out: bool = False
+    error: Optional[str] = None
+
+    @property
+    def evidence(self) -> str:
+        if self.error:
+            return f"[gate] invocation error: {self.error}"
+        if self.timed_out:
+            return "[gate] timed out"
+        return f"[gate] rc={self.returncode}\n{_truncate(self.output)}"
+
+
+def _truncate(text: str) -> str:
+    text = text or ""
+    if len(text) <= EVIDENCE_MAX_CHARS:
+        return text
+    return text[:EVIDENCE_MAX_CHARS] + f"\n... [truncated, {len(text)} chars total]"
+
+
+def _build_repair_prompt(task: kb.Task, prior_evidence: Optional[str] = None) -> str:
+    lines = [
+        "You are performing a bounded automated repair on a Hermes Kanban "
+        "recovery task. Fix the underlying issue so the following gate "
+        "command passes, then stop.",
+        "",
+        f"Task title: {task.title}",
+        "",
+        "Task body / failure description:",
+        task.body or "(no body)",
+        "",
+        f"Gate command (must exit 0 when you are done): {task.recovery_gate_cmd}",
+    ]
+    if prior_evidence:
+        lines += [
+            "",
+            "A previous automated repair attempt already ran and did NOT "
+            "make the gate pass. Its evidence (do not repeat the same "
+            "unsuccessful approach):",
+            prior_evidence,
+        ]
+    return "\n".join(lines)
+
+
+def _invoke_claude(prompt: str, cwd: str, timeout: int) -> AttemptResult:
+    claude_bin = shutil.which("claude") or "claude"
+    try:
+        proc = subprocess.run(
+            [
+                claude_bin, "-p", prompt,
+                "--output-format", "json",
+                "--permission-mode", "acceptEdits",
+            ],
+            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return AttemptResult("claude", None, "", "", timed_out=True)
+    except Exception as exc:
+        return AttemptResult("claude", None, "", "", error=str(exc))
+    return AttemptResult("claude", proc.returncode, proc.stdout, proc.stderr)
+
+
+def _invoke_codex(prompt: str, cwd: str, timeout: int) -> AttemptResult:
+    codex_bin = shutil.which("codex") or "codex"
+    with tempfile.NamedTemporaryFile(
+        prefix="hermes-recovery-codex-", suffix=".txt", delete=False
+    ) as tmp:
+        last_message_path = tmp.name
+    try:
+        proc = subprocess.run(
+            [
+                codex_bin, "exec", prompt,
+                "--json",
+                "--sandbox", "workspace-write",
+                "-o", last_message_path,
+            ],
+            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return AttemptResult("codex", None, "", "", timed_out=True)
+    except Exception as exc:
+        return AttemptResult("codex", None, "", "", error=str(exc))
+    finally:
+        try:
+            last_message = Path(last_message_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            last_message = ""
+        try:
+            Path(last_message_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    stdout = proc.stdout
+    if last_message.strip():
+        stdout = f"{stdout}\n--- last message ---\n{last_message}"
+    return AttemptResult("codex", proc.returncode, stdout, proc.stderr)
+
+
+def _gate_argv(gate_cmd: str) -> list[str]:
+    """Parse a simple gate command without invoking a shell."""
+    if any(token in gate_cmd for token in ("|", ";", "&&", "||", ">", "<", "`", "$(", "\n", "\r")):
+        raise ValueError("recovery_gate_cmd may not contain shell operators or redirection")
+    argv = shlex.split(gate_cmd)
+    if not argv:
+        raise ValueError("recovery_gate_cmd is empty")
+    return argv
+
+
+def _run_gate(gate_cmd: str, cwd: str, timeout: int) -> GateResult:
+    try:
+        proc = subprocess.run(
+            _gate_argv(gate_cmd), shell=False, cwd=cwd,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return GateResult(False, None, "", timed_out=True)
+    except Exception as exc:
+        return GateResult(False, None, "", error=str(exc))
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return GateResult(proc.returncode == 0, proc.returncode, output)
+
+
+def _claim_attempt(conn, task_id: str, kind: str, run_id: Optional[int]) -> bool:
+    """Durably consume one executor attempt using the existing task event log."""
+    with kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+        if row is not None:
+            return False
+        kb._append_event(
+            conn, task_id, kind,
+            {"executor": "claude" if kind == "recovery_claude_started" else "codex"},
+            run_id=run_id,
+        )
+    return True
+
+
+def run_claude_first_recovery(task_id: str) -> int:
+    """Mechanically run the claude-then-codex recovery lane for ``task_id``.
+
+    No Hermes model call, no Hermes tool loop. Returns 0 on any deterministic
+    outcome (completed OR escalated) since both are correct handling of a
+    recovery task; returns 1 only on an infrastructure failure (task
+    missing/misconfigured) so the dispatcher's failure-count bookkeeping
+    still reflects a real problem.
+    """
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            return 1
+        if task.executor_lane != kb.EXECUTOR_LANE_CLAUDE_RECOVERY:
+            # Caller is responsible for only invoking this for recovery-lane
+            # tasks; defensively refuse to silently no-op as a normal worker.
+            return 1
+        if not task.recovery_gate_cmd:
+            kb.block_task(
+                conn, task_id,
+                reason="recovery lane misconfigured: no recovery_gate_cmd set",
+                kind="needs_input",
+            )
+            return 1
+
+        cwd = task.workspace_path or "."
+        attempt_timeout = int(task.max_runtime_seconds or DEFAULT_ATTEMPT_TIMEOUT_SECONDS)
+        gate_timeout = min(attempt_timeout, DEFAULT_GATE_TIMEOUT_SECONDS)
+
+        started_at = time.time()
+
+        claude_prompt = _build_repair_prompt(task)
+        claude_attempt = _invoke_claude(claude_prompt, cwd, attempt_timeout)
+        claude_gate = _run_gate(task.recovery_gate_cmd, cwd, gate_timeout)
+
+        if claude_gate.ok:
+            _complete(
+                conn, task_id,
+                summary="Recovery lane: Claude Code repair verified gate green.",
+                attempts=[claude_attempt], gate=claude_gate,
+                started_at=started_at,
+            )
+            return 0
+
+        codex_prompt = _build_repair_prompt(task, prior_evidence=claude_attempt.evidence)
+        codex_attempt = _invoke_codex(codex_prompt, cwd, attempt_timeout)
+        codex_gate = _run_gate(task.recovery_gate_cmd, cwd, gate_timeout)
+
+        if codex_gate.ok:
+            _complete(
+                conn, task_id,
+                summary="Recovery lane: Codex repair verified gate green after Claude did not.",
+                attempts=[claude_attempt, codex_attempt], gate=codex_gate,
+                started_at=started_at,
+            )
+            return 0
+
+        _escalate(
+            conn, task_id,
+            attempts=[claude_attempt, codex_attempt],
+            gates=[claude_gate, codex_gate],
+        )
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _complete(conn, task_id, *, summary, attempts, gate, started_at) -> None:
+    evidence = "\n\n".join(a.evidence for a in attempts) + f"\n\n{gate.evidence}"
+    kb.add_comment(conn, task_id, author="recovery-lane", body=f"{summary}\n\n{evidence}")
+    kb.complete_task(
+        conn, task_id,
+        result=summary,
+        summary=summary,
+        metadata={
+            "recovery_lane": "claude_recovery",
+            "executors": [a.executor for a in attempts],
+            "duration_seconds": round(time.time() - started_at, 1),
+        },
+    )
+
+
+def _escalate(conn, task_id, *, attempts, gates) -> None:
+    evidence = "\n\n".join(
+        f"{a.evidence}\n\n{g.evidence}" for a, g in zip(attempts, gates)
+    )
+    kb.block_task(
+        conn, task_id,
+        reason=(
+            "Recovery lane exhausted: Claude Code and Codex each made one "
+            "bounded repair attempt; the gate is still not green. Evidence:\n\n"
+            f"{evidence}"
+        ),
+        kind="needs_input",
+    )
+    kb.add_comment(
+        conn, task_id, author="recovery-lane",
+        body="Both recovery attempts failed to turn the gate green. Escalated for human review.",
+    )
