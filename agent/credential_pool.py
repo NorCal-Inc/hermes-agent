@@ -1371,7 +1371,7 @@ class CredentialPool:
 
                 refreshed = refresh_anthropic_oauth_pure(
                     entry.refresh_token,
-                    use_json=entry.source.endswith("hermes_pkce"),
+                    use_json=(entry.source == "hermes_pkce" or entry.source.endswith(":dashboard_pkce")),
                 )
                 updated = replace(
                     entry,
@@ -1452,7 +1452,7 @@ class CredentialPool:
                         from agent.anthropic_adapter import refresh_anthropic_oauth_pure
                         refreshed = refresh_anthropic_oauth_pure(
                             synced.refresh_token,
-                            use_json=synced.source.endswith("hermes_pkce"),
+                            use_json=(synced.source == "hermes_pkce" or synced.source.endswith(":dashboard_pkce")),
                         )
                         updated = replace(
                             synced,

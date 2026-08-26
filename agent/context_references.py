@@ -394,9 +394,19 @@ def _expand_file_reference(
         end_idx = min(ref.line_end or ref.line_start, len(lines))
         text = "\n".join(lines[start_idx:end_idx])
 
+    # Whole saved webpages and other large text attachments can easily consume
+    # hundreds of thousands of tokens when Desktop expands them as @file refs.
+    # Do not inline a single text file above this budget. Hand the model the
+    # on-disk path instead so it can inspect/extract only the relevant portions
+    # with tools. Explicit line-range refs remain eligible because the selected
+    # slice is measured after slicing above.
+    inline_tokens = estimate_tokens_rough(text)
+    if inline_tokens > 50_000:
+        return None, _large_text_reference_block(ref, path, inline_tokens)
+
     lang = _code_fence_language(path)
     label = ref.raw
-    return None, f"📄 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
+    return None, f"📄 {label} ({inline_tokens} tokens)\n```{lang}\n{text}\n```"
 
 
 def _expand_folder_reference(
@@ -676,6 +686,22 @@ def _agent_visible_path(path: Path) -> str:
         return to_agent_visible_cache_path(str(path))
     except Exception:
         return str(path)
+
+
+def _large_text_reference_block(ref: ContextReference, path: Path, token_estimate: int) -> str:
+    mime, _ = mimetypes.guess_type(path.name)
+    mime = mime or "text/plain"
+    try:
+        size = format_bytes(path.stat().st_size)
+    except OSError:
+        size = "unknown size"
+    return (
+        f"📎 {ref.raw} ({mime}, {size}, ~{token_estimate:,} tokens) — large text file, "
+        f"not inlined to protect context and cost. It is available on disk at "
+        f"`{_agent_visible_path(path)}`. Use terminal/file tools to inspect, search, "
+        f"parse, or extract only the portions needed for the user's goal. Do not ask "
+        f"the user to re-upload it and do not claim the attachment is unsupported."
+    )
 
 
 def _binary_reference_block(ref: ContextReference, path: Path) -> str:

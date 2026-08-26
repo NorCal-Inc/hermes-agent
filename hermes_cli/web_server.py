@@ -10298,14 +10298,25 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
         except Exception:
             hermes_creds = None
     if hermes_creds and hermes_creds.get("accessToken"):
-        return {
-            "logged_in": True,
-            "source": "hermes_pkce",
-            "source_label": f"Hermes PKCE ({_get_hermes_oauth_file() if _get_hermes_oauth_file else None})",
-            "token_preview": _truncate_token(hermes_creds.get("accessToken")),
-            "expires_at": hermes_creds.get("expiresAt"),
-            "has_refresh_token": bool(hermes_creds.get("refreshToken")),
-        }
+        # A stored PKCE record is not necessarily usable.  The setup screen
+        # previously reported expired records as Connected, while runtime
+        # resolution correctly rejected them.  Keep setup status aligned with
+        # runtime readiness by treating expired access tokens as disconnected.
+        try:
+            import time as _time
+            _expires_at = int(hermes_creds.get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            _expires_at = 0
+        _expired = bool(_expires_at and _expires_at <= int(_time.time() * 1000) + 60_000)
+        if not _expired:
+            return {
+                "logged_in": True,
+                "source": "hermes_pkce",
+                "source_label": f"Hermes PKCE ({_get_hermes_oauth_file() if _get_hermes_oauth_file else None})",
+                "token_preview": _truncate_token(hermes_creds.get("accessToken")),
+                "expires_at": hermes_creds.get("expiresAt"),
+                "has_refresh_token": bool(hermes_creds.get("refreshToken")),
+            }
 
     # Env-var / secret-source path. ``get_env_value`` checks the process
     # environment first (where Bitwarden-sourced secrets land) then .env.
