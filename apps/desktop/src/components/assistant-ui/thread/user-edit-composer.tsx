@@ -24,7 +24,7 @@ import {
   releaseActiveComposer
 } from '@/app/chat/composer/focus'
 import { useAtCompletions } from '@/app/chat/composer/hooks/use-at-completions'
-import { rebuildAroundCaret } from '@/app/chat/composer/hooks/use-composer-trigger'
+import { rebuildAroundCaret, triggerKeyUpHandler } from '@/app/chat/composer/hooks/use-composer-trigger'
 import { useComposerUndo } from '@/app/chat/composer/hooks/use-composer-undo'
 import { useEmojiCompletions } from '@/app/chat/composer/hooks/use-emoji-completions'
 import { useSlashCompletions } from '@/app/chat/composer/hooks/use-slash-completions'
@@ -118,14 +118,43 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const slash = useSlashCompletions({ gateway })
   const emoji = useEmojiCompletions()
 
+  // Timers this composer schedules must not outlive it. Every callback below
+  // touches component state, a ref or the composer core, and this is the one
+  // composer that routinely unmounts mid-flight: confirming an edit tears it
+  // down while the 200ms submit latch is still pending, so the latch resumes
+  // against an unmounted tree. Two of the callbacks already carry defensive
+  // try/catch for the racing-teardown case; clearing the timers removes the
+  // race instead of surviving it.
+  const pendingTimeoutsRef = useRef<Set<number>>(new Set())
+
+  const scheduleTimeout = useCallback((run: () => void, delayMs: number): void => {
+    const id = window.setTimeout(() => {
+      pendingTimeoutsRef.current.delete(id)
+      run()
+    }, delayMs)
+
+    pendingTimeoutsRef.current.add(id)
+  }, [])
+
   // This is the one composer that routinely unmounts, so it is where the focus
   // bus leaks: confirming or cancelling an edit tears the composer down while
   // `'edit'` is still the active target. Release it alongside the thread-scroll
   // cleanup so keyboard routing falls back to the visible chat composer.
+  //
+  // It also drains whatever `scheduleTimeout` still has pending, which is a
+  // second concern under the same heading rather than a separate one: both
+  // are "this composer is going away", they unmount together by definition,
+  // and a sibling unmount-only effect would only be a second place to forget.
   useEffect(
     () => () => {
       notifyThreadEditClose()
       releaseActiveComposer('edit')
+
+      for (const id of pendingTimeoutsRef.current) {
+        window.clearTimeout(id)
+      }
+
+      pendingTimeoutsRef.current.clear()
     },
     []
   )
@@ -341,7 +370,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         draftRef.current = composerPlainText(editor)
         aui.composer().setText(draftRef.current)
         requestEditFocus()
-        starter ? window.setTimeout(refreshTrigger, 0) : closeTrigger()
+        starter ? scheduleTimeout(refreshTrigger, 0) : closeTrigger()
       }
 
       // In place first, spanning Chromium's split text nodes (see
@@ -360,7 +389,16 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
       finish()
     },
-    [aui, closeTrigger, recordUndoPoint, refreshTrigger, rememberInitialDraft, requestEditFocus, trigger]
+    [
+      aui,
+      closeTrigger,
+      recordUndoPoint,
+      refreshTrigger,
+      rememberInitialDraft,
+      requestEditFocus,
+      scheduleTimeout,
+      trigger
+    ]
   )
 
   const insertRefStrings = useCallback(
@@ -526,11 +564,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
       rememberInitialDraft()
       const nextDraft = syncDraftFromEditor(editor)
-      window.setTimeout(refreshTrigger, 0)
+      scheduleTimeout(refreshTrigger, 0)
 
       return nextDraft
     },
-    [refreshTrigger, rememberInitialDraft, syncDraftFromEditor]
+    [refreshTrigger, rememberInitialDraft, scheduleTimeout, syncDraftFromEditor]
   )
 
   const handleInput = (event: FormEvent<HTMLDivElement>) => {
@@ -602,7 +640,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       // Clear latch after cooldown to allow re-submission. This prevents rapid
       // double-Enter but doesn't require tracking when onEdit settles (which may
       // be synchronous or async, and whose promise we don't have access to).
-      window.setTimeout(() => {
+      scheduleTimeout(() => {
         setSubmitting(false)
       }, 200)
     } catch {
@@ -618,7 +656,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         return
       }
 
-      window.setTimeout(() => {
+      scheduleTimeout(() => {
         const root = rootRef.current
         const active = document.activeElement
 
@@ -653,7 +691,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         }
       }, 80)
     },
-    [aui, closeTrigger, submitting, syncDraftFromEditor]
+    [aui, closeTrigger, scheduleTimeout, submitting, syncDraftFromEditor]
   )
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -760,21 +798,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     }
   }
 
-  const handleKeyUp = () => {
-    // If this keyup belongs to a key the open trigger popover already consumed
-    // in keydown (Arrow/Enter/Tab/Escape), skip the refresh. Those keys never
-    // edit text, and for Escape the keydown already closed the menu — a refresh
-    // here would re-detect the still-present `/` and instantly reopen it. We
-    // read a ref set during keydown rather than `trigger`, because by keyup
-    // time React has re-rendered and `trigger` may already be null.
-    if (triggerKeyConsumedRef.current) {
-      triggerKeyConsumedRef.current = false
-
-      return
-    }
-
-    window.setTimeout(refreshTrigger, 0)
-  }
+  const handleKeyUp = triggerKeyUpHandler(triggerKeyConsumedRef, refreshTrigger)
 
   return (
     <ComposerPrimitive.Root className="contents" data-slot="aui_edit-composer-root">
@@ -824,7 +848,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               data-placeholder={copy.editMessage}
               data-slot={RICH_INPUT_SLOT}
               onBeforeInput={handleBeforeInput}
-              onBlur={() => window.setTimeout(closeTrigger, 80)}
+              onBlur={() => scheduleTimeout(closeTrigger, 80)}
               onCompositionEnd={event => {
                 composingRef.current = false
                 flushEditorToDraft(event.currentTarget)
