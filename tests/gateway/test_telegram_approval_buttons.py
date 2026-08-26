@@ -76,6 +76,36 @@ class _AuthRunner:
 
 
 # ===========================================================================
+# send_kanban_approval — first-class task approval buttons
+# ===========================================================================
+
+class TestTelegramKanbanApproval:
+    @pytest.mark.asyncio
+    async def test_sends_green_red_task_buttons(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
+        buttons = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: buttons.append((text, callback_data)) or (text, callback_data),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+
+        result = await adapter.send_kanban_approval(
+            "12345", task_id="t_deadbeef", title="Governance decision",
+            reason="Christopher approval required", board="default",
+        )
+
+        assert result.success is True
+        assert [b[0] for b in buttons] == ["✅ Approve", "❌ Deny"]
+        assert buttons[0][1].startswith("ka:approve:")
+        assert buttons[1][1].startswith("ka:deny:")
+        assert len(adapter._kanban_approval_state) == 1
+
+
+# ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
 

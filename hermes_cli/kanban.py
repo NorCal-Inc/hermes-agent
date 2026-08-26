@@ -399,6 +399,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--executor-lane",
+                          choices=sorted(kb.VALID_EXECUTOR_LANES),
+                          default=None, dest="executor_lane",
+                          help="Explicit executor lane. 'claude' routes one "
+                               "ordinary task directly to Claude Code before "
+                               "any Hermes agent/tool loop. 'claude_recovery' "
+                               "is the bounded Claude-then-Codex gate-repair "
+                               "lane and requires --recovery-gate-cmd. Omit "
+                               "for the normal Hermes worker. assignee=claude "
+                               "is accepted as shorthand for the direct lane.")
+    p_create.add_argument("--recovery-gate-cmd", default=None,
+                          dest="recovery_gate_cmd", metavar="CMD",
+                          help="Shell command the recovery lane runs "
+                               "(mechanically — never trusting Claude's or "
+                               "Codex's own report) to decide whether the "
+                               "gate is green. Required with --executor-lane "
+                               "claude_recovery.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -632,7 +649,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
             "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
+            "blocked for a human; 'approval_required' means Christopher must approve/deny; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
         ),
@@ -654,6 +671,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_approve = sub.add_parser(
+        "approve", help="Approve a task blocked with approval_required and resume it"
+    )
+    p_approve.add_argument("task_id")
+    p_approve.add_argument("--actor", default="Christopher")
+    p_approve.add_argument("--source", default="kanban-cli")
+
+    p_deny = sub.add_parser(
+        "deny", help="Deny a task blocked with approval_required; leave it safely blocked"
+    )
+    p_deny.add_argument("task_id")
+    p_deny.add_argument("--actor", default="Christopher")
+    p_deny.add_argument("--source", default="kanban-cli")
 
     p_request_review = sub.add_parser(
         "request-review",
@@ -1130,6 +1161,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "approve":  _cmd_approve,
+            "deny":     _cmd_deny,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -1586,6 +1619,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            executor_lane=getattr(args, "executor_lane", None),
+            recovery_gate_cmd=getattr(args, "recovery_gate_cmd", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2413,6 +2448,38 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_approve(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok = kb.resolve_task_approval(
+            conn, args.task_id, decision="approve",
+            actor=args.actor, source=args.source,
+        )
+    if not ok:
+        print(
+            f"cannot approve {args.task_id} (not awaiting approval or already resolved)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Approved {args.task_id}; task resumed")
+    return 0
+
+
+def _cmd_deny(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok = kb.resolve_task_approval(
+            conn, args.task_id, decision="deny",
+            actor=args.actor, source=args.source,
+        )
+    if not ok:
+        print(
+            f"cannot deny {args.task_id} (not awaiting approval or already resolved)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Denied {args.task_id}; proposed action remains blocked")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:

@@ -887,6 +887,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Kanban approval state: short callback id → (task_id, board_slug).
+        # Kept separate from dangerous-command approvals: tapping a task
+        # approval must never resolve a waiting terminal/tool approval.
+        self._kanban_approval_state: Dict[int, tuple[str, Optional[str]]] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -6141,6 +6145,53 @@ class TelegramAdapter(BasePlatformAdapter):
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
 
+    async def send_kanban_approval(
+        self, chat_id: str, *, task_id: str, title: str, reason: str = "",
+        board: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a first-class Kanban approval request with Approve/Deny buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            import itertools
+            if not hasattr(self, "_kanban_approval_counter"):
+                self._kanban_approval_counter = itertools.count(1)
+            approval_id = next(self._kanban_approval_counter)
+            self._kanban_approval_state[approval_id] = (task_id, board)
+
+            safe_title = _html.escape((title or task_id)[:500])
+            safe_reason = _html.escape((reason or "Approval is required before this task may continue.")[:2500])
+            board_line = f"\nBoard: <code>{_html.escape(board)}</code>" if board else ""
+            text = (
+                "🔐 <b>Christopher Approval Required</b>\n\n"
+                f"<b>{safe_title}</b>\n"
+                f"Task: <code>{_html.escape(task_id)}</code>{board_line}\n\n"
+                f"{safe_reason}"
+            )
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"ka:approve:{approval_id}"),
+                InlineKeyboardButton("❌ Deny", callback_data=f"ka:deny:{approval_id}"),
+            ]])
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(self._thread_kwargs_for_send(
+                chat_id, thread_id, metadata,
+                reply_to_message_id=reply_to_id, reply_to_mode=self._reply_to_mode,
+            ))
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.warning("[%s] send_kanban_approval failed: %s", self.name, _redact_telegram_error_text(exc))
+            return SendResult(success=False, error=_redact_telegram_error_text(exc))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -7262,6 +7313,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Kanban approval callbacks (ka:approve|deny:id) ---
+        if data.startswith("ka:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"approve", "deny"}:
+                await query.answer(text="Invalid task approval data.")
+                return
+            choice = parts[1]
+            try:
+                approval_id = int(parts[2])
+            except ValueError:
+                await query.answer(text="Invalid task approval data.")
+                return
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve tasks.")
+                return
+            state = self._kanban_approval_state.get(approval_id)
+            if not state:
+                await query.answer(text="This task approval has already been resolved.")
+                return
+            task_id, board_slug = state
+            user_display = getattr(query.from_user, "first_name", "Christopher") or "Christopher"
+            try:
+                from hermes_cli import kanban_db as _kb
+                conn = _kb.connect(board=board_slug)
+                try:
+                    resolved = _kb.resolve_task_approval(
+                        conn, task_id, decision=choice,
+                        actor=user_display, source="telegram-button",
+                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                logger.exception("Kanban approval callback failed for %s: %s", task_id, exc)
+                resolved = False
+            if not resolved:
+                await query.answer(text="⌛ Approval already resolved or no longer pending.")
+                return
+            self._kanban_approval_state.pop(approval_id, None)
+            if choice == "approve":
+                label = "✅ Approved"
+                edit_text = f"✅ Approved by {user_display}\n\n{task_id} resumed."
+            else:
+                label = "❌ Denied"
+                edit_text = f"❌ Denied by {user_display}\n\n{task_id} remains blocked; no action authorized."
+            await query.answer(text=label)
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(edit_text),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

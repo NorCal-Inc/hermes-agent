@@ -901,6 +901,53 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     assert subs[0]["delivery_mode"] == "notify"
 
 
+def test_direct_claude_api_origin_gets_wake_subscription(monkeypatch, worker_env):
+    """A direct-Claude card created from Erika's stateless API path has no
+    gateway platform/chat ContextVars, but its explicit origin session id is a
+    valid wake destination. Subscribe only this executor lane via api_server."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    out = kt._handle_create({
+        "title": "claude audit with wake",
+        "assignee": "default",
+        "executor_lane": "claude",
+        "session_id": "erika-api-session-42",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["platform"] == "api_server"
+    assert s["chat_id"] == "erika-api-session-42"
+    assert s["chat_type"] == "dm"
+    assert s["notifier_profile"] == "default"
+    assert s["delivery_mode"] == "notify+wake"
+
+
+def test_ordinary_api_session_id_still_does_not_auto_subscribe(monkeypatch, worker_env):
+    """Do not revive the broad HERMES_SESSION_ID fallback for ordinary work."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    out = kt._handle_create({
+        "title": "ordinary api-origin task",
+        "assignee": "peer",
+        "session_id": "api-session-no-auto-sub",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     """CLI / cron / test sessions have no persistent delivery channel.
     _maybe_auto_subscribe returns False and no row is written."""

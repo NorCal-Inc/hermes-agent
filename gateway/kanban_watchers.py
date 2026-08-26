@@ -526,6 +526,8 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        is_task_approval = False
+                        approval_reason = ""
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -558,8 +560,20 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                approval_reason = str(ev.payload["reason"])
+                                reason = f": {approval_reason[:160]}"
+                            is_task_approval = bool(
+                                ev.payload and ev.payload.get("kind") == "approval_required"
+                            )
+                            if is_task_approval:
+                                msg = (
+                                    f"🔐 {board_tag}Kanban {sub['task_id']} needs Christopher approval"
+                                    f" — {title}{reason}\n"
+                                    f"Approve: /kanban approve {sub['task_id']}  |  "
+                                    f"Deny: /kanban deny {sub['task_id']}"
+                                )
+                            else:
+                                msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -668,9 +682,20 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
+                            _approval_sender = getattr(adapter, "send_kanban_approval", None)
+                            if is_task_approval and callable(_approval_sender):
+                                _send_res = await _approval_sender(
+                                    sub["chat_id"],
+                                    task_id=sub["task_id"],
+                                    title=title,
+                                    reason=approval_reason,
+                                    board=board_slug,
+                                    metadata=metadata,
+                                )
+                            else:
+                                _send_res = await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
                             # transient failure) must count as a FAILED

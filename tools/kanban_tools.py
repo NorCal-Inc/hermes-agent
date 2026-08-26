@@ -227,7 +227,7 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "approval_required"})
 
 
 def _goal_judge_available() -> bool:
@@ -1409,6 +1409,8 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    executor_lane = args.get("executor_lane")
+    recovery_gate_cmd = args.get("recovery_gate_cmd")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1461,9 +1463,22 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                executor_lane=executor_lane,
+                recovery_gate_cmd=recovery_gate_cmd,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(
+                conn,
+                new_tid,
+                origin_session_id=session_id,
+                direct_claude=bool(
+                    new_task
+                    and (
+                        new_task.executor_lane == getattr(kb, "EXECUTOR_LANE_CLAUDE", "claude")
+                        or (new_task.assignee or "").strip().lower() == "claude"
+                    )
+                ),
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1481,7 +1496,13 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    origin_session_id: Optional[str] = None,
+    direct_claude: bool = False,
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1553,9 +1574,22 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+                # Direct-Claude cards created from Erika's stateless API path
+                # still carry the originating session id even though there is
+                # no push-capable platform/chat ContextVar.  For this one
+                # executor lane, register an api_server wake subscription so a
+                # completed/blocked/crashed/timed_out terminal event self-posts
+                # back into the originating Erika session.  Keep the historical
+                # no-op for ordinary CLI/cron/test tasks so we do not resurrect
+                # the over-eager HERMES_SESSION_ID subscription behavior.
+                api_origin = (origin_session_id or "").strip()
+                if not (direct_claude and api_origin):
+                    return False  # ordinary CLI / cron / test — no persistent channel
+                platform = "api_server"
+                chat_id = api_origin
+            else:
+                platform = "tui"
+                chat_id = session_key
         is_gateway_session = platform != "tui"
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         delivery_mode = "notify+wake" if is_gateway_session else None
@@ -1564,8 +1598,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
+            "default"
+            if platform == "api_server" and direct_claude
+            else (
+                get_session_env("HERMES_SESSION_PROFILE", "")
+                or os.environ.get("HERMES_PROFILE")
+            )
         )
         if not notifier_profile:
             try:
@@ -1862,7 +1900,7 @@ KANBAN_BLOCK_SCHEMA = {
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "needed), 'needs_input' (you need a human decision/answer), 'approval_required' (Christopher must approve/deny), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
@@ -1887,7 +1925,7 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": ["dependency", "needs_input", "approval_required", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
@@ -2304,6 +2342,30 @@ KANBAN_CREATE_SCHEMA = {
                 ),
             },
             "board": _board_schema_prop(),
+            "executor_lane": {
+                "type": "string",
+                "enum": ["claude", "claude_recovery"],
+                "description": (
+                    "Explicit executor lane. 'claude' routes one ordinary "
+                    "task directly to Claude Code before any Hermes agent/tool "
+                    "loop. 'claude_recovery' is the bounded Claude-then-Codex "
+                    "gate-repair lane. The worker never runs the normal Hermes "
+                    "reasoning/tool loop for either lane. 'claude_recovery' "
+                    "requires 'recovery_gate_cmd'. Omit for the normal Hermes worker "
+                    "(the default for every existing task). Never infer this "
+                    "from the title or body — only set it when the task is "
+                    "explicitly a recovery task."
+                ),
+            },
+            "recovery_gate_cmd": {
+                "type": "string",
+                "description": (
+                    "Shell command the recovery lane runs — mechanically, "
+                    "never by trusting Claude's or Codex's own report — to "
+                    "decide whether the gate is green (exit 0 = green). "
+                    "Required when 'executor_lane' is 'claude_recovery'."
+                ),
+            },
         },
         "required": ["title", "assignee"],
     },

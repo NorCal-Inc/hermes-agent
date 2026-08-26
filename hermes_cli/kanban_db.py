@@ -122,7 +122,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "approval_required", "capability", "transient"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -133,6 +133,25 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+# Explicit executor lane for a dispatched task. NULL (the default) means the
+# task runs through the normal Hermes worker (build agent, system prompt,
+# tool-calling loop). Two explicit non-null lanes exist:
+#
+# * "claude" runs one ordinary Kanban task directly through Claude Code,
+#   bypassing the Hermes model/tool loop. It is the deterministic technical
+#   executor lane used by Erika for normal Claude-owned work.
+# * "claude_recovery" is the stricter boot/gate repair lane: Claude gets one
+#   bounded attempt, then Codex gets one bounded attempt only if the same
+#   mechanical recovery_gate_cmd is still red.
+#
+# Neither lane is inferred from task title/body/skills. The sole compatibility
+# shorthand is assignee="claude", normalized mechanically to
+# assignee="default" + executor_lane="claude" so old/interactive routing does
+# not strand a card on a nonexistent Hermes profile.
+EXECUTOR_LANE_CLAUDE = "claude"
+EXECUTOR_LANE_CLAUDE_RECOVERY = "claude_recovery"
+VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CLAUDE_RECOVERY}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1141,6 +1160,14 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Explicit executor lane (one of VALID_EXECUTOR_LANES, or None for the
+    # normal Hermes worker). See the module-level comment above
+    # VALID_EXECUTOR_LANES.
+    executor_lane: Optional[str] = None
+    # Shell command the recovery lane runs (mechanically, never via LLM
+    # self-report) to decide whether the gate is green. Required at creation
+    # when executor_lane == EXECUTOR_LANE_CLAUDE_RECOVERY; otherwise ignored.
+    recovery_gate_cmd: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1261,12 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            executor_lane=(
+                row["executor_lane"] if "executor_lane" in keys and row["executor_lane"] else None
+            ),
+            recovery_gate_cmd=(
+                row["recovery_gate_cmd"] if "recovery_gate_cmd" in keys and row["recovery_gate_cmd"] else None
             ),
         )
 
@@ -1422,7 +1455,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit executor lane (see VALID_EXECUTOR_LANES). NULL (the default)
+    -- is the normal Hermes worker; "claude_recovery" mechanically bypasses
+    -- the Hermes agent/tool loop for this task's dispatched worker process.
+    executor_lane        TEXT,
+    -- Shell command the recovery lane runs to verify the gate is green.
+    -- Required (validated in create_task) when executor_lane is set.
+    recovery_gate_cmd    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2719,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "executor_lane" not in cols:
+        # NULL = normal Hermes worker (existing rows keep the behaviour they
+        # already had). "claude_recovery" mechanically bypasses the Hermes
+        # agent/tool loop — see VALID_EXECUTOR_LANES.
+        _add_column_if_missing(conn, "tasks", "executor_lane", "executor_lane TEXT")
+
+    if "recovery_gate_cmd" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recovery_gate_cmd", "recovery_gate_cmd TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3183,6 +3234,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    executor_lane: Optional[str] = None,
+    recovery_gate_cmd: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3244,6 +3297,33 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    executor_lane = (executor_lane or "").strip() or None
+    recovery_gate_cmd = (recovery_gate_cmd or "").strip() or None
+
+    # Simple operator/Erika shorthand: assignee="claude" means the direct
+    # Claude executor lane, not a Hermes profile named "claude". Persist the
+    # spawnable default profile as the dispatcher carrier; cli.py exits into
+    # Claude before any Hermes agent/tool loop is built.
+    if assignee == "claude" and executor_lane is None:
+        executor_lane = EXECUTOR_LANE_CLAUDE
+    if executor_lane == EXECUTOR_LANE_CLAUDE:
+        assignee = "default"
+
+    if executor_lane is not None and executor_lane not in VALID_EXECUTOR_LANES:
+        raise ValueError(
+            f"executor_lane must be one of {sorted(VALID_EXECUTOR_LANES)} or None, "
+            f"got {executor_lane!r}"
+        )
+    if executor_lane == EXECUTOR_LANE_CLAUDE_RECOVERY and not recovery_gate_cmd:
+        raise ValueError(
+            "recovery_gate_cmd is required when "
+            f"executor_lane={EXECUTOR_LANE_CLAUDE_RECOVERY!r}"
+        )
+    if recovery_gate_cmd and executor_lane != EXECUTOR_LANE_CLAUDE_RECOVERY:
+        raise ValueError(
+            "recovery_gate_cmd is only valid with "
+            f"executor_lane={EXECUTOR_LANE_CLAUDE_RECOVERY!r}"
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3497,8 +3577,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        executor_lane, recovery_gate_cmd
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3605,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        executor_lane,
+                        recovery_gate_cmd,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3635,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "executor_lane": executor_lane,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -6243,6 +6327,37 @@ def edit_completed_task_result(
     return True
 
 
+def _ensure_approval_telegram_subscription(conn: sqlite3.Connection, task_id: str) -> None:
+    """Best-effort owner Telegram subscription for approval-required blocks.
+
+    Called before the ``blocked`` event is appended so ``add_notify_sub``'s
+    caught-up cursor points to the prior event, making the new approval event
+    immediately deliverable. Empty config is an intentional no-op.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kcfg = cfg.get("kanban") or {}
+        chat_id = str(kcfg.get("approval_telegram_chat_id") or "").strip()
+        if not chat_id:
+            return
+        thread_id = str(kcfg.get("approval_telegram_thread_id") or "").strip() or None
+        chat_type = str(kcfg.get("approval_telegram_chat_type") or "group").strip() or "group"
+        notifier_profile = str(kcfg.get("approval_notifier_profile") or "overall_manager").strip() or "overall_manager"
+        add_notify_sub(
+            conn, task_id=task_id,
+            platform="telegram", chat_id=chat_id, thread_id=thread_id,
+            chat_type=chat_type, notifier_profile=notifier_profile,
+            delivery_mode="notify+wake",
+        )
+    except Exception as exc:
+        # Approval state itself must remain durable even if notification setup
+        # is temporarily unavailable. Existing notifier/diagnostics can repair
+        # delivery; never fail the block transition for a messaging outage.
+        _log.warning("approval Telegram auto-subscribe failed for %s: %s", task_id, exc)
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6263,7 +6378,7 @@ def block_task(
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
 
-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
+    * ``needs_input`` / ``approval_required`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
       unblock-loop counter (``block_recurrences``) increments. When it reaches
@@ -6282,6 +6397,13 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if kind == "approval_required":
+        # Subscribe BEFORE the approval event is emitted. add_notify_sub starts
+        # its cursor at the current max event id, so subscribing afterward would
+        # incorrectly mark the approval request itself as already consumed.
+        pre = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if pre is not None and pre["status"] in {"running", "ready"}:
+            _ensure_approval_telegram_subscription(conn, task_id)
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6885,6 +7007,71 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
+
+
+def resolve_task_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    actor: str = "Christopher",
+    source: str = "operator",
+) -> bool:
+    """Resolve a first-class human approval blocker.
+
+    ``approve`` records an auditable grant and resumes the same task through
+    :func:`unblock_task`. ``deny`` records an auditable denial, changes the
+    block kind to ``needs_input`` so it is no longer advertised as awaiting
+    approval, and deliberately leaves the task blocked. Keeping denial
+    non-terminal is fail-closed: dependent work cannot auto-promote merely
+    because authorization was refused.
+
+    Returns False for stale/duplicate decisions or tasks that are not
+    currently ``blocked`` with ``block_kind='approval_required'``.
+    """
+    choice = (decision or "").strip().lower()
+    if choice not in {"approve", "deny"}:
+        raise ValueError("decision must be 'approve' or 'deny'")
+    who = (actor or "Christopher").strip() or "Christopher"
+    via = (source or "operator").strip() or "operator"
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "blocked"
+            or row["block_kind"] != "approval_required"
+        ):
+            return False
+        kind = "approval_granted" if choice == "approve" else "approval_denied"
+        _append_event(
+            conn, task_id, kind,
+            {"actor": who, "source": via, "decision": choice},
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                who,
+                ("APPROVED" if choice == "approve" else "DENIED")
+                + f" via {via}.",
+                now,
+            ),
+        )
+        if choice == "deny":
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input', result = ? WHERE id = ?",
+                (f"Approval denied by {who} via {via}; proposed action not authorized.", task_id),
+            )
+            return True
+
+    # Run the normal resume machinery outside the decision transaction so all
+    # parent gating / stale-run cleanup stays centralized in unblock_task.
+    return unblock_task(conn, task_id)
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -10034,7 +10221,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, executor_lane FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10115,6 +10302,50 @@ def _dispatch_once_locked(
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
+        row_executor_lane = row["executor_lane"] if "executor_lane" in row.keys() else None
+
+        # Backward-compatible explicit shorthand. Older Erika/CLI surfaces may
+        # have created assignee="claude" before the first-class lane existed.
+        # Convert that exact token into the spawnable carrier profile + direct
+        # Claude lane. This is deterministic; no title/body inference occurs.
+        if row_assignee == "claude" and not row_executor_lane:
+            row_executor_lane = EXECUTOR_LANE_CLAUDE
+            if not dry_run:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET assignee = 'default', executor_lane = ? "
+                        "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+                        (EXECUTOR_LANE_CLAUDE, row["id"]),
+                    )
+                    _append_event(
+                        conn, row["id"], "executor_lane_normalized",
+                        {
+                            "from_assignee": "claude",
+                            "assignee": "default",
+                            "executor_lane": EXECUTOR_LANE_CLAUDE,
+                        },
+                    )
+            row_assignee = "default"
+        elif row_executor_lane == EXECUTOR_LANE_CLAUDE and row_assignee != "default":
+            # Explicit direct-Claude lane always rides the real default Hermes
+            # profile only far enough to enter cli.py's pre-agent bypass.
+            if not dry_run:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET assignee = 'default' WHERE id = ? "
+                        "AND status = 'ready' AND claim_lock IS NULL",
+                        (row["id"],),
+                    )
+                    _append_event(
+                        conn, row["id"], "executor_lane_normalized",
+                        {
+                            "from_assignee": row_assignee,
+                            "assignee": "default",
+                            "executor_lane": EXECUTOR_LANE_CLAUDE,
+                        },
+                    )
+            row_assignee = "default"
+
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback

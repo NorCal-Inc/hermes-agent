@@ -110,3 +110,73 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# First-class approval-required blockers
+# ---------------------------------------------------------------------------
+
+
+def test_approval_required_approve_resumes_task(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="needs approval")
+        assert kb.block_task(conn, tid, reason="Christopher must approve", kind="approval_required")
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "approval_required"
+
+        assert kb.resolve_task_approval(
+            conn, tid, decision="approve", actor="Christopher", source="telegram-button"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        events = [e.kind for e in kb.list_events(conn, tid)]
+        assert "approval_granted" in events
+        assert "unblocked" in events
+
+
+def test_approval_required_deny_is_fail_closed(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="needs approval")
+        assert kb.block_task(conn, tid, reason="Christopher must approve", kind="approval_required")
+
+        assert kb.resolve_task_approval(
+            conn, tid, decision="deny", actor="Christopher", source="telegram-button"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert "not authorized" in (task.result or "")
+        events = [e.kind for e in kb.list_events(conn, tid)]
+        assert "approval_denied" in events
+        assert "unblocked" not in events
+
+
+def test_approval_resolution_rejects_non_approval_block(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="ordinary input")
+        assert kb.block_task(conn, tid, reason="need a file", kind="needs_input")
+        assert not kb.resolve_task_approval(conn, tid, decision="approve")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_approval_required_auto_subscribes_before_block_event(kanban_home: Path) -> None:
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  approval_telegram_chat_id: '-1001234567890'\n"
+        "  approval_telegram_chat_type: group\n"
+        "  approval_notifier_profile: overall_manager\n"
+    )
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="remote approval")
+        assert kb.block_task(
+            conn, tid, reason="Christopher approval required", kind="approval_required"
+        )
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        sub = subs[0]
+        assert sub["platform"] == "telegram"
+        assert sub["chat_id"] == "-1001234567890"
+        assert sub["delivery_mode"] == "notify+wake"
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
+        assert sub["last_event_id"] < blocked.id

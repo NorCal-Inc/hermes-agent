@@ -5248,6 +5248,13 @@ class TurnRunner:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
         max_iterations = _current_max_iterations()
+        _profile_name = str(getattr(ctx.source, "profile", None) or "default").strip()
+        _thin_executive_mode = _profile_name == "default"
+        # Thin-Erika executive ceiling applies only to the default/Erika
+        # profile. Secondary Team Leader/worker profiles keep their configured
+        # execution budgets.
+        if _thin_executive_mode:
+            max_iterations = min(int(max_iterations), 8)
 
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
@@ -5273,6 +5280,12 @@ class TurnRunner:
             session_key=ctx.session_key,
             model=model,
         )
+        # Default only Erika/default-profile gateway turns to low reasoning.
+        # Explicit per-session/config reasoning remains authoritative when set;
+        # secondary profiles keep their own defaults.
+        if _thin_executive_mode and reasoning_config is None:
+            from hermes_constants import parse_reasoning_effort
+            reasoning_config = parse_reasoning_effort("low")
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -5628,10 +5641,28 @@ class TurnRunner:
                     f"Shared boot generator exception: {_shared_boot_exc}\n"
                     "</shared-boot-state>"
                 )
-            _agent_ephemeral = (
-                (_shared_boot_prompt + "\n\n" + combined_ephemeral).strip()
-                if combined_ephemeral else _shared_boot_prompt
-            )
+            # Default-profile Erika needs the same canonical runtime contract
+            # as local interactive CLI. It lives under ~/.hermes, outside normal
+            # CWD project-context discovery, so load it explicitly only for the
+            # thin executive profile; worker/TL profiles retain their own role
+            # context and do not inherit Erika's executive instructions.
+            _erika_runtime_contract = ""
+            if _thin_executive_mode:
+                try:
+                    with open("/home/chris/.hermes/HERMES.md", "r", encoding="utf-8") as _f:
+                        _erika_runtime_contract = _f.read().strip()
+                except Exception as _contract_exc:
+                    _erika_runtime_contract = (
+                        "ERIKA RUNTIME CONTRACT: UNAVAILABLE — "
+                        f"{type(_contract_exc).__name__}: {_contract_exc}"
+                    )
+            _agent_ephemeral = "\n\n".join(
+                part for part in (
+                    _shared_boot_prompt,
+                    _erika_runtime_contract,
+                    combined_ephemeral,
+                ) if part
+            ).strip()
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -5639,7 +5670,10 @@ class TurnRunner:
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 verbose_logging=False,
-                enabled_toolsets=ctx.enabled_toolsets,
+                enabled_toolsets=(
+                    ["executive"]
+                    if _thin_executive_mode else ctx.enabled_toolsets
+                ),
                 disabled_toolsets=ctx.disabled_toolsets,
                 ephemeral_system_prompt=_agent_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,

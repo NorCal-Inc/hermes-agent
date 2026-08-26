@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 import logging
 import copy
 import os
+import subprocess
 import shutil
 import sys
 import json
@@ -5125,9 +5126,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.max_turns = 500
         else:
             self.max_turns = 500
+
+        # Thin-Erika executive ceiling. Local interactive Hermes is the
+        # Christopher-facing executive surface; Kanban/cron/tool workers keep
+        # their configured execution budget. An explicit --max-turns still wins.
+        _session_source = (os.environ.get("HERMES_SESSION_SOURCE") or "cli").strip().lower()
+        self._thin_executive_mode = _session_source in {"", "cli", "local"}
+        if self._thin_executive_mode and max_turns is None:
+            self.max_turns = min(int(self.max_turns), 8)
         
-        # Parse and validate toolsets
+        # Parse and validate toolsets. Thin Erika gets the executive
+        # orchestrator surface by default; an explicit -t/--toolsets remains a
+        # deliberate operator override. Kanban/cron workers are not thin mode.
         self.enabled_toolsets = toolsets
+        if self._thin_executive_mode and toolsets is None:
+            self.enabled_toolsets = ["executive"]
         from agent.skill_utils import parse_config_string_list
 
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
@@ -5168,6 +5181,59 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
             or resolve_ephemeral_system_prompt(CLI_CONFIG)
         )
+
+        # NorCal local-CLI shared boot parity. Gateway sessions inject the same
+        # payload in gateway/run.py; the interactive CLI does not pass through
+        # that path, so inject it here before the first agent turn. This keeps
+        # Erika and Claude on the same doctrine/vault/Kanban starting line and
+        # prevents the agent from having to rediscover current-task state with
+        # recall/tmux/session forensics. --ignore-rules intentionally skips it.
+        if not self.ignore_rules:
+            try:
+                _shared_boot_proc = subprocess.run(
+                    ["/home/chris/.local/bin/hermes-shared-boot-context"],
+                    capture_output=True, text=True, timeout=45, check=False,
+                )
+                _shared_boot_prompt = (
+                    _shared_boot_proc.stdout or _shared_boot_proc.stderr or ""
+                ).strip()
+                if _shared_boot_proc.returncode != 0 or not _shared_boot_prompt:
+                    _shared_boot_prompt = (
+                        "<shared-boot-state>\n"
+                        "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
+                        f"Shared boot generator failed rc={_shared_boot_proc.returncode}.\n"
+                        "</shared-boot-state>"
+                    )
+            except Exception as _shared_boot_exc:
+                _shared_boot_prompt = (
+                    "<shared-boot-state>\n"
+                    "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
+                    f"Shared boot generator exception: {_shared_boot_exc}\n"
+                    "</shared-boot-state>"
+                )
+            # Erika's canonical runtime contract lives under ~/.hermes and is
+            # intentionally outside the /home/chris CWD discovery boundary.
+            # Load it explicitly for the Christopher-facing executive surface
+            # so behavior does not depend on where the CLI was launched. Do not
+            # inject it into Kanban/cron worker sessions.
+            _erika_runtime_contract = ""
+            if self._thin_executive_mode:
+                try:
+                    with open("/home/chris/.hermes/HERMES.md", "r", encoding="utf-8") as _f:
+                        _erika_runtime_contract = _f.read().strip()
+                except Exception as _contract_exc:
+                    _erika_runtime_contract = (
+                        "ERIKA RUNTIME CONTRACT: UNAVAILABLE — "
+                        f"{type(_contract_exc).__name__}: {_contract_exc}"
+                    )
+            self.system_prompt = "\n\n".join(
+                part for part in (
+                    _shared_boot_prompt,
+                    _erika_runtime_contract,
+                    self.system_prompt,
+                ) if part
+            )
+
         self.personalities = available_personalities(CLI_CONFIG)
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
@@ -5178,8 +5244,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Reasoning config (OpenRouter reasoning effort level)
         # Per-model override > global reasoning_effort — resolved through the
         # shared chokepoint in hermes_constants (Closes #21256).
-        from hermes_constants import resolve_reasoning_config
+        from hermes_constants import resolve_reasoning_config, parse_reasoning_effort
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        # Erika's ordinary executive surface should classify/route quickly;
+        # workers retain their configured reasoning. Explicit --reasoning wins.
+        if self._thin_executive_mode and reasoning is None:
+            self.reasoning_config = parse_reasoning_effort("low")
         # An explicit --reasoning wins over config for this run only (never
         # persisted). Kanban's dispatcher uses it to pin a task's thinking
         # depth without touching the worker profile's config.yaml. An
@@ -20343,21 +20413,29 @@ def main(
                 else:
                     toolsets_list.append(str(t))
     else:
-        # Coding posture (base Hermes): with no explicit --toolsets, collapse
-        # to the coding toolset (+ enabled MCP servers) when sitting in a code
-        # workspace. See agent/coding_context.py.
-        _coding = None
-        try:
-            from agent.coding_context import coding_selection
-            _coding = coding_selection(platform="cli", config=CLI_CONFIG)
-        except Exception:
-            _coding = None
-        if _coding is not None:
-            toolsets_list = _coding
+        # Normal Christopher-facing interactive Hermes is Erika, so default
+        # to the narrow executive surface. Only an ACTUAL user-supplied
+        # --toolsets value may widen this. Previously this launcher resolved
+        # the platform's full CLI tool list here before HermesCLI.__init__,
+        # which made the constructor mistake the implicit platform default for
+        # an explicit operator override and leaked terminal/session-search/etc.
+        _session_source = (os.environ.get("HERMES_SESSION_SOURCE") or "cli").strip().lower()
+        if _session_source in {"", "cli", "local"}:
+            toolsets_list = ["executive"]
         else:
-            # Use the shared resolver so MCP servers are included at runtime
-            from hermes_cli.tools_config import _get_platform_tools
-            toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
+            # Non-executive worker/automation paths retain the existing coding
+            # posture and platform tool resolution.
+            _coding = None
+            try:
+                from agent.coding_context import coding_selection
+                _coding = coding_selection(platform="cli", config=CLI_CONFIG)
+            except Exception:
+                _coding = None
+            if _coding is not None:
+                toolsets_list = _coding
+            else:
+                from hermes_cli.tools_config import _get_platform_tools
+                toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
 
@@ -20575,6 +20653,38 @@ def main(
                 except Exception as _exc:
                     # Best-effort enrichment; never block worker startup on it.
                     logger.debug("kanban image-ref extraction failed: %s", _exc)
+
+            # Explicit recovery-lane bypass. This check is deliberately its
+            # own fresh DB read (not folded into the best-effort image-ref
+            # try/except above) so a failure there can never accidentally
+            # mask a task that must NOT go through the normal Hermes
+            # agent/tool loop. Nothing above this point in the recovery case
+            # builds an agent, a system prompt, or a toolset — this is the
+            # earliest possible mechanical branch. See hermes_cli.kanban_db
+            # EXECUTOR_LANE_CLAUDE_RECOVERY and hermes_cli.recovery_lane.
+            if _kanban_task_id:
+                from hermes_cli import kanban_db as _kb_lane
+
+                _lane_conn = _kb_lane.connect()
+                try:
+                    _lane_task = _kb_lane.get_task(_lane_conn, _kanban_task_id)
+                finally:
+                    try:
+                        _lane_conn.close()
+                    except Exception:
+                        pass
+                if _lane_task is not None:
+                    if _lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE:
+                        from hermes_cli.recovery_lane import run_claude_executor
+
+                        _lane_rc = run_claude_executor(_kanban_task_id)
+                        sys.exit(_lane_rc)
+                    if _lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE_RECOVERY:
+                        from hermes_cli.recovery_lane import run_claude_first_recovery
+
+                        _lane_rc = run_claude_first_recovery(_kanban_task_id)
+                        sys.exit(_lane_rc)
+
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.

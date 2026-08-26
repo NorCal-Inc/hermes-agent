@@ -333,6 +333,24 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "executive": {
+        "description": (
+            "Thin executive/orchestrator surface: inspect canonical board state, "
+            "create/link/comment/unblock governed work, attach evidence, search/read "
+            "canonical vault context, and inspect explicitly supplied documents/images. Deliberately excludes worker "
+            "lifecycle completion/review/heartbeat controls, terminal, process, "
+            "code execution, web/browser research, memory/session forensics, file "
+            "mutation, and infrastructure/MCP tools."
+        ),
+        "tools": [
+            "kanban_show", "kanban_list", "kanban_create", "kanban_link",
+            "kanban_comment", "kanban_unblock",
+            "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "search_files", "read_file", "vision_analyze",
+        ],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

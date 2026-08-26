@@ -2525,6 +2525,15 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Owner-approval route for first-class Kanban ``approval_required``
+        # blockers. When chat_id is non-empty, block_task subscribes the task
+        # BEFORE emitting the blocked event so the approval request cannot be
+        # missed even when the task originated from API/desktop/CLI rather than
+        # Telegram. Empty by default for portable upstream installs.
+        "approval_telegram_chat_id": "",
+        "approval_telegram_thread_id": "",
+        "approval_telegram_chat_type": "group",
+        "approval_notifier_profile": "default",
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
