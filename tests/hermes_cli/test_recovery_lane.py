@@ -472,28 +472,40 @@ class _Harness:
         monkeypatch.setattr(recovery_lane.kb, "add_comment", fake_add_comment)
 
 
-def test_gate_green_after_claude_never_invokes_codex(monkeypatch):
+def test_gate_already_green_on_resume_invokes_no_executor(monkeypatch):
     task = _make_recovery_task()
     h = _Harness(monkeypatch, task, gate_results=[True])
 
     rc = recovery_lane.run_claude_first_recovery("t_recover")
 
     assert rc == 0
-    assert h.calls == ["claude", "gate"], "must not invoke codex once the gate is green"
+    assert h.calls == ["gate"], "a green resume gate must not consume Claude or Codex"
     assert len(h.complete_calls) == 1
     assert len(h.block_calls) == 0
 
 
-def test_codex_only_invoked_after_claude_gate_failure(monkeypatch):
+def test_gate_green_after_claude_never_invokes_codex(monkeypatch):
     task = _make_recovery_task()
     h = _Harness(monkeypatch, task, gate_results=[False, True])
 
     rc = recovery_lane.run_claude_first_recovery("t_recover")
 
     assert rc == 0
-    assert h.calls == ["claude", "gate", "codex", "gate"], (
-        "claude must run first; codex only after the mechanical gate check "
-        "(not Claude's own report) comes back red"
+    assert h.calls == ["gate", "claude", "gate"], "must not invoke codex once Claude makes the gate green"
+    assert len(h.complete_calls) == 1
+    assert len(h.block_calls) == 0
+
+
+def test_codex_only_invoked_after_claude_gate_failure(monkeypatch):
+    task = _make_recovery_task()
+    h = _Harness(monkeypatch, task, gate_results=[False, False, True])
+
+    rc = recovery_lane.run_claude_first_recovery("t_recover")
+
+    assert rc == 0
+    assert h.calls == ["gate", "claude", "gate", "codex", "gate"], (
+        "resume gate runs first; codex only after Claude and the mechanical "
+        "post-Claude gate check both leave the gate red"
     )
     assert len(h.complete_calls) == 1
     assert len(h.block_calls) == 0
@@ -501,12 +513,12 @@ def test_codex_only_invoked_after_claude_gate_failure(monkeypatch):
 
 def test_both_fail_escalates_exactly_once_no_retries(monkeypatch):
     task = _make_recovery_task()
-    h = _Harness(monkeypatch, task, gate_results=[False, False])
+    h = _Harness(monkeypatch, task, gate_results=[False, False, False])
 
     rc = recovery_lane.run_claude_first_recovery("t_recover")
 
     assert rc == 0
-    assert h.calls == ["claude", "gate", "codex", "gate"]
+    assert h.calls == ["gate", "claude", "gate", "codex", "gate"]
     assert h.calls.count("claude") == 1, "claude gets exactly one bounded attempt"
     assert h.calls.count("codex") == 1, "codex gets exactly one bounded attempt"
     assert len(h.complete_calls) == 0
@@ -519,7 +531,7 @@ def test_gate_is_reverified_mechanically_not_trusted_from_self_report(monkeypatc
     returncode=0 ("I succeeded"), the harness must still treat the outcome
     as failure because the gate command itself reports red."""
     task = _make_recovery_task()
-    h = _Harness(monkeypatch, task, gate_results=[False, False])
+    h = _Harness(monkeypatch, task, gate_results=[False, False, False])
 
     recovery_lane.run_claude_first_recovery("t_recover")
 
@@ -655,23 +667,23 @@ def test_recovery_lane_completion_promotes_dependents(kanban_home):
 def test_restart_skips_already_recorded_claude_attempt(monkeypatch):
     task = _make_recovery_task()
     h = _Harness(
-        monkeypatch, task, gate_results=[False, True],
+        monkeypatch, task, gate_results=[False, False, True],
         already_started={"recovery_claude_started"},
     )
     rc = recovery_lane.run_claude_first_recovery("t_recover")
     assert rc == 0
-    assert h.calls == ["gate", "codex", "gate"]
+    assert h.calls == ["gate", "gate", "codex", "gate"]
 
 
 def test_restart_after_both_attempts_runs_neither_again(monkeypatch):
     task = _make_recovery_task()
     h = _Harness(
-        monkeypatch, task, gate_results=[False, False],
+        monkeypatch, task, gate_results=[False, False, False],
         already_started={"recovery_claude_started", "recovery_codex_started"},
     )
     rc = recovery_lane.run_claude_first_recovery("t_recover")
     assert rc == 0
-    assert h.calls == ["gate", "gate"]
+    assert h.calls == ["gate", "gate", "gate"]
     assert len(h.block_calls) == 1
 
 

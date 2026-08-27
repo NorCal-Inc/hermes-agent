@@ -526,6 +526,20 @@ def run_claude_first_recovery(task_id: str) -> int:
         gate_timeout = min(attempt_timeout, DEFAULT_GATE_TIMEOUT_SECONDS)
         started_at = time.time()
 
+        # Resume/human-intervention short circuit: the prerequisite may have
+        # been repaired out-of-band while this recovery task was blocked.
+        # Always test the deterministic gate before consuming another bounded
+        # executor attempt. If it is already green, close through the recovery
+        # lane with gate evidence and let normal dependency promotion proceed.
+        pre_gate = _run_gate(task.recovery_gate_cmd, cwd, gate_timeout)
+        if pre_gate.ok:
+            return 0 if _complete(
+                conn, task_id,
+                summary="Recovery lane: gate already green at resume; no executor attempt required.",
+                attempts=[], gate=pre_gate,
+                started_at=started_at, expected_run_id=expected_run_id,
+            ) else 1
+
         try:
             run_claude = _claim_attempt(
                 conn, task_id, "recovery_claude_started", expected_run_id
