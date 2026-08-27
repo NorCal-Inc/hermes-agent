@@ -418,6 +418,7 @@ def _invoke_codex(prompt: str, cwd: str, timeout: int) -> AttemptResult:
                 codex_bin, "exec", prompt,
                 "--json",
                 "--sandbox", "workspace-write",
+                "--skip-git-repo-check",
                 "-o", last_message_path,
             ],
             cwd=cwd, capture_output=True, text=True, timeout=timeout,
