@@ -1,0 +1,4 @@
+# Canonical North Caledonia production policy overlay.
+# This is deployment policy, not the Hermes upstream software default.
+kanban:
+  gauntlet_enforcement: true

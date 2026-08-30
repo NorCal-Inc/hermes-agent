@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Claude Code SessionStart wrapper for the shared Erika/Hermes boot context."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import datetime as dt
+
+LOCAL = Path("/home/chris/.claude/CLAUDE.md")
+CANON = Path("/home/chris/services/life-wiki/vault/Business/Systems/Claude-Global-CLAUDE-canonical.md")
+SHARED = str(Path(__file__).resolve().parent / "hermes-shared-boot-context")
+
+
+def digest(path):
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+failures = []
+status = "OK"
+local_sha = digest(LOCAL)
+canon_sha = digest(CANON)
+
+if not canon_sha:
+    failures.append("canonical CLAUDE.md is missing or unreadable")
+    status = "MISSING_CANONICAL"
+elif not local_sha:
+    failures.append("local ~/.claude/CLAUDE.md is missing; canonical copy restored but this session must restart")
+    LOCAL.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(CANON, LOCAL)
+    status = "SYNCED_RESTART_REQUIRED"
+elif local_sha != canon_sha:
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    shutil.copy2(LOCAL, Path(str(LOCAL) + ".bak-" + ts))
+    shutil.copy2(CANON, LOCAL)
+    failures.append("local CLAUDE.md differed from canonical; repaired on disk, but this Claude process may already hold stale rules — restart required")
+    status = "SYNCED_RESTART_REQUIRED"
+
+try:
+    p = subprocess.run([SHARED], capture_output=True, text=True, timeout=45)
+    shared = (p.stdout or p.stderr or "").strip()
+    if p.returncode != 0 or not shared:
+        failures.append(f"shared boot generator failed rc={p.returncode}")
+except Exception as exc:
+    shared = ""
+    failures.append(f"shared boot generator exception: {exc}")
+
+caller_sync = (os.environ.get("CLAUDE_MD_SYNC") or "not-reported").strip()
+if failures:
+    boot = "DEGRADED — STOP BEFORE TASK EXECUTION"
+else:
+    boot = "COMPLETE"
+
+preface = "<claude-bootstrap>\n" + "\n".join([
+    f"CLAUDE BOOT STATUS: {boot}",
+    f"LOCAL/CANONICAL CLAUDE.md: {status}",
+    f"CALLER SYNC REPORT: {caller_sync}",
+    "Claude's CLAUDE.md is the role/rule file that must already be loaded before this SessionStart context. The shared payload below is the same doctrine/vault starting line used by Erika/Hermes.",
+    *(f"FAILURE: {x}" for x in failures),
+]) + "\n</claude-bootstrap>"
+
+ctx = shared + "\n\n" + preface
+print(json.dumps({
+    "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx},
+    "systemMessage": f"shared boot: {boot} | CLAUDE.md: {status}",
+}))

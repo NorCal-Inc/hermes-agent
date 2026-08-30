@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""Build the canonical shared startup context for Erika/Hermes and Claude Code.
+
+Role-neutral by design. Identity stays in SOUL.md (Erika) or CLAUDE.md (Claude).
+This payload supplies the same doctrine, vault map, and live-state starting line
+for GPT/Codex, Claude Code, and Hermes/Erika without loading company-private files.
+The canonical shared constraints file is emitted first and is a hard boot dependency.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import glob
+import hashlib
+import os
+from pathlib import Path
+import re
+import subprocess
+import sqlite3
+import sys
+
+CH = Path("/home/chris")
+HERMES = CH / ".hermes"
+DOCTRINE = HERMES / "doctrine"
+VAULT = CH / "services/life-wiki/vault"
+API_VAULT = VAULT / "artifacts/api-server/vault"
+KANBAN_DB = HERMES / "kanban.db"
+DAILY_INDEX_LINES = 12
+KANBAN_RECENT_SECONDS = 48 * 60 * 60
+BOOT_COMPACT = True
+BOOT_MAX_ACTIVE_PRIORITIES_CHARS = 6000
+BOOT_MAX_CHECKPOINT_CHARS = 4000
+BOOT_MAX_MISTAKE_INDEX_CHARS = 3000
+KANBAN_RECENT_TERMINAL_SECONDS = 6 * 60 * 60
+GATE_EXIT_CODE = "--gate-exit-code" in sys.argv[1:]
+BOOT_CONSTRAINTS = Path(__file__).resolve().parent / "boot-constraints.md"
+KANBAN_SHARED_ASSIGNEES = {
+    "overall_manager",
+    "default",
+    "compliance_worker",
+    "summary_worker",
+}
+
+
+def read_text(path: Path):
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except Exception as exc:
+        return None, f"{path}: {exc}"
+
+
+def run(argv, timeout=20):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        body = (p.stdout or p.stderr or "").strip()
+        return body, p.returncode
+    except Exception as exc:
+        return f"(failed: {exc})", 255
+
+
+def section(title: str, body: str) -> str:
+    return f"===== {title} =====\n{body}"
+
+
+def sha(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return "UNAVAILABLE"
+
+
+def version_of(path: Path) -> str:
+    text, err = read_text(path)
+    if err:
+        return "UNAVAILABLE"
+    m = re.search(r"(?m)^Version:\s*(.+)$", text or "")
+    return m.group(1).strip() if m else "UNVERSIONED"
+
+
+def _epoch_iso(value) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        return dt.datetime.fromtimestamp(float(value), tz=now.tzinfo).isoformat()
+    except Exception:
+        return str(value)
+
+
+def kanban_continuity_state() -> tuple[str, str | None]:
+    """Return bounded shared-system Kanban continuity without task bodies.
+
+    Boot must answer "what is currently in flight?" from the canonical task
+    database, not from model memory, old checkpoints, tmux panes, or Codex
+    session history. Company-scoped task bodies/titles are intentionally not
+    loaded here. Only shared-system assignees are eligible.
+    """
+    if not KANBAN_DB.exists():
+        return "KANBAN CONTINUITY: UNAVAILABLE — canonical kanban.db is missing", str(KANBAN_DB)
+
+    try:
+        con = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        cutoff = int(now.timestamp()) - KANBAN_RECENT_SECONDS
+        terminal_cutoff = int(now.timestamp()) - KANBAN_RECENT_TERMINAL_SECONDS
+        placeholders = ",".join("?" for _ in KANBAN_SHARED_ASSIGNEES)
+        params = tuple(sorted(KANBAN_SHARED_ASSIGNEES))
+
+        seed_rows = con.execute(
+            f"""
+            SELECT id,title,assignee,status,priority,created_at,started_at,
+                   completed_at,current_run_id,last_heartbeat_at,last_failure_error
+              FROM tasks
+             WHERE assignee IN ({placeholders})
+               AND (
+                    status='running'
+                    OR (status IN ('ready','todo','review','blocked') AND
+                        COALESCE(last_heartbeat_at,started_at,created_at,0) >= ?)
+                    OR (status='done' AND
+                        COALESCE(completed_at,last_heartbeat_at,started_at,created_at,0) >= ?)
+               )
+             ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'review' THEN 1
+                                  WHEN 'ready' THEN 2 WHEN 'todo' THEN 3 ELSE 4 END,
+                      COALESCE(last_heartbeat_at,started_at,created_at,0) DESC
+             LIMIT 20
+            """,
+            params + (cutoff, terminal_cutoff),
+        ).fetchall()
+
+        task_ids = {r["id"] for r in seed_rows}
+        frontier = set(task_ids)
+        # Pull one-hop parents/children, then a second hop. This preserves a
+        # completed orchestration parent and its pending verification child.
+        for _ in range(2):
+            if not frontier:
+                break
+            marks = ",".join("?" for _ in frontier)
+            links = con.execute(
+                f"SELECT parent_id,child_id FROM task_links "
+                f"WHERE parent_id IN ({marks}) OR child_id IN ({marks})",
+                tuple(frontier) + tuple(frontier),
+            ).fetchall()
+            discovered = set()
+            for link in links:
+                discovered.add(link["parent_id"])
+                discovered.add(link["child_id"])
+            frontier = discovered - task_ids
+            task_ids |= discovered
+
+        if not task_ids:
+            con.close()
+            return "KANBAN CONTINUITY: no recent shared-system active tasks", None
+
+        marks = ",".join("?" for _ in task_ids)
+        rows = con.execute(
+            f"""
+            SELECT id,title,assignee,status,priority,created_at,started_at,
+                   completed_at,current_run_id,last_heartbeat_at,last_failure_error
+              FROM tasks
+             WHERE id IN ({marks}) AND assignee IN ({placeholders})
+            """,
+            tuple(task_ids) + params,
+        ).fetchall()
+        by_id = {r["id"]: r for r in rows}
+        latest_runs = {}
+        for tid in by_id:
+            rr = con.execute(
+                "SELECT id,status,outcome,summary,error,started_at,ended_at "
+                "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if rr:
+                latest_runs[tid] = rr
+
+        links = con.execute(
+            f"SELECT parent_id,child_id FROM task_links "
+            f"WHERE parent_id IN ({marks}) OR child_id IN ({marks})",
+            tuple(task_ids) + tuple(task_ids),
+        ).fetchall()
+        con.close()
+
+        lines = [
+            "KANBAN CONTINUITY: canonical live task state",
+            f"source={KANBAN_DB}",
+            "rule=use this before recall/checkpoints/Codex-session forensics when asked for current task status",
+        ]
+
+        # Executive attention summary: make the governing interpretation
+        # explicit so a thin front-door agent does not have to infer it from a
+        # flat task dump or fall back to historical recall. A terminal task
+        # whose verifier summary says FAIL is completed as a phase, not accepted
+        # as an overall objective.
+        attention = []
+        for r in by_id.values():
+            rr = latest_runs.get(r["id"])
+            summary = ((rr["summary"] if rr else None) or "").strip().replace("\n", " ")
+            error = ((rr["error"] if rr else None) or r["last_failure_error"] or "").strip().replace("\n", " ")
+            fail_verdict = bool(re.match(r"\s*(FAIL|NO[- ]GO)\b", summary, re.I))
+            if r["status"] == "running":
+                rank = 0
+                reason = "RUNNING"
+            elif fail_verdict:
+                rank = 1
+                reason = "FAILED_VERIFICATION — phase may be done; objective is not accepted"
+            elif r["status"] in {"blocked", "review", "ready", "todo"}:
+                rank = 2
+                reason = f"UNRESOLVED_{str(r['status']).upper()}"
+            elif error:
+                rank = 3
+                reason = "TERMINAL_WITH_ERROR"
+            else:
+                continue
+            ts = r["last_heartbeat_at"] or r["completed_at"] or r["started_at"] or r["created_at"] or 0
+            attention.append((rank, -ts, r, reason, summary, error))
+        attention.sort(key=lambda x: (x[0], x[1]))
+        if attention:
+            _, _, primary, primary_reason, primary_summary, primary_error = attention[0]
+            lines.append(
+                "PRIMARY CURRENT TASK — use this first for generic current-task/status questions; "
+                "do not substitute older unresolved work unless the user names it:"
+            )
+            lines.append(
+                f"  {primary['id']} | {primary_reason} | title={primary['title']}"
+            )
+            detail = primary_summary or primary_error
+            if detail:
+                if len(detail) > 360:
+                    detail = detail[:357] + "..."
+                lines.append(f"    detail={detail}")
+            if len(attention) > 1:
+                lines.append("SECONDARY ATTENTION — report only if relevant to the user's request:")
+                for _, _, r, reason, summary, error in attention[1:3]:
+                    lines.append(f"  {r['id']} | {reason} | title={r['title']}")
+        else:
+            lines.append("PRIMARY CURRENT TASK: no running/unresolved/failed-verification shared-system task in this window")
+
+        ordered = sorted(
+            by_id.values(),
+            key=lambda r: (
+                0 if r["status"] == "running" else 1,
+                -(r["last_heartbeat_at"] or r["started_at"] or r["created_at"] or 0),
+            ),
+        )
+        for r in ordered:
+            failure = (r["last_failure_error"] or "").strip().replace("\n", " ")
+            if len(failure) > 180:
+                failure = failure[:177] + "..."
+            lines.append(
+                f"TASK {r['id']} | {r['status']} | assignee={r['assignee']} | "
+                f"run={r['current_run_id'] or '-'} | heartbeat={_epoch_iso(r['last_heartbeat_at'])} | "
+                f"title={r['title']}"
+            )
+            if failure:
+                lines.append(f"  last_failure={failure}")
+            rr = latest_runs.get(r["id"])
+            if rr:
+                summary = (rr["summary"] or "").strip().replace("\n", " ")
+                if len(summary) > 420:
+                    summary = summary[:417] + "..."
+                if rr["outcome"] or summary or rr["error"]:
+                    lines.append(
+                        f"  latest_run=id:{rr['id']} status:{rr['status'] or '-'} "
+                        f"outcome:{rr['outcome'] or '-'} ended:{_epoch_iso(rr['ended_at'])}"
+                    )
+                if summary:
+                    lines.append(f"  latest_summary={summary}")
+                if rr["error"]:
+                    err = str(rr["error"]).strip().replace("\n", " ")
+                    if len(err) > 220:
+                        err = err[:217] + "..."
+                    lines.append(f"  latest_error={err}")
+        if links:
+            lines.append("TASK GRAPH:")
+            seen_links = set()
+            for link in links:
+                pair = (link["parent_id"], link["child_id"])
+                if pair in seen_links or pair[0] not in by_id or pair[1] not in by_id:
+                    continue
+                seen_links.add(pair)
+                lines.append(f"  {pair[0]} -> {pair[1]}")
+        return "\n".join(lines), None
+    except Exception as exc:
+        return f"KANBAN CONTINUITY: UNAVAILABLE — {type(exc).__name__}: {exc}", str(exc)
+
+
+def precedence_order() -> list[str]:
+    text, err = read_text(DOCTRINE / "doctrine_precedence.md")
+    if err or not text:
+        return []
+    out = []
+    in_order = False
+    for line in text.splitlines():
+        if line.strip() == "## Precedence order":
+            in_order = True
+            continue
+        if in_order and line.startswith("## "):
+            break
+        m = re.match(r"^\d+\.\s+([A-Za-z0-9_.-]+\.md)\b", line.strip())
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+now = dt.datetime.now().astimezone()
+today = now.date().isoformat()
+failures: list[str] = []
+
+readme = DOCTRINE / "README.md"
+precedence = DOCTRINE / "doctrine_precedence.md"
+ordered = precedence_order()
+all_doctrine = sorted(p.name for p in DOCTRINE.glob("*.md") if p.is_file())
+reserved = {"README.md", "doctrine_precedence.md"}
+unranked = [n for n in all_doctrine if n not in reserved and n not in ordered]
+
+# Deterministic Gauntlet startup invariant. Startup must load and verify every
+# binding doctrine file before BOOT STATUS may become COMPLETE. The model must
+# receive the same live bodies in precedence order; a manifest plus an
+# instruction to fetch later is not sufficient authority. Hashes remain in the
+# manifest so the exact loaded corpus is auditable.
+doctrine_files = ["README.md", "doctrine_precedence.md"] + ordered + unranked
+seen = set()
+doctrine_files = [n for n in doctrine_files if not (n in seen or seen.add(n))]
+
+doctrine_manifest = []
+doctrine_loaded_sections = []
+source_hash_parts = []
+constraints_body, constraints_err = read_text(BOOT_CONSTRAINTS)
+if constraints_err or not (constraints_body or "").strip():
+    failures.append(constraints_err or f"{BOOT_CONSTRAINTS}: empty canonical boot constraints")
+    constraints_body = "# NORTH CALEDONIA SHARED BOOT CONSTRAINTS\n\nBOOT CONSTRAINTS UNAVAILABLE — STOP BEFORE TASK EXECUTION."
+else:
+    constraints_body = constraints_body.strip()
+    source_hash_parts.append(f"{BOOT_CONSTRAINTS}:{sha(BOOT_CONSTRAINTS)}")
+for name in doctrine_files:
+    p = DOCTRINE / name
+    body, err = read_text(p)
+    if err:
+        failures.append(err)
+        body = f"BOOT REQUIRED FILE UNAVAILABLE: {err}"
+    digest = sha(p)
+    source_hash_parts.append(f"{p}:{digest}")
+    flags = []
+    if name in unranked:
+        flags.append("UNRANKED-BUT-BINDING")
+    flag_text = f" flags={','.join(flags)}" if flags else ""
+    doctrine_manifest.append(f"{name} sha256={digest or 'UNAVAILABLE'} path={p}{flag_text}")
+    doctrine_loaded_sections.append(section(f"BINDING DOCTRINE: {name}", body or ""))
+
+doctrine_sections = [
+    section("DOCTRINE MANIFEST — deterministically loaded and verified below", "\n".join(doctrine_manifest)),
+    *doctrine_loaded_sections,
+]
+
+# Shared vault session-start chain. Deliberately excludes company-private folders.
+required_vault = [
+    ("vault/CLAUDE.md", VAULT / "CLAUDE.md", None),
+    ("VAULT-INDEX.md", API_VAULT / "VAULT-INDEX.md", None),
+    ("Identity/Profile.md", VAULT / "Identity/Profile.md", None),
+    ("Identity/Goals.md", VAULT / "Identity/Goals.md", None),
+    ("Identity/Rules.md", VAULT / "Identity/Rules.md", None),
+    ("Jobs/mistake-logging.md", VAULT / "Jobs/mistake-logging.md", None),
+    ("Active Priorities.md", VAULT / "Active Priorities.md", None),
+]
+
+vault_manifest = []
+for label, path, _ in required_vault:
+    body, err = read_text(path)
+    if err:
+        failures.append(err)
+    digest = sha(path)
+    source_hash_parts.append(f"{path}:{digest}")
+    vault_manifest.append(f"{label} sha256={digest or 'UNAVAILABLE'} path={path}")
+
+vault_sections = [section(
+    "SHARED VAULT MANIFEST — verified at startup; task-scoped bodies remain on demand",
+    "\n".join(vault_manifest),
+)]
+
+# VAULT-INDEX is the shared canonical index for both Claude and Erika. It is a
+# startup authority surface, not task-scoped company data, so load its live body
+# deterministically before COMPLETE.
+vault_index_path = API_VAULT / "VAULT-INDEX.md"
+vault_index_body, vault_index_err = read_text(vault_index_path)
+if vault_index_err:
+    failures.append(vault_index_err)
+    vault_index_body = f"BOOT REQUIRED FILE UNAVAILABLE: {vault_index_err}"
+vault_sections.append(section("SHARED CANONICAL VAULT-INDEX — deterministically loaded", vault_index_body or ""))
+
+# Today's daily log: index only unless a task requires deeper retrieval.
+daily = VAULT / "Logs/daily" / f"{today}.md"
+if not daily.exists():
+    # A new calendar day does not require a daily log to exist before the first
+    # session starts. Treat absence as an empty index, not a boot failure.
+    daily_view = "(today's daily log has not been created yet)"
+    daily_err = None
+else:
+    daily_body, daily_err = read_text(daily)
+    if daily_err:
+        failures.append(daily_err)
+        daily_view = f"BOOT REQUIRED FILE UNAVAILABLE: {daily_err}"
+    else:
+        lines = (daily_body or "").splitlines()
+        daily_view = "\n".join(lines[:DAILY_INDEX_LINES])
+        if len(lines) > DAILY_INDEX_LINES:
+            daily_view += f"\n... [index window only; {len(lines)-DAILY_INDEX_LINES} more lines at {daily}] ..."
+source_hash_parts.append(f"{daily}:{sha(daily)}")
+vault_sections.append(section(f"today's daily log index: {daily.name}", daily_view))
+
+# Latest checkpoint metadata for continuity.
+# IMPORTANT: do not inject arbitrary checkpoint body text into shared boot. A checkpoint may
+# contain company-private or task-scoped context. Shared boot may compare path/hash/mtime only;
+# the checkpoint body is opened later only after task scope is known and authorized.
+checkpoints = sorted(glob.glob(str(VAULT / "Logs/daily/*checkpoint*.md")), key=os.path.getmtime)
+if checkpoints:
+    cp = Path(checkpoints[-1])
+    source_hash_parts.append(f"{cp}:{sha(cp)}")
+    cp_meta = (
+        f"LATEST CHECKPOINT METADATA ONLY\n"
+        f"path={cp}\n"
+        f"sha256={sha(cp)}\n"
+        f"mtime={dt.datetime.fromtimestamp(cp.stat().st_mtime, tz=now.tzinfo).isoformat()}\n"
+        "body_not_loaded=true — open only after the current task scope authorizes it"
+    )
+    vault_sections.append(section(f"latest checkpoint metadata: {cp.name}", cp_meta))
+else:
+    failures.append("no checkpoint file found")
+
+# Live local repo state. No network fetch, no credentials, no company-private reads.
+doctrine_head, _ = run(["git", "-C", str(DOCTRINE), "rev-parse", "--short=12", "HEAD"])
+vault_head, _ = run(["git", "-C", str(VAULT), "rev-parse", "--short=12", "HEAD"])
+vault_status, _ = run(["git", "-C", str(VAULT), "status", "--short", "--branch"])
+
+# Vault truth checks from the canonical Claude boot sequence. The wrapper resolves its
+# own credentials without rendering them; only its human-readable verdict enters context.
+vault_prs, vp_rc = run([str(CH / ".local/bin/vault-pr-check")], timeout=30)
+if vp_rc != 0:
+    failures.append(f"vault-pr-check failed rc={vp_rc}")
+    vault_prs = vault_prs or "UNAVAILABLE — open vault PR state is unverified."
+elif not vault_prs:
+    vault_prs = "(none reported)"
+
+# Checkpoint freshness uses metadata only — never read Claude session bodies here, because
+# those may contain company-private context. Shared boot may compare timestamps, not commingle
+# session contents.
+claude_sessions = list((CH / ".claude/projects/-home-chris").glob("*.jsonl"))
+if claude_sessions:
+    newest_session = max(claude_sessions, key=lambda p: p.stat().st_mtime)
+    newest_session_ts = dt.datetime.fromtimestamp(newest_session.stat().st_mtime, tz=now.tzinfo)
+else:
+    newest_session = None
+    newest_session_ts = None
+
+if checkpoints:
+    checkpoint_ts = dt.datetime.fromtimestamp(Path(checkpoints[-1]).stat().st_mtime, tz=now.tzinfo)
+else:
+    checkpoint_ts = None
+
+if newest_session_ts and checkpoint_ts:
+    checkpoint_freshness = (
+        f"FRESH — checkpoint mtime {checkpoint_ts.isoformat()} >= newest Claude session mtime {newest_session_ts.isoformat()}"
+        if checkpoint_ts >= newest_session_ts
+        else f"STALE — newest Claude session mtime {newest_session_ts.isoformat()} is newer than checkpoint mtime {checkpoint_ts.isoformat()}; treat carry-forward state as unverified"
+    )
+elif newest_session_ts and not checkpoint_ts:
+    checkpoint_freshness = "STALE — Claude session history exists but no checkpoint was found"
+else:
+    checkpoint_freshness = "UNVERIFIED — no Claude session metadata available for comparison"
+
+# Open-item reconciliation is intentionally on-demand. It is not a boot safety
+# gate and historically costs several seconds even when returning nonzero.
+# Current-task continuity comes from canonical Kanban state; run the full
+# checker only when a request actually depends on broader open-item truth.
+open_items = (
+    "ON-DEMAND — not executed during thin boot. "
+    "Run /home/chris/.local/bin/open-items-check only when the current request "
+    "requires broader open-item reconciliation."
+)
+
+# Compact canonical open-priorities manifest. This is intentionally NOT the
+# full Active Priorities body: it gives Erika enough continuity to resolve
+# named work that is not currently represented by an active Kanban card, while
+# preserving the memory-on-demand/token discipline. Each OPEN section contributes
+# its heading plus the first non-empty content line only.
+active_priorities_path = VAULT / "Active Priorities.md"
+active_priorities_body, active_priorities_err = read_text(active_priorities_path)
+if active_priorities_err:
+    failures.append(active_priorities_err)
+    open_priorities_manifest = f"UNAVAILABLE — {active_priorities_err}"
+else:
+    ap_lines = (active_priorities_body or "").splitlines()
+    ap_rows = []
+    i = 0
+    while i < len(ap_lines):
+        line = ap_lines[i].strip()
+        if line.startswith("## OPEN "):
+            summary = ""
+            j = i + 1
+            while j < len(ap_lines):
+                candidate = ap_lines[j].strip()
+                if candidate.startswith("## "):
+                    break
+                if candidate and not candidate.startswith("<!--"):
+                    summary = candidate
+                    break
+                j += 1
+            ap_rows.append(f"- {line[3:]}" + (f" — {summary}" if summary else ""))
+        i += 1
+    open_priorities_manifest = "\n".join(ap_rows) if ap_rows else "(none)"
+
+kanban_continuity, kanban_err = kanban_continuity_state()
+if kanban_err:
+    failures.append(f"kanban continuity unavailable: {kanban_err}")
+
+# External skill/plugin supply-chain gate. Cleared third-party copies are pinned by content
+# hash and frozen locally. Any drift or unregistered externally installed skill/plugin makes
+# shared boot DEGRADED before an agent is allowed to execute work.
+skill_trust, st_rc = run([str(HERMES / "security/skill-trust/verify.py")], timeout=20)
+if st_rc != 0:
+    failures.append(f"skill supply-chain gate failed rc={st_rc}: {skill_trust or 'no verifier output'}")
+    skill_trust = skill_trust or "SKILL TRUST: FAIL — verifier returned no output"
+
+skill_integrity_raw, si_rc = run(
+    [str(CH / ".local/bin/skill-integrity"), "verify", "--json"], timeout=30
+)
+try:
+    si = __import__("json").loads(skill_integrity_raw or "{}")
+    violations = si.get("violations") or []
+    missing = si.get("missing") or []
+    unfrozen_all = si.get("unfrozen") or []
+    # Claude marketplace *.staging trees are source/download staging, not active
+    # installed payloads. Active installed plugins remain covered by the separate
+    # claude-cache root. Do not degrade boot solely for staged marketplace copies.
+    staging_unfrozen = [x for x in unfrozen_all if ".staging/" in x]
+    active_unfrozen = [x for x in unfrozen_all if ".staging/" not in x]
+    integrity_clean = not (violations or missing or active_unfrozen)
+    skill_integrity = (
+        f"SKILL INTEGRITY: {'OK' if integrity_clean else 'FAIL'} — "
+        f"frozen={si.get('locked', 0)} changed={len(violations)} "
+        f"active_unfrozen={len(active_unfrozen)} missing={len(missing)} "
+        f"staging_ignored={len(staging_unfrozen)}"
+    )
+    if not integrity_clean:
+        failures.append(
+            "full skill integrity gate failed: "
+            f"changed={len(violations)} active_unfrozen={len(active_unfrozen)} missing={len(missing)}"
+        )
+except Exception as exc:
+    skill_integrity = skill_integrity_raw or "SKILL INTEGRITY: FAIL — verifier returned no output"
+    if si_rc != 0:
+        failures.append(f"full skill integrity gate failed rc={si_rc}: {type(exc).__name__}: {exc}")
+
+# Runtime identity without reading secrets.
+def pyproject_version(root: Path) -> str:
+    p = root / "pyproject.toml"
+    body, err = read_text(p)
+    if err or not body:
+        return "UNAVAILABLE"
+    m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', body)
+    return m.group(1) if m else "UNAVAILABLE"
+
+target_v = pyproject_version(HERMES / "hermes-agent-next")
+
+fingerprint = hashlib.sha256("\n".join(source_hash_parts).encode()).hexdigest()
+boot_status = "DEGRADED — STOP BEFORE TASK EXECUTION" if failures else "COMPLETE"
+failure_text = "\n".join(f"- {x}" for x in failures) if failures else "(none)"
+unranked_text = ", ".join(unranked) if unranked else "(none)"
+doctrine_blob = "\n\n".join(doctrine_sections)
+vault_blob = "\n\n".join(vault_sections)
+
+print(f"""{constraints_body}
+
+BOOT CONSTRAINTS SHA256: {sha(BOOT_CONSTRAINTS)}
+
+<shared-boot-state>
+BOOT STATUS: {boot_status}
+BOOT TIME: {now.isoformat()}
+BOOT SOURCE FINGERPRINT: {fingerprint}
+DOCTRINE VERSION: {version_of(readme)}
+DOCTRINE REPO HEAD: {doctrine_head or 'UNAVAILABLE'}
+VAULT REPO HEAD: {vault_head or 'UNAVAILABLE'}
+HERMES RUNTIME VERSION: target={target_v}
+UNRANKED DOCTRINE FILES: {unranked_text}
+
+ROLE BOUNDARY:
+- Christopher is final authority.
+- Erika/Hermes governs company operations and routes work through the authority chain.
+- Claude Code is the privileged system-maintenance executor for architecture, code, infrastructure, security, recovery, repositories, and tooling.
+- Claude does not become a company operator or governance authority. Erika does not absorb Claude's maintenance execution.
+- Company-private data is never loaded merely because this is a shared boot. Every company remains a sealed lane. Cross-company uncertainty defaults to FORBIDDEN.
+
+GAUNTLET RELIABILITY CONTRACT:
+- Understand objective and acceptance criteria before mutation.
+- Investigate current state; do not act from remembered state.
+- Plan rollback before reversible mutation.
+- Execute only inside authorized scope.
+- Verify the work itself with falsifiable evidence.
+- Failed verification enters repair/recovery, never completion.
+- Regression-test material repairs.
+- Only verified lessons may become durable canonical learning; failed or unresolved attempts remain observations/candidates.
+- No direct EXECUTING -> COMPLETED claim.
+
+REQUIRED-CHAIN FAILURES:
+{failure_text}
+
+SKILL / PLUGIN SUPPLY-CHAIN GATE:
+{skill_trust}
+{skill_integrity}
+
+LOCAL VAULT GIT STATE:
+{vault_status or '(clean/no output)'}
+
+OPEN VAULT PR CHECK:
+{vault_prs}
+
+CHECKPOINT FRESHNESS (metadata only; no Claude session content loaded):
+{checkpoint_freshness}
+
+OPEN ITEMS — live checker output; RESOLVED outranks old checkpoint narrative, MANUAL means unverified:
+{open_items}
+
+OPEN PRIORITIES — canonical Active Priorities headings, compact manifest only:
+{open_priorities_manifest}
+
+CURRENT KANBAN CONTINUITY — canonical task database, shared-system lanes only:
+{kanban_continuity}
+
+{doctrine_blob}
+
+{vault_blob}
+</shared-boot-state>
+
+This block is the shared canonical startup context. Identity files may specialize role and tone but may not override doctrine. If BOOT STATUS is DEGRADED, ordinary task execution is blocked and the named failure must be surfaced. The sole execution exception is an explicitly created substrate-recovery task whose objective is to repair that named failed gate: its executor may inspect and repair only the failed gate, rerun the same gate for evidence, and report the result. The original user request remains parked until the gate is verified green. Read company-specific notes only when the current authorized task requires that company's scope.""")
+
+
+
+if GATE_EXIT_CODE and failures:
+    sys.exit(2)

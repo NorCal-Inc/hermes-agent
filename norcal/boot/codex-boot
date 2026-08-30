@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import hashlib, os, subprocess, sys
+
+HERE = Path(__file__).resolve().parent
+SHARED = HERE / "hermes-shared-boot-context"
+CONSTRAINTS = HERE / "boot-constraints.md"
+OUT = Path.home() / ".codex" / "norcal-boot-current.md"
+REAL_CODEX = Path("/home/chris/.hermes/node/bin/codex")
+
+def die(msg: str, rc: int = 2):
+    print(f"CODEX BOOT: DEGRADED — STOP BEFORE TASK EXECUTION: {msg}", file=sys.stderr)
+    raise SystemExit(rc)
+
+if not REAL_CODEX.exists():
+    die(f"real Codex binary missing: {REAL_CODEX}")
+try:
+    c = CONSTRAINTS.read_text(encoding="utf-8").strip()
+except Exception as exc:
+    die(f"canonical constraints unreadable: {exc}")
+proc = subprocess.run([str(SHARED), "--gate-exit-code"], capture_output=True, text=True, timeout=60)
+body = (proc.stdout or proc.stderr or "").strip()
+if proc.returncode != 0:
+    die(f"shared boot gate returned {proc.returncode}\n{body[-2000:]}")
+if not body.startswith(c):
+    die("shared boot output does not begin with the canonical constraints")
+if "BOOT STATUS: COMPLETE" not in body:
+    die("shared boot did not reach COMPLETE")
+OUT.parent.mkdir(parents=True, exist_ok=True)
+tmp = OUT.with_name("." + OUT.name + ".tmp")
+tmp.write_text(body + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, OUT)
+os.execv(str(REAL_CODEX), [str(REAL_CODEX), *sys.argv[1:]])
