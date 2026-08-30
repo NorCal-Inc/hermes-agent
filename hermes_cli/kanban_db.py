@@ -180,6 +180,68 @@ REGRESSION_EVIDENCE_KEYS = (
     "checks",
 )
 
+# --- Verified lessons: the last link of the Gauntlet contract -------------
+#
+# "Only verified lessons may become durable canonical learning; failed or
+# unresolved attempts remain observations/candidates." Everything above makes
+# a verdict durable; this makes the *learning* durable, and — the part that
+# actually changes behaviour — makes future work consume it mechanically
+# instead of hoping a model remembers.
+#
+# Three properties, each enforced in code rather than asserted in prose:
+#
+#   1. PROVENANCE. A lesson can only be promoted from a task whose Gauntlet
+#      state is durably VERIFIED (``verification_state='verified'`` with no
+#      regression debt outstanding — the same pair ``complete_task``'s UPDATE
+#      tests). A task that ever FAILED verification additionally has to show
+#      the material-repair proof was actually spent, so "it failed, then we
+#      said it passed" cannot become canon. See :func:`lesson_source_state`.
+#
+#   2. SCOPE. A lesson never crosses a tenant boundary. A tenant-scoped source
+#      produces a tenant-scoped lesson that only that tenant's tasks can ever
+#      receive. A source with no tenant produces nothing by default — an
+#      unscoped lesson is a cross-lane broadcast, so it takes an explicit
+#      operator flag (``allow_global``) to create one.
+#
+#   3. CONSUMPTION. :func:`build_worker_context` — the one funnel every
+#      dispatched worker reads its task through — injects the active,
+#      in-scope, applicable lessons as BINDING constraints with their source
+#      task and ledger id attached. No embeddings, no semantic inference: the
+#      applicability selector is an exact string match against a closed set of
+#      selectors derived from the receiving task row. A selector that does not
+#      match exactly does not fire.
+#
+# Retirement flips ``active`` and stamps who/when/why; the row and its
+# ``task_events`` trail stay, so a retired lesson stops being injected without
+# erasing that it once governed.
+LESSON_SCOPE_TENANT = "tenant"
+LESSON_SCOPE_GLOBAL = "global"
+VALID_LESSON_SCOPES = {LESSON_SCOPE_TENANT, LESSON_SCOPE_GLOBAL}
+
+# Applicability selectors. Deliberately a closed set of dimensions read
+# straight off the receiving task's row: every one of them is a fact the
+# kernel already knows, so matching is exact string equality and two readers
+# always agree on whether a lesson fires. ``all`` is the deliberate
+# board-or-tenant-wide selector.
+LESSON_SELECTOR_ALL = "all"
+LESSON_SELECTOR_DIMENSIONS = {
+    # dimension  -> Task attribute it is read from
+    "assignee": "assignee",
+    "project": "project_id",
+    "workspace": "workspace_kind",
+    "lane": "executor_lane",
+    "template": "workflow_template_id",
+    "tenant": "tenant",
+}
+# Bounds on the injected block, in the same spirit as the other _CTX_ caps
+# below: a board that promotes hundreds of lessons must not turn every worker
+# prompt into a rulebook.
+_CTX_MAX_LESSONS = 25
+_CTX_MAX_LESSON_BYTES = 2 * 1024
+# A lesson is a rule a future worker is told to obey, so the text itself is
+# bounded at write time too.
+LESSON_MAX_CHARS = 4000
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1651,6 +1713,50 @@ CREATE TABLE IF NOT EXISTS task_verifications (
 CREATE INDEX IF NOT EXISTS idx_task_verifications_task
     ON task_verifications(task_id, id);
 
+-- Promoted lessons: what a VERIFIED task established, in a form future work
+-- is made to consume. Written only by ``promote_lesson``, which refuses any
+-- source task that is not durably verified (and, if it ever failed, has not
+-- spent its material-repair proof). Rows are never deleted or rewritten;
+-- retirement stamps the three ``retired_*`` columns and flips ``active``, so
+-- a lesson that no longer governs is still visible as one that once did.
+CREATE TABLE IF NOT EXISTS task_lessons (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_task_id      TEXT NOT NULL,
+    -- Tenant lane this lesson belongs to. NULL only when ``scope='global'``,
+    -- which an operator has to ask for explicitly: a tenant-scoped source can
+    -- never produce a global lesson, and an untenanted source produces
+    -- nothing at all unless the operator says otherwise.
+    tenant              TEXT,
+    scope               TEXT NOT NULL,  -- 'tenant' | 'global'
+    -- Exact-match selector, normalised at write time: 'all' or
+    -- '<dimension>:<value>' over LESSON_SELECTOR_DIMENSIONS. No inference —
+    -- a receiving task either produces this exact string among its own
+    -- selectors or the lesson does not fire for it.
+    applicability       TEXT NOT NULL,
+    -- The rule itself. Injected verbatim into applicable workers' context as
+    -- a binding constraint, so it is bounded (LESSON_MAX_CHARS) at write time.
+    lesson              TEXT NOT NULL,
+    -- JSON provenance: free-form facts the promoter recorded, plus the
+    -- kernel-derived source snapshot (verified_at, verifier, ...).
+    evidence            TEXT,
+    -- Ledger ids the promotion was authorised by: the VERIFIED verdict row,
+    -- and the regression proof it spent when the source had ever failed.
+    verification_id     INTEGER,
+    regression_proof_id INTEGER,
+    created_by          TEXT,
+    created_at          INTEGER NOT NULL,
+    active              INTEGER NOT NULL DEFAULT 1,
+    retired_at          INTEGER,
+    retired_by          TEXT,
+    retired_reason      TEXT
+);
+
+-- Injection reads active lessons by scope + selector on every context build.
+CREATE INDEX IF NOT EXISTS idx_task_lessons_lookup
+    ON task_lessons(active, applicability);
+CREATE INDEX IF NOT EXISTS idx_task_lessons_source
+    ON task_lessons(source_task_id, id);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -2985,6 +3091,35 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "covers_phase_id",
                 "covers_phase_id INTEGER",
             )
+
+    # Promoted lessons. The table itself arrives via SCHEMA_SQL's CREATE TABLE
+    # IF NOT EXISTS, which ``connect()`` re-runs for every board — a legacy DB
+    # simply gains an empty table and behaves exactly as before, since nothing
+    # is injected until something is promoted. This pass covers the narrower
+    # case of a board written by an intermediate build that has the table but
+    # not every column, and is a no-op on a current one.
+    lessons_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='task_lessons'"
+    ).fetchone() is not None
+    if lessons_table_exists:
+        lesson_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_lessons)")
+        }
+        for col, ddl in (
+            ("tenant", "tenant TEXT"),
+            ("scope", f"scope TEXT NOT NULL DEFAULT '{LESSON_SCOPE_TENANT}'"),
+            ("evidence", "evidence TEXT"),
+            ("verification_id", "verification_id INTEGER"),
+            ("regression_proof_id", "regression_proof_id INTEGER"),
+            ("created_by", "created_by TEXT"),
+            ("active", "active INTEGER NOT NULL DEFAULT 1"),
+            ("retired_at", "retired_at INTEGER"),
+            ("retired_by", "retired_by TEXT"),
+            ("retired_reason", "retired_reason TEXT"),
+        ):
+            if col not in lesson_cols:
+                _add_column_if_missing(conn, "task_lessons", col, ddl)
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -7940,6 +8075,553 @@ def set_gauntlet_enforced(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Verified lessons — promotion, scope, and mechanical consumption
+# ---------------------------------------------------------------------------
+
+class LessonPromotionError(ValueError):
+    """A lesson promotion was refused. ``code`` classifies why.
+
+    Structured because every surface has to say the same thing about the same
+    refusal: the CLI prints it, the worker tool turns it into a retryable
+    error naming the legal next step, and the tests assert on the code rather
+    than on prose.
+    """
+
+    def __init__(self, code: str, message: str, **detail: Any):
+        self.code = code
+        self.detail = detail
+        super().__init__(message)
+
+
+def normalize_lesson_applicability(value: Optional[str]) -> str:
+    """Normalise and validate an applicability selector. Raises on garbage.
+
+    The selector is the whole matching mechanism, so it is deliberately a
+    closed grammar rather than free text: either the literal ``all`` or
+    ``<dimension>:<value>`` for a dimension in
+    :data:`LESSON_SELECTOR_DIMENSIONS`. Case and surrounding whitespace are
+    normalised at write time so that matching downstream is plain string
+    equality — no trimming, no case folding, no partial matches, no
+    inference.
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        raise LessonPromotionError(
+            "empty_applicability",
+            "applicability is required: name exactly which future tasks this "
+            "lesson binds, e.g. 'all', 'assignee:coder', 'project:api', "
+            f"'workspace:repo'. Valid dimensions: "
+            f"{', '.join(sorted(LESSON_SELECTOR_DIMENSIONS))}.",
+        )
+    if text == LESSON_SELECTOR_ALL:
+        return LESSON_SELECTOR_ALL
+    dimension, sep, target = text.partition(":")
+    target = target.strip()
+    if not sep or not target or dimension not in LESSON_SELECTOR_DIMENSIONS:
+        raise LessonPromotionError(
+            "invalid_applicability",
+            f"applicability {text!r} is not a valid selector. Use 'all' or "
+            f"'<dimension>:<value>' with dimension in "
+            f"{', '.join(sorted(LESSON_SELECTOR_DIMENSIONS))} — matching is "
+            f"exact, so a selector this kernel cannot evaluate is refused "
+            f"rather than silently never firing.",
+        )
+    return f"{dimension}:{target}"
+
+
+def task_lesson_selectors(task: Task) -> list[str]:
+    """Return the exact selector strings ``task`` matches, in stable order.
+
+    Read straight off the task row. This is the receiving half of the exact
+    match: a lesson fires for this task if and only if its ``applicability``
+    is one of these strings.
+    """
+    selectors = [LESSON_SELECTOR_ALL]
+    for dimension in sorted(LESSON_SELECTOR_DIMENSIONS):
+        raw = getattr(task, LESSON_SELECTOR_DIMENSIONS[dimension], None)
+        value = str(raw).strip().lower() if raw is not None else ""
+        if value:
+            selectors.append(f"{dimension}:{value}")
+    return selectors
+
+
+def _latest_verdict_row(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[sqlite3.Row]:
+    """Most recent ``kind='verdict'`` ledger row for a task, or None."""
+    return conn.execute(
+        "SELECT id, state, verifier, evidence, reason, created_at "
+        "FROM task_verifications "
+        "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, LEDGER_KIND_VERDICT),
+    ).fetchone()
+
+
+def _ever_failed_verification(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when this task's ledger contains any failing verdict, ever."""
+    return conn.execute(
+        "SELECT 1 FROM task_verifications "
+        "WHERE task_id = ? AND kind = ? AND state = ? LIMIT 1",
+        (task_id, LEDGER_KIND_VERDICT, VERIFICATION_FAILED),
+    ).fetchone() is not None
+
+
+def lesson_source_state(
+    conn: sqlite3.Connection, task_id: str
+) -> dict[str, Any]:
+    """Decide whether ``task_id`` is a legitimate source of canonical learning.
+
+    Returns a dict with ``ok`` plus, on refusal, ``code``/``detail``; on
+    success, the ledger ids that authorised it. The rule, in order:
+
+    * The head must be a durable ``verified`` — not ``pending`` (nobody has
+      ruled yet), not ``failed`` (it was ruled against), and not ``None``
+      (either it never entered the chain, or a later implementation run
+      invalidated the verdict, which is exactly the case where a lesson would
+      be drawn from work the verifier never saw).
+    * No regression debt may be outstanding: ``regression_required`` must be
+      clear. This is the same pair ``complete_task`` tests, so "may promote a
+      lesson" and "may complete" cannot drift apart.
+    * If the task EVER failed verification, the passing verdict must name the
+      regression proof it spent (``evidence.regression_proof_id``) and that
+      proof must be a real ledger row for this task recorded after the failure
+      that armed it. A repair blessed without re-running the checks is exactly
+      the "unresolved attempt" the contract keeps out of canon.
+    """
+    row = conn.execute(
+        "SELECT id, tenant, status, verification_state, regression_required "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "ok": False,
+            "code": "unknown_task",
+            "detail": f"task {task_id} not found",
+        }
+    keys = set(row.keys())
+    state = row["verification_state"] if "verification_state" in keys else None
+    regression_required = bool(
+        "regression_required" in keys and row["regression_required"]
+    )
+    base = {
+        "task_id": task_id,
+        "tenant": row["tenant"] if "tenant" in keys else None,
+        "status": row["status"],
+        "verification_state": state,
+    }
+
+    if state != VERIFICATION_VERIFIED:
+        if state == VERIFICATION_FAILED:
+            detail = (
+                f"task {task_id} FAILED verification; a failed attempt stays "
+                f"an observation, never canonical learning. Repair it, "
+                f"re-verify with regression evidence, then promote."
+            )
+        elif state == VERIFICATION_PENDING:
+            detail = (
+                f"task {task_id} is still awaiting a verdict; nothing is "
+                f"verified yet, so there is nothing to promote."
+            )
+        else:
+            detail = (
+                f"task {task_id} has no live verification (state="
+                f"{state!r}). Either it never entered the Gauntlet chain, or "
+                f"a later implementation run invalidated the verdict — "
+                f"either way the lesson would not be backed by a verifier."
+            )
+        return {**base, "ok": False, "code": "not_verified", "detail": detail}
+
+    if regression_required:
+        return {
+            **base,
+            "ok": False,
+            "code": "regression_outstanding",
+            "detail": (
+                f"task {task_id} still owes regression evidence for a "
+                f"material repair; its verified head cannot be spent on a "
+                f"lesson (or a completion) until a passing verdict carries "
+                f"the proof."
+            ),
+        }
+
+    verdict = _latest_verdict_row(conn, task_id)
+    if verdict is None or verdict["state"] != VERIFICATION_VERIFIED:
+        # The head says verified but the ledger behind it does not agree.
+        return {
+            **base,
+            "ok": False,
+            "code": "ledger_mismatch",
+            "detail": (
+                f"task {task_id} reads verified but its verification ledger "
+                f"does not show a passing verdict as the latest entry; "
+                f"refusing to promote learning with no evidence behind it."
+            ),
+        }
+
+    try:
+        verdict_evidence = json.loads(verdict["evidence"] or "null")
+    except (json.JSONDecodeError, TypeError):
+        verdict_evidence = None
+    proof_id = None
+    if isinstance(verdict_evidence, dict):
+        raw_proof = verdict_evidence.get("regression_proof_id")
+        if isinstance(raw_proof, int):
+            proof_id = raw_proof
+
+    if _ever_failed_verification(conn, task_id):
+        armed_after = _arming_failure_id(conn, task_id)
+        proof_ok = False
+        if proof_id is not None:
+            proof_ok = conn.execute(
+                "SELECT 1 FROM task_verifications "
+                "WHERE id = ? AND task_id = ? AND kind = ? AND id > ? LIMIT 1",
+                (proof_id, task_id, LEDGER_KIND_REGRESSION, armed_after),
+            ).fetchone() is not None
+        if not proof_ok:
+            return {
+                **base,
+                "ok": False,
+                "code": "regression_proof_missing",
+                "detail": (
+                    f"task {task_id} failed verification at least once, so "
+                    f"its passing verdict must name the regression proof it "
+                    f"spent. The ledger shows no such proof recorded after "
+                    f"the failure, so the repair was never demonstrated and "
+                    f"cannot become canonical learning."
+                ),
+            }
+
+    return {
+        **base,
+        "ok": True,
+        "verification_id": int(verdict["id"]),
+        "regression_proof_id": proof_id,
+        "verifier": verdict["verifier"],
+        "verified_at": verdict["created_at"],
+        "ever_failed": _ever_failed_verification(conn, task_id),
+    }
+
+
+def _lesson_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    try:
+        evidence = json.loads(row["evidence"]) if row["evidence"] else None
+    except (json.JSONDecodeError, TypeError):
+        evidence = None
+    return {
+        "id": int(row["id"]),
+        "source_task_id": row["source_task_id"],
+        "tenant": row["tenant"],
+        "scope": row["scope"],
+        "applicability": row["applicability"],
+        "lesson": row["lesson"],
+        "evidence": evidence,
+        "verification_id": row["verification_id"],
+        "regression_proof_id": row["regression_proof_id"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+        "active": bool(row["active"]),
+        "retired_at": row["retired_at"] if "retired_at" in keys else None,
+        "retired_by": row["retired_by"] if "retired_by" in keys else None,
+        "retired_reason": (
+            row["retired_reason"] if "retired_reason" in keys else None
+        ),
+    }
+
+
+def promote_lesson(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lesson: str,
+    applicability: str,
+    actor: Optional[str] = None,
+    evidence: Optional[dict] = None,
+    allow_global: bool = False,
+) -> dict[str, Any]:
+    """Promote a verified task's finding into a durable, binding lesson.
+
+    The one way a row enters ``task_lessons``. Refuses — raising
+    :class:`LessonPromotionError` and writing nothing — unless all of:
+
+    * ``lesson`` and ``applicability`` are non-empty, and the selector is one
+      this kernel can actually evaluate (:func:`normalize_lesson_applicability`).
+    * The source task is durably VERIFIED with any material-repair proof
+      already spent (:func:`lesson_source_state`).
+    * The scope is safe: a tenant-scoped source yields a lesson only that
+      tenant's tasks can receive, and never a global one. An untenanted
+      source yields nothing unless ``allow_global`` — an operator saying, in
+      as many words, "this belongs to every lane".
+
+    Returns the created lesson row as a dict. The refusal is recorded as a
+    ``lesson_promotion_blocked`` event on the source task, so an attempt to
+    launder an unverified claim into canon is as auditable as a successful
+    promotion. That event is written in its own transaction *after* the
+    refusal has rolled the promotion back — an audit row inside the aborted
+    transaction would roll back with it and the attempt would leave no trace.
+    """
+    text = (lesson or "").strip()
+    selector = normalize_lesson_applicability(applicability)
+    actor = _canonical_assignee(actor) if actor else None
+
+    if not text:
+        raise LessonPromotionError(
+            "empty_lesson",
+            "lesson text is required: state the rule future work must "
+            "follow, not that one exists.",
+        )
+    if len(text) > LESSON_MAX_CHARS:
+        raise LessonPromotionError(
+            "lesson_too_long",
+            f"lesson text is {len(text)} chars; the limit is "
+            f"{LESSON_MAX_CHARS}. A binding rule that does not fit in a "
+            f"paragraph is a document, and belongs on the card instead.",
+        )
+    if evidence is not None and not isinstance(evidence, dict):
+        raise LessonPromotionError(
+            "invalid_evidence",
+            "evidence must be a JSON object of falsifiable facts",
+        )
+    # A lesson is injected verbatim into future workers' prompts, so it goes
+    # through the same redaction boundary as every other durable handoff.
+    text = str(redact_review_value(text)).strip()
+
+    # Set when the promotion is refused inside the transaction below. The
+    # refusal has to leave the write txn before it is raised or audited, so
+    # the decision is carried out rather than thrown out.
+    refusal: Optional[LessonPromotionError] = None
+    row = None
+    with write_txn(conn):
+        state = lesson_source_state(conn, task_id)
+        source_tenant = state.get("tenant")
+        if not state["ok"]:
+            refusal = LessonPromotionError(
+                state["code"], state["detail"],
+                verification_state=state.get("verification_state"),
+            )
+        elif source_tenant and allow_global:
+            refusal = LessonPromotionError(
+                "tenant_cannot_go_global",
+                f"task {task_id} belongs to tenant {source_tenant!r}; a "
+                f"tenant-scoped source cannot produce a global lesson. Its "
+                f"learning stays inside its own lane.",
+                tenant=source_tenant,
+            )
+        elif not source_tenant and not allow_global:
+            refusal = LessonPromotionError(
+                "global_not_authorised",
+                f"task {task_id} has no tenant, so promoting it would create "
+                f"a lesson binding on every lane. That is an operator "
+                f"decision: re-run with the explicit global flag if it "
+                f"genuinely applies board-wide.",
+            )
+
+        if refusal is None:
+            if source_tenant:
+                scope, tenant = LESSON_SCOPE_TENANT, source_tenant
+            else:
+                scope, tenant = LESSON_SCOPE_GLOBAL, None
+
+            provenance: dict[str, Any] = {
+                "source_status": state["status"],
+                "verification_state": state["verification_state"],
+                "verification_id": state["verification_id"],
+                "verified_at": state["verified_at"],
+                "verifier": state["verifier"],
+                "source_ever_failed_verification": state["ever_failed"],
+            }
+            if state["regression_proof_id"] is not None:
+                provenance["regression_proof_id"] = state["regression_proof_id"]
+            if evidence:
+                provenance["promoter_evidence"] = redact_review_value(evidence)
+
+            now = int(time.time())
+            cur = conn.execute(
+                """
+                INSERT INTO task_lessons
+                    (source_task_id, tenant, scope, applicability, lesson,
+                     evidence, verification_id, regression_proof_id,
+                     created_by, created_at, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    task_id,
+                    tenant,
+                    scope,
+                    selector,
+                    text,
+                    json.dumps(provenance, ensure_ascii=False, sort_keys=True),
+                    state["verification_id"],
+                    state["regression_proof_id"],
+                    actor,
+                    now,
+                ),
+            )
+            lesson_id = int(cur.lastrowid)
+            _append_event(
+                conn, task_id, "lesson_promoted",
+                {
+                    "lesson_id": lesson_id,
+                    "scope": scope,
+                    "tenant": tenant,
+                    "applicability": selector,
+                    "actor": actor,
+                    "verification_id": state["verification_id"],
+                    "regression_proof_id": state["regression_proof_id"],
+                },
+            )
+            row = conn.execute(
+                "SELECT * FROM task_lessons WHERE id = ?", (lesson_id,)
+            ).fetchone()
+
+    if refusal is not None:
+        # Nothing was written by the aborted transaction. Record the attempt
+        # itself — a refused promotion is exactly the event a later reader
+        # wants to see, because it is someone trying to make unverified work
+        # canonical. Skipped for an unknown task: there is no card to hang it
+        # on, and task_events would carry a dangling id.
+        if refusal.code != "unknown_task":
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "lesson_promotion_blocked",
+                    {
+                        "code": refusal.code,
+                        "detail": str(refusal),
+                        "actor": actor,
+                        "applicability": selector,
+                        **refusal.detail,
+                    },
+                )
+        raise refusal
+    return _lesson_row_to_dict(row)
+
+
+def retire_lesson(
+    conn: sqlite3.Connection,
+    lesson_id: int,
+    *,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Stop injecting a lesson without erasing that it once governed.
+
+    Flips ``active`` to 0 and stamps who/when/why. The row stays, the
+    ``lesson_promoted`` event stays, and a ``lesson_retired`` event is
+    appended to the source task — so the history reads "this rule bound work
+    between these two dates", which is the question a later reader actually
+    has. Idempotent: retiring an already-retired lesson is refused rather than
+    silently re-stamping the record.
+    """
+    actor = _canonical_assignee(actor) if actor else None
+    reason_text = str(redact_review_value(reason or "")).strip() or None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, source_task_id, active FROM task_lessons WHERE id = ?",
+            (int(lesson_id),),
+        ).fetchone()
+        if row is None:
+            return False, f"lesson {lesson_id} not found"
+        if not row["active"]:
+            return False, f"lesson {lesson_id} is already retired"
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_lessons "
+            "SET active = 0, retired_at = ?, retired_by = ?, "
+            "    retired_reason = ? "
+            "WHERE id = ? AND active = 1",
+            (now, actor, reason_text, int(lesson_id)),
+        )
+        _append_event(
+            conn, row["source_task_id"], "lesson_retired",
+            {
+                "lesson_id": int(lesson_id),
+                "actor": actor,
+                "reason": reason_text,
+            },
+        )
+    return True, None
+
+
+def list_lessons(
+    conn: sqlite3.Connection,
+    *,
+    active_only: bool = True,
+    tenant: Optional[str] = None,
+    source_task_id: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """List promoted lessons, newest first. Read-only audit surface.
+
+    ``tenant`` filters to one lane's lessons plus the global ones — the same
+    visibility a task in that tenant has. Pass ``active_only=False`` to see
+    retired rows too (the history retirement deliberately preserves).
+    """
+    query = "SELECT * FROM task_lessons WHERE 1=1"
+    params: list[Any] = []
+    if active_only:
+        query += " AND active = 1"
+    if tenant is not None:
+        query += " AND (tenant = ? OR scope = ?)"
+        params.extend([tenant, LESSON_SCOPE_GLOBAL])
+    if source_task_id is not None:
+        query += " AND source_task_id = ?"
+        params.append(source_task_id)
+    query += " ORDER BY id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(int(limit))
+    return [
+        _lesson_row_to_dict(row) for row in conn.execute(query, params)
+    ]
+
+
+def lessons_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> list[dict[str, Any]]:
+    """Return the active lessons that bind ``task_id``, oldest first.
+
+    Two independent gates, both exact and both in SQL:
+
+    * SCOPE — a tenant-scoped lesson reaches only tasks in that same tenant.
+      A global lesson (which only an operator can create, and only from a
+      source that had no tenant of its own) reaches every task; that is what
+      global means, and it carries no company-private provenance by
+      construction.
+    * APPLICABILITY — the lesson's selector must be exactly one of the
+      selectors the receiving task itself produces
+      (:func:`task_lesson_selectors`). No fuzzy, semantic, or prefix
+      matching: a selector that does not match exactly does not fire.
+
+    This is the function :func:`build_worker_context` calls, so what a worker
+    is bound by is decided here by the kernel, not by a model recalling it.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return []
+    selectors = task_lesson_selectors(task)
+    placeholders = ",".join("?" for _ in selectors)
+    params: list[Any] = [*selectors]
+    if task.tenant:
+        scope_clause = "(scope = ? OR (scope = ? AND tenant = ?))"
+        params.extend([LESSON_SCOPE_GLOBAL, LESSON_SCOPE_TENANT, task.tenant])
+    else:
+        # An untenanted task is in no lane, so it can only receive lessons
+        # that belong to no lane either. Defaulting the other way would make
+        # "no tenant" the widest possible read of every company's learning.
+        scope_clause = "scope = ?"
+        params.append(LESSON_SCOPE_GLOBAL)
+    rows = conn.execute(
+        f"SELECT * FROM task_lessons "
+        f"WHERE active = 1 AND applicability IN ({placeholders}) "
+        f"  AND {scope_clause} "
+        f"ORDER BY id",
+        params,
+    ).fetchall()
+    return [_lesson_row_to_dict(r) for r in rows]
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12350,6 +13032,56 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+    # Binding verified lessons. This is where the verified-learning loop
+    # closes: the kernel selects them (:func:`lessons_for_task` — exact
+    # selector match, tenant-scoped) and states them as constraints, so the
+    # worker is bound by what a verifier established on earlier work whether
+    # or not any model remembers it. Provenance travels with each one so the
+    # worker can go read the source card rather than take the rule on faith.
+    lessons = lessons_for_task(conn, task_id)
+    if lessons:
+        omitted_l = max(0, len(lessons) - _CTX_MAX_LESSONS)
+        shown_l = lessons[-_CTX_MAX_LESSONS:] if omitted_l else lessons
+        lines.append("## Binding verified lessons")
+        lines.append(
+            "These are BINDING constraints on this task, not suggestions. "
+            "Each was promoted from a task that passed Gauntlet verification "
+            "(and, where it had failed first, proved its repair by re-running "
+            "the checks). Follow them. If one is wrong or cannot be followed "
+            "here, say so explicitly in your handoff and explain why — do not "
+            "silently ignore it."
+        )
+        if omitted_l:
+            lines.append(
+                f"_({omitted_l} earlier lesson{'s' if omitted_l != 1 else ''} "
+                f"omitted; showing the {len(shown_l)} most recent — see "
+                f"`hermes kanban lessons` for the full set)_"
+            )
+        for lesson in shown_l:
+            when = time.strftime(
+                "%Y-%m-%d", time.localtime(int(lesson["created_at"]))
+            )
+            scope_note = (
+                f"tenant {lesson['tenant']}"
+                if lesson["scope"] == LESSON_SCOPE_TENANT
+                else "global"
+            )
+            lines.append(
+                f"### Lesson {lesson['id']} — applies to "
+                f"`{lesson['applicability']}` ({scope_note})"
+            )
+            lines.append(_cap(lesson["lesson"], _CTX_MAX_LESSON_BYTES))
+            # Same treatment as a comment author: the promoter name is
+            # attribution, so it must not be able to close its own code span
+            # and read as framing text around the lesson.
+            promoter = (lesson["created_by"] or "(unattributed)").replace("`", "")
+            lines.append(
+                f"_source_: verified task `{lesson['source_task_id']}`, "
+                f"verification ledger #{lesson['verification_id']}, promoted "
+                f"by `{promoter}` on {when}"
+            )
+            lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has

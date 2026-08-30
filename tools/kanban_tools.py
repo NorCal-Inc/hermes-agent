@@ -1756,6 +1756,179 @@ _DESC_BOARD = (
 )
 
 
+def _handle_promote_lesson(args: dict, **kw) -> str:
+    """Promote a verified task's finding into a binding lesson for future work.
+
+    The kernel decides whether the source qualifies; this handler only shapes
+    the arguments and turns a refusal into an explanation the model can act on
+    (every refusal names the state that blocked it, so the legal next step is
+    "get it verified", not "try again").
+    """
+    tid = _default_task_id(args.get("source_task_id") or args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "source_task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    evidence = args.get("evidence")
+    if evidence is not None and not isinstance(evidence, dict):
+        return tool_error(
+            f"evidence must be an object/dict of provenance facts, got "
+            f"{type(evidence).__name__}"
+        )
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            lesson = kb.promote_lesson(
+                conn,
+                tid,
+                lesson=args.get("lesson") or "",
+                applicability=args.get("applicability") or "",
+                actor=_normalize_profile(args.get("actor"))
+                or os.environ.get("HERMES_PROFILE"),
+                evidence=evidence,
+                allow_global=bool(args.get("allow_global")),
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        # LessonPromotionError subclasses ValueError; its message already
+        # names the code and what would make the promotion legal.
+        if type(e).__name__ == "LessonPromotionError":
+            return tool_error(
+                f"kanban_promote_lesson refused ({e.code}): {e} Nothing was "
+                f"written — the board is unchanged."
+            )
+        logger.exception("kanban_promote_lesson failed")
+        return tool_error(f"kanban_promote_lesson: {e}")
+    return _ok(
+        lesson_id=lesson["id"],
+        source_task_id=lesson["source_task_id"],
+        scope=lesson["scope"],
+        tenant=lesson["tenant"],
+        applicability=lesson["applicability"],
+        verification_id=lesson["verification_id"],
+        note=(
+            "Recorded. Every future task matching "
+            f"'{lesson['applicability']}' in scope will receive this lesson "
+            "in its worker context as a binding constraint."
+        ),
+    )
+
+
+def _lesson_refusal(tool_name: str, exc: Exception) -> Optional[str]:
+    """Render a kernel refusal as a structured tool error, or None.
+
+    ``LessonPromotionError`` is raised out of :mod:`hermes_cli.kanban_db`,
+    which the tool layer imports lazily, so the class is matched by name
+    rather than held as an import-time reference — same reason the promote
+    handler does. ``code`` is surfaced verbatim because it is the stable part:
+    a model can branch on ``not_verified`` vs ``regression_outstanding``
+    without parsing prose.
+    """
+    if type(exc).__name__ != "LessonPromotionError":
+        return None
+    return tool_error(
+        f"{tool_name} refused ({exc.code}): {exc} Nothing was written — "
+        f"the board is unchanged."
+    )
+
+
+def _handle_retire_lesson(args: dict, **kw) -> str:
+    """Stop injecting a promoted lesson, keeping the row and its history.
+
+    Orchestrator-only. A lesson is a constraint the kernel imposes on future
+    workers, so a worker that finds one inconvenient must say so in its
+    handoff rather than revoke it mid-run.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_retire_lesson")
+    if delegated_err:
+        return delegated_err
+    orchestrator_err = _require_orchestrator_tool("kanban_retire_lesson")
+    if orchestrator_err:
+        return orchestrator_err
+    raw_id = args.get("lesson_id")
+    try:
+        lesson_id = int(raw_id)
+    except (TypeError, ValueError):
+        return tool_error(
+            f"lesson_id must be the integer id of a promoted lesson, got "
+            f"{raw_id!r} (list them with kanban_lessons)"
+        )
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok, detail = kb.retire_lesson(
+                conn,
+                lesson_id,
+                actor=_normalize_profile(args.get("actor"))
+                or os.environ.get("HERMES_PROFILE"),
+                reason=args.get("reason"),
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        refusal = _lesson_refusal("kanban_retire_lesson", e)
+        if refusal:
+            return refusal
+        logger.exception("kanban_retire_lesson failed")
+        return tool_error(f"kanban_retire_lesson: {e}")
+    if not ok:
+        return tool_error(f"kanban_retire_lesson: {detail}")
+    return _ok(
+        lesson_id=lesson_id,
+        active=False,
+        note=(
+            "Retired. It stops being injected into new worker contexts; the "
+            "row and its promotion/retirement events are kept, so the record "
+            "that it once governed survives."
+        ),
+    )
+
+
+def _handle_lessons(args: dict, **kw) -> str:
+    """List promoted lessons, or exactly the ones binding one task.
+
+    Read-only, so it is available to workers too: a worker that wants to see
+    the provenance behind a constraint it was handed should be able to,
+    without an orchestrator round-trip.
+    """
+    include_retired, err = _parse_bool_arg(args, "include_retired")
+    if err:
+        return tool_error(f"kanban_lessons: {err}")
+    tid = args.get("task_id")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            if tid:
+                if kb.get_task(conn, str(tid)) is None:
+                    return tool_error(f"kanban_lessons: task {tid} not found")
+                lessons = kb.lessons_for_task(conn, str(tid))
+                scope_note = (
+                    f"the lessons task {tid} receives at dispatch (exact "
+                    f"selector match, tenant-scoped)"
+                )
+            else:
+                lessons = kb.list_lessons(
+                    conn,
+                    active_only=not include_retired,
+                    tenant=_normalize_profile(args.get("tenant")),
+                    source_task_id=_normalize_profile(
+                        args.get("source_task_id")
+                    ),
+                    limit=KANBAN_LIST_MAX_LIMIT,
+                )
+                scope_note = (
+                    "retired lessons included" if include_retired
+                    else "active lessons only"
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_lessons failed")
+        return tool_error(f"kanban_lessons: {e}")
+    return _ok(count=len(lessons), scope=scope_note, lessons=lessons)
+
+
 def _board_schema_prop() -> dict[str, str]:
     """Schema fragment for the optional ``board`` parameter.
 
@@ -2457,6 +2630,154 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_PROMOTE_LESSON_SCHEMA = {
+    "name": "kanban_promote_lesson",
+    "description": (
+        "Promote a durable rule out of a task that PASSED Gauntlet "
+        "verification, so future applicable tasks are given it "
+        "automatically in their context as a binding constraint. This is "
+        "the only way a finding becomes canonical learning. The kernel "
+        "refuses any source task that is not verified — unverified, "
+        "pending, and failed tasks stay observations, and a task that "
+        "failed once must have proved its repair by re-running the checks. "
+        "Scope is enforced, not chosen: a tenant's task produces a lesson "
+        "only that tenant's tasks can ever receive."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_task_id": {
+                "type": "string",
+                "description": (
+                    "The VERIFIED task the lesson came from. Defaults to "
+                    "your own task id."
+                ),
+            },
+            "lesson": {
+                "type": "string",
+                "description": (
+                    "The rule future work must follow, stated so someone "
+                    "who never saw this task can act on it. State the rule, "
+                    "not that a rule exists."
+                ),
+            },
+            "applicability": {
+                "type": "string",
+                "description": (
+                    "Which future tasks this binds. Matched EXACTLY — no "
+                    "semantic inference. Either 'all' or "
+                    "'<dimension>:<value>' with dimension one of: assignee, "
+                    "project, workspace, lane, template, tenant. Examples: "
+                    "'assignee:coder', 'workspace:repo', 'project:api'. "
+                    "Prefer the narrowest selector that is actually true."
+                ),
+            },
+            "evidence": {
+                "type": "object",
+                "description": (
+                    "Optional extra provenance (commands, links, the "
+                    "specific failure this prevents). The verdict id, "
+                    "verifier and any regression proof are recorded by the "
+                    "kernel automatically."
+                ),
+            },
+            "allow_global": {
+                "type": "boolean",
+                "description": (
+                    "Operator-only: make the lesson binding on every tenant. "
+                    "Legal ONLY when the source task has no tenant. Leave "
+                    "unset — the safe default keeps learning inside its lane."
+                ),
+            },
+            "actor": {
+                "type": "string",
+                "description": "Who is promoting it. Defaults to your profile.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["lesson", "applicability"],
+    },
+}
+
+KANBAN_RETIRE_LESSON_SCHEMA = {
+    "name": "kanban_retire_lesson",
+    "description": (
+        "Stop a promoted lesson from being injected into future work, "
+        "because it no longer holds (the constraint was superseded, the "
+        "system it described is gone, or it turned out to be wrong). The "
+        "row and its history are kept — a retired lesson still reads as one "
+        "that once governed, between the dates it did. Orchestrator-only: a "
+        "task worker that disagrees with a binding lesson says so in its "
+        "handoff instead of revoking it mid-run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "lesson_id": {
+                "type": "integer",
+                "description": (
+                    "Id of the lesson to retire (see kanban_lessons)."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why it no longer applies. Recorded on the row and in "
+                    "the source task's history."
+                ),
+            },
+            "actor": {
+                "type": "string",
+                "description": "Who retired it. Defaults to your profile.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["lesson_id"],
+    },
+}
+
+KANBAN_LESSONS_SCHEMA = {
+    "name": "kanban_lessons",
+    "description": (
+        "List promoted lessons with their provenance — the verified source "
+        "task, the verdict ledger id, who promoted it and when. Pass "
+        "``task_id`` to see exactly the lessons that task receives at "
+        "dispatch (scope plus exact selector match) rather than the whole "
+        "board's. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": (
+                    "Show the lessons binding this task instead of listing "
+                    "the board. Ignores the filters below."
+                ),
+            },
+            "tenant": {
+                "type": "string",
+                "description": (
+                    "Only lessons visible to this tenant: its own plus the "
+                    "global ones."
+                ),
+            },
+            "source_task_id": {
+                "type": "string",
+                "description": "Only lessons promoted from this task.",
+            },
+            "include_retired": {
+                "type": "boolean",
+                "description": (
+                    "Include retired lessons. Default false (active only)."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2586,4 +2907,31 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_promote_lesson",
+    toolset="kanban",
+    schema=KANBAN_PROMOTE_LESSON_SCHEMA,
+    handler=_handle_promote_lesson,
+    check_fn=_check_kanban_mode,
+    emoji="🎓",
+)
+
+registry.register(
+    name="kanban_retire_lesson",
+    toolset="kanban",
+    schema=KANBAN_RETIRE_LESSON_SCHEMA,
+    handler=_handle_retire_lesson,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🎓",
+)
+
+registry.register(
+    name="kanban_lessons",
+    toolset="kanban",
+    schema=KANBAN_LESSONS_SCHEMA,
+    handler=_handle_lessons,
+    check_fn=_check_kanban_mode,
+    emoji="🎓",
 )

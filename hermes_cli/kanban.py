@@ -808,6 +808,89 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restore the classic lifecycle (the verification ledger is kept).",
     )
 
+    p_lesson_promote = sub.add_parser(
+        "lesson-promote",
+        help=(
+            "Promote a VERIFIED task's finding into a binding lesson that "
+            "future applicable tasks are given automatically"
+        ),
+    )
+    p_lesson_promote.add_argument("task_id")
+    p_lesson_promote.add_argument(
+        "--lesson", required=True,
+        help="The rule future work must follow. Quote it.",
+    )
+    p_lesson_promote.add_argument(
+        "--applicability", "--applies-to", required=True,
+        help=(
+            "Which future tasks this binds, matched EXACTLY: 'all' or "
+            "'<dimension>:<value>' where dimension is one of assignee, "
+            "project, workspace, lane, template, tenant "
+            "(e.g. 'assignee:coder', 'workspace:repo')."
+        ),
+    )
+    p_lesson_promote.add_argument(
+        "--evidence", default=None,
+        help=(
+            "JSON object of extra provenance to store alongside the "
+            "kernel-recorded verdict id and verifier."
+        ),
+    )
+    p_lesson_promote.add_argument(
+        "--actor", default=None,
+        help="Who is promoting it. Defaults to the acting profile.",
+    )
+    p_lesson_promote.add_argument(
+        "--global", dest="allow_global", action="store_true",
+        help=(
+            "Operator flag: make this lesson binding on EVERY tenant. Only "
+            "legal when the source task has no tenant of its own — a "
+            "tenant-scoped task's learning never leaves its lane."
+        ),
+    )
+
+    p_lesson_retire = sub.add_parser(
+        "lesson-retire",
+        help="Stop injecting a lesson (the row and its history are kept)",
+    )
+    p_lesson_retire.add_argument("lesson_id", type=int)
+    p_lesson_retire.add_argument(
+        "--reason", default=None,
+        help="Why it no longer applies. Recorded on the lesson row.",
+    )
+    p_lesson_retire.add_argument(
+        "--actor", default=None,
+        help="Who retired it. Defaults to the acting profile.",
+    )
+
+    p_lessons = sub.add_parser(
+        "lessons",
+        help="List promoted lessons, or show the ones binding a given task",
+    )
+    p_lessons.add_argument(
+        "--task", dest="task_id", default=None,
+        help=(
+            "Show exactly the lessons this task receives at dispatch "
+            "(scope + exact selector match), instead of listing the board's."
+        ),
+    )
+    p_lessons.add_argument(
+        "--tenant", default=None,
+        help="Only lessons visible to this tenant (its own plus global ones).",
+    )
+    p_lessons.add_argument(
+        "--source", default=None,
+        help="Only lessons promoted from this source task.",
+    )
+    p_lessons.add_argument(
+        "--all", dest="include_retired", action="store_true",
+        help="Include retired lessons (default shows active ones only).",
+    )
+    p_lessons.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit JSON instead of the text table.",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1246,6 +1329,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reopen-review":  _cmd_reopen_review,
             "verify":   _cmd_verify,
             "gauntlet": _cmd_gauntlet,
+            "lesson-promote": _cmd_lesson_promote,
+            "lesson-retire":  _cmd_lesson_retire,
+            "lessons":  _cmd_lessons,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2709,6 +2795,108 @@ def _cmd_gauntlet(args: argparse.Namespace) -> int:
                 print(f"cannot set gauntlet enforcement for {tid} (unknown id)",
                       file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_lesson_promote(args: argparse.Namespace) -> int:
+    raw_evidence = getattr(args, "evidence", None)
+    evidence = None
+    if raw_evidence:
+        try:
+            evidence = json.loads(raw_evidence)
+            if not isinstance(evidence, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --evidence: {exc}", file=sys.stderr)
+            return 2
+    with kb.connect_closing() as conn:
+        try:
+            lesson = kb.promote_lesson(
+                conn,
+                args.task_id,
+                lesson=args.lesson,
+                applicability=args.applicability,
+                actor=getattr(args, "actor", None) or _profile_author(),
+                evidence=evidence,
+                allow_global=bool(getattr(args, "allow_global", False)),
+            )
+        except kb.LessonPromotionError as exc:
+            print(f"cannot promote a lesson from {args.task_id}: {exc}",
+                  file=sys.stderr)
+            return 1
+    scope = (
+        "global (every tenant)"
+        if lesson["scope"] == kb.LESSON_SCOPE_GLOBAL
+        else f"tenant {lesson['tenant']}"
+    )
+    print(
+        f"Promoted lesson {lesson['id']} from verified task "
+        f"{lesson['source_task_id']} — {scope}, binding on tasks matching "
+        f"'{lesson['applicability']}'"
+    )
+    return 0
+
+
+def _cmd_lesson_retire(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, detail = kb.retire_lesson(
+            conn,
+            args.lesson_id,
+            actor=getattr(args, "actor", None) or _profile_author(),
+            reason=getattr(args, "reason", None),
+        )
+    if not ok:
+        print(f"cannot retire lesson {args.lesson_id}: {detail}",
+              file=sys.stderr)
+        return 1
+    print(
+        f"Retired lesson {args.lesson_id} — it stops being injected; the row "
+        f"and its history are kept"
+    )
+    return 0
+
+
+def _cmd_lessons(args: argparse.Namespace) -> int:
+    task_id = getattr(args, "task_id", None)
+    with kb.connect_closing() as conn:
+        if task_id:
+            if kb.get_task(conn, task_id) is None:
+                print(f"kanban: task {task_id} not found", file=sys.stderr)
+                return 1
+            lessons = kb.lessons_for_task(conn, task_id)
+        else:
+            lessons = kb.list_lessons(
+                conn,
+                active_only=not bool(getattr(args, "include_retired", False)),
+                tenant=getattr(args, "tenant", None),
+                source_task_id=getattr(args, "source", None),
+            )
+    if getattr(args, "as_json", False):
+        print(json.dumps(lessons, indent=2, ensure_ascii=False))
+        return 0
+    if not lessons:
+        print(
+            f"No lessons binding {task_id}" if task_id
+            else "No promoted lessons"
+        )
+        return 0
+    if task_id:
+        print(f"Lessons injected into {task_id} at dispatch:")
+    for lesson in lessons:
+        scope = (
+            "global" if lesson["scope"] == kb.LESSON_SCOPE_GLOBAL
+            else f"tenant:{lesson['tenant']}"
+        )
+        state = "active" if lesson["active"] else "RETIRED"
+        print(
+            f"#{lesson['id']:<4} [{state}] {scope}  "
+            f"applies-to={lesson['applicability']}  "
+            f"from={lesson['source_task_id']}"
+        )
+        for line in lesson["lesson"].splitlines():
+            print(f"      {line}")
+        if not lesson["active"] and lesson["retired_reason"]:
+            print(f"      (retired: {lesson['retired_reason']})")
+    return 0
 
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
