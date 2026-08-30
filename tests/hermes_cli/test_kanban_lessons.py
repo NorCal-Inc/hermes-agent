@@ -756,15 +756,19 @@ class TestToolSurface:
 
 
 # ---------------------------------------------------------------------------
-# Coverage merged from the parallel test_kanban_verified_lessons.py draft.
+# Consolidated coverage.
 #
-# That file and this one were written independently against the same feature
-# and overlap almost entirely — 49 tests there, 44 here, four cases in common
-# by name and most of the rest equivalent in substance. These four had no
-# counterpart here, and each pins a property the rest of the file does not:
-# who may revoke a binding constraint, whether the tool validates its input,
-# whether promotion trusts the materialised head or the ledger, and whether
-# the tools are actually reachable.
+# A second suite for this feature was written independently and overlapped
+# almost entirely with this one (49 tests there, 44 here). It was consolidated
+# into this file on 2026-08-30 and removed, so THIS file is the single
+# canonical lessons suite — two near-identical suites drift, and the one that
+# drifts is always the one that quietly stops refusing something.
+#
+# Four of its cases had no counterpart here and are kept below. Each pins a
+# property the rest of the file does not: who may revoke a binding constraint,
+# whether the tool validates its input, whether promotion trusts the
+# materialised head or the append-only ledger, and whether the tools are
+# actually reachable through the registry.
 # ---------------------------------------------------------------------------
 
 class TestRetireToolAuthority:
