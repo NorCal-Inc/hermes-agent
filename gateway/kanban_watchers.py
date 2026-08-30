@@ -1748,6 +1748,22 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
+                        # Gauntlet freshness is reported on its own line and
+                        # at WARNING, independent of whether this tick spawned
+                        # anything: parked-and-forgotten verification work is
+                        # precisely the case where the dispatcher looks idle
+                        # and healthy. Nothing was mutated to produce this —
+                        # the ids are cards a human needs to move.
+                        if res is not None and getattr(res, "gauntlet_stale", None):
+                            logger.warning(
+                                "kanban dispatcher [%s]: %d gauntlet task(s) with no "
+                                "lifecycle progress for kanban."
+                                "gauntlet_stale_timeout_seconds: %s "
+                                "(detection only — no task state was changed)",
+                                slug,
+                                len(res.gauntlet_stale),
+                                ", ".join(res.gauntlet_stale[:10]),
+                            )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)
                     if ready_pending and not any_spawned:

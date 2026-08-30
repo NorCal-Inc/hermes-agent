@@ -2613,6 +2613,21 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Gauntlet freshness: a Gauntlet-enforced task that is parked
+        # mid-chain — waiting on a verification nobody performs, owing a
+        # regression proof nobody produces, or simply never picked up — with
+        # no durable lifecycle event for this many seconds is reported as
+        # abandoned. Detection is observability ONLY: the dispatcher appends
+        # a `gauntlet_stale` event and surfaces the ids on its tick result;
+        # it never completes, verifies, unblocks or reassigns the card (a
+        # scanner has no evidence, and inventing a transition would defeat
+        # the chain it is watching). 0 disables the scan entirely.
+        "gauntlet_stale_timeout_seconds": 14400,
+        # How long before the SAME unchanged stale episode may alert again.
+        # An episode is keyed on the last durable lifecycle event, so real
+        # progress always starts a fresh one; this bounds repeat alerts while
+        # nothing changes. 0 means an unchanged episode alerts exactly once.
+        "gauntlet_stale_realert_seconds": 14400,
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible

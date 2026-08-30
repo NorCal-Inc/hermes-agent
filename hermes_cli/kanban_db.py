@@ -242,6 +242,77 @@ _CTX_MAX_LESSON_BYTES = 2 * 1024
 # bounded at write time too.
 LESSON_MAX_CHARS = 4000
 
+# --- Freshness: Gauntlet work that was abandoned mid-chain ----------------
+#
+# Everything above makes the chain impossible to SKIP. None of it makes the
+# chain impossible to ABANDON. A card handed off to verification sits in
+# ``review`` with ``verification_state='pending'`` indefinitely if no verifier
+# ever claims it; a card whose verdict FAILED sits with
+# ``regression_required=1`` indefinitely if the repair is never done. Both are
+# indistinguishable from healthy in-flight work on every board, and neither is
+# visible to the running-task freshness path (:func:`detect_stale_running`),
+# which only ever looks at ``status='running'`` plus a worker heartbeat.
+# Enforcement without freshness converts silent false completion into silent
+# indefinite parking — quieter, equally unfinished.
+#
+# So the kernel scans for it and does exactly ONE thing about it: it says so.
+# Detection is observability/escalation, never workflow mutation. Nothing here
+# completes, unblocks, reassigns, requeues or re-verifies a task — the whole
+# point of the Gauntlet is that those transitions require evidence a scanner
+# does not have. The only write is an auditable ``gauntlet_stale`` event.
+#
+# Statuses scanned. Deliberately a closed set:
+#   review  — parked mid-verification (pending / failed / unstarted / a
+#             verdict nobody ever spent).
+#   ready / todo / blocked — enforced work nobody has moved, including the
+#             repair leg of a failed verdict (``regression_required``).
+# ``running`` is excluded because it is already owned by
+# :func:`detect_stale_running`: a wedged worker is reclaimed to ``ready``,
+# where this scan then picks the card up. Scanning it here as well would flag
+# live, heartbeating workers as abandoned. ``scheduled`` is excluded because a
+# future start time is not staleness, and ``triage`` because a card that has
+# not been decomposed yet has no Gauntlet leg to be parked in. ``done`` and
+# ``archived`` are terminal and never flagged.
+GAUNTLET_STALE_STATUSES = ("review", "ready", "todo", "blocked")
+
+# The audit event this scan emits. One per stale episode/window.
+GAUNTLET_STALE_EVENT = "gauntlet_stale"
+
+# Event kinds that do NOT count as durable lifecycle progress. Everything else
+# in ``task_events`` does — a comment, an edit, a claim, a verdict, a status
+# change all mean a human or agent touched the card.
+#
+# This is a denylist rather than an allowlist on purpose: a new lifecycle event
+# added later should count as progress by default (a false negative merely
+# delays an alert), whereas a new kind silently omitted from an allowlist would
+# make every card look permanently stale. The members are the per-tick
+# dispatcher chatter and the refusal records — a spawn the guard skipped again,
+# a completion the gate refused again, and this scan's own alert are exactly
+# the signals that recur while NOTHING is happening, so counting them as
+# progress would make an abandoned card look freshest right when it is most
+# abandoned.
+_GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
+    GAUNTLET_STALE_EVENT,
+    "respawn_guarded",
+    "reclaim_deferred",
+    "claim_rejected",
+    "completion_blocked_unverified",
+    "completion_blocked_no_regression",
+    "completion_blocked_hallucination",
+    "verification_blocked_no_regression",
+    "lesson_promotion_blocked",
+    "suspected_hallucinated_references",
+)
+
+# Conservative defaults, mirroring ``kanban.dispatch_stale_timeout_seconds``:
+# four hours of no lifecycle progress before a card is called abandoned, and
+# four hours between repeat alerts for the same unchanged episode. Both are
+# config-overridable (``kanban.gauntlet_stale_timeout_seconds`` /
+# ``kanban.gauntlet_stale_realert_seconds``); a timeout of 0 disables the scan
+# entirely.
+DEFAULT_GAUNTLET_STALE_TIMEOUT_SECONDS = 14400
+DEFAULT_GAUNTLET_STALE_REALERT_SECONDS = 14400
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -495,6 +566,7 @@ def _fire_dispatch_tick_hook(
             result.reconciled_orphans,
             result.crashed,
             result.stale,
+            result.gauntlet_stale,
             result.timed_out,
             result.auto_blocked,
             result.rate_limited,
@@ -1751,11 +1823,12 @@ CREATE TABLE IF NOT EXISTS task_lessons (
     retired_reason      TEXT
 );
 
--- Injection reads active lessons by scope + selector on every context build.
-CREATE INDEX IF NOT EXISTS idx_task_lessons_lookup
-    ON task_lessons(active, applicability);
-CREATE INDEX IF NOT EXISTS idx_task_lessons_source
-    ON task_lessons(source_task_id, id);
+-- NOTE: the two indexes this table needs are NOT created here. One of them
+-- covers ``active``, a column an intermediate build's table may not have yet,
+-- and a CREATE INDEX in this script runs *before* the additive column pass —
+-- so on such a board the whole schema script would abort with "no such column:
+-- active" and the DB would fail to open at all. They are created in
+-- ``_migrate_add_optional_columns`` instead, after the columns are backfilled.
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
@@ -3120,6 +3193,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ):
             if col not in lesson_cols:
                 _add_column_if_missing(conn, "task_lessons", col, ddl)
+        # Only now that every column is guaranteed present. SCHEMA_SQL cannot
+        # carry these: it runs as one script *before* this pass, so an index
+        # over ``active`` would abort the whole script — and therefore the
+        # connection — on exactly the intermediate board this pass exists to
+        # upgrade. The lookup index serves lessons_for_task's
+        # ``active = 1 AND applicability IN (...)`` on every context build.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_lessons_lookup "
+            "ON task_lessons(active, applicability)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_lessons_source "
+            "ON task_lessons(source_task_id, id)"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -9979,6 +10066,17 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    gauntlet_stale: list[str] = field(default_factory=list)
+    """Task ids alerted this tick by :func:`detect_stale_gauntlet_work` —
+    Gauntlet-enforced cards parked mid-chain (awaiting verification, owing a
+    regression proof, or simply never picked up) with no durable lifecycle
+    progress for ``kanban.gauntlet_stale_timeout_seconds``.
+
+    Observability ONLY: unlike every other list on this result, nothing was
+    reclaimed, requeued, completed or failed to produce it — the tick appended
+    a ``gauntlet_stale`` event and left the cards exactly as they were. One id
+    appears once per stale episode (or per
+    ``kanban.gauntlet_stale_realert_seconds``), not once per tick."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -10596,6 +10694,284 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
+
+
+# ---------------------------------------------------------------------------
+# Gauntlet freshness: work parked mid-chain and then abandoned
+# ---------------------------------------------------------------------------
+
+
+def _kanban_config_int(key: str, default: int) -> int:
+    """Read a non-negative int from ``kanban.<key>``, live.
+
+    Consulted per scan rather than captured at import so an operator can turn
+    detection off (0) or retune it without restarting the gateway — the same
+    live-read contract as :func:`gauntlet_enforcement_default`. Missing config,
+    an unreadable file, or a malformed value all fall back to ``default``: a
+    freshness scan must never be the thing that breaks a dispatcher tick.
+    """
+    try:
+        from hermes_cli.config import load_config
+        raw = (load_config() or {}).get("kanban", {}).get(key, default)
+    except Exception:
+        return default
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        _log.warning(
+            "kanban: invalid kanban.%s=%r; using default %d", key, raw, default,
+        )
+        return default
+    return max(0, value)
+
+
+def gauntlet_stale_timeout_default() -> int:
+    """Seconds of no lifecycle progress before Gauntlet work is called stale.
+
+    ``kanban.gauntlet_stale_timeout_seconds``; 0 disables the scan entirely.
+    """
+    return _kanban_config_int(
+        "gauntlet_stale_timeout_seconds",
+        DEFAULT_GAUNTLET_STALE_TIMEOUT_SECONDS,
+    )
+
+
+def gauntlet_stale_realert_default() -> int:
+    """Seconds before the SAME unchanged stale episode may alert again.
+
+    ``kanban.gauntlet_stale_realert_seconds``. 0 means "never re-alert on an
+    unchanged episode" — the alert then fires exactly once and only durable
+    lifecycle progress can arm a fresh one.
+    """
+    return _kanban_config_int(
+        "gauntlet_stale_realert_seconds",
+        DEFAULT_GAUNTLET_STALE_REALERT_SECONDS,
+    )
+
+
+@dataclass
+class GauntletStaleTask:
+    """One Gauntlet-enforced card with no durable lifecycle progress.
+
+    Carries the same facts as the emitted ``gauntlet_stale`` event so a caller
+    (dispatcher telemetry, an observer, a test) can act on the scan result
+    without re-reading the ledger.
+    """
+
+    task_id: str
+    status: str
+    verification_state: Optional[str]
+    regression_required: bool
+    age_seconds: int
+    reasons: list[str]
+    last_event_id: Optional[int]
+    last_event_at: Optional[int]
+    last_event_kind: Optional[str]
+
+
+def _last_meaningful_event(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[sqlite3.Row]:
+    """Latest ``task_events`` row that represents actual lifecycle progress.
+
+    Filters out the per-tick dispatcher chatter and refusal records listed in
+    ``_GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS`` — including this scan's own
+    ``gauntlet_stale`` event, which would otherwise reset the very clock it
+    reads and make every card permanently fresh after its first alert.
+    """
+    placeholders = ",".join("?" * len(_GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS))
+    return conn.execute(
+        f"SELECT id, kind, created_at FROM task_events "
+        f"WHERE task_id = ? AND kind NOT IN ({placeholders}) "
+        f"ORDER BY id DESC LIMIT 1",
+        (task_id, *_GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS),
+    ).fetchone()
+
+
+def _gauntlet_stale_reasons(
+    status: str, verification_state: Optional[str], regression_required: bool,
+) -> list[str]:
+    """Classify WHY this card is parked. Ordered, stable, machine-readable."""
+    reasons: list[str] = []
+    if status == "review":
+        if verification_state == VERIFICATION_PENDING:
+            reasons.append("verification_pending")
+        elif verification_state == VERIFICATION_FAILED:
+            reasons.append("verification_failed")
+        elif verification_state == VERIFICATION_VERIFIED:
+            # Verified but never completed: the verdict was issued and then
+            # nobody spent it. Still unfinished work.
+            reasons.append("verified_not_completed")
+        else:
+            reasons.append("verification_unstarted")
+    if regression_required:
+        reasons.append("regression_required")
+    if status != "review":
+        reasons.append(f"parked_{status}")
+    return reasons
+
+
+def detect_stale_gauntlet_work(
+    conn: sqlite3.Connection,
+    *,
+    stale_timeout_seconds: Optional[int] = None,
+    realert_seconds: Optional[int] = None,
+    now: Optional[int] = None,
+) -> list["GauntletStaleTask"]:
+    """Find Gauntlet-enforced work that has been parked mid-chain and forgotten.
+
+    A card is stale when all of the following hold:
+
+    1. Its status is one of :data:`GAUNTLET_STALE_STATUSES` — never ``done``
+       or ``archived`` (terminal), never ``running`` (owned by
+       :func:`detect_stale_running`), never ``scheduled``/``triage``.
+    2. It is Gauntlet-enforced, per-task (``tasks.gauntlet_enforced``) or
+       board-wide (``kanban.gauntlet_enforcement``, read live).
+    3. Its last DURABLE lifecycle event is older than the stale timeout.
+       "Durable" excludes per-tick dispatcher chatter, refusal records, and
+       this scan's own alerts — see
+       ``_GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS``. With no qualifying event
+       at all, the clock runs from ``started_at``/``created_at``, so a card
+       created and then never touched is detectable too.
+
+    **This function never mutates workflow state.** It does not complete,
+    verify, unblock, requeue, reassign or fail anything: a scanner has no
+    evidence, and manufacturing a transition here would defeat the entire
+    point of the chain it is watching. Its only write is an append-only
+    ``gauntlet_stale`` event on ``task_events`` — the auditable record that
+    the board was told.
+
+    Anti-spam: one alert per *episode*. An episode is keyed on the id of the
+    last meaningful event, so an alert repeats only when (a) durable progress
+    has happened since — a new episode, which alerts immediately once it goes
+    stale again — or (b) ``realert_seconds`` has elapsed since the last alert
+    for the same unchanged episode. ``realert_seconds=0`` means an unchanged
+    episode alerts exactly once, ever.
+
+    Returns the cards alerted on THIS scan (suppressed duplicates are not
+    returned — the event is the surface, and returning them would re-spam any
+    consumer of the dispatch result). ``stale_timeout_seconds=0`` disables
+    detection entirely and returns ``[]``. Both windows default to the live
+    config values when not passed explicitly.
+    """
+    timeout = (
+        gauntlet_stale_timeout_default()
+        if stale_timeout_seconds is None
+        else int(stale_timeout_seconds)
+    )
+    if timeout <= 0:
+        return []
+    realert = (
+        gauntlet_stale_realert_default()
+        if realert_seconds is None
+        else int(realert_seconds)
+    )
+    now_ts = int(time.time()) if now is None else int(now)
+
+    placeholders = ",".join("?" * len(GAUNTLET_STALE_STATUSES))
+    try:
+        rows = conn.execute(
+            f"SELECT id, status, gauntlet_enforced, verification_state, "
+            f"regression_required, created_at, started_at FROM tasks "
+            f"WHERE status IN ({placeholders}) "
+            f"ORDER BY created_at ASC, id ASC",
+            GAUNTLET_STALE_STATUSES,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Pre-Gauntlet board that has not been migrated yet (no
+        # gauntlet_enforced column). Nothing on it can be enforced, so there
+        # is nothing to detect.
+        return []
+
+    # Board-wide enforcement is a config read; resolve it at most once per
+    # scan and only if some card actually needs it.
+    board_default: Optional[bool] = None
+    stale: list[GauntletStaleTask] = []
+
+    for row in rows:
+        tid = row["id"]
+        if row["gauntlet_enforced"]:
+            enforced = True
+        else:
+            if board_default is None:
+                board_default = gauntlet_enforcement_default()
+            enforced = board_default
+        if not enforced:
+            continue
+
+        event = _last_meaningful_event(conn, tid)
+        if event is not None:
+            last_event_id: Optional[int] = int(event["id"])
+            last_event_kind: Optional[str] = event["kind"]
+            last_at = int(event["created_at"])
+        else:
+            last_event_id = None
+            last_event_kind = None
+            last_at = int(row["started_at"] or row["created_at"] or now_ts)
+
+        age = now_ts - last_at
+        if age < timeout:
+            continue
+
+        # Episode de-duplication. The marker is the last meaningful event id;
+        # equality means nothing durable has happened since we last said so.
+        prev = conn.execute(
+            "SELECT payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+            (tid, GAUNTLET_STALE_EVENT),
+        ).fetchone()
+        if prev is not None:
+            try:
+                prev_payload = json.loads(prev["payload"]) if prev["payload"] else {}
+            except Exception:
+                prev_payload = {}
+            same_episode = (
+                prev_payload.get("last_event_id", "__missing__") == last_event_id
+            )
+            if same_episode:
+                if realert <= 0:
+                    continue
+                if now_ts - int(prev["created_at"]) < realert:
+                    continue
+
+        status = str(row["status"])
+        verification_state = row["verification_state"]
+        regression_required = bool(row["regression_required"])
+        reasons = _gauntlet_stale_reasons(
+            status, verification_state, regression_required,
+        )
+        payload = {
+            "age_seconds": int(age),
+            "status": status,
+            "verification_state": verification_state,
+            "regression_required": regression_required,
+            "reasons": reasons,
+            "last_event_id": last_event_id,
+            "last_event_at": last_at,
+            "last_event_kind": last_event_kind,
+            "timeout_seconds": int(timeout),
+            "realert_seconds": int(realert),
+        }
+        # The ONLY write. No UPDATE on tasks anywhere in this function.
+        with write_txn(conn):
+            _append_event(conn, tid, GAUNTLET_STALE_EVENT, payload)
+        stale.append(
+            GauntletStaleTask(
+                task_id=tid,
+                status=status,
+                verification_state=verification_state,
+                regression_required=regression_required,
+                age_seconds=int(age),
+                reasons=reasons,
+                last_event_id=last_event_id,
+                last_event_at=last_at,
+                last_event_kind=last_event_kind,
+            )
+        )
+
+    return stale
 
 
 def reconcile_orphaned_running(
@@ -11740,6 +12116,8 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gauntlet_stale_timeout_seconds: Optional[int] = None,
+    gauntlet_stale_realert_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -11775,6 +12153,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            gauntlet_stale_timeout_seconds=gauntlet_stale_timeout_seconds,
+            gauntlet_stale_realert_seconds=gauntlet_stale_realert_seconds,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -11795,6 +12175,8 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                gauntlet_stale_timeout_seconds=gauntlet_stale_timeout_seconds,
+                gauntlet_stale_realert_seconds=gauntlet_stale_realert_seconds,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -11822,6 +12204,8 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gauntlet_stale_timeout_seconds: Optional[int] = None,
+    gauntlet_stale_realert_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -11891,6 +12275,27 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Gauntlet freshness. Runs BEFORE any of the concurrency/memory-pressure
+    # early returns below: a saturated or memory-pressured host is exactly
+    # when work sits parked, so the one tick that would notice must not be
+    # the one that gets skipped. Purely observational — it appends a
+    # 'gauntlet_stale' event and changes no task state — and defensively
+    # wrapped, because an observability pass must never be able to take a
+    # dispatcher tick down with it.
+    try:
+        result.gauntlet_stale = [
+            entry.task_id
+            for entry in detect_stale_gauntlet_work(
+                conn,
+                stale_timeout_seconds=gauntlet_stale_timeout_seconds,
+                realert_seconds=gauntlet_stale_realert_seconds,
+            )
+        ]
+    except Exception:
+        _log.exception(
+            "kanban dispatch: gauntlet freshness scan failed (tick continues)"
+        )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
