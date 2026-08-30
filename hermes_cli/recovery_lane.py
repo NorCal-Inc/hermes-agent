@@ -20,6 +20,13 @@ Sequence, each step plain deterministic Python:
 6. Gate green -> complete the task, noting both attempts.
 7. Gate still red -> block the task once (kind="needs_input") with both
    attempts' evidence recorded as a comment. One escalation, no retry loop.
+
+Steps 3 and 6 assume the card allows an executor to close itself. When the
+card is Gauntlet-enforced (``tasks.gauntlet_enforced``, or the board-wide
+``kanban.gauntlet_enforcement`` config), it does not: this lane is an
+executor, so a green gate hands the card to the review lane as
+VERIFICATION_PENDING with the gate evidence attached instead of completing
+it. See ``_handoff_for_verification``.
 """
 
 from __future__ import annotations
@@ -355,20 +362,35 @@ def run_claude_executor(task_id: str) -> int:
 
         result = _extract_claude_result(attempt.stdout)
         summary = result[:4000]
-        ok = kb.complete_task(
-            conn,
-            task_id,
-            result=result,
-            summary=summary,
-            metadata={
-                "executor_lane": "claude",
-                "executor": "claude",
-                "duration_seconds": round(time.time() - started_at, 1),
-                "changed_workspace_files": [str(p) for p in changed],
-                "attached_files": attached + registered_in_place,
-            },
-            expected_run_id=expected_run_id,
-        )
+        metadata = {
+            "executor_lane": "claude",
+            "executor": "claude",
+            "duration_seconds": round(time.time() - started_at, 1),
+            "changed_workspace_files": [str(p) for p in changed],
+            "attached_files": attached + registered_in_place,
+        }
+        try:
+            ok = kb.complete_task(
+                conn,
+                task_id,
+                result=result,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
+        except kb.VerificationRequiredError:
+            handed_off = _handoff_for_verification(
+                conn, task_id,
+                summary=summary,
+                evidence=(
+                    f"{attempt.evidence}\n\n"
+                    f"Attached files: {(attached + registered_in_place) or 'none'}"
+                ),
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+                author="claude-lane",
+            )
+            return 0 if handed_off else 1
         if ok:
             kb.add_comment(
                 conn,
@@ -602,21 +624,58 @@ def run_claude_first_recovery(task_id: str) -> int:
             pass
 
 
+def _handoff_for_verification(
+    conn, task_id, *, summary, evidence, metadata, expected_run_id, author
+) -> bool:
+    """Park a gauntlet-enforced task in the review lane with its gate evidence.
+
+    The recovery lane is an executor, so under Gauntlet enforcement it may not
+    close its own card even though its gate is a mechanical (non-LLM) check.
+    Rather than fail the run, hand the work off as VERIFICATION_PENDING with
+    the gate output attached — that is the one legal next step, and it keeps
+    the evidence with the card for whoever records the verdict.
+    """
+    ok = kb.request_review(
+        conn, task_id,
+        summary=summary,
+        metadata=metadata,
+        expected_run_id=expected_run_id,
+    )
+    if ok:
+        kb.add_comment(
+            conn, task_id, author=author,
+            body=(
+                "Gauntlet enforcement is on for this card, so the executor "
+                "cannot self-complete. Handed off for verification with the "
+                f"gate evidence below.\n\n{summary}\n\n{evidence}"
+            ),
+        )
+    return bool(ok)
+
+
 def _complete(
     conn, task_id, *, summary, attempts, gate, started_at, expected_run_id
 ) -> bool:
     evidence = "\n\n".join(a.evidence for a in attempts) + f"\n\n{gate.evidence}"
-    ok = kb.complete_task(
-        conn, task_id,
-        result=summary,
-        summary=summary,
-        metadata={
-            "recovery_lane": "claude_recovery",
-            "executors": [a.executor for a in attempts],
-            "duration_seconds": round(time.time() - started_at, 1),
-        },
-        expected_run_id=expected_run_id,
-    )
+    metadata = {
+        "recovery_lane": "claude_recovery",
+        "executors": [a.executor for a in attempts],
+        "duration_seconds": round(time.time() - started_at, 1),
+    }
+    try:
+        ok = kb.complete_task(
+            conn, task_id,
+            result=summary,
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+    except kb.VerificationRequiredError:
+        return _handoff_for_verification(
+            conn, task_id,
+            summary=summary, evidence=evidence, metadata=metadata,
+            expected_run_id=expected_run_id, author="recovery-lane",
+        )
     if ok:
         kb.add_comment(
             conn, task_id, author="recovery-lane", body=f"{summary}\n\n{evidence}"

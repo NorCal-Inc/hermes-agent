@@ -779,6 +779,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.VerificationRequiredError as verify_err:
+                # Gauntlet lifecycle: this task cannot be self-completed by
+                # its executor. Like the hallucinated-cards gate, the task was
+                # NOT mutated and is still in-flight — say so explicitly, or
+                # the model reads a tool_error as terminal and blocks/crashes
+                # instead of taking the one legal next step (#22923).
+                return tool_error(
+                    f"kanban_complete blocked: {verify_err} "
+                    f"Your task is still in-flight (no state change). "
+                    f"Call kanban_request_review with your implementation "
+                    f"summary and the evidence you produced; a verifier "
+                    f"records the verdict and the task completes from there."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the

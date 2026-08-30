@@ -2544,6 +2544,16 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Board-wide Gauntlet enforcement. When true, EVERY task must reach
+        # 'done' through running -> review -> verified, and no executor can
+        # close its own card — `hermes kanban verify --pass` (or an approval
+        # from inside a reviewer run) is the only route to completion.
+        # Default false: turning this on changes the meaning of a bare
+        # complete for every existing surface (CLI, dashboard, worker tool,
+        # recovery lane), so it is a deliberate operator choice. Per-task
+        # enforcement is available without it via `hermes kanban create
+        # --gauntlet` / `hermes kanban gauntlet <id> --on`.
+        "gauntlet_enforcement": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

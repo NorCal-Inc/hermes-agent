@@ -81,6 +81,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "gauntlet_enforced": t.gauntlet_enforced,
+        "verification_state": t.verification_state,
     }
 
 
@@ -416,6 +418,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "Codex's own report) to decide whether the "
                                "gate is green. Required with --executor-lane "
                                "claude_recovery.")
+    p_create.add_argument("--gauntlet", action="store_true", default=None,
+                          help="Require the full Gauntlet chain to complete "
+                               "this task: running -> review -> verified -> "
+                               "done. The executor cannot close its own card; "
+                               "a verifier must record a passing verdict via "
+                               "`hermes kanban verify`. Defaults to the "
+                               "kanban.gauntlet_enforcement config value.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -728,6 +737,64 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reopen_review.add_argument(
         "--reason", default=None,
         help="Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons.",
+    )
+
+    p_verify = sub.add_parser(
+        "verify",
+        help=(
+            "Record the verification verdict for a task in the review lane "
+            "(the VERIFIED step of the Gauntlet chain)"
+        ),
+    )
+    p_verify.add_argument("task_id")
+    v_group = p_verify.add_mutually_exclusive_group(required=True)
+    v_group.add_argument(
+        "--pass", dest="passed", action="store_true",
+        help="Verification passed — the task becomes completable.",
+    )
+    v_group.add_argument(
+        "--fail", dest="passed", action="store_false",
+        help=(
+            "Verification failed — routes the task back for repair. "
+            "Requires --reason."
+        ),
+    )
+    p_verify.add_argument(
+        "--reason", default=None,
+        help="Why it passed or failed. Required for --fail.",
+    )
+    p_verify.add_argument(
+        "--verifier", default=None,
+        help="Profile/person recording the verdict. Defaults to the reviewer run's assignee.",
+    )
+    p_verify.add_argument(
+        "--evidence", default=None,
+        help=(
+            "JSON object of falsifiable facts (commands run, exit codes, test "
+            "counts, artefact paths). Stored on the verification ledger."
+        ),
+    )
+    p_verify.add_argument(
+        "--no-route", action="store_true",
+        help=(
+            "On --fail, leave the task in review instead of routing it back "
+            "for rework. It stays non-completable either way."
+        ),
+    )
+
+    p_gauntlet = sub.add_parser(
+        "gauntlet",
+        help="Turn the Gauntlet completion chain on or off for a task",
+    )
+    p_gauntlet.add_argument("task_ids", nargs="+")
+    g_group = p_gauntlet.add_mutually_exclusive_group(required=True)
+    g_group.add_argument(
+        "--on", dest="enabled", action="store_true",
+        help="Require running -> review -> verified -> done for these tasks.",
+    )
+    g_group.add_argument(
+        "--off", dest="enabled", action="store_false",
+        help="Restore the classic lifecycle (the verification ledger is kept).",
     )
 
     p_promote = sub.add_parser(
@@ -1166,6 +1233,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
+            "verify":   _cmd_verify,
+            "gauntlet": _cmd_gauntlet,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1621,6 +1690,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
             executor_lane=getattr(args, "executor_lane", None),
             recovery_gate_cmd=getattr(args, "recovery_gate_cmd", None),
+            gauntlet=getattr(args, "gauntlet", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2327,13 +2397,25 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.VerificationRequiredError as e:
+                failed.append(tid)
+                print(
+                    f"kanban: {e} "
+                    f"Use 'hermes kanban request-review {tid}' to hand it "
+                    f"off, then 'hermes kanban verify {tid} --pass' once it "
+                    f"checks out.",
+                    file=sys.stderr,
+                )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2534,6 +2616,71 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             + (f": {display_summary}" if display_summary else "")
         )
     return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    passed = bool(args.passed)
+    reason = (getattr(args, "reason", None) or "").strip() or None
+    raw_evidence = getattr(args, "evidence", None)
+    evidence = None
+    if raw_evidence:
+        try:
+            evidence = json.loads(raw_evidence)
+            if not isinstance(evidence, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --evidence: {exc}", file=sys.stderr)
+            return 2
+    if not passed and not reason:
+        print("kanban: --fail requires --reason", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok, detail = kb.record_verification(
+            conn,
+            tid,
+            passed=passed,
+            # Fall back to the acting profile: a verdict with no attributable
+            # verifier is a weaker audit record than the ledger can carry.
+            verifier=getattr(args, "verifier", None) or _profile_author(),
+            evidence=evidence,
+            reason=reason,
+            expected_run_id=_worker_run_id_for(tid),
+            route_on_failure=not bool(getattr(args, "no_route", False)),
+        )
+        if not ok:
+            print(f"cannot verify {tid}: {detail}", file=sys.stderr)
+            return 1
+        if passed:
+            print(f"Verified {tid} — it can now be completed")
+        elif detail == "rework":
+            task = kb.get_task(conn, tid)
+            print(
+                f"Verification of {tid} FAILED; routed back for repair"
+                + (f" (now {task.status})" if task else "")
+            )
+        else:
+            print(
+                f"Verification of {tid} FAILED; it stays in review and "
+                f"cannot be completed"
+            )
+    return 0
+
+
+def _cmd_gauntlet(args: argparse.Namespace) -> int:
+    enabled = bool(args.enabled)
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in args.task_ids:
+            if kb.set_gauntlet_enforced(conn, tid, enabled):
+                print(
+                    f"Gauntlet enforcement {'ON' if enabled else 'OFF'} for {tid}"
+                )
+            else:
+                failed.append(tid)
+                print(f"cannot set gauntlet enforcement for {tid} (unknown id)",
+                      file=sys.stderr)
+    return 0 if not failed else 1
 
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:

@@ -102,6 +102,35 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# ---------------------------------------------------------------------------
+# Gauntlet verification lifecycle
+# ---------------------------------------------------------------------------
+#
+# The Gauntlet reliability contract forbids an executor claiming its own work
+# complete. The required chain is
+#
+#   EXECUTING              -> status 'running'
+#   VERIFICATION_PENDING   -> status 'review',  verification_state 'pending'
+#   VERIFIED               -> verification_state 'verified'
+#   COMPLETED              -> status 'done'
+#
+# This is layered onto the existing review lane rather than adding a second
+# scheduler or a new kanban column: ``review`` *is* VERIFICATION_PENDING, so
+# every board, dashboard, watcher and notifier keeps rendering it unchanged.
+# What is new is the verdict — a durable, auditable ledger row plus the
+# materialised ``tasks.verification_state`` that :func:`complete_task` tests
+# inside its own UPDATE ... WHERE. Because the guard is a SQL predicate on the
+# transition itself, a direct ``running -> done`` write cannot succeed even
+# under a race or from a caller that skipped the Python pre-checks.
+VERIFICATION_PENDING = "pending"
+VERIFICATION_VERIFIED = "verified"
+VERIFICATION_FAILED = "failed"
+VALID_VERIFICATION_STATES = {
+    VERIFICATION_PENDING,
+    VERIFICATION_VERIFIED,
+    VERIFICATION_FAILED,
+}
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1168,6 +1197,13 @@ class Task:
     # self-report) to decide whether the gate is green. Required at creation
     # when executor_lane == EXECUTOR_LANE_CLAUDE_RECOVERY; otherwise ignored.
     recovery_gate_cmd: Optional[str] = None
+    # True when this task may only reach 'done' through the full Gauntlet
+    # chain (running -> review/pending -> verified -> done). See the column
+    # comment in SCHEMA_SQL and :func:`gauntlet_required`.
+    gauntlet_enforced: bool = False
+    # Head of the task_verifications ledger: None | 'pending' | 'verified' |
+    # 'failed'. Only 'verified' satisfies the completion guard.
+    verification_state: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1267,6 +1303,16 @@ class Task:
             ),
             recovery_gate_cmd=(
                 row["recovery_gate_cmd"] if "recovery_gate_cmd" in keys and row["recovery_gate_cmd"] else None
+            ),
+            gauntlet_enforced=(
+                bool(row["gauntlet_enforced"])
+                if "gauntlet_enforced" in keys and row["gauntlet_enforced"]
+                else False
+            ),
+            verification_state=(
+                row["verification_state"]
+                if "verification_state" in keys and row["verification_state"]
+                else None
             ),
         )
 
@@ -1462,7 +1508,25 @@ CREATE TABLE IF NOT EXISTS tasks (
     executor_lane        TEXT,
     -- Shell command the recovery lane runs to verify the gate is green.
     -- Required (validated in create_task) when executor_lane is set.
-    recovery_gate_cmd    TEXT
+    recovery_gate_cmd    TEXT,
+    -- Gauntlet lifecycle enforcement. When 1, this task may only reach
+    -- 'done' through the full chain
+    --   running -> review (verification_state='pending')
+    --           -> verification_state='verified' -> done
+    -- The guard is in complete_task's UPDATE ... WHERE, so a direct
+    -- running -> done write is impossible at the kernel boundary rather
+    -- than merely discouraged. 0 (the default) preserves the classic
+    -- lifecycle for every pre-existing caller. The live config key
+    -- ``kanban.gauntlet_enforcement`` raises the floor board-wide without
+    -- needing a per-row backfill.
+    gauntlet_enforced    INTEGER NOT NULL DEFAULT 0,
+    -- Materialised head of the task_verifications ledger:
+    -- NULL (no verification phase entered) | 'pending' | 'verified' |
+    -- 'failed'. Denormalised onto the task so the completion guard can be
+    -- expressed as a single atomic SQL predicate. Cleared whenever a new
+    -- implementation run starts, so a stale verdict can never be spent on
+    -- work it did not cover.
+    verification_state   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1487,6 +1551,27 @@ CREATE TABLE IF NOT EXISTS task_events (
     payload    TEXT,
     created_at INTEGER NOT NULL
 );
+
+-- Append-only verification ledger for the Gauntlet lifecycle. One row per
+-- verification-phase transition: the 'pending' row written by
+-- request_review, then a terminal 'verified'/'failed' row written by
+-- record_verification. ``evidence`` is a JSON blob of falsifiable facts
+-- (commands run, exit codes, test counts, artefact paths). The task row's
+-- ``verification_state`` is the materialised head of this ledger; the
+-- ledger itself is what makes a completion auditable after the fact.
+CREATE TABLE IF NOT EXISTS task_verifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    state      TEXT NOT NULL,
+    verifier   TEXT,
+    evidence   TEXT,
+    reason     TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_verifications_task
+    ON task_verifications(task_id, id);
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
@@ -2730,6 +2815,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "recovery_gate_cmd", "recovery_gate_cmd TEXT"
         )
 
+    if "gauntlet_enforced" not in cols:
+        # 0 on every legacy row: the Gauntlet chain is opt-in per task, so a
+        # migrated board keeps the exact completion behaviour it had before
+        # this column existed. Operators raise the floor board-wide with the
+        # ``kanban.gauntlet_enforcement`` config key, which is consulted live
+        # rather than backfilled.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "gauntlet_enforced",
+            "gauntlet_enforced INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "verification_state" not in cols:
+        # NULL on legacy rows = "no verification phase entered". A task
+        # already parked in ``review`` when this migration runs is NOT
+        # backfilled to 'pending': it never produced a ledger row, so
+        # inventing one would fabricate audit history. It re-enters the
+        # chain on its next request_review.
+        _add_column_if_missing(
+            conn, "tasks", "verification_state", "verification_state TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3236,6 +3344,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     executor_lane: Optional[str] = None,
     recovery_gate_cmd: Optional[str] = None,
+    gauntlet: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3299,6 +3408,12 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     executor_lane = (executor_lane or "").strip() or None
     recovery_gate_cmd = (recovery_gate_cmd or "").strip() or None
+    # ``None`` (the default) inherits the board-wide config so operators who
+    # enabled enforcement get it stamped on new rows; an explicit True/False
+    # from the caller always wins.
+    gauntlet_enforced = (
+        gauntlet_enforcement_default() if gauntlet is None else bool(gauntlet)
+    )
 
     # Simple operator/Erika shorthand: assignee="claude" means the direct
     # Claude executor lane, not a Hermes profile named "claude". Persist the
@@ -3578,8 +3693,9 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
-                        executor_lane, recovery_gate_cmd
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        executor_lane, recovery_gate_cmd,
+                        gauntlet_enforced
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3607,6 +3723,7 @@ def create_task(
                         session_id,
                         executor_lane,
                         recovery_gate_cmd,
+                        1 if gauntlet_enforced else 0,
                     ),
                 )
                 for pid in parents:
@@ -4774,6 +4891,9 @@ def claim_task(
         )
         if cur.rowcount != 1:
             return None
+        # A new implementation run invalidates any prior verdict — it covered
+        # the previous run's work, not this one. Ledger rows are kept.
+        _clear_verification_state(conn, task_id)
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
@@ -5429,6 +5549,185 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class VerificationRequiredError(ValueError):
+    """Raised by ``complete_task`` when a Gauntlet-enforced task tries to
+    reach ``done`` without a durable VERIFIED verdict.
+
+    The task is NOT mutated: like :class:`HallucinatedCardsError` this gate
+    runs before the write transaction, so the caller can fix the lifecycle
+    (request review, get it verified) and retry the same completion. Kept a
+    ``ValueError`` subclass so existing tool-error handlers treat it as a
+    recoverable user error rather than a crash.
+
+    ``.status`` is the task status at rejection and ``.verification_state``
+    the ledger head (``None`` when no verification phase was ever entered) —
+    together they tell the caller which step of the chain is missing.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        status: Optional[str],
+        verification_state: Optional[str],
+    ):
+        self.task_id = task_id
+        self.status = status
+        self.verification_state = verification_state
+        if verification_state == VERIFICATION_FAILED:
+            detail = (
+                "its latest verification FAILED; it must be repaired and "
+                "re-verified"
+            )
+        elif verification_state == VERIFICATION_PENDING:
+            detail = (
+                "it is awaiting verification; a verifier must record a "
+                "passing verdict first"
+            )
+        else:
+            detail = (
+                "no verification phase was entered; hand off with "
+                "request_review, then have a verifier record the verdict"
+            )
+        super().__init__(
+            f"completion blocked: {task_id} is gauntlet-enforced and "
+            f"{detail} (status={status!r}, "
+            f"verification_state={verification_state!r}). The required chain "
+            f"is running -> review -> verified -> done."
+        )
+
+
+def gauntlet_enforcement_default() -> bool:
+    """Return whether every task on this board is Gauntlet-enforced.
+
+    Per-task ``gauntlet_enforced`` is the primary switch; this config key
+    (``kanban.gauntlet_enforcement``) raises the floor for the whole board
+    without a backfill, and is consulted live so flipping it takes effect on
+    tasks that already exist.
+
+    Defaults to ``False``. Enforcement changes the meaning of a bare
+    ``complete_task`` for every existing caller — CLI, dashboard, worker tool,
+    recovery lane — so it is an operator decision, not a silent upgrade.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool(
+            (load_config() or {}).get("kanban", {}).get(
+                "gauntlet_enforcement", False
+            )
+        )
+    except Exception:
+        return False
+
+
+def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` may only complete via a VERIFIED verdict."""
+    row = conn.execute(
+        "SELECT gauntlet_enforced FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if row["gauntlet_enforced"]:
+        return True
+    return gauntlet_enforcement_default()
+
+
+def _record_verification_row(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    state: str,
+    run_id: Optional[int] = None,
+    verifier: Optional[str] = None,
+    evidence: Optional[dict] = None,
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> int:
+    """Append one row to the verification ledger and materialise its head.
+
+    Must be called inside an open write transaction: the ledger row and the
+    ``tasks.verification_state`` it materialises have to land together, or the
+    completion guard could read a head with no evidence behind it.
+    """
+    if state not in VALID_VERIFICATION_STATES:
+        raise ValueError(
+            f"verification state must be one of "
+            f"{sorted(VALID_VERIFICATION_STATES)}, got {state!r}"
+        )
+    ts = int(time.time()) if now is None else int(now)
+    payload = None
+    if evidence is not None:
+        try:
+            payload = json.dumps(redact_review_value(evidence))
+        except (TypeError, ValueError):
+            payload = json.dumps({"unserialisable": repr(evidence)[:2000]})
+    cur = conn.execute(
+        """
+        INSERT INTO task_verifications
+            (task_id, run_id, state, verifier, evidence, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            int(run_id) if run_id is not None else None,
+            state,
+            verifier,
+            payload,
+            (str(redact_review_value(reason)).strip() or None) if reason else None,
+            ts,
+        ),
+    )
+    conn.execute(
+        "UPDATE tasks SET verification_state = ? WHERE id = ?",
+        (state, task_id),
+    )
+    return int(cur.lastrowid)
+
+
+def _clear_verification_state(conn: sqlite3.Connection, task_id: str) -> None:
+    """Drop a stale verdict when a fresh implementation run starts.
+
+    A VERIFIED verdict certifies the run it was issued against. Re-claiming
+    the task for implementation means new work the verdict never saw, so it
+    must not remain spendable. The ledger rows stay — only the materialised
+    head is cleared — so the audit trail of what was verified when survives.
+
+    Deliberately NOT called by :func:`claim_review_task`: that claim *is* the
+    verification phase continuing, not new implementation.
+    """
+    conn.execute(
+        "UPDATE tasks SET verification_state = NULL "
+        "WHERE id = ? AND verification_state IS NOT NULL",
+        (task_id,),
+    )
+
+
+def _review_run_verification(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[Optional[int], Optional[str]]:
+    """Return ``(run_id, reviewer)`` when the active run is a reviewer run.
+
+    A run claimed from the ``review`` lane is structurally not the
+    implementer's: :func:`request_review` ends the implementation run and
+    parks the task in ``review`` before :func:`claim_review_task` can open
+    this one, and the claim records ``source_status=review`` on its event.
+    An approval issued from inside such a run is therefore a second party's
+    verdict — the executor cannot manufacture one for itself — so it counts
+    as the VERIFIED step rather than a self-report.
+
+    Returns ``(None, None)`` when there is no such run.
+    """
+    row = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return None, None
+    run_id = int(row["current_run_id"])
+    if _retry_status_for_run(conn, task_id, run_id) != "review":
+        return None, None
+    return run_id, row["assignee"]
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5482,6 +5781,40 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
 
+    # Gate: the Gauntlet chain. A gauntlet-enforced task reaches 'done' only
+    # from a VERIFIED verdict, so a bare running -> done completion claim by
+    # the executor is refused here with a diagnosis, and refused again as a
+    # SQL predicate on the transition itself further down. This pre-check
+    # exists for the error message and the audit event; the predicate is what
+    # makes it mechanical.
+    require_verified = gauntlet_required(conn, task_id)
+    if require_verified:
+        vrow = conn.execute(
+            "SELECT status, verification_state FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if vrow is not None and vrow["verification_state"] != VERIFICATION_VERIFIED:
+            review_run_id, _reviewer = _review_run_verification(conn, task_id)
+            # A reviewer run may approve inline (see _review_run_verification);
+            # anything else is the executor claiming its own work complete.
+            if review_run_id is None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_unverified",
+                        {
+                            "status": vrow["status"],
+                            "verification_state": vrow["verification_state"],
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                raise VerificationRequiredError(
+                    task_id, vrow["status"], vrow["verification_state"]
+                )
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -5523,6 +5856,44 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Re-decide enforcement inside the write txn — the config could have
+        # been flipped, or the task re-flagged, since the pre-check above.
+        require_verified = gauntlet_required(conn, task_id)
+        if require_verified:
+            head = conn.execute(
+                "SELECT verification_state FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if head is not None and head["verification_state"] != VERIFICATION_VERIFIED:
+                review_run_id, reviewer = _review_run_verification(conn, task_id)
+                if review_run_id is None:
+                    # Lost the race with a re-claim/reopen, or the pre-check
+                    # was bypassed entirely. Refuse without mutating.
+                    return False
+                # Reviewer approving from inside their own review run: record
+                # the verdict atomically with the completion it authorises, so
+                # the ledger can never show a 'done' with nothing behind it.
+                _record_verification_row(
+                    conn, task_id,
+                    state=VERIFICATION_VERIFIED,
+                    run_id=review_run_id,
+                    verifier=reviewer,
+                    evidence={
+                        "source": "review_run_approval",
+                        "run_id": review_run_id,
+                    },
+                    reason="approved by reviewer run",
+                    now=now,
+                )
+                _append_event(
+                    conn, task_id, "verification_passed",
+                    {
+                        "verifier": reviewer,
+                        "source": "review_run_approval",
+                    },
+                    run_id=review_run_id,
+                )
+        verified_guard = 1 if require_verified else 0
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5537,8 +5908,11 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
+                   -- Gauntlet: EXECUTING -> COMPLETED is unreachable unless a
+                   -- VERIFIED verdict is already materialised on the row.
+                   AND (? = 0 OR verification_state = 'verified')
                 """,
-                (result, now, task_id),
+                (result, now, task_id, verified_guard),
             )
         else:
             cur = conn.execute(
@@ -5555,8 +5929,10 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
+                   -- Gauntlet: see the no-CAS branch above.
+                   AND (? = 0 OR verification_state = 'verified')
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, task_id, int(expected_run_id), verified_guard),
             )
         if cur.rowcount != 1:
             return False
@@ -6755,6 +7131,20 @@ def request_review(
                 summary=summary,
                 metadata=metadata,
             )
+        # Gauntlet: entering the review lane IS entering VERIFICATION_PENDING.
+        # Recorded unconditionally, not just for enforced tasks, so the ledger
+        # is complete if enforcement is switched on later — and so the
+        # ``pending -> verified`` verdict always has a phase-start to sit
+        # against. It does not gate anything on its own.
+        _record_verification_row(
+            conn,
+            task_id,
+            state=VERIFICATION_PENDING,
+            run_id=run_id,
+            verifier=reviewer,
+            evidence={"implementer": implementer, "reviewer": reviewer},
+            reason="implementation handed off for verification",
+        )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
         _append_event(
@@ -6765,6 +7155,7 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "verification_state": VERIFICATION_PENDING,
             },
             run_id=run_id,
         )
@@ -6868,6 +7259,9 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        # Back to the implementer: the verification phase is over and its
+        # verdict (pending or failed) no longer describes the work in flight.
+        _clear_verification_state(conn, task_id)
         run_id = _end_run(
             conn,
             task_id,
@@ -6888,6 +7282,182 @@ def request_changes(
             run_id=run_id,
         )
     return True, implementer
+
+
+def record_verification(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    passed: bool,
+    verifier: Optional[str] = None,
+    evidence: Optional[dict] = None,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    route_on_failure: bool = True,
+) -> tuple[bool, Optional[str]]:
+    """Record the VERIFIED / failed verdict for a task in the review lane.
+
+    This is the only way to reach ``verification_state='verified'``, and it is
+    legal only from inside the verification phase — the task is parked in
+    ``review``, or a reviewer run claimed from ``review`` is in flight. An
+    implementer's own ``running`` task is refused, which is what makes the
+    Gauntlet chain non-bypassable: the executor has no route to the state its
+    own completion requires.
+
+    ``evidence`` is a free-form dict of falsifiable facts (commands, exit
+    codes, test counts, artefact paths) persisted on the ledger row. It is
+    passed through :func:`redact_review_value` like every other reviewer-
+    supplied payload.
+
+    On ``passed=False`` the verdict is durable and the task is routed back for
+    repair: ``request_changes`` when a reviewer run is in flight, otherwise
+    ``reopen_review_task``. If routing is declined (``route_on_failure=False``)
+    or fails, the task stays in ``review`` with a ``failed`` head — either way
+    it cannot complete. ``reason`` is required for a failing verdict.
+
+    Returns ``(ok, detail)``: ``detail`` is the resulting status on success and
+    a diagnostic string on refusal.
+    """
+    reason_text = str(redact_review_value(reason or "")).strip() or None
+    if not passed and not reason_text:
+        return False, "reason is required for a failing verification"
+    verifier = _canonical_assignee(verifier) if verifier else None
+
+    review_run_id: Optional[int] = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id, verification_state "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        status = row["status"]
+        if status == "review":
+            # Parked awaiting a verifier. No run in flight to bind to; the
+            # verdict attaches to the run that requested the review.
+            phase_run_id = None
+        elif status == "running":
+            review_run_id, run_reviewer = _review_run_verification(conn, task_id)
+            if review_run_id is None:
+                return False, (
+                    "task is running an implementation run; an executor "
+                    "cannot verify its own work — hand off with "
+                    "request_review first"
+                )
+            if expected_run_id is not None and int(expected_run_id) != review_run_id:
+                return False, "run_id mismatch"
+            if verifier is None and run_reviewer:
+                verifier = _canonical_assignee(run_reviewer)
+            phase_run_id = review_run_id
+        else:
+            return False, (
+                f"task is {status!r}; verification is only valid from the "
+                f"review lane (status 'review', or a reviewer run claimed "
+                f"from it)"
+            )
+
+        state = VERIFICATION_VERIFIED if passed else VERIFICATION_FAILED
+        _record_verification_row(
+            conn,
+            task_id,
+            state=state,
+            run_id=phase_run_id,
+            verifier=verifier,
+            evidence=evidence,
+            reason=reason_text,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "verification_passed" if passed else "verification_failed",
+            {
+                "verifier": verifier,
+                "reason": reason_text,
+                "source": "record_verification",
+            },
+            run_id=phase_run_id,
+        )
+
+    if passed:
+        return True, VERIFICATION_VERIFIED
+    if not route_on_failure:
+        # Verdict is durable; the task stays in review and stays non-complete.
+        return True, VERIFICATION_FAILED
+
+    # Route to repair/rework. Both helpers open their own write transaction,
+    # so they run after the verdict is already committed — a failure to route
+    # therefore leaves a task that is blocked from completing, never one that
+    # slipped through.
+    if review_run_id is not None:
+        ok, detail = request_changes(
+            conn, task_id, reason=reason_text or "verification failed",
+            expected_run_id=review_run_id,
+        )
+        if not ok:
+            return True, VERIFICATION_FAILED
+        return True, "rework"
+    if reopen_review_task(conn, task_id):
+        return True, "rework"
+    return True, VERIFICATION_FAILED
+
+
+def verification_history(
+    conn: sqlite3.Connection, task_id: str
+) -> list[dict[str, Any]]:
+    """Return the task's verification ledger, oldest first.
+
+    The audit trail behind ``tasks.verification_state``: which phase starts,
+    verdicts, verifiers and evidence produced the current head. Survives the
+    head being cleared by a re-claim, so a completed task's history shows what
+    was verified and when.
+    """
+    rows = conn.execute(
+        "SELECT id, run_id, state, verifier, evidence, reason, created_at "
+        "FROM task_verifications WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            evidence = json.loads(r["evidence"]) if r["evidence"] else None
+        except (json.JSONDecodeError, TypeError):
+            evidence = None
+        out.append(
+            {
+                "id": int(r["id"]),
+                "run_id": r["run_id"],
+                "state": r["state"],
+                "verifier": r["verifier"],
+                "evidence": evidence,
+                "reason": r["reason"],
+                "created_at": r["created_at"],
+            }
+        )
+    return out
+
+
+def set_gauntlet_enforced(
+    conn: sqlite3.Connection, task_id: str, enabled: bool
+) -> bool:
+    """Turn the per-task Gauntlet chain on or off. Returns False if unknown.
+
+    Turning it *off* does not erase the ledger; it only stops the completion
+    guard consulting the head. ``kanban.gauntlet_enforcement`` still applies
+    board-wide regardless of this flag.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET gauntlet_enforced = ? WHERE id = ?",
+            (1 if enabled else 0, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "gauntlet_enforcement",
+            {"enabled": bool(enabled)},
+        )
+    return True
 
 
 def promote_task(
@@ -7191,6 +7761,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        # Leaving the review lane for rework — see request_changes.
+        _clear_verification_state(conn, task_id)
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
