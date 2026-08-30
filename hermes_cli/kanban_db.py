@@ -131,6 +131,55 @@ VALID_VERIFICATION_STATES = {
     VERIFICATION_FAILED,
 }
 
+# --- Regression evidence after a material repair -------------------------
+#
+# The Gauntlet contract also says a material repair must be regression-tested.
+# A failing verdict is what makes the next round of work a repair, so a
+# ``failed`` verdict ARMS the requirement on the task row
+# (``tasks.regression_required = 1``). It stays armed across the rework — the
+# repair run, the re-handoff, everything — and is disarmed by exactly one
+# thing: a PASS verdict carrying an explicit regression proof. A PASS without
+# one is refused deterministically, so a repaired card cannot be re-blessed on
+# the strength of the same "it works now" claim that failed the first time.
+#
+# The proof lives in the same append-only ledger as the verdicts rather than a
+# parallel store, distinguished by two columns:
+#
+#   task_verifications.kind             'verdict' (default) | 'regression'
+#   task_verifications.covers_phase_id  for a regression row, the ledger id of
+#                                       the VERIFICATION_PENDING row (the
+#                                       verification phase) it was produced
+#                                       against
+#
+# ``covers_phase_id`` is what makes a proof unspendable on work it never saw:
+# every ``request_review`` opens a NEW phase row, so a proof gathered against
+# the previous phase no longer matches the current one and the gate stays
+# closed. Ordinary verification evidence is untouched — it is still free-form
+# JSON on the verdict row (``kind='verdict'``); only ``kind='regression'``
+# rows satisfy the repair gate, and only with at least one field naming the
+# check that was actually re-run.
+LEDGER_KIND_VERDICT = "verdict"
+LEDGER_KIND_REGRESSION = "regression"
+# ``state`` on a regression row. Deliberately NOT a member of
+# VALID_VERIFICATION_STATES: a proof is not a verdict and must never be
+# materialised as the head of ``tasks.verification_state``.
+VERIFICATION_REGRESSION = "regression"
+VALID_LEDGER_STATES = VALID_VERIFICATION_STATES | {VERIFICATION_REGRESSION}
+# Minimal contract for a regression proof: a JSON object naming at least one
+# check that was re-executed. "It passed" is a claim; "pytest -q tests/foo.py
+# exited 0" is evidence. Additional keys (exit_code, passed, failed, artefact
+# paths, durations) are encouraged and stored verbatim.
+REGRESSION_EVIDENCE_KEYS = (
+    "command",
+    "commands",
+    "test",
+    "tests",
+    "suite",
+    "suites",
+    "check",
+    "checks",
+)
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1204,6 +1253,12 @@ class Task:
     # Head of the task_verifications ledger: None | 'pending' | 'verified' |
     # 'failed'. Only 'verified' satisfies the completion guard.
     verification_state: Optional[str] = None
+    # True once a failing verdict has made the next round of work a material
+    # repair: the next PASS must carry an explicit regression proof bound to
+    # the current verification phase. Survives the repair run; cleared only by
+    # such a PASS. See the REGRESSION EVIDENCE comment near
+    # VERIFICATION_REGRESSION.
+    regression_required: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1313,6 +1368,11 @@ class Task:
                 row["verification_state"]
                 if "verification_state" in keys and row["verification_state"]
                 else None
+            ),
+            regression_required=(
+                bool(row["regression_required"])
+                if "regression_required" in keys and row["regression_required"]
+                else False
             ),
         )
 
@@ -1526,7 +1586,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- expressed as a single atomic SQL predicate. Cleared whenever a new
     -- implementation run starts, so a stale verdict can never be spent on
     -- work it did not cover.
-    verification_state   TEXT
+    verification_state   TEXT,
+    -- Armed by a failing verdict: the work that follows is a material repair,
+    -- so the next PASS verdict must carry an explicit regression proof (a
+    -- task_verifications row with kind='regression' bound to the current
+    -- verification phase). Survives the repair run and the re-handoff;
+    -- cleared only by a PASS that spends such a proof. complete_task tests it
+    -- in the same UPDATE ... WHERE as verification_state, so a repaired card
+    -- with no regression evidence cannot reach 'done' even when every Python
+    -- pre-check is bypassed.
+    regression_required  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1567,7 +1636,16 @@ CREATE TABLE IF NOT EXISTS task_verifications (
     verifier   TEXT,
     evidence   TEXT,
     reason     TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- 'verdict' (a phase start or a pass/fail verdict; the historical shape of
+    -- this table) or 'regression' (a regression proof for a material repair).
+    -- Only 'verdict' rows materialise tasks.verification_state.
+    kind       TEXT NOT NULL DEFAULT 'verdict',
+    -- Regression rows only: the id of the VERIFICATION_PENDING row whose
+    -- verification phase this proof was produced against. A later
+    -- request_review opens a new phase with a new id, so a proof gathered
+    -- against earlier work stops matching and cannot be spent on it.
+    covers_phase_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_verifications_task
@@ -2838,6 +2916,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "verification_state", "verification_state TEXT"
         )
 
+    if "regression_required" not in cols:
+        # 0 on every legacy row. Nothing is retro-armed: the requirement is
+        # evidence-driven, and a board migrated mid-flight has no recorded
+        # failing verdict for the work already in progress, so inventing one
+        # would block cards on a repair that was never diagnosed. It arms on
+        # the first failing verdict after the migration.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "regression_required",
+            "regression_required INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2866,6 +2957,34 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    # task_verifications gained the regression-proof discriminators. A board
+    # written by the first Gauntlet release has verdict rows only, so the
+    # 'verdict' default is exactly right for them and covers_phase_id stays
+    # NULL (a verdict row does not cover a phase, it *is* one).
+    verif_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='task_verifications'"
+    ).fetchone() is not None
+    if verif_table_exists:
+        verif_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(task_verifications)")
+        }
+        if "kind" not in verif_cols:
+            _add_column_if_missing(
+                conn,
+                "task_verifications",
+                "kind",
+                "kind TEXT NOT NULL DEFAULT 'verdict'",
+            )
+        if "covers_phase_id" not in verif_cols:
+            _add_column_if_missing(
+                conn,
+                "task_verifications",
+                "covers_phase_id",
+                "covers_phase_id INTEGER",
+            )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -5569,10 +5688,25 @@ class VerificationRequiredError(ValueError):
         task_id: str,
         status: Optional[str],
         verification_state: Optional[str],
+        regression_detail: Optional[str] = None,
     ):
         self.task_id = task_id
         self.status = status
         self.verification_state = verification_state
+        # Set when the missing step is specifically the regression proof owed
+        # for a material repair, so a caller can tell "not verified yet" apart
+        # from "verified is unreachable until you re-run the checks".
+        self.regression_required = regression_detail is not None
+        self.regression_detail = regression_detail
+        if regression_detail is not None:
+            super().__init__(
+                f"completion blocked: {task_id} is gauntlet-enforced and "
+                f"{regression_detail} (status={status!r}, "
+                f"verification_state={verification_state!r}). The required "
+                f"chain is running -> review -> verified -> done, and after a "
+                f"failed verification the verdict needs regression evidence."
+            )
+            return
         if verification_state == VERIFICATION_FAILED:
             detail = (
                 "its latest verification FAILED; it must be repaired and "
@@ -5641,17 +5775,34 @@ def _record_verification_row(
     evidence: Optional[dict] = None,
     reason: Optional[str] = None,
     now: Optional[int] = None,
+    kind: str = LEDGER_KIND_VERDICT,
+    covers_phase_id: Optional[int] = None,
 ) -> int:
     """Append one row to the verification ledger and materialise its head.
 
     Must be called inside an open write transaction: the ledger row and the
     ``tasks.verification_state`` it materialises have to land together, or the
     completion guard could read a head with no evidence behind it.
+
+    ``kind='regression'`` writes a regression proof instead of a verdict: it is
+    appended to the same ledger and is equally durable, but it deliberately
+    does NOT touch ``tasks.verification_state`` — a proof is an input to a
+    verdict, never a verdict itself.
     """
-    if state not in VALID_VERIFICATION_STATES:
+    if kind not in (LEDGER_KIND_VERDICT, LEDGER_KIND_REGRESSION):
+        raise ValueError(
+            f"ledger kind must be {LEDGER_KIND_VERDICT!r} or "
+            f"{LEDGER_KIND_REGRESSION!r}, got {kind!r}"
+        )
+    if kind == LEDGER_KIND_VERDICT and state not in VALID_VERIFICATION_STATES:
         raise ValueError(
             f"verification state must be one of "
             f"{sorted(VALID_VERIFICATION_STATES)}, got {state!r}"
+        )
+    if kind == LEDGER_KIND_REGRESSION and state != VERIFICATION_REGRESSION:
+        raise ValueError(
+            f"regression rows carry state {VERIFICATION_REGRESSION!r}, "
+            f"got {state!r}"
         )
     ts = int(time.time()) if now is None else int(now)
     payload = None
@@ -5663,8 +5814,9 @@ def _record_verification_row(
     cur = conn.execute(
         """
         INSERT INTO task_verifications
-            (task_id, run_id, state, verifier, evidence, reason, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (task_id, run_id, state, verifier, evidence, reason, created_at,
+             kind, covers_phase_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
@@ -5674,12 +5826,15 @@ def _record_verification_row(
             payload,
             (str(redact_review_value(reason)).strip() or None) if reason else None,
             ts,
+            kind,
+            int(covers_phase_id) if covers_phase_id is not None else None,
         ),
     )
-    conn.execute(
-        "UPDATE tasks SET verification_state = ? WHERE id = ?",
-        (state, task_id),
-    )
+    if kind == LEDGER_KIND_VERDICT:
+        conn.execute(
+            "UPDATE tasks SET verification_state = ? WHERE id = ?",
+            (state, task_id),
+        )
     return int(cur.lastrowid)
 
 
@@ -5698,6 +5853,194 @@ def _clear_verification_state(conn: sqlite3.Connection, task_id: str) -> None:
         "UPDATE tasks SET verification_state = NULL "
         "WHERE id = ? AND verification_state IS NOT NULL",
         (task_id,),
+    )
+
+
+def regression_evidence_required(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return True when the next PASS on ``task_id`` must carry a proof.
+
+    Materialised on the task by the failing verdict that made the following
+    work a material repair. Read (never inferred) so the requirement survives
+    a process restart, a re-claim, and a different verifier.
+    """
+    row = conn.execute(
+        "SELECT regression_required FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    keys = set(row.keys())
+    return bool("regression_required" in keys and row["regression_required"])
+
+
+def _current_verification_phase(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[tuple[int, Optional[int]]]:
+    """Return ``(phase_id, run_id)`` of the open verification phase, if any.
+
+    The phase is the latest ``pending`` verdict row — written by
+    :func:`request_review` when the implementation was handed off. Its ledger
+    id is the token a regression proof binds to, which is what stops a proof
+    being spent on a later, unrelated run: the next handoff writes a new
+    phase row with a new id.
+    """
+    row = conn.execute(
+        "SELECT id, run_id FROM task_verifications "
+        "WHERE task_id = ? AND kind = ? AND state = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, LEDGER_KIND_VERDICT, VERIFICATION_PENDING),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["id"]), (int(row["run_id"]) if row["run_id"] is not None else None)
+
+
+def _arming_failure_id(conn: sqlite3.Connection, task_id: str) -> int:
+    """Ledger id of the failing verdict that armed the requirement (0 if none).
+
+    A proof must post-date the failure it answers. Without this, a proof
+    gathered *before* the verification failed — describing exactly the code
+    that then failed — would satisfy the gate.
+    """
+    row = conn.execute(
+        "SELECT MAX(id) AS id FROM task_verifications "
+        "WHERE task_id = ? AND kind = ? AND state = ?",
+        (task_id, LEDGER_KIND_VERDICT, VERIFICATION_FAILED),
+    ).fetchone()
+    if row is None or row["id"] is None:
+        return 0
+    return int(row["id"])
+
+
+def _existing_regression_proof(
+    conn: sqlite3.Connection, task_id: str, phase_id: int, after_id: int
+) -> Optional[int]:
+    """Ledger id of a live regression proof for this phase, or ``None``.
+
+    "Live" means both bound to the current verification phase and recorded
+    after the failing verdict that armed the requirement.
+    """
+    row = conn.execute(
+        "SELECT id FROM task_verifications "
+        "WHERE task_id = ? AND kind = ? AND covers_phase_id = ? AND id > ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, LEDGER_KIND_REGRESSION, int(phase_id), int(after_id)),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def _validate_regression_evidence(evidence: Any) -> tuple[bool, Optional[str]]:
+    """Check a regression proof against the minimal contract.
+
+    Deliberately narrow: it must be a JSON object, and it must name at least
+    one check that was actually re-run. "regressions: none" is a claim; a
+    command with an exit code is a fact somebody else can re-execute.
+    """
+    if not isinstance(evidence, dict) or not evidence:
+        return False, (
+            "regression evidence must be a non-empty JSON object of "
+            "falsifiable facts"
+        )
+    if not any(evidence.get(k) for k in REGRESSION_EVIDENCE_KEYS):
+        return False, (
+            "regression evidence must name the check that was re-run — "
+            "include at least one of "
+            f"{', '.join(REGRESSION_EVIDENCE_KEYS)} "
+            "(plus exit codes / counts / artefact paths as available)"
+        )
+    return True, None
+
+
+def _regression_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    evidence: Optional[dict] = None,
+    verifier: Optional[str] = None,
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> tuple[bool, Optional[str], Optional[int]]:
+    """Decide whether a PASS may be recorded, recording the proof if supplied.
+
+    Returns ``(ok, detail, proof_id)``. ``ok`` is True when the task is not in
+    a repair cycle at all (the ordinary first-pass case — nothing extra is
+    demanded of it), when ``evidence`` satisfies the contract and has just
+    been appended to the ledger, or when a live proof for this phase was
+    already recorded. Otherwise ``detail`` says exactly what is missing.
+
+    Must run inside the caller's write transaction: the proof row and the
+    verdict that spends it have to land together, or the ledger could show a
+    VERIFIED repair with no proof behind it.
+    """
+    required = regression_evidence_required(conn, task_id)
+    phase = _current_verification_phase(conn, task_id)
+
+    if evidence is not None:
+        # Recorded whether or not it was demanded. A verifier who re-ran the
+        # checks unprompted has produced evidence; silently discarding it
+        # because the gate happened to be open would make the ledger lie by
+        # omission.
+        ok, detail = _validate_regression_evidence(evidence)
+        if not ok:
+            return False, detail, None
+        if phase is None and required:
+            return False, (
+                "no verification phase is open to bind regression evidence "
+                "to; hand the repair off with request_review first"
+            ), None
+        proof_id = _record_verification_row(
+            conn,
+            task_id,
+            state=VERIFICATION_REGRESSION,
+            kind=LEDGER_KIND_REGRESSION,
+            run_id=phase[1] if phase else None,
+            covers_phase_id=phase[0] if phase else None,
+            verifier=verifier,
+            evidence=evidence,
+            reason=reason or "regression evidence for a material repair",
+            now=now,
+        )
+        return True, None, proof_id
+
+    if not required:
+        return True, None, None
+
+    if phase is None:
+        return False, (
+            "no verification phase is open to bind regression evidence to; "
+            "hand the repair off with request_review first"
+        ), None
+    phase_id, _phase_run_id = phase
+    armed_after = _arming_failure_id(conn, task_id)
+    existing = _existing_regression_proof(conn, task_id, phase_id, armed_after)
+    if existing is not None:
+        return True, None, existing
+
+    return False, (
+        "regression evidence is required: this task failed verification and "
+        "the work since then is a material repair, so a passing verdict must "
+        "carry proof that the checks were re-run against the repaired work. "
+        "Supply a JSON object naming at least one of "
+        f"{', '.join(REGRESSION_EVIDENCE_KEYS)} "
+        "(e.g. `hermes kanban verify <id> --pass --regression-evidence "
+        "'{\"command\": \"pytest -q tests/foo.py\", \"exit_code\": 0}'`)"
+    ), None
+
+
+def _spend_regression_requirement(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Disarm the repair gate once a PASS has spent a live proof.
+
+    Only ever called in the same transaction as the VERIFIED verdict that the
+    proof backs, so ``regression_required = 0`` and ``verification_state =
+    'verified'`` become true together — the pair the completion UPDATE tests.
+    The ledger rows stay: what was re-run, by whom and when is exactly the
+    record a later reader needs.
+    """
+    conn.execute(
+        "UPDATE tasks SET regression_required = 0 WHERE id = ?", (task_id,)
     )
 
 
@@ -5742,6 +6085,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    regression_evidence: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5774,6 +6118,13 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    ``regression_evidence`` is only consulted on the reviewer-run approval
+    path (a run claimed from ``review`` approving inline, which is how the
+    agent review lane records its verdict). When that task owes a regression
+    proof for a material repair, the evidence is recorded on the ledger and
+    spent by the verdict this call writes; without it the approval is refused
+    exactly like an unverified completion.
     """
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
@@ -5814,6 +6165,35 @@ def complete_task(
                 raise VerificationRequiredError(
                     task_id, vrow["status"], vrow["verification_state"]
                 )
+            # Reviewer run approving a material repair: the inline verdict is
+            # only legal if the regression proof it owes is available. Checked
+            # here read-only (nothing is recorded on a refusal but the audit
+            # event) and again, authoritatively, inside the write txn.
+            if regression_evidence_required(conn, task_id):
+                if regression_evidence is not None:
+                    # Shape-check the supplied proof here so a malformed one is
+                    # a named refusal rather than a bare False from the UPDATE.
+                    ok_reg, reg_detail = _validate_regression_evidence(
+                        regression_evidence
+                    )
+                else:
+                    ok_reg, reg_detail, _ = _regression_gate(conn, task_id)
+                if not ok_reg:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, task_id, "completion_blocked_no_regression",
+                            {
+                                "status": vrow["status"],
+                                "verification_state": vrow["verification_state"],
+                                "detail": reg_detail,
+                                "run_id": review_run_id,
+                            },
+                            run_id=review_run_id,
+                        )
+                    raise VerificationRequiredError(
+                        task_id, vrow["status"], vrow["verification_state"],
+                        regression_detail=reg_detail,
+                    )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5873,23 +6253,42 @@ def complete_task(
                 # Reviewer approving from inside their own review run: record
                 # the verdict atomically with the completion it authorises, so
                 # the ledger can never show a 'done' with nothing behind it.
+                # A material repair owes its regression proof first — recorded
+                # in this same transaction, so proof and verdict are one write.
+                ok_reg, reg_detail, proof_id = _regression_gate(
+                    conn, task_id,
+                    evidence=regression_evidence,
+                    verifier=reviewer,
+                    now=now,
+                )
+                if not ok_reg:
+                    # Armed between the pre-check and here, or the pre-check
+                    # was bypassed. Refuse without mutating: the rollback of
+                    # this txn also discards anything the gate wrote.
+                    return False
+                verdict_evidence: dict[str, Any] = {
+                    "source": "review_run_approval",
+                    "run_id": review_run_id,
+                }
+                if proof_id is not None:
+                    verdict_evidence["regression_proof_id"] = proof_id
                 _record_verification_row(
                     conn, task_id,
                     state=VERIFICATION_VERIFIED,
                     run_id=review_run_id,
                     verifier=reviewer,
-                    evidence={
-                        "source": "review_run_approval",
-                        "run_id": review_run_id,
-                    },
+                    evidence=verdict_evidence,
                     reason="approved by reviewer run",
                     now=now,
                 )
+                if proof_id is not None:
+                    _spend_regression_requirement(conn, task_id)
                 _append_event(
                     conn, task_id, "verification_passed",
                     {
                         "verifier": reviewer,
                         "source": "review_run_approval",
+                        "regression_proof_id": proof_id,
                     },
                     run_id=review_run_id,
                 )
@@ -5909,8 +6308,12 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    -- Gauntlet: EXECUTING -> COMPLETED is unreachable unless a
-                   -- VERIFIED verdict is already materialised on the row.
-                   AND (? = 0 OR verification_state = 'verified')
+                   -- VERIFIED verdict is already materialised on the row, and
+                   -- a repair still owing regression evidence is unreachable
+                   -- even with one (only a PASS that spent a live proof
+                   -- clears regression_required).
+                   AND (? = 0 OR (verification_state = 'verified'
+                                  AND regression_required = 0))
                 """,
                 (result, now, task_id, verified_guard),
             )
@@ -5930,7 +6333,8 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                    -- Gauntlet: see the no-CAS branch above.
-                   AND (? = 0 OR verification_state = 'verified')
+                   AND (? = 0 OR (verification_state = 'verified'
+                                  AND regression_required = 0))
                 """,
                 (result, now, task_id, int(expected_run_id), verified_guard),
             )
@@ -7261,6 +7665,11 @@ def request_changes(
             return False, "task changed during review handoff"
         # Back to the implementer: the verification phase is over and its
         # verdict (pending or failed) no longer describes the work in flight.
+        # ``regression_required`` is deliberately NOT cleared here: if a
+        # failing verdict armed it, the rework this routing starts is the
+        # repair that owes the proof. A bare request_changes with no recorded
+        # verdict does not arm it — the requirement follows the verdict, not
+        # the routing, so review conversations keep their existing behaviour.
         _clear_verification_state(conn, task_id)
         run_id = _end_run(
             conn,
@@ -7294,6 +7703,7 @@ def record_verification(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     route_on_failure: bool = True,
+    regression_evidence: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Record the VERIFIED / failed verdict for a task in the review lane.
 
@@ -7308,6 +7718,16 @@ def record_verification(
     codes, test counts, artefact paths) persisted on the ledger row. It is
     passed through :func:`redact_review_value` like every other reviewer-
     supplied payload.
+
+    ``regression_evidence`` is the distinct, structured thing a PASS after a
+    material repair must carry: proof that the checks were re-run against the
+    repaired work. It is recorded as its own ledger row (``kind='regression'``)
+    bound to the current verification phase, in the same transaction as the
+    verdict that spends it. Required — and only required — once a failing
+    verdict has armed ``tasks.regression_required``; a first-pass task never
+    needs it. A PASS that owes one and cannot produce one is refused with the
+    verdict unwritten, so the task stays non-complete and the ledger never
+    shows a repair blessed on a bare assurance.
 
     On ``passed=False`` the verdict is durable and the task is routed back for
     repair: ``request_changes`` when a reviewer run is in flight, otherwise
@@ -7357,16 +7777,67 @@ def record_verification(
                 f"from it)"
             )
 
+        proof_id: Optional[int] = None
+        if passed:
+            # A material repair owes regression evidence before it can be
+            # blessed. The gate records the proof (when supplied) inside this
+            # transaction; on refusal nothing at all is written — no verdict,
+            # no partial proof — so the task simply stays where it was.
+            ok_reg, reg_detail, proof_id = _regression_gate(
+                conn,
+                task_id,
+                evidence=regression_evidence,
+                verifier=verifier,
+                reason=reason_text,
+            )
+            if not ok_reg:
+                _append_event(
+                    conn,
+                    task_id,
+                    "verification_blocked_no_regression",
+                    {
+                        "verifier": verifier,
+                        "detail": reg_detail,
+                        "status": status,
+                    },
+                    run_id=phase_run_id,
+                )
+                return False, reg_detail
+        elif regression_evidence is not None:
+            # Nothing to bless, so nothing to prove. Refusing loudly beats
+            # silently dropping a payload the caller thought was recorded.
+            return False, (
+                "regression evidence belongs on a passing verdict; a failing "
+                "one takes --reason and ordinary evidence"
+            )
+
         state = VERIFICATION_VERIFIED if passed else VERIFICATION_FAILED
+        verdict_evidence = evidence
+        if proof_id is not None:
+            # Bind proof to verdict from both sides: the proof names the phase
+            # it covers, the verdict names the proof it spent.
+            verdict_evidence = dict(evidence or {})
+            verdict_evidence["regression_proof_id"] = proof_id
         _record_verification_row(
             conn,
             task_id,
             state=state,
             run_id=phase_run_id,
             verifier=verifier,
-            evidence=evidence,
+            evidence=verdict_evidence,
             reason=reason_text,
         )
+        if passed:
+            if proof_id is not None:
+                _spend_regression_requirement(conn, task_id)
+        else:
+            # Arm the repair gate: whatever happens next is a repair of work
+            # that has already been found wanting, so its eventual PASS has to
+            # show the checks re-run rather than re-assert that it works.
+            conn.execute(
+                "UPDATE tasks SET regression_required = 1 WHERE id = ?",
+                (task_id,),
+            )
         _append_event(
             conn,
             task_id,
@@ -7375,6 +7846,11 @@ def record_verification(
                 "verifier": verifier,
                 "reason": reason_text,
                 "source": "record_verification",
+                **(
+                    {"regression_proof_id": proof_id}
+                    if passed
+                    else {"regression_required": True}
+                ),
             },
             run_id=phase_run_id,
         )
@@ -7413,7 +7889,8 @@ def verification_history(
     was verified and when.
     """
     rows = conn.execute(
-        "SELECT id, run_id, state, verifier, evidence, reason, created_at "
+        "SELECT id, run_id, state, verifier, evidence, reason, created_at, "
+        "       kind, covers_phase_id "
         "FROM task_verifications WHERE task_id = ? ORDER BY id",
         (task_id,),
     ).fetchall()
@@ -7432,6 +7909,9 @@ def verification_history(
                 "evidence": evidence,
                 "reason": r["reason"],
                 "created_at": r["created_at"],
+                # 'verdict' | 'regression' — what this row is evidence OF.
+                "kind": r["kind"] or LEDGER_KIND_VERDICT,
+                "covers_phase_id": r["covers_phase_id"],
             }
         )
     return out

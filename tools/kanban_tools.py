@@ -681,6 +681,12 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    regression_evidence = args.get("regression_evidence")
+    if regression_evidence is not None and not isinstance(regression_evidence, dict):
+        return tool_error(
+            f"regression_evidence must be an object/dict naming the checks "
+            f"you re-ran, got {type(regression_evidence).__name__}"
+        )
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -771,6 +777,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    regression_evidence=regression_evidence,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -785,6 +792,19 @@ def _handle_complete(args: dict, **kw) -> str:
                 # NOT mutated and is still in-flight — say so explicitly, or
                 # the model reads a tool_error as terminal and blocks/crashes
                 # instead of taking the one legal next step (#22923).
+                if verify_err.regression_required:
+                    # Reviewer approving a repaired card without the proof it
+                    # owes. The legal next step is different from the one
+                    # below: re-run the checks and resubmit WITH them.
+                    return tool_error(
+                        f"kanban_complete blocked: {verify_err} "
+                        f"Your task is still in-flight (no state change). "
+                        f"Re-run the checks that failed (plus the suite around "
+                        f"the change) and call kanban_complete again with "
+                        f"regression_evidence, e.g. "
+                        f"{{\"command\": \"pytest -q tests/foo.py\", "
+                        f"\"exit_code\": 0, \"passed\": 12}}."
+                    )
                 return tool_error(
                     f"kanban_complete blocked: {verify_err} "
                     f"Your task is still in-flight (no state change). "
@@ -1878,6 +1898,20 @@ KANBAN_COMPLETE_SCHEMA = {
                     "``kanban_create`` call — do not invent or "
                     "remember ids from prose. Omit the field if you "
                     "did not create any cards."
+                ),
+            },
+            "regression_evidence": {
+                "type": "object",
+                "description": (
+                    "Only for a REVIEWER approving a card that previously "
+                    "failed verification and has since been repaired: proof "
+                    "that you re-ran the checks against the repaired work. "
+                    "Must name at least one check — e.g. {\"command\": "
+                    "\"pytest -q tests/foo.py\", \"exit_code\": 0, "
+                    "\"passed\": 12} — and is stored as its own row on the "
+                    "task's verification ledger. Omit it otherwise; a "
+                    "first-pass task does not need one, and the error you "
+                    "get back will say so if one is required."
                 ),
             },
             "artifacts": {

@@ -83,6 +83,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "current_step_key": t.current_step_key,
         "gauntlet_enforced": t.gauntlet_enforced,
         "verification_state": t.verification_state,
+        "regression_required": t.regression_required,
     }
 
 
@@ -772,6 +773,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help=(
             "JSON object of falsifiable facts (commands run, exit codes, test "
             "counts, artefact paths). Stored on the verification ledger."
+        ),
+    )
+    p_verify.add_argument(
+        "--regression-evidence", dest="regression_evidence", default=None,
+        help=(
+            "JSON object proving the checks were re-run against a repaired "
+            "task (must name at least one of: command, commands, test, "
+            "tests, suite, suites, check, checks). REQUIRED with --pass once "
+            "a failing verdict has made the work a material repair; recorded "
+            "as its own regression row on the verification ledger."
         ),
     )
     p_verify.add_argument(
@@ -2407,11 +2418,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 )
             except kb.VerificationRequiredError as e:
                 failed.append(tid)
+                verify_hint = (
+                    f"'hermes kanban verify {tid} --pass "
+                    f"--regression-evidence '{{\"command\": \"...\", "
+                    f"\"exit_code\": 0}}''"
+                    if e.regression_required
+                    else f"'hermes kanban verify {tid} --pass'"
+                )
                 print(
                     f"kanban: {e} "
                     f"Use 'hermes kanban request-review {tid}' to hand it "
-                    f"off, then 'hermes kanban verify {tid} --pass' once it "
-                    f"checks out.",
+                    f"off, then {verify_hint} once it checks out.",
                     file=sys.stderr,
                 )
                 continue
@@ -2632,6 +2649,16 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --evidence: {exc}", file=sys.stderr)
             return 2
+    raw_regression = getattr(args, "regression_evidence", None)
+    regression_evidence = None
+    if raw_regression:
+        try:
+            regression_evidence = json.loads(raw_regression)
+            if not isinstance(regression_evidence, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --regression-evidence: {exc}", file=sys.stderr)
+            return 2
     if not passed and not reason:
         print("kanban: --fail requires --reason", file=sys.stderr)
         return 2
@@ -2647,6 +2674,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             reason=reason,
             expected_run_id=_worker_run_id_for(tid),
             route_on_failure=not bool(getattr(args, "no_route", False)),
+            regression_evidence=regression_evidence,
         )
         if not ok:
             print(f"cannot verify {tid}: {detail}", file=sys.stderr)
