@@ -756,6 +756,96 @@ class TestToolSurface:
 
 
 # ---------------------------------------------------------------------------
+# Coverage merged from the parallel test_kanban_verified_lessons.py draft.
+#
+# That file and this one were written independently against the same feature
+# and overlap almost entirely — 49 tests there, 44 here, four cases in common
+# by name and most of the rest equivalent in substance. These four had no
+# counterpart here, and each pins a property the rest of the file does not:
+# who may revoke a binding constraint, whether the tool validates its input,
+# whether promotion trusts the materialised head or the ledger, and whether
+# the tools are actually reachable.
+# ---------------------------------------------------------------------------
+
+class TestRetireToolAuthority:
+    def test_retire_tool_is_orchestrator_only(self, kanban_home, monkeypatch):
+        """A worker that finds a constraint inconvenient cannot revoke it.
+
+        The whole value of a binding lesson is that the party it binds cannot
+        switch it off. Promotion is gated on evidence; retirement has to be
+        gated on authority, or the constraint is advisory in practice.
+        """
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn, tenant="acme")
+            lesson = _promote(conn, src, lesson="x")
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", src)
+        out = json.loads(kt._handle_retire_lesson({"lesson_id": lesson["id"]}))
+        assert out.get("ok") is not True
+        assert "orchestrator-only" in json.dumps(out)
+        with kb.connect_closing() as conn:
+            assert len(kb.list_lessons(conn)) == 1
+
+    def test_retire_tool_rejects_a_non_integer_id(self, kanban_home):
+        from tools import kanban_tools as kt
+
+        out = json.loads(kt._handle_retire_lesson({"lesson_id": "not-an-id"}))
+        assert out.get("ok") is not True
+        assert "lesson_id must be" in json.dumps(out)
+
+
+class TestLedgerIsTheEvidence:
+    def test_tampered_verified_head_over_a_failing_verdict_is_caught(
+        self, kanban_home
+    ):
+        """The ledger, not the head column, is the evidence.
+
+        ``verification_state`` is a materialised convenience so the completion
+        guard can be one SQL predicate. It is therefore the field a race or a
+        hand-edit can leave wrong. Promotion re-reads the append-only ledger
+        rather than trusting the denormalised head, so "it failed, then someone
+        wrote 'verified' on it" does not become canon.
+        """
+        with kb.connect_closing() as conn:
+            tid, _run_id = _pending(conn, tenant="acme")
+            kb.record_verification(
+                conn, tid, passed=False, verifier="reviewer", reason="red",
+                route_on_failure=False,
+            )
+            conn.execute(
+                "UPDATE tasks SET verification_state = ?, "
+                "regression_required = 0 WHERE id = ?",
+                (kb.VERIFICATION_VERIFIED, tid),
+            )
+            conn.commit()
+            assert kb.get_task(conn, tid).verification_state == (
+                kb.VERIFICATION_VERIFIED
+            )
+
+            with pytest.raises(kb.LessonPromotionError) as exc:
+                _promote(conn, tid, lesson="looked fine")
+            assert exc.value.code == "ledger_mismatch"
+            assert kb.list_lessons(conn) == []
+
+
+class TestToolRegistration:
+    def test_tools_are_registered(self, kanban_home):
+        """Reachability. A tool the registry does not expose binds nobody."""
+        from tools import kanban_tools as kt  # noqa: F401
+        from tools.registry import registry
+
+        for name in (
+            "kanban_promote_lesson", "kanban_lessons", "kanban_retire_lesson"
+        ):
+            entry = registry.get_entry(name)
+            assert entry is not None, f"{name} is not registered"
+            assert entry.schema["name"] == name
+            assert entry.toolset == "kanban"
+
+
+# ---------------------------------------------------------------------------
 # Schema migration
 # ---------------------------------------------------------------------------
 

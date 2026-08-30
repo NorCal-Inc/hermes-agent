@@ -2643,6 +2643,61 @@ DEFAULT_CONFIG = {
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
     },
+    # -----------------------------------------------------------------
+    # Execution supervisor
+    # -----------------------------------------------------------------
+    # Deterministic ownership for governed external executor processes
+    # (claude, codex, a gate command). Exists because a synchronous caller
+    # that hits its timeout does NOT reliably end the process it started:
+    # subprocess kills the direct child only, so grandchildren are reparented
+    # to init and keep mutating state while the controller reports failure.
+    # Every setting here is a bound on that; none of them grants authority.
+    "execution": {
+        # Executor classes that may be launched at all. Deny-by-default: a
+        # class absent from this list is refused before any record is written
+        # and before any process exists.
+        "allowed_executors": ["claude", "codex", "shell"],
+        # Absolute directory prefixes an execution's working directory may
+        # fall under, compared after symlink resolution. Empty/unset falls
+        # back to HERMES_HOME plus the board's workspaces root — deliberately
+        # NOT the process cwd or $HOME, because a boundary whose default is
+        # "wherever the caller happens to be" is not a boundary.
+        "allowed_roots": [],
+        # Optional allow-list of registered launcher names (see
+        # exec_supervisor.LAUNCHERS). Empty means "any registered launcher";
+        # there is no way to run unregistered argv either way.
+        "allowed_command_classes": [],
+        # Hard runtime cap for any single execution. The effective cap is the
+        # tightest of this, the per-executor override, and what the caller
+        # asked for — a caller can only ever request less.
+        "max_runtime_seconds": 3600,
+        # Per-executor overrides, e.g. {"shell": 600}.
+        "max_runtime_seconds_by_executor": {},
+        # Longest synchronous wait allowed. A request above this is not given
+        # a longer wait: the execution is created supervisor-owned instead, so
+        # the work most likely to outlive its caller never depended on the
+        # caller. This is the mechanical form of "long jobs use tracked
+        # background execution from the beginning".
+        "sync_ceiling_seconds": 900,
+        # A live executor whose owner has reported no progress for this long
+        # is reconciled as stale. Generous on purpose: an agentic executor is
+        # legitimately quiet for long stretches, and a false positive kills
+        # real work. 0 disables stale-heartbeat reconciliation (the runtime
+        # cap still applies).
+        "stale_heartbeat_seconds": 1800,
+        # Grace between SIGTERM and SIGKILL when ending a process GROUP.
+        "terminate_grace_seconds": 10,
+        # What reconciliation does with a live executor whose controller is
+        # gone: "terminate" (default) ends the group and records
+        # controller_lost; "adopt" transfers it to the supervisor, which then
+        # holds it to the runtime cap. There is deliberately no third option
+        # meaning "log it and leave it running".
+        "orphan_policy": "terminate",
+        # Whether sudo-eligible launchers may run at all. Off unless an
+        # operator turns it on; the supervisor is an execution-control
+        # boundary, not root authority.
+        "allow_sudo": False,
+    },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {

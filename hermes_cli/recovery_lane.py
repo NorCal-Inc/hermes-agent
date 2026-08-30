@@ -27,20 +27,39 @@ card is Gauntlet-enforced (``tasks.gauntlet_enforced``, or the board-wide
 executor, so a green gate hands the card to the review lane as
 VERIFICATION_PENDING with the gate evidence attached instead of completing
 it. See ``_handoff_for_verification``.
+
+Every external process in that sequence — both agentic attempts and the gate
+command — is launched through ``hermes_cli.exec_supervisor`` rather than a
+bare ``subprocess.run(timeout=...)``.
+
+This lane is where the split-brain actually happened. ``subprocess.run``'s
+timeout kills only the direct child, so a Claude invocation that hit the
+bound was reported to the controller as a timeout while its surviving
+grandchildren kept working, unsupervised, and later produced commits. The
+supervisor removes that outcome structurally: a durable execution record
+exists before the process does, the child is started in its own session so
+the whole tree is signalable as one group, and every exit path — timeout,
+exception, KeyboardInterrupt — either confirms the group dead or transfers
+ownership to the supervisor in the same transaction. There is no path on
+which this lane returns while an executor it started is still running
+unowned.
+
+The lane keeps its own Gauntlet handoff (``route_task=False`` on every
+launch) because its evidence is the GATE's exit code, gathered after the
+executor exits — a handoff fired by the supervisor at executor-exit time
+would move the card out of ``running`` before the gate had even run.
 """
 
 from __future__ import annotations
 
 import json
-import shlex
-import shutil
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli import exec_supervisor as ex
 from hermes_cli import kanban_db as kb
 
 # Bound on each of the Claude and Codex attempts when the task doesn't set
@@ -63,14 +82,42 @@ class AttemptResult:
     stderr: str
     timed_out: bool = False
     error: Optional[str] = None
+    #: Durable execution record this attempt ran under. Carried into the
+    #: evidence so a human reading a blocked card can run
+    #: ``hermes kanban exec show <id>`` and see who owned the process and how
+    #: it actually ended, rather than inferring it from an exit code.
+    execution_id: Optional[str] = None
+    #: Supervisor status (completed / failed / timed_out / controller_lost /
+    #: terminated / stale). ``returncode == 0`` alone is NOT success here.
+    execution_status: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """Whether this attempt genuinely ran to a clean finish.
+
+        Deliberately not ``returncode == 0``: a controller-lost or terminated
+        execution can leave a stale zero lying around, and the entire point of
+        the supervisor is that the status, not the exit code, is the authority
+        on whether an executor finished.
+        """
+        return self.execution_status == ex.STATUS_COMPLETED and self.returncode == 0
 
     @property
     def evidence(self) -> str:
+        suffix = f" [execution {self.execution_id}]" if self.execution_id else ""
         if self.error:
-            return f"[{self.executor}] invocation error: {self.error}"
+            return f"[{self.executor}] invocation error: {self.error}{suffix}"
         if self.timed_out:
-            return f"[{self.executor}] timed out (rc=None)"
-        parts = [f"[{self.executor}] rc={self.returncode}"]
+            return (
+                f"[{self.executor}] timed out (rc=None); the supervisor "
+                f"confirmed the process group ended{suffix}"
+            )
+        if self.execution_status and self.execution_status != ex.STATUS_COMPLETED:
+            return (
+                f"[{self.executor}] execution ended "
+                f"{self.execution_status} (rc={self.returncode}){suffix}"
+            )
+        parts = [f"[{self.executor}] rc={self.returncode}{suffix}"]
         if self.stdout.strip():
             parts.append(f"stdout:\n{_truncate(self.stdout)}")
         if self.stderr.strip():
@@ -314,9 +361,16 @@ def run_claude_executor(task_id: str) -> int:
 
         track_files = task.workspace_kind == "scratch" or "attach" in (task.body or "").lower()
         before = _snapshot_workspace(cwd) if track_files else {}
-        attempt = _invoke_claude(_build_claude_task_prompt(task), cwd, timeout)
+        attempt = _invoke_claude(
+            _build_claude_task_prompt(task), cwd, timeout, task_id=task_id,
+        )
 
-        if attempt.error or attempt.timed_out or attempt.returncode != 0:
+        # ``attempt.ok`` rather than ``returncode == 0``: the supervisor's
+        # status is the authority on whether the executor finished. A
+        # controller-lost or terminated execution can leave a zero behind,
+        # and treating that as success is exactly the split-brain this lane
+        # was rewired to end.
+        if not attempt.ok:
             reason = "Direct Claude executor failed or timed out.\n\n" + attempt.evidence
             ok = kb.block_task(
                 conn,
@@ -410,82 +464,145 @@ def run_claude_executor(task_id: str) -> int:
             pass
 
 
-def _invoke_claude(prompt: str, cwd: str, timeout: int) -> AttemptResult:
-    claude_bin = shutil.which("claude") or "claude"
+def _invoke_claude(
+    prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
+) -> AttemptResult:
+    """One bounded Claude attempt, under durable supervisor ownership.
+
+    The prompt is passed to the launcher in memory and is never persisted:
+    the execution record stores the command CLASS (``claude.headless``), not
+    the argv. See ``exec_supervisor.Launcher``.
+    """
+    return _supervised_attempt(
+        "claude", "claude.headless", {"prompt": prompt}, cwd, timeout,
+        task_id=task_id,
+    )
+
+
+def _supervised_attempt(
+    executor: str,
+    command_class: str,
+    spec: dict,
+    cwd: str,
+    timeout: int,
+    *,
+    task_id: Optional[str] = None,
+) -> AttemptResult:
+    """Shared body for the agentic attempts.
+
+    A policy refusal is returned as a failed attempt rather than raised: the
+    lane's contract is one bounded attempt then a decision, and a refused
+    launch is a decidable outcome. It is never silently retried, and the
+    refusal text names the policy code so an operator can see which bound
+    said no.
+    """
     try:
-        proc = subprocess.run(
-            [
-                claude_bin, "-p", prompt,
-                "--output-format", "json",
-                "--permission-mode", "acceptEdits",
-            ],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        result = ex.run_supervised(
+            command_class=command_class,
+            spec=spec,
+            cwd=cwd,
+            task_id=task_id,
+            timeout=timeout,
+            # This lane performs its own Gauntlet handoff after the gate runs.
+            route_task=False,
         )
-    except subprocess.TimeoutExpired:
-        return AttemptResult("claude", None, "", "", timed_out=True)
-    except Exception as exc:
-        return AttemptResult("claude", None, "", "", error=str(exc))
-    return AttemptResult("claude", proc.returncode, proc.stdout, proc.stderr)
+    except ex.ExecutionPolicyError as exc:
+        return AttemptResult(
+            executor, None, "", "",
+            error=f"refused by execution policy ({exc.code}): {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        return AttemptResult(executor, None, "", "", error=str(exc))
+    return AttemptResult(
+        executor,
+        result.exit_code,
+        result.stdout,
+        result.stderr,
+        timed_out=result.timed_out,
+        error=result.error,
+        execution_id=result.execution_id,
+        execution_status=result.status,
+    )
 
 
-def _invoke_codex(prompt: str, cwd: str, timeout: int) -> AttemptResult:
-    codex_bin = shutil.which("codex") or "codex"
+def _invoke_codex(
+    prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
+) -> AttemptResult:
+    """One bounded Codex attempt, under durable supervisor ownership."""
     with tempfile.NamedTemporaryFile(
         prefix="hermes-recovery-codex-", suffix=".txt", delete=False
     ) as tmp:
         last_message_path = tmp.name
     try:
-        proc = subprocess.run(
-            [
-                codex_bin, "exec", prompt,
-                "--json",
-                "--sandbox", "workspace-write",
-                "--skip-git-repo-check",
-                "-o", last_message_path,
-            ],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        attempt = _supervised_attempt(
+            "codex", "codex.exec",
+            {"prompt": prompt, "last_message_path": last_message_path},
+            cwd, timeout, task_id=task_id,
         )
-    except subprocess.TimeoutExpired:
-        return AttemptResult("codex", None, "", "", timed_out=True)
-    except Exception as exc:
-        return AttemptResult("codex", None, "", "", error=str(exc))
     finally:
         try:
-            last_message = Path(last_message_path).read_text(encoding="utf-8", errors="replace")
+            last_message = Path(last_message_path).read_text(
+                encoding="utf-8", errors="replace"
+            )
         except Exception:
             last_message = ""
         try:
             Path(last_message_path).unlink(missing_ok=True)
         except Exception:
             pass
-    stdout = proc.stdout
     if last_message.strip():
-        stdout = f"{stdout}\n--- last message ---\n{last_message}"
-    return AttemptResult("codex", proc.returncode, stdout, proc.stderr)
+        attempt.stdout = f"{attempt.stdout}\n--- last message ---\n{last_message}"
+    return attempt
 
 
 def _gate_argv(gate_cmd: str) -> list[str]:
-    """Parse a simple gate command without invoking a shell."""
-    if any(token in gate_cmd for token in ("|", ";", "&&", "||", ">", "<", "`", "$(", "\n", "\r")):
-        raise ValueError("recovery_gate_cmd may not contain shell operators or redirection")
-    argv = shlex.split(gate_cmd)
-    if not argv:
-        raise ValueError("recovery_gate_cmd is empty")
-    return argv
+    """Parse a simple gate command without invoking a shell.
 
+    Delegates to the supervisor so there is exactly ONE definition of what a
+    gate command may contain. Two copies of a security-relevant parser drift,
+    and the copy that drifts is always the one that stops refusing something.
 
-def _run_gate(gate_cmd: str, cwd: str, timeout: int) -> GateResult:
+    Re-raised as ``ValueError`` to preserve this function's historical
+    contract for existing callers and tests.
+    """
     try:
-        proc = subprocess.run(
-            _gate_argv(gate_cmd), shell=False, cwd=cwd,
-            capture_output=True, text=True, timeout=timeout,
+        return ex.gate_argv(gate_cmd)
+    except ex.ExecutionPolicyError as exc:
+        raise ValueError(f"recovery_gate_cmd rejected: {exc}") from exc
+
+
+def _run_gate(
+    gate_cmd: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
+) -> GateResult:
+    """Run the mechanical gate under supervision.
+
+    The gate decides whether the card may be handed off, so an ambiguous gate
+    is worse than a red one: ``ok`` requires the supervisor to have observed a
+    genuine ``completed`` execution with exit code 0. A gate that was
+    terminated, timed out, or lost its controller is NOT green, no matter what
+    exit code happened to be recorded.
+    """
+    try:
+        result = ex.run_supervised(
+            command_class="shell.gate",
+            spec={"command": gate_cmd},
+            cwd=cwd,
+            task_id=task_id,
+            timeout=timeout,
+            route_task=False,
         )
-    except subprocess.TimeoutExpired:
-        return GateResult(False, None, "", timed_out=True)
-    except Exception as exc:
+    except ex.ExecutionPolicyError as exc:
+        return GateResult(
+            False, None, "",
+            error=f"refused by execution policy ({exc.code}): {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
         return GateResult(False, None, "", error=str(exc))
-    output = (proc.stdout or "") + (proc.stderr or "")
-    return GateResult(proc.returncode == 0, proc.returncode, output)
+    output = (result.stdout or "") + (result.stderr or "")
+    green = result.status == ex.STATUS_COMPLETED and result.exit_code == 0
+    return GateResult(
+        green, result.exit_code, output, timed_out=result.timed_out,
+    )
 
 
 def _claim_attempt(conn, task_id: str, kind: str, run_id: Optional[int]) -> bool:
@@ -553,7 +670,9 @@ def run_claude_first_recovery(task_id: str) -> int:
         # Always test the deterministic gate before consuming another bounded
         # executor attempt. If it is already green, close through the recovery
         # lane with gate evidence and let normal dependency promotion proceed.
-        pre_gate = _run_gate(task.recovery_gate_cmd, cwd, gate_timeout)
+        pre_gate = _run_gate(
+            task.recovery_gate_cmd, cwd, gate_timeout, task_id=task_id,
+        )
         if pre_gate.ok:
             return 0 if _complete(
                 conn, task_id,
@@ -569,14 +688,18 @@ def run_claude_first_recovery(task_id: str) -> int:
         except RuntimeError:
             return 1
         claude_attempt = (
-            _invoke_claude(_build_repair_prompt(task), cwd, attempt_timeout)
+            _invoke_claude(
+                _build_repair_prompt(task), cwd, attempt_timeout, task_id=task_id,
+            )
             if run_claude
             else AttemptResult(
                 "claude", None, "", "",
                 error="prior Claude attempt already recorded; not repeated",
             )
         )
-        claude_gate = _run_gate(task.recovery_gate_cmd, cwd, gate_timeout)
+        claude_gate = _run_gate(
+            task.recovery_gate_cmd, cwd, gate_timeout, task_id=task_id,
+        )
         if claude_gate.ok:
             return 0 if _complete(
                 conn, task_id,
@@ -594,7 +717,7 @@ def run_claude_first_recovery(task_id: str) -> int:
         codex_attempt = (
             _invoke_codex(
                 _build_repair_prompt(task, prior_evidence=claude_attempt.evidence),
-                cwd, attempt_timeout,
+                cwd, attempt_timeout, task_id=task_id,
             )
             if run_codex
             else AttemptResult(
@@ -602,7 +725,9 @@ def run_claude_first_recovery(task_id: str) -> int:
                 error="prior Codex attempt already recorded; not repeated",
             )
         )
-        codex_gate = _run_gate(task.recovery_gate_cmd, cwd, gate_timeout)
+        codex_gate = _run_gate(
+            task.recovery_gate_cmd, cwd, gate_timeout, task_id=task_id,
+        )
         if codex_gate.ok:
             return 0 if _complete(
                 conn, task_id,

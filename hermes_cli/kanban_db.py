@@ -302,6 +302,15 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     "verification_blocked_no_regression",
     "lesson_promotion_blocked",
     "suspected_hallucinated_references",
+    # Execution-supervisor refusals. A launch the policy refused, or an
+    # execution the reconciler could not settle, recurs for exactly as long as
+    # nothing is being fixed — counting it as progress would make an
+    # abandoned card look freshest at the moment it is most abandoned. The
+    # supervisor's *settling* events (``execution_finished`` /
+    # ``execution_failed``) are deliberately absent from this list: those mean
+    # something really happened to the card.
+    "execution_refused",
+    "execution_reconcile_failed",
 )
 
 # Conservative defaults, mirroring ``kanban.dispatch_stale_timeout_seconds``:
@@ -1895,6 +1904,122 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
+
+-- ---------------------------------------------------------------------
+-- Execution supervisor: durable ownership for governed external processes
+-- ---------------------------------------------------------------------
+--
+-- The failure this table exists to make impossible: a synchronous caller
+-- launches an external executor (claude, codex, a gate command), the call
+-- hits its timeout, the caller reports EXECUTION FAILED — and the child
+-- survives, reparented to init, still mutating the working tree. The
+-- controller believes the work ended; the executor believes it is running.
+-- Nobody owns it, and it later produces commits nobody authorised.
+--
+-- ``subprocess.run(timeout=...)`` cannot prevent that on its own: it kills
+-- only the direct child, so any grandchild (a CLI's own daemon, a spawned
+-- node process) is orphaned silently. The fix is not a bigger timeout, it
+-- is an ownership record that exists BEFORE the process does and has no
+-- state meaning "the caller returned and nobody owns this".
+--
+-- Every row is therefore written and committed before ``Popen``. Ownership
+-- is explicit in ``ownership``: 'controller' (a synchronous caller is
+-- waiting, and losing it terminates the process group) or 'supervisor' (a
+-- durable background job, reconciled by :func:`exec_supervisor.reconcile`).
+-- There is no third value, so "returned but unowned" is unrepresentable
+-- rather than merely unlikely.
+--
+-- Deliberately NOT stored: argv, environment, prompts, tokens. Only
+-- ``command_class`` — the name of a registered launcher — is persisted, so
+-- an execution record can never become a place a secret leaks to. See
+-- ``exec_supervisor.LAUNCHERS``.
+CREATE TABLE IF NOT EXISTS executions (
+    id                 TEXT PRIMARY KEY,
+    -- Optional: a governed executor usually belongs to a Gauntlet card, but
+    -- a gate command or an ad-hoc operator run legitimately has no task.
+    task_id            TEXT,
+    -- Registered executor class (claude / codex / shell / ...). Checked
+    -- against the policy's allow-list BEFORE the record is written.
+    executor_type      TEXT NOT NULL,
+    -- Name of the registered launcher that built argv. Never the argv.
+    command_class      TEXT NOT NULL,
+    cwd                TEXT NOT NULL,
+    pid                INTEGER,
+    -- Process-group id. Populated because the child is started with
+    -- start_new_session=True: signalling the GROUP is what makes
+    -- termination cover grandchildren instead of orphaning them.
+    pgid               INTEGER,
+    -- Process identity fingerprint captured at launch (Linux: boot-relative
+    -- start time + comm from /proc/<pid>/stat). PID alone is not identity —
+    -- a recycled PID belonging to an unrelated process must never be
+    -- mistaken for this executor and must never be signalled. Reconciliation
+    -- compares the live fingerprint against this one.
+    proc_key           TEXT,
+    -- Durable, per-execution random identity. Survives PID reuse and is
+    -- exported to the child as HERMES_EXECUTION_ID for correlation. Not a
+    -- credential: it authorises nothing.
+    nonce              TEXT NOT NULL,
+    controller_pid     INTEGER,
+    controller_key     TEXT,
+    -- Ownership token of the controlling session. Opaque and non-secret;
+    -- it identifies WHICH controller owns the row so a second controller
+    -- cannot silently adopt a live execution.
+    controller_token   TEXT NOT NULL,
+    -- 'controller' | 'supervisor'. See the note above.
+    ownership          TEXT NOT NULL,
+    max_runtime_s      INTEGER,
+    started_at         INTEGER NOT NULL,
+    -- Last progress signal from an owner actively watching the child.
+    -- Advanced by the synchronous waiter and by explicit heartbeat() calls,
+    -- NEVER by reconciliation — a reconciler that refreshed it would make
+    -- every abandoned job look permanently fresh.
+    heartbeat_at       INTEGER NOT NULL,
+    -- Last time reconciliation observed this row. Separate from the
+    -- heartbeat precisely so "the supervisor is running" and "the executor
+    -- is making progress" stay independently visible.
+    last_observed_at   INTEGER,
+    ended_at           INTEGER,
+    -- launching | running | completed | failed | timed_out | controller_lost
+    -- | stale | terminated | recovered
+    status             TEXT NOT NULL,
+    exit_code          INTEGER,
+    termination_reason TEXT,
+    -- Optional pointer to the rollback / pre-change artefact this execution
+    -- can be undone with. Read-only jobs legitimately have none.
+    rollback_ref       TEXT,
+    -- Whether settling this execution should drive the Gauntlet lifecycle of
+    -- ``task_id`` (hand a clean exit to VERIFICATION_PENDING, route every
+    -- non-success into recovery). 1 for the ordinary case.
+    --
+    -- 0 for a caller that already owns that routing and would otherwise be
+    -- raced by it — the Claude recovery lane runs its own gate command AFTER
+    -- the executor exits and hands off with that gate's evidence attached, so
+    -- a supervisor handoff firing first would move the card out of 'running'
+    -- and leave the lane's richer handoff refused. Setting it to 0 buys no
+    -- freedom to skip the chain: completion is still gated in
+    -- ``complete_task``'s UPDATE ... WHERE, which no caller can talk its way
+    -- past. It only says WHICH owner performs the handoff.
+    route_task         INTEGER NOT NULL DEFAULT 1,
+    created_at         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status, started_at);
+CREATE INDEX IF NOT EXISTS idx_executions_task   ON executions(task_id, started_at);
+
+-- Append-only audit trail for executions. Separate from ``task_events``
+-- because an execution may have no task, and because an execution's
+-- ownership transitions have to stay auditable even when the card is
+-- later archived.
+CREATE TABLE IF NOT EXISTS execution_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    payload      TEXT,
+    created_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_exec
+    ON execution_events(execution_id, id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
@@ -10077,6 +10202,22 @@ class DispatchResult:
     a ``gauntlet_stale`` event and left the cards exactly as they were. One id
     appears once per stale episode (or per
     ``kanban.gauntlet_stale_realert_seconds``), not once per tick."""
+    executions_reconciled: dict = field(default_factory=dict)
+    """Outcome of this tick's execution-supervisor reconciliation pass.
+
+    The shape of :meth:`exec_supervisor.ReconcileResult.to_dict` — every
+    non-terminal execution row resolved to a terminal status, adopted into
+    supervisor ownership, or confirmed healthy and untouched.
+
+    Unlike :attr:`gauntlet_stale`, this pass DOES mutate: a live executor whose
+    controller has died is terminated (or adopted, per
+    ``execution.orphan_policy``), and one past its runtime cap is killed. That
+    is the point — the failure it exists to stop is an executor that outlived
+    its controller and kept committing, and an observability-only response to
+    a live orphan would leave exactly that condition in place.
+
+    Empty dict when the pass found nothing to do or could not run.
+    """
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -12295,6 +12436,27 @@ def _dispatch_once_locked(
     except Exception:
         _log.exception(
             "kanban dispatch: gauntlet freshness scan failed (tick continues)"
+        )
+
+    # Execution-supervisor reconciliation. Runs in the same pre-early-return
+    # position and for a sharper version of the same reason: a saturated host
+    # is exactly when a controller dies mid-execution, and the orphan it
+    # leaves behind keeps mutating the working tree for as long as nobody
+    # looks. Deliberately AFTER the freshness scan so a task routed into
+    # recovery by a settled execution is already visible to the next tick's
+    # scan rather than this one's.
+    #
+    # Imported lazily: exec_supervisor imports this module, so a module-level
+    # import here would be circular.
+    try:
+        from hermes_cli import exec_supervisor as _exec_sup
+
+        _recon = _exec_sup.reconcile(conn)
+        if _recon.checked:
+            result.executions_reconciled = _recon.to_dict()
+    except Exception:
+        _log.exception(
+            "kanban dispatch: execution reconciliation failed (tick continues)"
         )
 
     # Count tasks already running so max_spawn enforces concurrency rather

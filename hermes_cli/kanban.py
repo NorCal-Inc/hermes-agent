@@ -808,6 +808,65 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restore the classic lifecycle (the verification ledger is kept).",
     )
 
+    p_exec = sub.add_parser(
+        "exec",
+        help="Inspect and control governed executor processes",
+        description=(
+            "The execution supervisor's operator surface. Every governed "
+            "external executor (claude, codex, a gate command) gets a durable "
+            "execution record BEFORE its process starts, and that record "
+            "always names an owner: a synchronous controller, or the "
+            "supervisor itself. These commands answer what is running, who "
+            "owns it, what task it belongs to, how long it has run, when it "
+            "last showed progress, whether its controller is still alive, "
+            "whether it is inside policy, and how it ended. Raw environment "
+            "and argv are deliberately never stored or printed."
+        ),
+    )
+    exec_sub = p_exec.add_subparsers(dest="exec_action")
+
+    e_list = exec_sub.add_parser(
+        "list", aliases=["ls"], help="List execution records, newest first",
+    )
+    e_list.add_argument(
+        "--active", action="store_true",
+        help="Only executions that have not reached a terminal status.",
+    )
+    e_list.add_argument(
+        "--status", default=None,
+        help="Filter to one status (completed, failed, timed_out, "
+             "controller_lost, stale, terminated, recovered, running, launching).",
+    )
+    e_list.add_argument("--task", dest="task_id", default=None,
+                        help="Only executions belonging to this task.")
+    e_list.add_argument("--limit", type=int, default=25)
+    e_list.add_argument("--json", action="store_true")
+
+    e_show = exec_sub.add_parser(
+        "show", help="Show one execution with its full audit trail",
+    )
+    e_show.add_argument("execution_id")
+    e_show.add_argument("--json", action="store_true")
+
+    e_reconcile = exec_sub.add_parser(
+        "reconcile",
+        help=(
+            "Resolve every non-terminal execution deterministically "
+            "(this MUTATES: live orphans are terminated or adopted)"
+        ),
+    )
+    e_reconcile.add_argument("--json", action="store_true")
+
+    e_terminate = exec_sub.add_parser(
+        "terminate", help="End a running execution's process group",
+    )
+    e_terminate.add_argument("execution_id")
+    e_terminate.add_argument(
+        "--reason", default="operator_request",
+        help="Recorded on the execution's termination_reason.",
+    )
+    e_terminate.add_argument("--json", action="store_true")
+
     p_lesson_promote = sub.add_parser(
         "lesson-promote",
         help=(
@@ -1329,6 +1388,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reopen-review":  _cmd_reopen_review,
             "verify":   _cmd_verify,
             "gauntlet": _cmd_gauntlet,
+            "exec":     _dispatch_exec,
             "lesson-promote": _cmd_lesson_promote,
             "lesson-retire":  _cmd_lesson_retire,
             "lessons":  _cmd_lessons,
@@ -2795,6 +2855,182 @@ def _cmd_gauntlet(args: argparse.Namespace) -> int:
                 print(f"cannot set gauntlet enforcement for {tid} (unknown id)",
                       file=sys.stderr)
     return 0 if not failed else 1
+
+
+# ---------------------------------------------------------------------------
+# Execution supervisor
+# ---------------------------------------------------------------------------
+
+
+def _fmt_duration(seconds) -> str:
+    if seconds is None:
+        return "-"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _dispatch_exec(args: argparse.Namespace) -> int:
+    sub = getattr(args, "exec_action", None)
+    if not sub:
+        print(
+            "usage: hermes kanban exec <list|show|reconcile|terminate>",
+            file=sys.stderr,
+        )
+        return 2
+    if sub in ("list", "ls"):
+        return _cmd_exec_list(args)
+    if sub == "show":
+        return _cmd_exec_show(args)
+    if sub == "reconcile":
+        return _cmd_exec_reconcile(args)
+    if sub == "terminate":
+        return _cmd_exec_terminate(args)
+    print(f"kanban exec: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_exec_list(args: argparse.Namespace) -> int:
+    from hermes_cli import exec_supervisor as ex
+
+    with kb.connect_closing() as conn:
+        records = ex.list_executions(
+            conn,
+            status=getattr(args, "status", None),
+            active_only=bool(getattr(args, "active", False)),
+            task_id=getattr(args, "task_id", None),
+            limit=getattr(args, "limit", 25) or 25,
+        )
+        rows = [ex.describe(conn, record) for record in records]
+
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No executions match.")
+        return 0
+
+    # The header is the operator's actual question list, in order: what is it,
+    # who owns it, whose card, how long, when did it last show progress, is the
+    # controller alive, is it inside policy, how did it end.
+    print(
+        f"{'ID':<20} {'EXECUTOR':<10} {'OWNER':<11} {'TASK':<14} "
+        f"{'RUNTIME':>8} {'PROGRESS':>9} {'CTRL':<6} {'POL':<4} STATUS"
+    )
+    for row in rows:
+        since = row.get("seconds_since_heartbeat")
+        ctrl = "-" if row["terminal"] else ("alive" if row["controller_alive"] else "DEAD")
+        pol = "ok" if row["within_policy"] else "OUT"
+        status = row["status"]
+        if row.get("exit_code") is not None:
+            status += f" (rc={row['exit_code']})"
+        print(
+            f"{row['id']:<20} {row['executor_type']:<10} {row['ownership']:<11} "
+            f"{(row['task_id'] or '-'):<14} "
+            f"{_fmt_duration(row['runtime_seconds']):>8} "
+            f"{_fmt_duration(since):>9} {ctrl:<6} {pol:<4} {status}"
+        )
+    return 0
+
+
+def _cmd_exec_show(args: argparse.Namespace) -> int:
+    from hermes_cli import exec_supervisor as ex
+
+    with kb.connect_closing() as conn:
+        record = ex.get_execution(conn, args.execution_id)
+        if record is None:
+            print(
+                f"kanban exec: no execution {args.execution_id!r} on this board",
+                file=sys.stderr,
+            )
+            return 1
+        data = ex.describe(conn, record)
+        data["events"] = ex.execution_events(conn, record.id)
+
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+
+    print(f"Execution {data['id']}")
+    print(f"  status            {data['status']}"
+          + (f" (rc={data['exit_code']})" if data.get("exit_code") is not None else ""))
+    if data.get("termination_reason"):
+        print(f"  termination       {data['termination_reason']}")
+    print(f"  executor          {data['executor_type']} / {data['command_class']}")
+    print(f"  task              {data['task_id'] or '-'}")
+    print(f"  owner             {data['ownership']}")
+    print(f"  cwd               {data['cwd']}")
+    print(f"  pid / pgid        {data['pid'] or '-'} / {data['pgid'] or '-'}")
+    print(f"  controller pid    {data['controller_pid'] or '-'} "
+          f"({'alive' if data['controller_alive'] else 'not alive'})")
+    print(f"  executor alive    {'yes' if data['executor_alive'] else 'no'}")
+    print(f"  runtime           {_fmt_duration(data['runtime_seconds'])}"
+          f" (cap {_fmt_duration(data['max_runtime_s'])})")
+    print(f"  last progress     {_fmt_duration(data['seconds_since_heartbeat'])} ago")
+    print(f"  within policy     {'yes' if data['within_policy'] else 'NO: ' + ', '.join(data['policy_notes'])}")
+    print(f"  rollback ref      {data['rollback_ref'] or '-'}")
+    print(f"  started           {_fmt_ts(data['started_at'])}")
+    print(f"  ended             {_fmt_ts(data['ended_at']) if data['ended_at'] else '-'}")
+    if data["events"]:
+        print("  audit trail:")
+        for event in data["events"]:
+            payload = json.dumps(event["payload"]) if event["payload"] else ""
+            print(f"    {_fmt_ts(event['created_at'])}  {event['kind']:<10} {payload}")
+    return 0
+
+
+def _cmd_exec_reconcile(args: argparse.Namespace) -> int:
+    from hermes_cli import exec_supervisor as ex
+
+    with kb.connect_closing() as conn:
+        result = ex.reconcile(conn)
+    data = result.to_dict()
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"Checked {data['checked']} non-terminal execution(s).")
+    for key in (
+        "completed", "failed", "timed_out", "controller_lost",
+        "stale", "terminated", "recovered", "adopted", "untouched",
+    ):
+        ids = data.get(key) or []
+        if ids:
+            print(f"  {key:<16} {len(ids):>3}  {', '.join(ids[:10])}"
+                  + (" ..." if len(ids) > 10 else ""))
+    return 0
+
+
+def _cmd_exec_terminate(args: argparse.Namespace) -> int:
+    from hermes_cli import exec_supervisor as ex
+
+    with kb.connect_closing() as conn:
+        try:
+            record = ex.terminate_execution(
+                conn, args.execution_id, reason=args.reason,
+            )
+        except ex.ExecutionNotFound as exc:
+            print(f"kanban exec: {exc}", file=sys.stderr)
+            return 1
+        data = ex.describe(conn, record)
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"{record.id}: {record.status}"
+          + (f" ({record.termination_reason})" if record.termination_reason else ""))
+    # A record still owned by the supervisor means the process would not die.
+    # Say so rather than reporting a clean kill: this module exists precisely
+    # because "we sent a signal" was once mistaken for "the process ended".
+    if not record.is_terminal:
+        print(
+            "  NOTE: the process could not be confirmed dead; ownership was "
+            "transferred to the supervisor and it will be reconciled again.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def _cmd_lesson_promote(args: argparse.Namespace) -> int:

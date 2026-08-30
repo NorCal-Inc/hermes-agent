@@ -1764,6 +1764,43 @@ class GatewayKanbanWatchersMixin:
                                 len(res.gauntlet_stale),
                                 ", ".join(res.gauntlet_stale[:10]),
                             )
+                        # Execution supervisor. Reported separately from the
+                        # freshness line above, and at WARNING only when the
+                        # pass actually DID something: unlike that scan, this
+                        # one mutates — a live executor whose controller died
+                        # was terminated or adopted here. An operator reading
+                        # the log needs to see that as an event, not as part
+                        # of the routine idle chatter.
+                        _recon = (
+                            getattr(res, "executions_reconciled", None) or {}
+                            if res is not None
+                            else {}
+                        )
+                        if _recon:
+                            _acted = {
+                                key: ids
+                                for key, ids in _recon.items()
+                                if key not in ("checked", "untouched") and ids
+                            }
+                            if _acted:
+                                logger.warning(
+                                    "kanban dispatcher [%s]: execution supervisor "
+                                    "reconciled %d of %d non-terminal execution(s): %s",
+                                    slug,
+                                    sum(len(ids) for ids in _acted.values()),
+                                    _recon.get("checked", 0),
+                                    "; ".join(
+                                        f"{key}={len(ids)} ({', '.join(ids[:5])})"
+                                        for key, ids in sorted(_acted.items())
+                                    ),
+                                )
+                            else:
+                                logger.debug(
+                                    "kanban dispatcher [%s]: %d execution(s) healthy "
+                                    "and owned",
+                                    slug,
+                                    _recon.get("checked", 0),
+                                )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)
                     if ready_pending and not any_spawned:

@@ -253,8 +253,10 @@ def test_direct_claude_executor_completes_with_attachment(monkeypatch):
     monkeypatch.setattr(recovery_lane, "_snapshot_workspace", lambda cwd: {})
     monkeypatch.setattr(
         recovery_lane, "_invoke_claude",
-        lambda prompt, cwd, timeout: recovery_lane.AttemptResult(
-            "claude", 0, '{"result":"Audit finished with evidence."}', ""
+        lambda prompt, cwd, timeout, *, task_id=None: recovery_lane.AttemptResult(
+            "claude", 0, '{"result":"Audit finished with evidence."}', "",
+            execution_id="x_fake_claude",
+            execution_status=recovery_lane.ex.STATUS_COMPLETED,
         ),
     )
     monkeypatch.setattr(
@@ -324,7 +326,11 @@ def test_direct_claude_executor_accepts_existing_registered_attachment(monkeypat
     monkeypatch.setattr(recovery_lane, "_snapshot_workspace", lambda cwd: {})
     monkeypatch.setattr(
         recovery_lane, "_invoke_claude",
-        lambda prompt, cwd, timeout: recovery_lane.AttemptResult("claude", 0, "done", ""),
+        lambda prompt, cwd, timeout, *, task_id=None: recovery_lane.AttemptResult(
+            "claude", 0, "done", "",
+            execution_id="x_fake_claude",
+            execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        ),
     )
     monkeypatch.setattr(recovery_lane, "_changed_workspace_files", lambda cwd, before: [])
     monkeypatch.setattr(recovery_lane, "_register_attachment_dir_files", lambda c, tid: [])
@@ -363,7 +369,11 @@ def test_direct_claude_executor_blocks_when_required_attachment_missing(monkeypa
     monkeypatch.setattr(recovery_lane, "_snapshot_workspace", lambda cwd: {})
     monkeypatch.setattr(
         recovery_lane, "_invoke_claude",
-        lambda prompt, cwd, timeout: recovery_lane.AttemptResult("claude", 0, "done", ""),
+        lambda prompt, cwd, timeout, *, task_id=None: recovery_lane.AttemptResult(
+            "claude", 0, "done", "",
+            execution_id="x_fake_claude",
+            execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        ),
     )
     monkeypatch.setattr(recovery_lane, "_changed_workspace_files", lambda cwd, before: [])
     monkeypatch.setattr(
@@ -439,15 +449,32 @@ class _Harness:
 
         monkeypatch.setattr(recovery_lane, "_claim_attempt", fake_claim_attempt)
 
-        def fake_invoke_claude(prompt, cwd, timeout):
+        # The lane now launches every external process through the execution
+        # supervisor, so these doubles stand in for a SUPERVISED attempt:
+        # they take the ``task_id`` the lane threads through for the execution
+        # record, and a successful one has to carry the supervisor status as
+        # well as the exit code. That is not test bookkeeping — ``AttemptResult
+        # .ok`` deliberately refuses to read a bare rc=0 as success, because a
+        # controller-lost or terminated execution can leave one behind. A fake
+        # that could still claim success with an exit code alone would be
+        # faking the exact thing the supervisor exists to distinguish.
+        def fake_invoke_claude(prompt, cwd, timeout, *, task_id=None):
             self.calls.append("claude")
-            return recovery_lane.AttemptResult("claude", 0, "claude did work", "")
+            return recovery_lane.AttemptResult(
+                "claude", 0, "claude did work", "",
+                execution_id="x_fake_claude",
+                execution_status=recovery_lane.ex.STATUS_COMPLETED,
+            )
 
-        def fake_invoke_codex(prompt, cwd, timeout):
+        def fake_invoke_codex(prompt, cwd, timeout, *, task_id=None):
             self.calls.append("codex")
-            return recovery_lane.AttemptResult("codex", 0, "codex did work", "")
+            return recovery_lane.AttemptResult(
+                "codex", 0, "codex did work", "",
+                execution_id="x_fake_codex",
+                execution_status=recovery_lane.ex.STATUS_COMPLETED,
+            )
 
-        def fake_run_gate(cmd, cwd, timeout):
+        def fake_run_gate(cmd, cwd, timeout, *, task_id=None):
             self.calls.append("gate")
             ok = self._gate_results.pop(0)
             return recovery_lane.GateResult(ok, 0 if ok else 1, "gate output")
