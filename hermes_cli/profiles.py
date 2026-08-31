@@ -1314,17 +1314,12 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     """Give every named profile that predates per-profile ``.env`` files one.
 
     Profiles created before the dashboard/CLI started seeding a ``.env``
-    (PR #44792) have none, so once the Channels/Keys endpoints became
-    profile-scoped those profiles stopped inheriting the root install's
-    credentials and showed everything as unconfigured. To avoid breaking
-    anyone on update, copy the DEFAULT install's ``.env`` into each named
-    profile that lacks one — that preserves the effective credentials those
-    profiles were already running with (they previously read the root
-    ``.env`` via the process environment). Users can then diverge per
-    profile from there.
+    (PR #44792) may have none. Named profiles are security boundaries, so
+    backfill must never copy the default install's credentials into them.
+    Instead, create an empty profile-local ``.env`` with explanatory comments.
+    Required credentials must be provisioned explicitly for that profile.
 
-    Falls back to the placeholder header when the default install has no
-    ``.env`` itself. Never overwrites an existing profile ``.env``.
+    Never overwrites an existing profile ``.env``.
 
     Returns the list of profile names that received a backfilled ``.env``.
     """
@@ -1332,8 +1327,6 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     profiles_root = _get_profiles_root()
     if not profiles_root.is_dir():
         return backfilled
-
-    default_env = _get_default_hermes_home() / ".env"
 
     for entry in sorted(profiles_root.iterdir()):
         if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
@@ -1344,15 +1337,13 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
         if env_path.exists():
             continue
         try:
-            if default_env.is_file():
-                shutil.copy2(default_env, env_path)
-            else:
-                env_path.write_text(
-                    "# Per-profile secrets for this Hermes profile.\n"
-                    "# API keys and tokens set here override the shell environment.\n"
-                    "# Behavioral settings belong in config.yaml, not here.\n",
-                    encoding="utf-8",
-                )
+            env_path.write_text(
+                "# Per-profile secrets for this Hermes profile.\n"
+                "# Credentials must be provisioned explicitly for this profile.\n"
+                "# Global/root credentials are never copied into named profiles.\n"
+                "# Behavioral settings belong in config.yaml, not here.\n",
+                encoding="utf-8",
+            )
             os.chmod(str(env_path), 0o600)
             backfilled.append(entry.name)
         except OSError as e:
