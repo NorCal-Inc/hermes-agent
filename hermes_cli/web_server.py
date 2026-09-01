@@ -18940,8 +18940,14 @@ def start_server(
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still
         # reaped via the WebSocketDisconnect → disconnect/reap path.
-        ws_ping_interval=None if _is_loopback else 20.0,
-        ws_ping_timeout=None if _is_loopback else 20.0,
+        # SSH-backed Desktop sessions arrive through a loopback tunnel, but
+        # that transport can become half-open while the local Desktop still
+        # believes it is connected. Keep protocol pings enabled for SSH-owned
+        # backends so dead/stale tunnels are detected and closed. Standalone
+        # loopback dashboards retain the no-ping behavior to avoid false
+        # disconnects during local event-loop stalls.
+        ws_ping_interval=(20.0 if (_SSH_OWNER_NONCE or not _is_loopback) else None),
+        ws_ping_timeout=(20.0 if (_SSH_OWNER_NONCE or not _is_loopback) else None),
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)

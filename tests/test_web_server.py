@@ -109,6 +109,27 @@ def test_start_server_disables_ws_ping_on_loopback(monkeypatch):
     assert captured["ws_ping_timeout"] is None
 
 
+def test_start_server_enables_ws_ping_for_ssh_owned_loopback(monkeypatch):
+    """SSH-owned Desktop backends need protocol pings even on loopback.
+
+    The socket is loopback only on the server side because SSH forwards the
+    remote Desktop transport into localhost. A dropped remote tunnel can
+    therefore remain half-open and must be detected by WebSocket keepalive.
+    """
+    captured = _stub_uvicorn(monkeypatch)
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        ssh_session_token="s" * 64,
+        ssh_owner_nonce="0123456789abcdef",
+    )
+
+    assert captured["ws_ping_interval"] and captured["ws_ping_interval"] > 0
+    assert captured["ws_ping_timeout"] and captured["ws_ping_timeout"] > 0
+
+
 def test_start_server_accepts_base64_desktop_attachments_above_preview_limit(monkeypatch):
     """The gateway frame cap must fit the Desktop attachment default after
     base64 expansion and JSON framing; uvicorn's 16 MiB default would reject
