@@ -6452,6 +6452,42 @@ def _review_run_verification(
     return run_id, row["assignee"]
 
 
+def _review_requested_implementer(
+    conn: sqlite3.Connection, task_id: str, fallback_assignee: Optional[str] = None
+) -> Optional[str]:
+    """Return the implementer identity recorded on the phase's ``review_requested``
+    handoff, falling back to the task's current assignee.
+
+    The implementer identity lives on the ``review_requested`` event that
+    parked this phase — NOT necessarily ``tasks.assignee``, which
+    ``request_review``/``reopen_review_task`` may reassign to the reviewer
+    while the task is parked. Reading current assignee alone would compare
+    the reviewer against itself and never catch the real case (author
+    reassigns nothing, e.g. a governance profile that stays its own assignee
+    throughout, like t_7311348b). Shared by every caller that must refuse a
+    verifier matching the implementer — see ``record_verification`` and
+    ``complete_task``'s implicit reviewer-approval path.
+    """
+    implementer = None
+    req_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if req_event is not None and req_event["payload"]:
+        try:
+            req_payload = json.loads(req_event["payload"])
+        except (json.JSONDecodeError, TypeError):
+            req_payload = {}
+        imp = req_payload.get("implementer") if isinstance(req_payload, dict) else None
+        if isinstance(imp, str) and imp.strip():
+            implementer = _canonical_assignee(imp)
+    if implementer is None and fallback_assignee:
+        implementer = _canonical_assignee(fallback_assignee)
+    return implementer
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -6630,6 +6666,29 @@ def complete_task(
                 if review_run_id is None:
                     # Lost the race with a re-claim/reopen, or the pre-check
                     # was bypassed entirely. Refuse without mutating.
+                    return False
+                # Verifier independence (doctrine_verification.md): this
+                # implicit approval path derives "reviewer" purely from which
+                # RUN claimed the review lane, not from WHO is acting — the
+                # same profile can stay its own assignee across the whole
+                # phase (a governance profile that never reassigns, e.g.
+                # t_7311348b/t_aba8b8d8) and this path would otherwise record
+                # a "VERIFIED" verdict for its own decision with no identity
+                # check at all, unlike the explicit `record_verification`
+                # CLI path. Apply the same refusal here. ``return False``
+                # (not raise) so the audit event below still commits — this
+                # function returns normally on refusal elsewhere in this
+                # block too, only raising pre-write gate errors it wants the
+                # caller to see as ``VerificationRequiredError``.
+                implementer = _review_requested_implementer(conn, task_id, reviewer)
+                if reviewer and implementer and _canonical_assignee(reviewer) == implementer:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "verification_blocked_self_review",
+                        {"verifier": reviewer, "implementer": implementer},
+                        run_id=review_run_id,
+                    )
                     return False
                 # Reviewer approving from inside their own review run: record
                 # the verdict atomically with the completion it authorises, so
@@ -8172,30 +8231,8 @@ def record_verification(
         # one here — a real exception is a doctrine amendment, not a code
         # bypass.
         # The implementer identity lives on the ``review_requested`` event
-        # that parked this phase — NOT necessarily ``tasks.assignee``, which
-        # ``request_review`` may reassign to the reviewer while the task is
-        # parked (see the ``assignee_sql`` reassignment in
-        # ``reopen_review_task``/``request_review``). Reading current
-        # assignee here would compare the reviewer against itself and never
-        # catch the real case (author reassigns nothing, e.g. a governance
-        # profile that stays its own assignee throughout, like t_7311348b).
-        implementer = None
-        _req_event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_requested' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if _req_event is not None and _req_event["payload"]:
-            try:
-                _req_payload = json.loads(_req_event["payload"])
-            except (json.JSONDecodeError, TypeError):
-                _req_payload = {}
-            _imp = _req_payload.get("implementer") if isinstance(_req_payload, dict) else None
-            if isinstance(_imp, str) and _imp.strip():
-                implementer = _canonical_assignee(_imp)
-        if implementer is None and row["assignee"]:
-            implementer = _canonical_assignee(row["assignee"])
+        # that parked this phase — see ``_review_requested_implementer``.
+        implementer = _review_requested_implementer(conn, task_id, row["assignee"])
         if verifier and implementer and verifier == implementer:
             return False, (
                 f"verifier {verifier!r} matches the implementer "

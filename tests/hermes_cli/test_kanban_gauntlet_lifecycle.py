@@ -228,8 +228,12 @@ class TestValidChain:
         """
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
+            # Implementer stays the task's original assignee ("default");
+            # the reviewer must be a genuinely different identity for
+            # implicit auto-approval to be legitimate second-party review —
+            # see TestVerifierIndependence for the same-identity refusal.
             kb.request_review(
-                conn, tid, summary="impl", reviewer="default",
+                conn, tid, summary="impl", reviewer="reviewer",
                 expected_run_id=run_id,
             )
             reviewer_run = kb.claim_review_task(conn, tid)
@@ -424,11 +428,16 @@ REGRESSION_PROOF = {
 }
 
 
-def _fail_then_repair(conn, tid, run_id, *, summary="fixed"):
+def _fail_then_repair(conn, tid, run_id, *, summary="fixed", reviewer="default"):
     """Fail verification, then run the repair up to the re-handoff.
 
     Returns the repair run's id. The task is left parked in ``review`` with
     the requirement armed and a fresh verification phase open.
+
+    ``reviewer`` names who the repair round is handed to (default matches
+    the original implementer identity, as most callers here don't care;
+    pass a distinct identity when the test needs implicit auto-approval to
+    be legitimate second-party review rather than the same profile).
     """
     kb.request_review(
         conn, tid, summary="impl", reviewer="default", expected_run_id=run_id,
@@ -439,7 +448,7 @@ def _fail_then_repair(conn, tid, run_id, *, summary="fixed"):
     repaired = kb.claim_task(conn, tid)
     assert repaired is not None and repaired.status == "running"
     assert kb.request_review(
-        conn, tid, summary=summary, reviewer="default",
+        conn, tid, summary=summary, reviewer=reviewer,
         expected_run_id=repaired.current_run_id,
     ) is True
     return repaired.current_run_id
@@ -787,7 +796,7 @@ class TestReviewerRunApproval:
     def test_inline_approval_with_the_proof_completes(self, kanban_home):
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
-            _fail_then_repair(conn, tid, run_id)
+            _fail_then_repair(conn, tid, run_id, reviewer="reviewer")
             reviewer_run = kb.claim_review_task(conn, tid)
 
             assert kb.complete_task(
@@ -1138,3 +1147,40 @@ class TestVerifierIndependence:
             )
             assert kb.complete_task(conn, tid, summary="ruling made") is True
             assert kb.get_task(conn, tid).status == "done"
+
+    def test_reviewer_run_approval_refuses_when_reviewer_matches_implementer(
+        self, kanban_home
+    ):
+        """The same identity check `record_verification` enforces must also
+        hold for `complete_task`'s implicit ``review_run_approval`` path.
+
+        Reproduces the live incident on t_aba8b8d8: the task's assignee
+        ("erika") never gets reassigned across request_review/claim_review,
+        so ``_review_run_verification`` hands back "erika" as the reviewer
+        while "erika" is also the implementer on file — a structurally
+        different RUN, but not a different PARTY. Before this fix,
+        `complete_task` recorded a VERIFIED verdict for this with no
+        identity check at all (unlike the explicit `record_verification`
+        CLI path, which already refused the equivalent case).
+        """
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="governance ruling", assignee="erika",
+                gauntlet=True,
+            )
+            claimed = kb.claim_task(conn, tid)
+            kb.request_review(
+                conn, tid, summary="ruling made", reviewer="erika",
+                expected_run_id=claimed.current_run_id,
+            )
+            reviewer_run = kb.claim_review_task(conn, tid)
+            assert reviewer_run is not None
+
+            assert kb.complete_task(conn, tid, summary="approved") is False
+
+            task = kb.get_task(conn, tid)
+            assert task.verification_state != kb.VERIFICATION_VERIFIED
+            assert task.status != "done"
+            assert len(
+                _events(conn, tid, kind="verification_blocked_self_review")
+            ) == 1
