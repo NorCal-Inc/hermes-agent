@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import hashlib, os, subprocess, sys
+from recovery_boot import recovery_task_id, shared_boot_complete, validate_recovery_task
 
 HERE = Path(__file__).resolve().parent
 SHARED = HERE / "hermes-shared-boot-context"
 CONSTRAINTS = HERE / "boot-constraints.md"
 OUT = Path.home() / ".codex" / "norcal-boot-current.md"
+RECOVERY_OUT = Path.home() / ".codex" / "norcal-recovery-current.md"
 REAL_CODEX = Path("/home/chris/.hermes/node/bin/codex")
 
 def die(msg: str, rc: int = 2):
@@ -18,17 +20,44 @@ try:
     c = CONSTRAINTS.read_text(encoding="utf-8").strip()
 except Exception as exc:
     die(f"canonical constraints unreadable: {exc}")
-proc = subprocess.run([str(SHARED), "--gate-exit-code"], capture_output=True, text=True, timeout=60)
+recovery_id = recovery_task_id()
+recovery = False
+if recovery_id:
+    recovery, reason = validate_recovery_task(recovery_id)
+    if not recovery:
+        die(f"invalid recovery authority: {reason}")
+
+shared_argv = [str(SHARED)] if recovery else [str(SHARED), "--gate-exit-code"]
+proc = subprocess.run(shared_argv, capture_output=True, text=True, timeout=60)
 body = (proc.stdout or proc.stderr or "").strip()
 if proc.returncode != 0:
-    die(f"shared boot gate returned {proc.returncode}\n{body[-2000:]}")
+    die(f"shared boot generator returned {proc.returncode}\n{body[-2000:]}")
 if not body.startswith(c):
     die("shared boot output does not begin with the canonical constraints")
-if "BOOT STATUS: COMPLETE" not in body:
+if "<shared-boot-state>" not in body:
+    die("shared boot state missing")
+if not recovery and not shared_boot_complete(body):
     die("shared boot did not reach COMPLETE")
-OUT.parent.mkdir(parents=True, exist_ok=True)
-tmp = OUT.with_name("." + OUT.name + ".tmp")
+
+target = RECOVERY_OUT if recovery else OUT
+if recovery:
+    body += (
+        "\n\n<RECOVERY-ONLY>\n"
+        f"RECOVERY TASK: {recovery_id}\n"
+        "Authority is limited to diagnosing and repairing the named failed boot gate, "
+        "rerunning its deterministic gate, and reporting evidence. Ordinary task work "
+        "is prohibited until shared boot is COMPLETE.\n"
+        "</RECOVERY-ONLY>"
+    )
+target.parent.mkdir(parents=True, exist_ok=True)
+tmp = target.with_name("." + target.name + ".tmp")
 tmp.write_text(body + "\n", encoding="utf-8")
 os.chmod(tmp, 0o600)
-os.replace(tmp, OUT)
-os.execv(str(REAL_CODEX), [str(REAL_CODEX), *sys.argv[1:]])
+os.replace(tmp, target)
+
+argv = [str(REAL_CODEX), *sys.argv[1:]]
+if recovery:
+    if len(argv) < 2 or argv[1] != "exec":
+        die("recovery authority is valid only for non-interactive codex exec")
+    argv[2:2] = ["-c", f'model_instructions_file="{RECOVERY_OUT}"']
+os.execv(str(REAL_CODEX), argv)

@@ -491,7 +491,7 @@ class _Harness:
             self.comment_calls.append({"author": author, "body": body})
             return 1
 
-        monkeypatch.setattr(recovery_lane, "_invoke_claude", fake_invoke_claude)
+        monkeypatch.setattr(recovery_lane, "_invoke_recovery_claude", fake_invoke_claude)
         monkeypatch.setattr(recovery_lane, "_invoke_codex", fake_invoke_codex)
         monkeypatch.setattr(recovery_lane, "_run_gate", fake_run_gate)
         monkeypatch.setattr(recovery_lane.kb, "complete_task", fake_complete_task)
@@ -765,3 +765,20 @@ def test_telegram_notify_wake_inherits_to_dependent_continuation(kanban_home):
     assert row["chat_id"] == "-1003809943982"
     assert row["notifier_profile"] == "overall_manager"
     assert row["delivery_mode"] == "notify+wake"
+
+
+def test_recovery_executor_uses_distinct_supervisor_command_classes(monkeypatch):
+    calls = []
+    def fake_run_supervised(**kw):
+        calls.append((kw["command_class"], kw["spec"]))
+        return type("R", (), {
+            "exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False,
+            "error": None, "execution_id": "x_test", "status": recovery_lane.ex.STATUS_COMPLETED,
+        })()
+    monkeypatch.setattr(recovery_lane.ex, "run_supervised", fake_run_supervised)
+    recovery_lane._invoke_recovery_claude("repair", "/tmp", 10, task_id="t_recover")
+    recovery_lane._invoke_codex("repair", "/tmp", 10, task_id="t_recover")
+    assert calls[0][0] == "claude.recovery"
+    assert calls[0][1]["task_id"] == "t_recover"
+    assert calls[1][0] == "codex.recovery"
+    assert calls[1][1]["task_id"] == "t_recover"

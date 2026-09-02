@@ -27,6 +27,7 @@ for src,dst in [
     (HERE/'hermes-shared-boot-context', LOCAL/'hermes-shared-boot-context'),
     (HERE/'claude-boot-context', LOCAL/'boot-context'),
     (HERE/'claude-session-start-gate.py', LOCAL/'claude-session-start-gate.py'),
+    (HERE/'claude-tool-guard.py', LOCAL/'claude-tool-guard.py'),
     (HERE/'codex-boot', LOCAL/'codex'),
 ]: link(src,dst)
 

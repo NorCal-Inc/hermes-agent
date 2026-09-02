@@ -16,3 +16,4 @@ These constraints bind every North Caledonia operating entry point: GPT/Codex, C
 12. Critical work must not silently become stale or abandoned. Stale work and lost-controller executions require deterministic reconciliation.
 13. Company-private data remains sealed to its company lane. Cross-company uncertainty defaults FORBIDDEN.
 14. If a required boot gate is DEGRADED, ordinary task execution is blocked. Only narrowly scoped recovery of the named failed gate is permitted until the same gate is re-verified green.
+15. Every binding boot gate must fail closed for ordinary work and remain mechanically recoverable through a distinct recovery-only executor path. The recovery executor must not require the failed gate to be green before it can repair that same gate.

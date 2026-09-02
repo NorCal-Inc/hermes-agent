@@ -2,9 +2,11 @@
 import datetime as dt
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
+from recovery_boot import recovery_task_id, shared_boot_complete, validate_recovery_task
 
 STATE_DIR = Path('/home/chris/.claude/session-gates')
 BOOT = str(Path(__file__).resolve().parent / 'claude-boot-context')
@@ -35,15 +37,28 @@ except Exception as exc:
     }
 
 ctx = str(payload.get('hookSpecificOutput', {}).get('additionalContext') or '')
-claude_complete = 'CLAUDE BOOT STATUS: COMPLETE' in ctx
-shared_complete = '<shared-boot-state>' in ctx and 'BOOT STATUS: COMPLETE' in ctx
+claude_complete = bool(re.search(r'(?m)^CLAUDE BOOT STATUS: COMPLETE\s*$', ctx))
+shared_loaded = '<shared-boot-state>' in ctx
+shared_complete = bool(shared_loaded and shared_boot_complete(ctx))
 complete = bool(sid and claude_complete and shared_complete and (proc is None or proc.returncode == 0))
+recovery_id = recovery_task_id()
+recovery_authorized, recovery_reason = validate_recovery_task(recovery_id) if recovery_id else (False, 'not requested')
+# Claude role rules must be synchronized even for recovery. The shared gate itself may
+# be red because repairing that named gate is the sole purpose of this session.
+claude_rules_ready = 'LOCAL/CANONICAL CLAUDE.md: OK' in ctx
+recovery_only = bool(
+    sid and recovery_authorized and shared_loaded and claude_rules_ready
+    and (proc is None or proc.returncode == 0)
+)
 
 state = {
     'session_id': sid,
     'cwd': cwd,
     'created_at': dt.datetime.now(dt.timezone.utc).isoformat(),
     'complete': complete,
+    'recovery_only': recovery_only,
+    'recovery_task_id': recovery_id if recovery_only else None,
+    'recovery_authority_reason': recovery_reason,
     'claude_boot_complete': claude_complete,
     'shared_boot_complete': shared_complete,
     'boot_returncode': None if proc is None else proc.returncode,
@@ -55,7 +70,17 @@ if sid:
     os.chmod(tmp, 0o600)
     os.replace(tmp, final)
 
-if not complete:
+if recovery_only and not complete:
+    msg = payload.get('systemMessage') or ''
+    payload['systemMessage'] = (msg + f' | RECOVERY-ONLY ACTIVE: {recovery_id}').strip(' |')
+    hso = payload.setdefault('hookSpecificOutput', {})
+    existing = str(hso.get('additionalContext') or '')
+    hso['additionalContext'] = existing + (
+        '\n\n<RECOVERY-ONLY>Normal execution remains blocked. This session may only diagnose '
+        'and repair the failed boot gate named by its authorized recovery card, rerun '
+        'the deterministic gate, and report evidence.</RECOVERY-ONLY>'
+    )
+elif not complete:
     msg = payload.get('systemMessage') or ''
     payload['systemMessage'] = (msg + ' | HARD GATE ACTIVE: all tools denied until a fresh session reaches COMPLETE').strip(' |')
     hso = payload.setdefault('hookSpecificOutput', {})

@@ -479,6 +479,18 @@ def _invoke_claude(
     )
 
 
+def _invoke_recovery_claude(
+    prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
+) -> AttemptResult:
+    """One bounded Claude recovery attempt using the recovery-only boot path."""
+    if not task_id:
+        return AttemptResult("claude", None, "", "", error="recovery task id missing")
+    return _supervised_attempt(
+        "claude", "claude.recovery", {"prompt": prompt, "task_id": task_id},
+        cwd, timeout, task_id=task_id,
+    )
+
+
 def _supervised_attempt(
     executor: str,
     command_class: str,
@@ -534,9 +546,11 @@ def _invoke_codex(
     ) as tmp:
         last_message_path = tmp.name
     try:
+        if not task_id:
+            return AttemptResult("codex", None, "", "", error="recovery task id missing")
         attempt = _supervised_attempt(
-            "codex", "codex.exec",
-            {"prompt": prompt, "last_message_path": last_message_path},
+            "codex", "codex.recovery",
+            {"prompt": prompt, "last_message_path": last_message_path, "task_id": task_id},
             cwd, timeout, task_id=task_id,
         )
     finally:
@@ -688,7 +702,7 @@ def run_claude_first_recovery(task_id: str) -> int:
         except RuntimeError:
             return 1
         claude_attempt = (
-            _invoke_claude(
+            _invoke_recovery_claude(
                 _build_repair_prompt(task), cwd, attempt_timeout, task_id=task_id,
             )
             if run_claude

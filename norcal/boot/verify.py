@@ -13,6 +13,15 @@ cfg=(HOME/'.codex/config.toml').read_text(encoding='utf-8')
 if 'model_instructions_file = "/home/chris/.codex/norcal-boot-current.md"' not in cfg: errs.append('Codex model_instructions_file not configured')
 runtime=(HOME/'.hermes/config.yaml').read_text(encoding='utf-8')
 if 'gauntlet_enforcement: true' not in runtime: errs.append('North Caledonia live config does not enable kanban.gauntlet_enforcement')
+session_src=(HERE/'claude-session-start-gate.py').read_text(encoding='utf-8')
+claude_src=(HERE/'claude-boot-context').read_text(encoding='utf-8')
+codex_src=(HERE/'codex-boot').read_text(encoding='utf-8')
+helper_src=(HERE/'recovery_boot.py').read_text(encoding='utf-8')
+for name, src in [('Claude SessionStart', session_src), ('Claude boot wrapper', claude_src), ('Codex boot wrapper', codex_src)]:
+    if 'shared_boot_complete' not in src:
+        errs.append(f'{name} does not use the canonical exact shared boot-state parser')
+if '^BOOT STATUS: COMPLETE\\s*$' not in helper_src:
+    errs.append('canonical shared boot-state parser is not exact-line anchored')
 p=subprocess.run([str(HERE/'hermes-shared-boot-context'),'--gate-exit-code'],capture_output=True,text=True,timeout=60)
 body=(p.stdout or p.stderr or '').strip()
 if p.returncode!=0: errs.append(f'shared generator gate rc={p.returncode}')

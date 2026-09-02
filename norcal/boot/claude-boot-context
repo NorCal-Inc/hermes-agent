@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import datetime as dt
+from recovery_boot import shared_boot_complete
 
 LOCAL = Path("/home/chris/.claude/CLAUDE.md")
 CANON = Path("/home/chris/services/life-wiki/vault/Business/Systems/Claude-Global-CLAUDE-canonical.md")
@@ -42,8 +43,11 @@ elif local_sha != canon_sha:
 try:
     p = subprocess.run([SHARED], capture_output=True, text=True, timeout=45)
     shared = (p.stdout or p.stderr or "").strip()
+    shared_declares_complete = shared_boot_complete(shared)
     if p.returncode != 0 or not shared:
         failures.append(f"shared boot generator failed rc={p.returncode}")
+    elif not shared_declares_complete:
+        failures.append("shared boot state is DEGRADED")
 except Exception as exc:
     shared = ""
     failures.append(f"shared boot generator exception: {exc}")

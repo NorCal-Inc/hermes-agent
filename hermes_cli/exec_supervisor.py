@@ -474,6 +474,46 @@ def _build_codex_exec(spec: dict) -> list[str]:
     return argv
 
 
+def _build_claude_recovery(spec: dict) -> list[str]:
+    """Claude launcher for one mechanically-authorized recovery card only."""
+    prompt = _require_str(spec, "prompt")
+    task_id = _require_str(spec, "task_id")
+    binary = shutil.which("claude") or "claude"
+    return [
+        "/usr/bin/env",
+        f"NORCAL_RECOVERY_TASK_ID={task_id}",
+        binary,
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+
+
+def _build_codex_recovery(spec: dict) -> list[str]:
+    """Codex launcher for one mechanically-authorized recovery card only."""
+    prompt = _require_str(spec, "prompt")
+    task_id = _require_str(spec, "task_id")
+    binary = shutil.which("codex") or "codex"
+    argv = [
+        "/usr/bin/env",
+        f"NORCAL_RECOVERY_TASK_ID={task_id}",
+        binary,
+        "exec",
+        prompt,
+        "--json",
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+    ]
+    last_message_path = spec.get("last_message_path")
+    if last_message_path:
+        argv += ["-o", str(last_message_path)]
+    return argv
+
+
 #: Shell metacharacters a gate command may not contain. A gate is a bounded
 #: check, so it is parsed with ``shlex`` and executed with ``shell=False``:
 #: there is no interpreter to inject into. Refusing the operators outright
@@ -521,6 +561,8 @@ def _build_shell_argv(spec: dict) -> list[str]:
 LAUNCHERS: dict[str, Launcher] = {
     "claude.headless": Launcher("claude.headless", "claude", _build_claude_headless),
     "codex.exec": Launcher("codex.exec", "codex", _build_codex_exec),
+    "claude.recovery": Launcher("claude.recovery", "claude", _build_claude_recovery),
+    "codex.recovery": Launcher("codex.recovery", "codex", _build_codex_recovery),
     "shell.gate": Launcher("shell.gate", "shell", _build_shell_gate),
     "shell.argv": Launcher("shell.argv", "shell", _build_shell_argv),
 }
