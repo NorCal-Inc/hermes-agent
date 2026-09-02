@@ -1368,6 +1368,61 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         conn.close()
 
 
+def test_gave_up_creates_durable_escalation_and_notifies_linked_tasks(
+    kanban_home,
+):
+    """Regression for t_f2d639a3 defect #1: retry exhaustion used to just
+    flip status to 'blocked' with a 'gave_up' event and stop there — no
+    durable marker distinguishing it from an ordinary block, no evidence
+    comment, and nothing told a provenance parent or a dependent waiting
+    on this exact task that it had stopped retrying (real instances:
+    t_500a3503's parent t_7311348b never heard it gave up; t_d40a8c70's
+    dependent t_aba8b8d8 was left waiting on it forever with no signal).
+
+    This does NOT change the pinned status='blocked' outcome asserted by
+    test_protocol_violation_budget_not_consumed_by_other_failures above,
+    or by test_review_retry_still_trips_the_failure_breaker in
+    test_kanban_review_lifecycle_complete.py — it only adds durable,
+    additive escalation state alongside it.
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="governance decision", assignee="w")
+        assert kb.complete_task(conn, parent, summary="ruling made") is True
+        tid = kb.create_task(
+            conn, title="implementation", assignee="w", parents=[parent],
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.status == "running"
+        dependent = kb.create_task(conn, title="waits on tid", assignee="w")
+        kb.link_tasks(conn, parent_id=tid, child_id=dependent)
+
+        assert kb._record_spawn_failure(
+            conn, tid, "worker crashed", failure_limit=1,
+        ) is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+        own_comments = [c.body for c in kb.list_comments(conn, tid)]
+        assert any("Retry exhaustion" in b and "worker crashed" in b
+                    for b in own_comments)
+
+        for related_id, relation in ((parent, "parent"), (dependent, "dependent")):
+            linked = [
+                e for e in kb.list_events(conn, related_id)
+                if e.kind == "linked_task_gave_up"
+            ]
+            assert len(linked) == 1, f"{relation} got {len(linked)} events"
+            assert linked[0].payload["task_id"] == tid
+            assert linked[0].payload["relation"] == relation
+            related_comments = [c.body for c in kb.list_comments(conn, related_id)]
+            assert any(tid in b and relation in b for b in related_comments)
+    finally:
+        conn.close()
+
+
 
 
 

@@ -997,4 +997,144 @@ class TestMigration:
             )
             assert ok is True
             assert kb.complete_task(conn, tid, summary="ok") is True
+
+
+# ---------------------------------------------------------------------------
+# Governed-parent inheritance (t_f2d639a3 defect #2)
+#
+# ``create_task`` used to stamp ``gauntlet_enforced`` from the board-wide
+# default only — a child spawned under a gauntlet-enforced parent (the
+# ordinary "governance decision -> implementation task" shape used
+# throughout this board) silently lost enforcement whenever the board
+# default was off, letting exactly the kind of work governance exists for
+# skip verification. Real-world instance: t_7311348b (gauntlet_enforced=1)
+# spawned t_500a3503 (gauntlet_enforced=0).
+# ---------------------------------------------------------------------------
+
+class TestGauntletInheritance:
+    def test_child_of_governed_parent_inherits_enforcement(self, kanban_home):
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(
+                conn, title="governance decision", assignee="default",
+                gauntlet=True,
+            )
+            child = kb.create_task(
+                conn, title="implementation", assignee="default",
+                parents=[parent],
+            )
+            assert kb.get_task(conn, child).gauntlet_enforced is True
+
+    def test_child_cannot_complete_without_verification(self, kanban_home):
+        """The actual acceptance bar: a governed child must not be able to
+        take the running -> done shortcut just because it inherited
+        enforcement rather than being created with gauntlet=True directly."""
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(
+                conn, title="governance decision", assignee="default",
+                gauntlet=True,
+            )
+            parent_claim = kb.claim_task(conn, parent)
+            kb.request_review(
+                conn, parent, summary="ruling made", reviewer="reviewer",
+                expected_run_id=parent_claim.current_run_id,
+            )
+            kb.record_verification(conn, parent, passed=True, verifier="reviewer")
+            assert kb.complete_task(conn, parent, summary="ruling made") is True
+
+            child = kb.create_task(
+                conn, title="implementation", assignee="default",
+                parents=[parent],
+            )
+            claimed = kb.claim_task(conn, child)
+            assert claimed is not None and claimed.status == "running"
+            with pytest.raises(kb.VerificationRequiredError):
+                kb.complete_task(conn, child, summary="done, trust me")
+            assert kb.get_task(conn, child).status == "running"
+
+    def test_explicit_gauntlet_false_is_the_doctrine_exception_and_wins(
+        self, kanban_home
+    ):
+        """An explicit ``gauntlet=False`` from the caller is the only
+        sanctioned exception — it must still override parent inheritance,
+        exactly like it already overrides the board-wide default."""
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(
+                conn, title="governance decision", assignee="default",
+                gauntlet=True,
+            )
+            child = kb.create_task(
+                conn, title="explicitly exempted", assignee="default",
+                parents=[parent], gauntlet=False,
+            )
+            assert kb.get_task(conn, child).gauntlet_enforced is False
+
+    def test_child_of_ungoverned_parent_still_uses_board_default(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(
+                conn, title="ordinary task", assignee="default",
+            )
+            assert kb.get_task(conn, parent).gauntlet_enforced is False
+            child = kb.create_task(
+                conn, title="ordinary child", assignee="default",
+                parents=[parent],
+            )
+            assert kb.get_task(conn, child).gauntlet_enforced is False
+
+
+# ---------------------------------------------------------------------------
+# Verifier independence (t_f2d639a3 defect #4)
+#
+# ``record_verification`` refused an executor verifying its own IN-FLIGHT
+# run (a structural, run-identity check), but never compared the verifier's
+# identity to the implementer's. The same profile could author a decision,
+# park it in review, and then approve its own review with no error at all.
+# Real-world instance: t_7311348b — implementer "erika", verifier "erika".
+# ---------------------------------------------------------------------------
+
+class TestVerifierIndependence:
+    def test_same_identity_cannot_verify_its_own_parked_review(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="governance ruling", assignee="erika",
+                gauntlet=True,
+            )
+            claimed = kb.claim_task(conn, tid)
+            kb.request_review(
+                conn, tid, summary="ruling made", reviewer="erika",
+                expected_run_id=claimed.current_run_id,
+            )
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier="erika",
+            )
+            assert ok is False
+            assert "matches the implementer" in detail
+            assert kb.get_task(conn, tid).verification_state != (
+                kb.VERIFICATION_VERIFIED
+            )
+
+    def test_different_identity_can_still_verify(self, kanban_home):
+        """The guard is identity-scoped, not a blanket new restriction —
+        an actually-independent reviewer must be unaffected."""
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="governance ruling", assignee="erika",
+                gauntlet=True,
+            )
+            claimed = kb.claim_task(conn, tid)
+            kb.request_review(
+                conn, tid, summary="ruling made", reviewer="default",
+                expected_run_id=claimed.current_run_id,
+            )
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier="atlas",
+            )
+            assert ok is True, detail
+            assert kb.get_task(conn, tid).verification_state == (
+                kb.VERIFICATION_VERIFIED
+            )
+            assert kb.complete_task(conn, tid, summary="ruling made") is True
             assert kb.get_task(conn, tid).status == "done"

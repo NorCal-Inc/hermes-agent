@@ -3884,6 +3884,25 @@ def create_task(
     gauntlet_enforced = (
         gauntlet_enforcement_default() if gauntlet is None else bool(gauntlet)
     )
+    if gauntlet is None and not gauntlet_enforced:
+        # A governed parent's enforcement must carry down to its children:
+        # otherwise a task created under a gauntlet-enforced parent (e.g. a
+        # governance decision spawning an implementation task) silently
+        # loses enforcement the moment the board-wide default is off, and
+        # can complete without verification even though the work it does
+        # is exactly what the parent required governance for. Only an
+        # explicit gauntlet=False from the caller (a real doctrine
+        # exception) or the parent itself being unenforced skips this.
+        for _parent_id in parents:
+            if not _parent_id:
+                continue
+            _parent_row = conn.execute(
+                "SELECT gauntlet_enforced FROM tasks WHERE id = ?",
+                (_parent_id,),
+            ).fetchone()
+            if _parent_row is not None and _parent_row["gauntlet_enforced"]:
+                gauntlet_enforced = True
+                break
 
     # Simple operator/Erika shorthand: assignee="claude" means the direct
     # Claude executor lane, not a Hermes profile named "claude". Persist the
@@ -8139,6 +8158,53 @@ def record_verification(
                 f"from it)"
             )
 
+        # Verifier independence (doctrine_verification.md: "the verifier
+        # should be independent of the executor where practical"). The
+        # `status == "running"` branch above already refuses an executor
+        # verifying its OWN in-flight run structurally, but that guard is
+        # about which RUN is claimed, not WHO is acting — the same profile
+        # can author a decision (as the task's assignee/implementer) and
+        # then separately claim the review run, or verify a parked
+        # 'review' task outright, and nothing compared identities. Refuse
+        # unless the caller passes no verifier at all (untracked/legacy
+        # callers) or names someone other than the implementer. No
+        # doctrine exception for this is currently on file; do not invent
+        # one here — a real exception is a doctrine amendment, not a code
+        # bypass.
+        # The implementer identity lives on the ``review_requested`` event
+        # that parked this phase — NOT necessarily ``tasks.assignee``, which
+        # ``request_review`` may reassign to the reviewer while the task is
+        # parked (see the ``assignee_sql`` reassignment in
+        # ``reopen_review_task``/``request_review``). Reading current
+        # assignee here would compare the reviewer against itself and never
+        # catch the real case (author reassigns nothing, e.g. a governance
+        # profile that stays its own assignee throughout, like t_7311348b).
+        implementer = None
+        _req_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if _req_event is not None and _req_event["payload"]:
+            try:
+                _req_payload = json.loads(_req_event["payload"])
+            except (json.JSONDecodeError, TypeError):
+                _req_payload = {}
+            _imp = _req_payload.get("implementer") if isinstance(_req_payload, dict) else None
+            if isinstance(_imp, str) and _imp.strip():
+                implementer = _canonical_assignee(_imp)
+        if implementer is None and row["assignee"]:
+            implementer = _canonical_assignee(row["assignee"])
+        if verifier and implementer and verifier == implementer:
+            return False, (
+                f"verifier {verifier!r} matches the implementer "
+                f"{implementer!r}; doctrine_verification.md requires an "
+                f"independent verifier and no governance-ruling exception "
+                f"is on file — route to a different reviewer or the "
+                f"codex_verify lane"
+            )
+
         proof_id: Optional[int] = None
         if passed:
             # A material repair owes regression evidence before it can be
@@ -11735,6 +11801,50 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            # Retry exhaustion must not silently orphan the task in the
+            # undifferentiated ``blocked`` bucket. Mark it durably as
+            # needing a human decision (reusing the recovery lane's own
+            # "block once with evidence" idiom — ``needs_input`` is
+            # already a VALID_BLOCK_KINDS member), record the evidence as
+            # a comment, and fan the failure out to every linked task:
+            # provenance parents (e.g. a governance task whose spawned
+            # implementation gave up) and dependents gated on this task
+            # (e.g. a task parked in ``dependency_wait`` on this one) —
+            # both were previously stuck with no signal at all once this
+            # task stopped retrying.
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?",
+                (task_id,),
+            )
+            evidence = (
+                f"Retry exhaustion (gave_up): {failures} consecutive "
+                f"failures reached the effective limit ({effective_limit}, "
+                f"source={limit_source}). Trigger: {outcome}. Last error: "
+                f"{error[:500]}. Needs a human decision or an approved "
+                f"recovery lane before `unblock` is safe to run."
+            )
+            add_comment(conn, task_id, "dispatcher", evidence)
+            linked = [
+                (pid, "parent") for pid in parent_ids(conn, task_id)
+            ] + [
+                (cid, "dependent") for cid in child_ids(conn, task_id)
+            ]
+            for related_id, relation in linked:
+                _append_event(
+                    conn, related_id, "linked_task_gave_up",
+                    {
+                        "task_id": task_id,
+                        "relation": relation,
+                        "error": error[:500],
+                        "failures": failures,
+                    },
+                )
+                add_comment(
+                    conn, related_id, "dispatcher",
+                    f"Linked task {task_id} ({relation}) gave up after "
+                    f"{failures} consecutive failures and needs a human "
+                    f"decision: {error[:500]}",
+                )
             blocked = True
         else:
             # Below threshold.
