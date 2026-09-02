@@ -81,6 +81,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -13443,6 +13444,111 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _spawn_gateway_scoped_worker(
+    cmd: list[str],
+    *,
+    cwd: Optional[str],
+    env: dict[str, str],
+    stdout,
+    task_id: str,
+    run_id: Optional[int],
+) -> Optional[int]:
+    """Launch a Kanban worker outside the gateway service cgroup on Linux.
+
+    ``start_new_session=True`` detaches a POSIX process group but does not move
+    the child out of its systemd cgroup. A Kanban worker that legitimately
+    restarts ``hermes-gateway.service`` would therefore kill itself and every
+    sibling worker still living in the gateway unit. When this dispatcher is
+    itself running inside the gateway, use ``systemd-run --user --scope`` to
+    move the worker into a sibling transient scope before it starts work.
+
+    The transient ``systemd-run`` client remains a gateway child, so its PID is
+    not a valid worker-liveness handle. A fixed shell shim writes its own PID
+    after systemd has moved it into the scope and then ``exec``s Hermes. That
+    stable PID is what the Kanban task records. No argv or environment values
+    are serialized into the unit definition, and the child inherits the same
+    environment as the historical direct ``Popen`` path.
+
+    Returns ``None`` when the escape path is not applicable. Once a scope
+    launch is attempted, inability to obtain the scoped worker PID is a spawn
+    failure rather than a fallback to a second direct launch, avoiding
+    duplicate execution.
+    """
+    if (
+        not sys.platform.startswith("linux")
+        or env.get("_HERMES_GATEWAY") != "1"
+        or not os.environ.get("INVOCATION_ID")
+    ):
+        return None
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        return None
+
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip("-._") or "task"
+    suffix = secrets.token_hex(4)
+    run_part = str(run_id) if run_id is not None else "run"
+    unit = f"hermes-kanban-{safe_task[:64]}-{run_part}-{suffix}"
+
+    fd, pid_path = tempfile.mkstemp(prefix="hermes-kanban-worker-", suffix=".pid")
+    os.close(fd)
+    try:
+        # $1 is the private pidfile. After shift, "$@" is the exact worker
+        # argv. The shell becomes the worker via exec, so the PID written here
+        # remains valid for the whole Hermes worker lifetime.
+        shim = 'printf "%s\n" "$$" > "$1"; shift; exec "$@"'
+        launcher = subprocess.Popen(  # noqa: S603 -- fixed systemd-run + shell shim
+            [
+                systemd_run,
+                "--user",
+                "--scope",
+                "--quiet",
+                "--unit",
+                unit,
+                "/bin/sh",
+                "-c",
+                shim,
+                "sh",
+                pid_path,
+                *cmd,
+            ],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                raw = Path(pid_path).read_text(encoding="ascii").strip()
+            except OSError:
+                raw = ""
+            if raw:
+                try:
+                    pid = int(raw)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "systemd scope worker wrote an invalid PID"
+                    ) from exc
+                if pid > 1:
+                    return pid
+                raise RuntimeError("systemd scope worker wrote an invalid PID")
+            rc = launcher.poll()
+            if rc is not None:
+                raise RuntimeError(
+                    f"systemd-run worker scope exited before publishing PID (rc={rc})"
+                )
+            time.sleep(0.02)
+        raise RuntimeError("systemd-run worker scope did not publish PID within 5s")
+    finally:
+        try:
+            Path(pid_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -13633,10 +13739,21 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    worker_cwd = workspace if os.path.isdir(workspace) else None
     try:
+        scoped_pid = _spawn_gateway_scoped_worker(
+            cmd,
+            cwd=worker_cwd,
+            env=env,
+            stdout=log_f,
+            task_id=task.id,
+            run_id=task.current_run_id,
+        )
+        if scoped_pid is not None:
+            return scoped_pid
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=worker_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,

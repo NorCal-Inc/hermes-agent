@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 
 def _make_task(kb, *, assignee: str):
@@ -161,3 +162,92 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_escapes_gateway_systemd_cgroup(monkeypatch, tmp_path):
+    """Gateway-owned dispatch must place workers in a sibling systemd scope."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("INVOCATION_ID", "gateway-invocation")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    real_which = kb.shutil.which
+    monkeypatch.setattr(
+        kb.shutil,
+        "which",
+        lambda name: "/usr/bin/systemd-run"
+        if name == "systemd-run"
+        else real_which(name),
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 7001
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        sh_index = cmd.index("/bin/sh")
+        pidfile = cmd[sh_index + 4]
+        Path(pidfile).write_text("8123\n", encoding="ascii")
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+    assert pid == 8123
+    assert captured["cmd"][:4] == [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+    ]
+    assert "--unit" in captured["cmd"]
+    assert captured["env"]["_HERMES_GATEWAY"] == "1"
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+
+
+def test_default_spawn_keeps_direct_popen_outside_gateway(monkeypatch, tmp_path):
+    """Non-gateway dispatchers retain the historical direct Popen path."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+    assert pid == 4242
+    assert captured["cmd"][0] == "hermes"
