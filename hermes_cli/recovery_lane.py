@@ -206,6 +206,8 @@ def _build_codex_verifier_prompt(task: kb.Task) -> str:
         f"Task ID: {task.id}",
         f"Task title: {task.title}",
         f"Tenant: {task.tenant or 'shared / none'}",
+        f"Target workspace/path: {task.workspace_path or '(none; use task brief paths)'}",
+        "The verifier process itself runs from a governed scratch directory. Read the target path by absolute path when the brief requires it.",
         "",
         "Verification brief / acceptance criteria:",
         task.body or "(no body)",
@@ -402,13 +404,15 @@ def run_codex_verifier(task_id: str) -> int:
         if expected_run_id is None:
             return 1
         try:
-            cwd_path = kb.resolve_workspace(task)
-            if str(cwd_path) != (task.workspace_path or ""):
-                kb.set_workspace_path(conn, task_id, cwd_path)
-            cwd = str(cwd_path)
+            # Verifiers execute from the governed Kanban scratch root regardless
+            # of the target repository path. This preserves execution.allowed_roots
+            # while the read-only Codex sandbox may inspect the target by absolute path.
+            verifier_cwd = kb.workspaces_root() / task.id / "atlas-verify"
+            verifier_cwd.mkdir(parents=True, exist_ok=True)
+            cwd = str(verifier_cwd)
         except Exception as exc:
             return 0 if kb.block_task(
-                conn, task_id, reason=f"Codex verifier workspace resolution failed: {exc}",
+                conn, task_id, reason=f"Codex verifier scratch workspace resolution failed: {exc}",
                 kind="needs_input", expected_run_id=expected_run_id,
             ) else 1
         timeout = int(task.max_runtime_seconds or DEFAULT_ATTEMPT_TIMEOUT_SECONDS)

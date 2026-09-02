@@ -302,6 +302,39 @@ def test_codex_verify_launcher_is_mechanically_read_only(monkeypatch):
     assert "--skip-git-repo-check" in argv
 
 
+def test_codex_verifier_runs_from_governed_scratch_for_external_target(monkeypatch, tmp_path):
+    external = "/home/chris/hermes/repos/Logos-Covenant"
+    task = _make_recovery_task(
+        executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+        recovery_gate_cmd=None,
+        body="Verify external repo read-only.",
+        workspace_kind="dir",
+        workspace_path=external,
+    )
+    conn = object(); calls=[]; complete_calls=[]
+    scratch_root = tmp_path / "kanban-workspaces"
+    monkeypatch.setattr(recovery_lane.kb, "connect", lambda: conn)
+    monkeypatch.setattr(recovery_lane.kb, "get_task", lambda c, tid: task)
+    monkeypatch.setattr(recovery_lane.kb, "workspaces_root", lambda: scratch_root)
+    monkeypatch.setattr(recovery_lane, "_claim_codex_verifier_attempt", lambda c, tid, rid: True)
+    monkeypatch.setattr(
+        recovery_lane, "_invoke_codex_verifier",
+        lambda prompt, cwd, timeout, *, task_id=None: calls.append((prompt,cwd)) or recovery_lane.AttemptResult(
+            "codex", 0, "--- last message ---\nPASS", "",
+            execution_id="x_verify", execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        ),
+    )
+    monkeypatch.setattr(recovery_lane.kb, "complete_task", lambda c, tid, **kw: complete_calls.append(kw) or True)
+    monkeypatch.setattr(recovery_lane.kb, "block_task", lambda *a, **k: True)
+    monkeypatch.setattr(recovery_lane.kb, "add_comment", lambda *a, **k: 1)
+    assert recovery_lane.run_codex_verifier("t_recover") == 0
+    assert calls
+    prompt,cwd = calls[0]
+    assert external in prompt
+    assert cwd == str(scratch_root / "t_recover" / "atlas-verify")
+    assert len(complete_calls) == 1
+
+
 def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
     workspace = tmp_path / "verify-work"
     task = _make_recovery_task(
