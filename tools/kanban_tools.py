@@ -2564,11 +2564,13 @@ KANBAN_CREATE_SCHEMA = {
             "board": _board_schema_prop(),
             "executor_lane": {
                 "type": "string",
-                "enum": ["claude", "claude_recovery"],
+                "enum": ["claude", "codex_verify", "claude_recovery"],
                 "description": (
                     "Explicit executor lane. 'claude' routes one ordinary "
                     "task directly to Claude Code before any Hermes agent/tool "
-                    "loop. 'claude_recovery' is the bounded Claude-then-Codex "
+                    "loop. 'codex_verify' runs an independent Codex verifier "
+                    "under a read-only sandbox; assignee='atlas' is the exact "
+                    "compatibility shorthand. 'claude_recovery' is the bounded Claude-then-Codex "
                     "gate-repair lane. The worker never runs the normal Hermes "
                     "reasoning/tool loop for either lane. 'claude_recovery' "
                     "requires 'recovery_gate_cmd'. Omit for the normal Hermes worker "

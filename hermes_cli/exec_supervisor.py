@@ -492,6 +492,25 @@ def _build_claude_recovery(spec: dict) -> list[str]:
     ]
 
 
+def _build_codex_verify(spec: dict) -> list[str]:
+    """Independent Codex verifier. Filesystem mutation is mechanically denied."""
+    prompt = _require_str(spec, "prompt")
+    binary = shutil.which("codex") or "codex"
+    argv = [
+        binary,
+        "exec",
+        prompt,
+        "--json",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+    ]
+    last_message_path = spec.get("last_message_path")
+    if last_message_path:
+        argv += ["-o", str(last_message_path)]
+    return argv
+
+
 def _build_codex_recovery(spec: dict) -> list[str]:
     """Codex launcher for one mechanically-authorized recovery card only."""
     prompt = _require_str(spec, "prompt")
@@ -561,6 +580,7 @@ def _build_shell_argv(spec: dict) -> list[str]:
 LAUNCHERS: dict[str, Launcher] = {
     "claude.headless": Launcher("claude.headless", "claude", _build_claude_headless),
     "codex.exec": Launcher("codex.exec", "codex", _build_codex_exec),
+    "codex.verify": Launcher("codex.verify", "codex", _build_codex_verify),
     "claude.recovery": Launcher("claude.recovery", "claude", _build_claude_recovery),
     "codex.recovery": Launcher("codex.recovery", "codex", _build_codex_recovery),
     "shell.gate": Launcher("shell.gate", "shell", _build_shell_gate),

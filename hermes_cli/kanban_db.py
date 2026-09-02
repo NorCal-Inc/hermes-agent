@@ -361,17 +361,21 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # * "claude" runs one ordinary Kanban task directly through Claude Code,
 #   bypassing the Hermes model/tool loop. It is the deterministic technical
 #   executor lane used by Erika for normal Claude-owned work.
+# * "codex_verify" runs one independent verification task through Codex in a
+#   read-only sandbox. The compatibility shorthand assignee="atlas" maps here;
+#   Atlas is a verifier lane, not a persistent Hermes profile.
 # * "claude_recovery" is the stricter boot/gate repair lane: Claude gets one
 #   bounded attempt, then Codex gets one bounded attempt only if the same
 #   mechanical recovery_gate_cmd is still red.
 #
-# Neither lane is inferred from task title/body/skills. The sole compatibility
-# shorthand is assignee="claude", normalized mechanically to
-# assignee="default" + executor_lane="claude" so old/interactive routing does
-# not strand a card on a nonexistent Hermes profile.
+# No lane is inferred from task title/body/skills. Compatibility shorthands are
+# exact tokens only: assignee="claude" -> direct Claude; assignee="atlas" ->
+# read-only Codex verifier. Both ride the spawnable default profile only far
+# enough to enter cli.py's pre-agent executor bypass.
 EXECUTOR_LANE_CLAUDE = "claude"
+EXECUTOR_LANE_CODEX_VERIFY = "codex_verify"
 EXECUTOR_LANE_CLAUDE_RECOVERY = "claude_recovery"
-VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CLAUDE_RECOVERY}
+VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_RECOVERY}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -3887,7 +3891,9 @@ def create_task(
     # Claude before any Hermes agent/tool loop is built.
     if assignee == "claude" and executor_lane is None:
         executor_lane = EXECUTOR_LANE_CLAUDE
-    if executor_lane == EXECUTOR_LANE_CLAUDE:
+    elif assignee == "atlas" and executor_lane is None:
+        executor_lane = EXECUTOR_LANE_CODEX_VERIFY
+    if executor_lane in {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY}:
         assignee = "default"
 
     if executor_lane is not None and executor_lane not in VALID_EXECUTOR_LANES:
@@ -12627,7 +12633,25 @@ def _dispatch_once_locked(
                         },
                     )
             row_assignee = "default"
-        elif row_executor_lane == EXECUTOR_LANE_CLAUDE and row_assignee != "default":
+        elif row_assignee == "atlas" and not row_executor_lane:
+            row_executor_lane = EXECUTOR_LANE_CODEX_VERIFY
+            if not dry_run:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET assignee = 'default', executor_lane = ? "
+                        "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+                        (EXECUTOR_LANE_CODEX_VERIFY, row["id"]),
+                    )
+                    _append_event(
+                        conn, row["id"], "executor_lane_normalized",
+                        {
+                            "from_assignee": "atlas",
+                            "assignee": "default",
+                            "executor_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                        },
+                    )
+            row_assignee = "default"
+        elif row_executor_lane in {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY} and row_assignee != "default":
             # Explicit direct-Claude lane always rides the real default Hermes
             # profile only far enough to enter cli.py's pre-agent bypass.
             if not dry_run:
@@ -12642,7 +12666,7 @@ def _dispatch_once_locked(
                         {
                             "from_assignee": row_assignee,
                             "assignee": "default",
-                            "executor_lane": EXECUTOR_LANE_CLAUDE,
+                            "executor_lane": row_executor_lane,
                         },
                     )
             row_assignee = "default"

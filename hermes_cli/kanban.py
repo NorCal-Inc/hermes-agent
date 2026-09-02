@@ -407,7 +407,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           default=None, dest="executor_lane",
                           help="Explicit executor lane. 'claude' routes one "
                                "ordinary task directly to Claude Code before "
-                               "any Hermes agent/tool loop. 'claude_recovery' "
+                               "any Hermes agent/tool loop. 'codex_verify' runs "
+                               "an independent read-only Codex verifier (assignee=atlas "
+                               "is accepted as shorthand). 'claude_recovery' "
                                "is the bounded Claude-then-Codex gate-repair "
                                "lane and requires --recovery-gate-cmd. Omit "
                                "for the normal Hermes worker. assignee=claude "

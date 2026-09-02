@@ -196,6 +196,34 @@ def _build_claude_task_prompt(task: kb.Task) -> str:
     ])
 
 
+def _build_codex_verifier_prompt(task: kb.Task) -> str:
+    return "\n".join([
+        "You are Atlas, the independent Codex verification executor for one Hermes Kanban task.",
+        "This is a READ-ONLY verification lane. Do not edit files, commit, deploy, or mutate services/databases.",
+        "Re-derive the requested checks independently from live files/state and report falsifiable evidence.",
+        "Do not trust an implementer's self-report when the task asks you to verify it.",
+        "",
+        f"Task ID: {task.id}",
+        f"Task title: {task.title}",
+        f"Tenant: {task.tenant or 'shared / none'}",
+        "",
+        "Verification brief / acceptance criteria:",
+        task.body or "(no body)",
+        "",
+        "End with a concise structured verdict: PASS/FAIL per requested item, evidence, and explicit GO/NO-GO when applicable.",
+    ])
+
+
+def _extract_codex_result(stdout: str) -> str:
+    text = (stdout or "").strip()
+    marker = "--- last message ---"
+    if marker in text:
+        last = text.rsplit(marker, 1)[1].strip()
+        if last:
+            return last
+    return _truncate(text) if text else "Codex verifier completed with no textual result."
+
+
 def _extract_claude_result(stdout: str) -> str:
     text = (stdout or "").strip()
     if not text:
@@ -279,6 +307,31 @@ def _claim_direct_claude_attempt(conn, task_id: str, run_id: Optional[int]) -> b
     return True
 
 
+def _claim_codex_verifier_attempt(conn, task_id: str, run_id: Optional[int]) -> bool:
+    if run_id is None:
+        raise RuntimeError("Codex verifier task has no active run")
+    kind = "codex_verifier_started"
+    with kb.write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or current["current_run_id"] is None
+            or int(current["current_run_id"]) != int(run_id)
+        ):
+            raise RuntimeError("stale Codex verifier run")
+        prior = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? LIMIT 1",
+            (task_id, kind, run_id),
+        ).fetchone()
+        if prior is not None:
+            return False
+        kb._append_event(conn, task_id, kind, {"executor": "codex"}, run_id=run_id)
+    return True
+
+
 def _attach_changed_files(conn, task_id: str, files: list[Path]) -> list[str]:
     attached: list[str] = []
     for path in files[:20]:
@@ -336,6 +389,73 @@ def _register_attachment_dir_files(conn, task_id: str) -> list[str]:
         except Exception:
             continue
     return registered
+
+
+def run_codex_verifier(task_id: str) -> int:
+    """Run one independent read-only verification task through Codex."""
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None or task.executor_lane != kb.EXECUTOR_LANE_CODEX_VERIFY:
+            return 1
+        expected_run_id = task.current_run_id
+        if expected_run_id is None:
+            return 1
+        try:
+            cwd_path = kb.resolve_workspace(task)
+            if str(cwd_path) != (task.workspace_path or ""):
+                kb.set_workspace_path(conn, task_id, cwd_path)
+            cwd = str(cwd_path)
+        except Exception as exc:
+            return 0 if kb.block_task(
+                conn, task_id, reason=f"Codex verifier workspace resolution failed: {exc}",
+                kind="needs_input", expected_run_id=expected_run_id,
+            ) else 1
+        timeout = int(task.max_runtime_seconds or DEFAULT_ATTEMPT_TIMEOUT_SECONDS)
+        started_at = time.time()
+        try:
+            should_run = _claim_codex_verifier_attempt(conn, task_id, expected_run_id)
+        except RuntimeError:
+            return 1
+        if not should_run:
+            return 1
+        attempt = _invoke_codex_verifier(
+            _build_codex_verifier_prompt(task), cwd, timeout, task_id=task_id,
+        )
+        if not attempt.ok:
+            reason = "Codex verifier failed or timed out.\n\n" + attempt.evidence
+            ok = kb.block_task(conn, task_id, reason=reason, kind="needs_input", expected_run_id=expected_run_id)
+            if ok:
+                kb.add_comment(conn, task_id, author="atlas-codex-lane", body=attempt.evidence)
+            return 0 if ok else 1
+        result = _extract_codex_result(attempt.stdout)
+        summary = result[:4000]
+        metadata = {
+            "executor_lane": "codex_verify",
+            "executor": "codex",
+            "sandbox": "read-only",
+            "duration_seconds": round(time.time() - started_at, 1),
+        }
+        try:
+            ok = kb.complete_task(
+                conn, task_id, result=result, summary=summary, metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
+        except kb.VerificationRequiredError:
+            handed_off = _handoff_for_verification(
+                conn, task_id, summary=summary, evidence=attempt.evidence,
+                metadata=metadata, expected_run_id=expected_run_id,
+                author="atlas-codex-lane",
+            )
+            return 0 if handed_off else 1
+        if ok:
+            kb.add_comment(conn, task_id, author="atlas-codex-lane", body=attempt.evidence)
+        return 0 if ok else 1
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def run_claude_executor(task_id: str) -> int:
@@ -477,6 +597,32 @@ def _invoke_claude(
         "claude", "claude.headless", {"prompt": prompt}, cwd, timeout,
         task_id=task_id,
     )
+
+
+def _invoke_codex_verifier(
+    prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
+) -> AttemptResult:
+    """One bounded independent Codex verification attempt in read-only sandbox."""
+    with tempfile.NamedTemporaryFile(prefix="hermes-codex-verify-", suffix=".txt", delete=False) as tmp:
+        last_message_path = tmp.name
+    try:
+        attempt = _supervised_attempt(
+            "codex", "codex.verify",
+            {"prompt": prompt, "last_message_path": last_message_path},
+            cwd, timeout, task_id=task_id,
+        )
+    finally:
+        try:
+            last_message = Path(last_message_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            last_message = ""
+        try:
+            Path(last_message_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    if last_message.strip():
+        attempt.stdout = f"{attempt.stdout}\n--- last message ---\n{last_message}"
+    return attempt
 
 
 def _invoke_recovery_claude(

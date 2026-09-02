@@ -108,6 +108,26 @@ def test_assignee_claude_is_shorthand_for_direct_lane(kanban_home):
     assert task.assignee == "default"
 
 
+def test_assignee_atlas_is_shorthand_for_readonly_codex_verifier(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="verify implementation", assignee="atlas")
+        task = kb.get_task(conn, tid)
+    assert task.executor_lane == "codex_verify"
+    assert task.assignee == "default"
+    assert task.recovery_gate_cmd is None
+
+
+def test_explicit_codex_verify_lane_normalizes_to_default_carrier(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="verify implementation", assignee="overall_manager",
+            executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+        )
+        task = kb.get_task(conn, tid)
+    assert task.executor_lane == "codex_verify"
+    assert task.assignee == "default"
+
+
 def test_recovery_gate_cmd_rejected_on_direct_claude_lane(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="only valid with"):
@@ -176,6 +196,29 @@ def test_legacy_db_migrates_executor_lane_columns(tmp_path, monkeypatch):
     assert task.recovery_gate_cmd is None
 
 
+def test_dispatcher_normalizes_legacy_atlas_ready_card(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy atlas verify", assignee="default", initial_status="running")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='atlas', executor_lane=NULL, status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (tid,),
+            )
+        monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "default")
+        spawned=[]
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace, **kw: spawned.append((task.id, task.assignee, task.executor_lane)) or 4242,
+            max_spawn=1,
+        )
+        task = kb.get_task(conn, tid)
+    assert task.assignee == "default"
+    assert task.executor_lane == "codex_verify"
+    assert res.spawned and res.spawned[0][0] == tid
+    assert spawned and spawned[0][2] == "codex_verify"
+
+
 # ---------------------------------------------------------------------------
 # Creation surfaces (tool schema + CLI flags)
 # ---------------------------------------------------------------------------
@@ -187,6 +230,7 @@ def test_kanban_create_tool_schema_exposes_executor_lane():
     props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
     assert "executor_lane" in props
     assert "claude" in props["executor_lane"]["enum"]
+    assert "codex_verify" in props["executor_lane"]["enum"]
     assert "claude_recovery" in props["executor_lane"]["enum"]
     assert "recovery_gate_cmd" in props
 
@@ -220,6 +264,18 @@ def test_kanban_cli_create_accepts_direct_claude_lane():
     assert args.recovery_gate_cmd is None
 
 
+def test_kanban_cli_create_accepts_codex_verify_lane():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="kanban_action")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "create", "verify it",
+        "--assignee", "default",
+        "--executor-lane", "codex_verify",
+    ])
+    assert args.executor_lane == "codex_verify"
+
+
 def test_kanban_cli_create_defaults_executor_lane_none():
     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
     sub = parser.add_subparsers(dest="kanban_action")
@@ -228,6 +284,65 @@ def test_kanban_cli_create_defaults_executor_lane_none():
     args = parser.parse_args(["kanban", "create", "ordinary task", "--assignee", "default"])
     assert args.executor_lane is None
     assert args.recovery_gate_cmd is None
+
+
+# ---------------------------------------------------------------------------
+# Atlas / Codex read-only verifier lane
+# ---------------------------------------------------------------------------
+
+
+def test_codex_verify_launcher_is_mechanically_read_only(monkeypatch):
+    monkeypatch.setattr(recovery_lane.ex.shutil, "which", lambda name: f"/bin/{name}")
+    argv = recovery_lane.ex.LAUNCHERS["codex.verify"].build({
+        "prompt": "verify", "last_message_path": "/tmp/last.txt"
+    })
+    assert argv[0] == "/bin/codex"
+    assert argv[1] == "exec"
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in argv
+
+
+def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
+    workspace = tmp_path / "verify-work"
+    task = _make_recovery_task(
+        executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+        recovery_gate_cmd=None,
+        body="Verify the implementation read-only.",
+        workspace_kind="scratch",
+        workspace_path=str(workspace),
+    )
+    conn = object(); complete_calls=[]; block_calls=[]; comments=[]
+    monkeypatch.setattr(recovery_lane.kb, "connect", lambda: conn)
+    monkeypatch.setattr(recovery_lane.kb, "get_task", lambda c, tid: task)
+    monkeypatch.setattr(recovery_lane.kb, "resolve_workspace", lambda t: workspace)
+    monkeypatch.setattr(recovery_lane.kb, "set_workspace_path", lambda *a, **k: None)
+    monkeypatch.setattr(recovery_lane, "_claim_codex_verifier_attempt", lambda c, tid, rid: True)
+    monkeypatch.setattr(
+        recovery_lane, "_invoke_codex_verifier",
+        lambda prompt, cwd, timeout, *, task_id=None: recovery_lane.AttemptResult(
+            "codex", 0, "trace\n--- last message ---\nPASS all checks; GO",
+            "", execution_id="x_fake_codex_verify",
+            execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        ),
+    )
+    monkeypatch.setattr(
+        recovery_lane.kb, "complete_task",
+        lambda c, tid, **kw: complete_calls.append(kw) or True,
+    )
+    monkeypatch.setattr(
+        recovery_lane.kb, "block_task",
+        lambda c, tid, **kw: block_calls.append(kw) or True,
+    )
+    monkeypatch.setattr(
+        recovery_lane.kb, "add_comment",
+        lambda c, tid, author, body: comments.append((author, body)) or 1,
+    )
+    rc = recovery_lane.run_codex_verifier("t_recover")
+    assert rc == 0
+    assert not block_calls
+    assert len(complete_calls) == 1
+    assert complete_calls[0]["result"] == "PASS all checks; GO"
+    assert complete_calls[0]["metadata"]["sandbox"] == "read-only"
 
 
 # ---------------------------------------------------------------------------
@@ -609,9 +724,15 @@ def test_cli_recovery_bypass_precedes_hermes_worker_loop():
     )
     direct_invoke = source.index("run_claude_executor(_kanban_task_id)", direct_check)
     direct_exit = source.index("sys.exit(_lane_rc)", direct_invoke)
+    codex_check = source.index(
+        "_lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CODEX_VERIFY",
+        direct_exit,
+    )
+    codex_invoke = source.index("run_codex_verifier(_kanban_task_id)", codex_check)
+    codex_exit = source.index("sys.exit(_lane_rc)", codex_invoke)
     lane_check = source.index(
         "_lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE_RECOVERY",
-        direct_exit,
+        codex_exit,
     )
     lane_invoke = source.index("run_claude_first_recovery(_kanban_task_id)", lane_check)
     lane_exit = source.index("sys.exit(_lane_rc)", lane_invoke)
