@@ -677,23 +677,28 @@ def _fallback_alive(pid: Optional[int]) -> bool:
     return True
 
 
-def identity_matches(pid: Optional[int], recorded_key: Optional[str]) -> bool:
-    """Whether the live process at ``pid`` is still the recorded executor.
+def _same_process_key(live: Optional[str], recorded: Optional[str]) -> bool:
+    """Compare process identity without treating a legitimate exec() as PID reuse.
 
-    False when the process is gone, when the fingerprint differs (PID reuse),
-    and — deliberately — when identity cannot be established at all. The cost
-    of a false negative is a record classified ``stale``; the cost of a false
-    positive is signalling an unrelated process that happens to have inherited
-    the number. Those are not symmetric, so this errs to False.
+    Linux PID reuse safety comes from /proc starttime. The ``comm`` suffix is
+    diagnostic only because exec() may change it while preserving the same PID
+    and starttime. For legacy/non-Linux keys, retain exact comparison.
     """
+    if not live or not recorded:
+        return False
+    if live.startswith("linux:") and recorded.startswith("linux:"):
+        try:
+            return live.split(":", 2)[1] == recorded.split(":", 2)[1]
+        except Exception:
+            return False
+    return live == recorded
+
+
+def identity_matches(pid: Optional[int], recorded_key: Optional[str]) -> bool:
+    """Whether the live process at ``pid`` is still the recorded executor."""
     if not pid or pid <= 0:
         return False
-    live = process_identity(pid)
-    if live is None:
-        return False
-    if not recorded_key:
-        return False
-    return live == recorded_key
+    return _same_process_key(process_identity(pid), recorded_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1930,7 +1935,7 @@ def _reconcile_one(
         return
 
     live_identity = process_identity(pid) if pid else None
-    if record.proc_key and live_identity is not None and live_identity != record.proc_key:
+    if record.proc_key and live_identity is not None and not _same_process_key(live_identity, record.proc_key):
         # Rule 1. The number was recycled. Do not touch whatever owns it now.
         _finish(
             conn, record, result, status=STATUS_STALE, reason="pid_reused", now=now

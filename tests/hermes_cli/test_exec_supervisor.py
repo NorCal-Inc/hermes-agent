@@ -783,6 +783,19 @@ class TestPidReuse:
         assert ex.identity_matches(os.getpid(), ex.process_identity(os.getpid()))
 
 
+def test_linux_process_identity_allows_exec_comm_change_but_not_starttime_change(monkeypatch):
+    recorded = "linux:12345:python3"
+    monkeypatch.setattr(ex, "process_identity", lambda pid: "linux:12345:node")
+    assert ex.identity_matches(999, recorded) is True
+    monkeypatch.setattr(ex, "process_identity", lambda pid: "linux:12346:node")
+    assert ex.identity_matches(999, recorded) is False
+
+
+def test_reconcile_does_not_mark_same_starttime_exec_as_pid_reused(monkeypatch, tmp_path):
+    assert ex._same_process_key("linux:777:node", "linux:777:python3") is True
+    assert ex._same_process_key("linux:778:node", "linux:777:python3") is False
+
+
 # ---------------------------------------------------------------------------
 # 7. Policy
 # ---------------------------------------------------------------------------
