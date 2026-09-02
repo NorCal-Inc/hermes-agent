@@ -1184,3 +1184,52 @@ class TestVerifierIndependence:
             assert len(
                 _events(conn, tid, kind="verification_blocked_self_review")
             ) == 1
+
+
+class TestAssigneeIntegrity:
+    """``assign_task`` must refuse assignee values that can never dispatch.
+
+    Root cause reproduced on t_500a3503 (t_f2d639a3 evidence packet): a
+    recovery-lane reassignment wrote assignee="codex_verify" directly —
+    an executor_lane identifier, not a profile or a recognized shorthand.
+    The only code that knows how to turn a legacy shorthand ("claude" /
+    "atlas") into a real (assignee="default", executor_lane=...) pair
+    runs exclusively inside ready-queue dispatch for status='ready' rows,
+    so a task reassigned like this while already in another status (here,
+    'review') silently could never be claimed again — no exception, no
+    dispatcher signal, nothing but a permanently stuck task. This suite
+    pins the fix: invalid tokens are refused at the write, not discovered
+    later by their absence from any queue.
+    """
+
+    def test_rejects_executor_lane_identifier_as_assignee(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="implementation", assignee="default")
+            with pytest.raises(ValueError, match="codex_verify"):
+                kb.assign_task(conn, tid, "codex_verify")
+            # The bad write must not have landed.
+            assert kb.get_task(conn, tid).assignee == "default"
+
+    def test_rejects_arbitrary_nonexistent_profile(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="implementation", assignee="default")
+            with pytest.raises(ValueError):
+                kb.assign_task(conn, tid, "definitely-not-a-real-profile")
+
+    def test_accepts_real_profile(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="implementation", assignee="default")
+            assert kb.assign_task(conn, tid, "default") is True
+
+    def test_accepts_legacy_claude_atlas_shorthand(self, kanban_home):
+        """These two exact tokens are still honoured for backward
+        compatibility (see EXECUTOR_LANE_CLAUDE / EXECUTOR_LANE_CODEX_VERIFY
+        module docs) — only ``assign_task`` doesn't itself translate them
+        into (assignee="default", executor_lane=...); that normalization
+        still happens lazily at ready-queue claim time. Rejecting them here
+        would break the documented compatibility shorthand.
+        """
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="implementation", assignee="default")
+            assert kb.assign_task(conn, tid, "claude") is True
+            assert kb.assign_task(conn, tid, "atlas") is True

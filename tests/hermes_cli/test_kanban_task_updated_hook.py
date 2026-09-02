@@ -40,7 +40,9 @@ def captured_updates(monkeypatch):
     finally:
         mgr._hooks = saved
 
-def test_assign_fires_updated_with_changed_fields(kanban_home, captured_updates):
+def test_assign_fires_updated_with_changed_fields(
+    kanban_home, captured_updates, all_assignees_spawnable
+):
     """assign_task fires the observer post-commit with the changed field."""
     assignee_at_fire_time: list = []
 
@@ -77,7 +79,7 @@ def test_assign_fires_updated_with_changed_fields(kanban_home, captured_updates)
     assert "run_id" in kw
     assert assignee_at_fire_time == ["bob"]
 
-def test_raising_callback_does_not_break_assign(kanban_home):
+def test_raising_callback_does_not_break_assign(kanban_home, all_assignees_spawnable):
     mgr = get_plugin_manager()
     saved = {k: list(v) for k, v in mgr._hooks.items()}
 
@@ -97,7 +99,9 @@ def test_raising_callback_does_not_break_assign(kanban_home):
         mgr._hooks = saved
 
 
-def test_no_subscriber_short_circuits_task_updated(kanban_home, monkeypatch):
+def test_no_subscriber_short_circuits_task_updated(
+    kanban_home, monkeypatch, all_assignees_spawnable
+):
     from hermes_cli import lifecycle
 
     invoked: list[str] = []

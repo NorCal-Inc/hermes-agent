@@ -4396,8 +4396,33 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
+
+    Raises ``ValueError`` if ``profile`` is neither an existing Hermes
+    profile nor one of the two recognized legacy shorthand tokens
+    ("claude", "atlas"). Executor-lane identifiers such as
+    ``EXECUTOR_LANE_CODEX_VERIFY`` ("codex_verify") or
+    ``EXECUTOR_LANE_CLAUDE_RECOVERY`` belong in the ``executor_lane``
+    column, never in ``assignee`` — writing one here previously produced
+    a task that silently could never be claimed: the shorthand
+    auto-normalization that converts "claude"/"atlas" into
+    (assignee="default", executor_lane=...) only runs for status='ready'
+    rows during ready-queue dispatch, so a task reassigned this way while
+    already in another status (e.g. 'review') stalled with no error and
+    no dispatcher signal (see t_500a3503, t_f2d639a3 evidence packet).
     """
     profile = _canonical_assignee(profile)
+    if profile is not None and profile not in (EXECUTOR_LANE_CLAUDE, "atlas"):
+        from hermes_cli.profiles import profile_exists as _profile_exists
+
+        if not _profile_exists(profile):
+            raise ValueError(
+                f"cannot assign {task_id!r} to {profile!r}: not an existing "
+                f"Hermes profile and not a recognized shorthand "
+                f"({EXECUTOR_LANE_CLAUDE!r} or 'atlas'). Executor-lane "
+                f"identifiers (e.g. {EXECUTOR_LANE_CODEX_VERIFY!r}, "
+                f"{EXECUTOR_LANE_CLAUDE_RECOVERY!r}) must be set via "
+                f"executor_lane, never assignee."
+            )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
