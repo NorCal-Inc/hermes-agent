@@ -213,6 +213,7 @@ def _build_codex_verifier_prompt(task: kb.Task) -> str:
         task.body or "(no body)",
         "",
         "End with a concise structured verdict: PASS/FAIL per requested item, evidence, and explicit GO/NO-GO when applicable.",
+        "The FINAL line must be exactly one of: ATLAS_VERDICT: PASS or ATLAS_VERDICT: FAIL.",
     ])
 
 
@@ -224,6 +225,19 @@ def _extract_codex_result(stdout: str) -> str:
         if last:
             return last
     return _truncate(text) if text else "Codex verifier completed with no textual result."
+
+
+def _atlas_verdict(result: str) -> Optional[bool]:
+    """Parse the required final Atlas verdict line. Missing/ambiguous fails closed."""
+    lines = [line.strip() for line in (result or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    final = lines[-1]
+    if final == "ATLAS_VERDICT: PASS":
+        return True
+    if final == "ATLAS_VERDICT: FAIL":
+        return False
+    return None
 
 
 def _extract_claude_result(stdout: str) -> str:
@@ -434,6 +448,20 @@ def run_codex_verifier(task_id: str) -> int:
             return 0 if ok else 1
         result = _extract_codex_result(attempt.stdout)
         summary = result[:4000]
+        verdict = _atlas_verdict(result)
+        if verdict is not True:
+            reason = (
+                "Atlas verification failed.\n\n" + result
+                if verdict is False
+                else "Atlas verification result is missing the required final ATLAS_VERDICT line.\n\n" + result
+            )
+            ok = kb.block_task(
+                conn, task_id, reason=reason, kind="needs_input",
+                expected_run_id=expected_run_id,
+            )
+            if ok:
+                kb.add_comment(conn, task_id, author="atlas-codex-lane", body=result)
+            return 0 if ok else 1
         metadata = {
             "executor_lane": "codex_verify",
             "executor": "codex",

@@ -6107,11 +6107,20 @@ def gauntlet_enforcement_default() -> bool:
 
 
 def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` may only complete via a VERIFIED verdict."""
+    """Return True when ``task_id`` may only complete via a VERIFIED verdict.
+
+    ``codex_verify`` tasks are themselves the independent verification artifact.
+    Sending them through the generic review lane would recursively "verify the
+    verifier" and can confuse process success with the reviewed work's verdict.
+    They therefore complete with their PASS/FAIL report as evidence; the target
+    task's verification ledger remains the authority on whether the target passed.
+    """
     row = conn.execute(
-        "SELECT gauntlet_enforced FROM tasks WHERE id = ?", (task_id,)
+        "SELECT gauntlet_enforced, executor_lane FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
+        return False
+    if row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
         return False
     if row["gauntlet_enforced"]:
         return True

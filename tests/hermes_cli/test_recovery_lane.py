@@ -291,6 +291,14 @@ def test_kanban_cli_create_defaults_executor_lane_none():
 # ---------------------------------------------------------------------------
 
 
+def test_codex_verify_task_does_not_recursively_require_gauntlet_review(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="independent verify", assignee="atlas")
+        task = kb.get_task(conn, tid)
+        assert task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+        assert kb.gauntlet_required(conn, tid) is False
+
+
 def test_codex_verify_launcher_is_mechanically_read_only(monkeypatch):
     monkeypatch.setattr(recovery_lane.ex.shutil, "which", lambda name: f"/bin/{name}")
     argv = recovery_lane.ex.LAUNCHERS["codex.verify"].build({
@@ -320,7 +328,7 @@ def test_codex_verifier_runs_from_governed_scratch_for_external_target(monkeypat
     monkeypatch.setattr(
         recovery_lane, "_invoke_codex_verifier",
         lambda prompt, cwd, timeout, *, task_id=None: calls.append((prompt,cwd)) or recovery_lane.AttemptResult(
-            "codex", 0, "--- last message ---\nPASS", "",
+            "codex", 0, "--- last message ---\nPASS\nATLAS_VERDICT: PASS", "",
             execution_id="x_verify", execution_status=recovery_lane.ex.STATUS_COMPLETED,
         ),
     )
@@ -353,7 +361,7 @@ def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
     monkeypatch.setattr(
         recovery_lane, "_invoke_codex_verifier",
         lambda prompt, cwd, timeout, *, task_id=None: recovery_lane.AttemptResult(
-            "codex", 0, "trace\n--- last message ---\nPASS all checks; GO",
+            "codex", 0, "trace\n--- last message ---\nPASS all checks; GO\nATLAS_VERDICT: PASS",
             "", execution_id="x_fake_codex_verify",
             execution_status=recovery_lane.ex.STATUS_COMPLETED,
         ),
@@ -374,8 +382,44 @@ def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
     assert rc == 0
     assert not block_calls
     assert len(complete_calls) == 1
-    assert complete_calls[0]["result"] == "PASS all checks; GO"
+    assert complete_calls[0]["result"] == "PASS all checks; GO\nATLAS_VERDICT: PASS"
     assert complete_calls[0]["metadata"]["sandbox"] == "read-only"
+
+
+def test_atlas_verdict_parser_is_fail_closed():
+    assert recovery_lane._atlas_verdict("ok\nATLAS_VERDICT: PASS") is True
+    assert recovery_lane._atlas_verdict("bad\nATLAS_VERDICT: FAIL") is False
+    assert recovery_lane._atlas_verdict("PASS") is None
+    assert recovery_lane._atlas_verdict("ATLAS_VERDICT: PASS\ntrailing prose") is None
+
+
+def test_codex_verifier_fail_blocks_instead_of_releasing_children(monkeypatch, tmp_path):
+    task = _make_recovery_task(
+        executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+        recovery_gate_cmd=None,
+        body="Verify deployment gate.",
+        workspace_kind="scratch",
+        workspace_path=str(tmp_path),
+    )
+    conn=object(); complete_calls=[]; block_calls=[]
+    monkeypatch.setattr(recovery_lane.kb, "connect", lambda: conn)
+    monkeypatch.setattr(recovery_lane.kb, "get_task", lambda c, tid: task)
+    monkeypatch.setattr(recovery_lane.kb, "workspaces_root", lambda: tmp_path)
+    monkeypatch.setattr(recovery_lane, "_claim_codex_verifier_attempt", lambda *a: True)
+    monkeypatch.setattr(
+        recovery_lane, "_invoke_codex_verifier",
+        lambda *a, **k: recovery_lane.AttemptResult(
+            "codex", 0, "--- last message ---\nNO-GO\nATLAS_VERDICT: FAIL", "",
+            execution_id="x_fail", execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        ),
+    )
+    monkeypatch.setattr(recovery_lane.kb, "complete_task", lambda *a, **k: complete_calls.append(k) or True)
+    monkeypatch.setattr(recovery_lane.kb, "block_task", lambda *a, **k: block_calls.append(k) or True)
+    monkeypatch.setattr(recovery_lane.kb, "add_comment", lambda *a, **k: 1)
+    assert recovery_lane.run_codex_verifier("t_recover") == 0
+    assert complete_calls == []
+    assert len(block_calls) == 1
+    assert "Atlas verification failed" in block_calls[0]["reason"]
 
 
 # ---------------------------------------------------------------------------
