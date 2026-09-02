@@ -358,6 +358,14 @@ def default_allowed_roots() -> tuple[str, ...]:
         roots.append(str(kb.workspaces_root()))
     except Exception:
         pass
+    # Canonical checked-out project repositories live here. Direct executor
+    # lanes need to work in those repositories (including commit/deploy tasks),
+    # while still refusing arbitrary $HOME paths. This is intentionally the
+    # repository root, not /home/chris or Path.home() itself.
+    try:
+        roots.append(str(Path.home() / "hermes" / "repos"))
+    except Exception:
+        pass
     # De-duplicate while preserving order.
     seen: set[str] = set()
     out: list[str] = []

@@ -801,6 +801,13 @@ def test_reconcile_does_not_mark_same_starttime_exec_as_pid_reused(monkeypatch, 
 # ---------------------------------------------------------------------------
 
 
+def test_default_allowed_roots_include_canonical_project_repo_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    roots = ex.default_allowed_roots()
+    assert str(tmp_path / "hermes" / "repos") in roots
+    assert str(tmp_path) not in roots
+
+
 class TestPolicy:
     def test_unauthorized_working_root_is_rejected(self, kanban_home, tmp_path, policy):
         outside = tmp_path / "elsewhere"
