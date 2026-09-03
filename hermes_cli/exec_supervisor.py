@@ -501,7 +501,13 @@ def _build_claude_recovery(spec: dict) -> list[str]:
 
 
 def _build_codex_verify(spec: dict) -> list[str]:
-    """Independent Codex verifier. Filesystem mutation is mechanically denied."""
+    """Independent Codex verifier in a disposable writable scratch sandbox.
+
+    The verifier CWD is a governed scratch directory, never the source workspace
+    under review. ``workspace-write`` therefore permits pytest/temp artifacts
+    only in verifier scratch (plus the sandbox's temp locations) while target
+    repositories remain outside the writable workspace boundary.
+    """
     prompt = _require_str(spec, "prompt")
     binary = shutil.which("codex") or "codex"
     argv = [
@@ -510,7 +516,7 @@ def _build_codex_verify(spec: dict) -> list[str]:
         prompt,
         "--json",
         "--sandbox",
-        "read-only",
+        "workspace-write",
         "--skip-git-repo-check",
     ]
     last_message_path = spec.get("last_message_path")
