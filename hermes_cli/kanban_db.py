@@ -5228,7 +5228,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks to ``ready`` when every parent is satisfied.
+
+    "Satisfied" is :func:`_parents_satisfied` — normally ``done``/``archived``,
+    plus the evidence-ready carve-out for an independent verifier child.
 
     Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
     MUST be called OUTSIDE any open write transaction (plain ``write_txn``
@@ -5274,13 +5277,7 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _parents_satisfied(conn, task_id):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -5321,14 +5318,91 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+# Dependency gating normally demands every parent be terminal
+# ('done'/'archived'). Applied to an *independent verifier* child that rule is
+# circular by construction and deadlocks the Gauntlet: a gauntlet-enforced
+# parent only reaches 'done' from a VERIFIED verdict, the verdict may only come
+# from an independent verifier (same-identity review is refused by
+# ``record_verification``), and the verifier child could never start because
+# its parent was not yet 'done'. Every gate behaves correctly and the chain
+# still stops — observed live on t_cda2da6b (complete evidence packet, parked
+# at verification_state='pending' after a correctly-refused self-review) whose
+# codex_verify child t_0c9e2a80 sat in 'todo' with nothing that could ever
+# promote it.
+#
+# The carve-out is narrow: a child in the ``codex_verify`` lane ALSO accepts a
+# parent that is *evidence-ready* — one that has handed its implementation off
+# for verification and left something falsifiable to check. Three exact SQL
+# conditions, none of them inferred:
+#
+#   1. the parent's verification head is ``pending`` — ``request_review`` ran
+#      and no verdict has been spent since (a later FAIL flips the head to
+#      ``failed``, or a routed failure clears it, and the child stops being
+#      eligible — fail-closed);
+#   2. an open ``verdict``/``pending`` row exists on the ledger — the same
+#      durable phase record :func:`_current_verification_phase` reads, so the
+#      gate agrees with the ledger rather than with a materialised head alone;
+#   3. the parent carries at least one attachment — the evidence packet the
+#      verifier is being asked to verify.
+#
+# Nothing else moves. The parent still cannot go EXECUTING -> COMPLETED, still
+# needs an independent VERIFIED verdict before 'done', same-identity review is
+# still refused, and an ordinary (non-verifier) child still waits for a
+# terminal parent. Only the verifier's *start* gate moves, from "parent
+# completed" to "parent produced evidence".
+#
+# The outer COALESCE is load-bearing, not defensive noise. ``executor_lane``
+# and ``verification_state`` are both NULL-able, and under SQL three-valued
+# logic ``NULL AND TRUE`` is NULL, so a bare ``NOT (...)`` would evaluate to
+# NULL and drop the parent row from the result — silently making EVERY child of
+# such a parent eligible. That would invert the carve-out into a hole; the
+# COALESCE forces the unknown case back to "not evidence-ready", i.e. still
+# gated. Pinned by ``test_ordinary_child_still_requires_terminal_parent``.
+_EVIDENCE_READY_PARENT_SQL = """
+    (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
+    AND p.verification_state = :pending
+    AND EXISTS (
+        SELECT 1 FROM task_verifications v
+         WHERE v.task_id = p.id
+           AND v.kind = :verdict_kind
+           AND v.state = :pending
+    )
+    AND EXISTS (
+        SELECT 1 FROM task_attachments a WHERE a.task_id = p.id
+    )
+"""
+
+_UNSATISFIED_PARENTS_SQL = f"""
+    SELECT 1
+      FROM task_links l
+      JOIN tasks p ON p.id = l.parent_id
+     WHERE l.child_id = :child
+       AND p.status NOT IN ('done', 'archived')
+       AND NOT COALESCE(({_EVIDENCE_READY_PARENT_SQL}), 0)
+     LIMIT 1
+"""
+
+_PARENT_GATE_PARAMS = {
+    "verify_lane": EXECUTOR_LANE_CODEX_VERIFY,
+    "pending": VERIFICATION_PENDING,
+    "verdict_kind": LEDGER_KIND_VERDICT,
+}
+
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
+    """Return whether every direct parent is satisfied for dependency gating.
+
+    Satisfied means terminal ('done'/'archived') — or, for an independent
+    verifier child only, evidence-ready. See ``_EVIDENCE_READY_PARENT_SQL``
+    above for why the second case exists and how narrow it is.
+
+    This is the dependency-eligibility predicate: :func:`recompute_ready`,
+    :func:`claim_task`, :func:`claim_review_task`, :func:`complete_task` and
+    :func:`request_review` all read it from here so they cannot drift into
+    disagreeing about the same chain.
+    """
     return conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
+        _UNSATISFIED_PARENTS_SQL, {**_PARENT_GATE_PARAMS, "child": task_id},
     ).fetchone() is None
 
 
@@ -5348,21 +5422,19 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
+        # Structural invariant: never transition ready -> running while a
+        # parent dependency is unsatisfied. This is the single enforcement
+        # point regardless of which writer (create_task, link_tasks,
+        # unblock_task, release_stale_claims, manual SQL) set status='ready'.
+        # If a racy writer promoted a task with unsatisfied parents, demote it
+        # back to 'todo' here — recompute_ready will re-promote when the
+        # parents actually become satisfied. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        # Reads the same predicate recompute_ready promotes on: if the two
+        # disagreed, a verifier child freed by the evidence-ready carve-out
+        # would be promoted and then demoted straight back on every dispatch
+        # pass — a todo -> ready -> todo flap, not a working chain.
+        if not _parents_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",

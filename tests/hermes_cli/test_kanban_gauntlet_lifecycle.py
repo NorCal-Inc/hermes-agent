@@ -1233,3 +1233,291 @@ class TestAssigneeIntegrity:
             tid = kb.create_task(conn, title="implementation", assignee="default")
             assert kb.assign_task(conn, tid, "claude") is True
             assert kb.assign_task(conn, tid, "atlas") is True
+
+
+# ---------------------------------------------------------------------------
+# Evidence-ready verifier dependencies
+#
+# The durable rule pinned below: **an independent verifier child's start gate
+# keys on the parent's evidence readiness (verification-pending + an open
+# ledger phase + an evidence packet), never on terminal parent completion.**
+# Gating an independent verifier on parent completion is circular whenever the
+# parent is gauntlet-enforced, because the completion it waits for is the very
+# thing the verifier exists to authorise. Live instance: t_cda2da6b (complete
+# evidence packet, verification_state='pending', parked after a correctly
+# refused same-identity review) and its codex_verify child t_0c9e2a80, stuck
+# in 'todo' with nothing that could ever promote it.
+#
+# The tests are deliberately bidirectional: the first two prove the deadlock
+# is broken, and everything after them proves the carve-out did not become a
+# hole — ordinary children still wait for a terminal parent, an evidence-less
+# or pre-handoff parent still gates its verifier, a failed verdict closes the
+# carve-out again, and the completion / independence gates are untouched.
+# ---------------------------------------------------------------------------
+
+class TestEvidenceReadyVerifierDependency:
+    @staticmethod
+    def _evidence_ready_parent(conn, *, attach=True, assignee="default"):
+        """Drive a gauntlet parent to VERIFICATION_PENDING with a packet."""
+        pid = kb.create_task(
+            conn, title="execution with evidence", assignee=assignee,
+            gauntlet=True,
+        )
+        claimed = kb.claim_task(conn, pid)
+        assert claimed is not None and claimed.status == "running"
+        if attach:
+            kb.add_attachment(
+                conn, pid,
+                filename="EXECUTION-EVIDENCE-PACKET.md",
+                stored_path=f"/tmp/{pid}/EXECUTION-EVIDENCE-PACKET.md",
+                size=16819, uploaded_by="claude-lane",
+            )
+        assert kb.request_review(
+            conn, pid, summary="execution evidence packet complete",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        parent = kb.get_task(conn, pid)
+        assert parent.status == "review"
+        assert parent.verification_state == kb.VERIFICATION_PENDING
+        return pid
+
+    @staticmethod
+    def _verifier_child(conn, parent_id, title="independent codex verification"):
+        return kb.create_task(
+            conn, title=title, assignee="default",
+            executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+            parents=[parent_id], gauntlet=True,
+        )
+
+    # -- the deadlock is broken --------------------------------------------
+
+    def test_verifier_child_promotes_from_evidence_ready_parent(
+        self, kanban_home
+    ):
+        """The exact t_cda2da6b / t_0c9e2a80 shape, end to end."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            cid = self._verifier_child(conn, pid)
+            assert kb.get_task(conn, cid).status == "todo"
+
+            assert kb.recompute_ready(conn) >= 1
+
+            # The verifier is eligible...
+            assert kb.get_task(conn, cid).status == "ready"
+            # ...and the parent was NOT dragged to a terminal state to make
+            # that happen. It is still awaiting its independent verdict.
+            parent = kb.get_task(conn, pid)
+            assert parent.status == "review"
+            assert parent.verification_state == kb.VERIFICATION_PENDING
+            assert parent.completed_at is None
+
+    def test_promoted_verifier_is_not_demoted_back_on_claim(self, kanban_home):
+        """Promotion is worthless if the claim-time invariant demotes it
+        straight back. If recompute_ready and claim_task read different
+        predicates the card flaps todo -> ready -> todo forever instead of
+        running, which is what the live board actually showed."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            cid = self._verifier_child(conn, pid)
+            kb.recompute_ready(conn)
+
+            claimed = kb.claim_task(conn, cid)
+            assert claimed is not None
+            assert claimed.status == "running"
+            assert _events(conn, cid, kind="claim_rejected") == []
+
+    # -- the carve-out is not a hole ---------------------------------------
+
+    def test_ordinary_child_still_requires_terminal_parent(self, kanban_home):
+        """The carve-out is lane-scoped. A non-verifier child of the very same
+        evidence-ready parent must not move until the parent is genuinely
+        terminal. This is also the test that catches the SQL three-valued-logic
+        inversion: without the COALESCE the NULL executor_lane would drop the
+        parent row and free every child."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            ordinary = kb.create_task(
+                conn, title="follow-on implementation", assignee="default",
+                parents=[pid],
+            )
+            verifier = self._verifier_child(conn, pid)
+
+            kb.recompute_ready(conn)
+
+            assert kb.get_task(conn, verifier).status == "ready"
+            assert kb.get_task(conn, ordinary).status == "todo"
+
+            # And it moves only once the parent is genuinely terminal.
+            ok, detail = kb.record_verification(
+                conn, pid, passed=True, verifier="atlas",
+            )
+            assert ok is True, detail
+            assert kb.complete_task(conn, pid, summary="verified") is True
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, ordinary).status == "ready"
+
+    def test_ordinary_child_claim_is_still_rejected_and_demoted(
+        self, kanban_home
+    ):
+        """The claim-time invariant is intact for everyone else: force a
+        non-verifier child to 'ready' behind the predicate's back and it is
+        still refused and demoted."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            ordinary = kb.create_task(
+                conn, title="follow-on implementation", assignee="default",
+                parents=[pid],
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                    (ordinary,),
+                )
+
+            assert kb.claim_task(conn, ordinary) is None
+            assert kb.get_task(conn, ordinary).status == "todo"
+            rejected = _events(conn, ordinary, kind="claim_rejected")
+            assert len(rejected) == 1
+            assert rejected[0][1]["reason"] == "parents_not_done"
+
+    def test_no_evidence_packet_keeps_verifier_gated(self, kanban_home):
+        """Verification-pending alone is not enough: with nothing attached
+        there is nothing falsifiable for the verifier to check."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn, attach=False)
+            cid = self._verifier_child(conn, pid)
+
+            kb.recompute_ready(conn)
+
+            assert kb.get_task(conn, cid).status == "todo"
+
+    def test_parent_still_executing_keeps_verifier_gated(self, kanban_home):
+        """Attachments alone are not enough either — before the handoff there
+        is no verification phase to verify."""
+        with kb.connect_closing() as conn:
+            pid = kb.create_task(
+                conn, title="still executing", assignee="default",
+                gauntlet=True,
+            )
+            assert kb.claim_task(conn, pid) is not None
+            kb.add_attachment(
+                conn, pid, filename="partial.log",
+                stored_path=f"/tmp/{pid}/partial.log", size=12,
+            )
+            cid = self._verifier_child(conn, pid)
+
+            kb.recompute_ready(conn)
+
+            assert kb.get_task(conn, pid).status == "running"
+            assert kb.get_task(conn, pid).verification_state is None
+            assert kb.get_task(conn, cid).status == "todo"
+
+    def test_failed_verdict_closes_the_carve_out(self, kanban_home):
+        """A FAIL moves the verification head off 'pending', so the parent
+        stops being evidence-ready and a fresh verifier is gated again —
+        fail-closed, like every other Gauntlet gate.
+
+        ``route_on_failure=False`` so the ``failed`` head is the state under
+        test; the routed variant is covered below.
+        """
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            ok, detail = kb.record_verification(
+                conn, pid, passed=False, verifier="atlas",
+                reason="fixture did not survive restart",
+                route_on_failure=False,
+            )
+            assert ok is True, detail
+            assert kb.get_task(conn, pid).verification_state == (
+                kb.VERIFICATION_FAILED
+            )
+            cid = self._verifier_child(conn, pid)
+
+            kb.recompute_ready(conn)
+
+            assert kb.get_task(conn, cid).status == "todo"
+
+    def test_routed_failure_closes_the_carve_out(self, kanban_home):
+        """The default failure path routes the parent back for repair, which
+        takes the verification head off 'pending' outright. Same conclusion:
+        the parent is no longer evidence-ready and a verifier is gated."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            cid = self._verifier_child(conn, pid)
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, cid).status == "ready"
+
+            ok, detail = kb.record_verification(
+                conn, pid, passed=False, verifier="atlas",
+                reason="fixture did not survive restart",
+            )
+            assert ok is True, detail
+            assert kb.get_task(conn, pid).verification_state != (
+                kb.VERIFICATION_PENDING
+            )
+
+            # A verifier created after the failure gets no carve-out.
+            later = self._verifier_child(
+                conn, pid, title="second codex verification",
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, later).status == "todo"
+
+    # -- nothing else moved -------------------------------------------------
+
+    def test_parent_completion_gate_is_unchanged(self, kanban_home):
+        """An evidence-ready parent with an eligible verifier is still refused
+        a completion: no direct route, no bypass, no weakening."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            cid = self._verifier_child(conn, pid)
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, cid).status == "ready"
+
+            with pytest.raises(kb.VerificationRequiredError) as exc:
+                kb.complete_task(conn, pid, summary="verifier is running")
+            assert exc.value.task_id == pid
+            parent = kb.get_task(conn, pid)
+            assert parent.status != "done"
+            assert parent.completed_at is None
+            assert parent.verification_state == kb.VERIFICATION_PENDING
+
+    def test_same_identity_review_still_refused(self, kanban_home):
+        """Freeing the verifier must not have handed the implementer a way to
+        verify itself while it waits."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn, assignee="erika")
+            self._verifier_child(conn, pid)
+            kb.recompute_ready(conn)
+
+            ok, detail = kb.record_verification(
+                conn, pid, passed=True, verifier="erika",
+            )
+            assert ok is False
+            assert kb.get_task(conn, pid).verification_state == (
+                kb.VERIFICATION_PENDING
+            )
+
+    def test_verifier_verdict_then_parent_completes_normally(self, kanban_home):
+        """The whole point: the chain now terminates. The freed verifier runs
+        and closes out, an independent verdict lands on the parent, and only
+        then does the parent complete."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            cid = self._verifier_child(conn, pid)
+            kb.recompute_ready(conn)
+
+            claimed = kb.claim_task(conn, cid)
+            assert claimed is not None
+            assert kb.complete_task(
+                conn, cid, summary="PASS: fixture survives restart",
+            ) is True
+            assert kb.get_task(conn, cid).status == "done"
+
+            ok, detail = kb.record_verification(
+                conn, pid, passed=True, verifier="atlas",
+                evidence={"command": "pytest -q", "exit_code": 0},
+            )
+            assert ok is True, detail
+            assert kb.complete_task(conn, pid, summary="verified") is True
+            assert kb.get_task(conn, pid).status == "done"
