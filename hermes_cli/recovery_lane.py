@@ -426,7 +426,7 @@ def _register_attachment_dir_files(conn, task_id: str) -> list[str]:
 
 
 def run_codex_verifier(task_id: str) -> int:
-    """Run one independent read-only verification task through Codex."""
+    """Run one independent verifier with writable scratch, read-only target access."""
     conn = kb.connect()
     try:
         task = kb.get_task(conn, task_id)
@@ -483,7 +483,7 @@ def run_codex_verifier(task_id: str) -> int:
         metadata = {
             "executor_lane": "codex_verify",
             "executor": "codex",
-            "sandbox": "read-only",
+            "sandbox": "workspace-write-scratch; target-read-only",
             "duration_seconds": round(time.time() - started_at, 1),
         }
         try:
@@ -669,7 +669,7 @@ def _invoke_claude(
 def _invoke_codex_verifier(
     prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
 ) -> AttemptResult:
-    """One bounded independent Codex verification attempt in read-only sandbox."""
+    """One bounded independent Codex attempt in disposable writable scratch."""
     with tempfile.NamedTemporaryFile(prefix="hermes-codex-verify-", suffix=".txt", delete=False) as tmp:
         last_message_path = tmp.name
     try:

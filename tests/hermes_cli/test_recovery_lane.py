@@ -299,14 +299,14 @@ def test_codex_verify_task_does_not_recursively_require_gauntlet_review(kanban_h
         assert kb.gauntlet_required(conn, tid) is False
 
 
-def test_codex_verify_launcher_is_mechanically_read_only(monkeypatch):
+def test_codex_verify_launcher_writes_only_governed_scratch(monkeypatch):
     monkeypatch.setattr(recovery_lane.ex.shutil, "which", lambda name: f"/bin/{name}")
     argv = recovery_lane.ex.LAUNCHERS["codex.verify"].build({
         "prompt": "verify", "last_message_path": "/tmp/last.txt"
     })
     assert argv[0] == "/bin/codex"
     assert argv[1] == "exec"
-    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert "--skip-git-repo-check" in argv
 
 
@@ -383,7 +383,7 @@ def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
     assert not block_calls
     assert len(complete_calls) == 1
     assert complete_calls[0]["result"] == "PASS all checks; GO\nATLAS_VERDICT: PASS"
-    assert complete_calls[0]["metadata"]["sandbox"] == "read-only"
+    assert complete_calls[0]["metadata"]["sandbox"] == "workspace-write-scratch; target-read-only"
 
 
 def test_atlas_verdict_parser_is_fail_closed():
