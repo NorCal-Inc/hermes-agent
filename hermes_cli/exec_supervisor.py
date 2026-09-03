@@ -1409,7 +1409,10 @@ def run_supervised(
     # the orphan-producing timeout path.
     ownership = (
         OWNERSHIP_SUPERVISOR
-        if effective_timeout > policy.sync_ceiling_seconds
+        if (
+            command_class == "codex.verify"
+            or effective_timeout > policy.sync_ceiling_seconds
+        )
         else OWNERSHIP_CONTROLLER
     )
 
