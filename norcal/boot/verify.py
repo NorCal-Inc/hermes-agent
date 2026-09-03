@@ -22,6 +22,20 @@ for name, src in [('Claude SessionStart', session_src), ('Claude boot wrapper', 
         errs.append(f'{name} does not use the canonical exact shared boot-state parser')
 if '^BOOT STATUS: COMPLETE\\s*$' not in helper_src:
     errs.append('canonical shared boot-state parser is not exact-line anchored')
+# Hermes/Erika parity. The two Erika session-creation paths must build their fresh-session
+# prompt through the shared chokepoint, which reuses the same exact-line parser above. They
+# previously judged boot success by exit code alone, and the generator exits 0 on a degraded
+# boot unless --gate-exit-code is passed, so Erika alone failed open.
+REPO=HERE.parents[1]
+norcal_boot_src=(REPO/'hermes_cli/norcal_boot.py').read_text(encoding='utf-8') if (REPO/'hermes_cli/norcal_boot.py').exists() else ''
+if 'shared_boot_complete' not in norcal_boot_src:
+    errs.append('Hermes session boot chokepoint does not use the canonical exact shared boot-state parser')
+for name, rel in [('Hermes interactive CLI', 'cli.py'), ('Hermes gateway', 'gateway/run.py')]:
+    src=(REPO/rel).read_text(encoding='utf-8') if (REPO/rel).exists() else ''
+    if 'build_session_boot_prompt' not in src:
+        errs.append(f'{name} does not build its fresh-session prompt through the shared boot chokepoint')
+    if '_shared_boot_proc.returncode != 0' in src:
+        errs.append(f'{name} still treats a zero generator exit code as a passed boot gate')
 p=subprocess.run([str(HERE/'hermes-shared-boot-context'),'--gate-exit-code'],capture_output=True,text=True,timeout=60)
 body=(p.stdout or p.stderr or '').strip()
 if p.returncode!=0: errs.append(f'shared generator gate rc={p.returncode}')

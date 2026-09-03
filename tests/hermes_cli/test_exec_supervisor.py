@@ -596,6 +596,27 @@ class TestReconciliation:
     def test_stale_heartbeat_is_detected_and_reconciled(
         self, kanban_home, workroot, policy
     ):
+        """The liveness rule still reaps — within its own authority.
+
+        Rewritten twice on 2026-09-03, and the second rewrite is the one that
+        matters. The original pinned ``max_runtime_s=3600`` against a 10 s
+        liveness window and asserted the reap on an execution that had never
+        heartbeated — i.e. it asserted the inversion that killed t_aef6bbe1 at
+        half its authorized runtime. The first rewrite dodged that by shrinking
+        the cap below the window, which made the fixture pass but described a
+        situation the rule can no longer reach.
+
+        What the rule means now: a heartbeat WAS recorded (by
+        ``ex.LivenessPump``, after proving the process against /proc) and then
+        stopped. That is genuine evidence of a lost owner, and reaping on it is
+        the level-3 window doing its actual job rather than shadowing the
+        level-1 cap. So the fixture writes one real heartbeat, ages it past the
+        window, and leaves the authorized cap far away.
+
+        The precedence half — never-heartbeated work surviving to its own cap —
+        is pinned in ``test_exec_timeout_hierarchy.py`` and
+        ``test_exec_heartbeat_liveness.py``.
+        """
         stale_policy = ex.ExecutionPolicy(
             **{**policy.__dict__, "stale_heartbeat_seconds": 10}
         )
@@ -612,18 +633,30 @@ class TestReconciliation:
                     controller_pid=os.getpid(),
                     controller_key=ex.process_identity(os.getpid()),
                     ownership=ex.OWNERSHIP_SUPERVISOR,
+                    # Comfortably above the aged runtime below, so Rule 3
+                    # (the authorized cap) does not preempt and this really
+                    # does exercise Rule 5.
                     max_runtime_s=3600,
                 )
                 ex._attach_process(
                     conn, record.id, pid=proc.pid, pgid=os.getpgid(proc.pid),
                     proc_key=ex.process_identity(proc.pid),
                 )
+                # Staleness is now "a heartbeat existed and then stopped",
+                # not "the row is old": ``ex.stale_reap_permitted`` refuses to
+                # reap a live process that was never heartbeated at all, since
+                # ``heartbeat_at == started_at`` is seeded, not observed. So
+                # age ``started_at`` and leave ``heartbeat_at`` strictly after
+                # it — one real heartbeat, 500 s ago, under a 10 s window.
+                # Same rule, same expectations; only the fixture now describes
+                # a situation that can actually occur.
                 conn.execute(
-                    "UPDATE executions SET heartbeat_at = heartbeat_at - 600 "
-                    "WHERE id = ?",
+                    "UPDATE executions SET started_at = started_at - 600, "
+                    "heartbeat_at = heartbeat_at - 500 WHERE id = ?",
                     (record.id,),
                 )
                 conn.commit()
+                assert ex.has_recorded_heartbeat(ex.get_execution(conn, record.id))
                 result = ex.reconcile(conn, policy=stale_policy)
                 refreshed = ex.get_execution(conn, record.id)
             assert record.id in result.stale

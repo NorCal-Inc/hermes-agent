@@ -103,6 +103,18 @@ class AttemptResult:
         return self.execution_status == ex.STATUS_COMPLETED and self.returncode == 0
 
     @property
+    def infrastructure(self) -> bool:
+        """Whether the control plane ended this attempt, rather than the work.
+
+        A runtime cap, a lease/liveness reap, an orphan-policy kill or an
+        operator terminate says nothing about whether the repair was going
+        well. Keeping the two apart is what lets the lane block the card as
+        "resume me" instead of "this approach failed", and what keeps the
+        ordinary implementation retry budget unspent.
+        """
+        return ex.is_infrastructure_termination(self.execution_status)
+
+    @property
     def evidence(self) -> str:
         suffix = f" [execution {self.execution_id}]" if self.execution_id else ""
         if self.error:
@@ -113,9 +125,15 @@ class AttemptResult:
                 f"confirmed the process group ended{suffix}"
             )
         if self.execution_status and self.execution_status != ex.STATUS_COMPLETED:
+            # Name the CLASS in the evidence line itself. This string is what a
+            # human and the next executor read off the blocked card, and
+            # "execution ended failed (rc=143)" was read as an implementation
+            # failure on t_aef6bbe1 when it was the supervisor's own SIGTERM.
+            klass = "infrastructure" if self.infrastructure else "implementation"
             return (
                 f"[{self.executor}] execution ended "
-                f"{self.execution_status} (rc={self.returncode}){suffix}"
+                f"{self.execution_status} (rc={self.returncode}) "
+                f"[failure_class={klass}]{suffix}"
             )
         parts = [f"[{self.executor}] rc={self.returncode}{suffix}"]
         if self.stdout.strip():
@@ -523,7 +541,24 @@ def run_claude_executor(task_id: str) -> int:
         # and treating that as success is exactly the split-brain this lane
         # was rewired to end.
         if not attempt.ok:
-            reason = "Direct Claude executor failed or timed out.\n\n" + attempt.evidence
+            # An infrastructure termination is a RESUME instruction, not a
+            # verdict on the work: the workspace, the session transcript and
+            # any attachments the attempt already produced are intact, and the
+            # next attempt must continue from them rather than restart
+            # diagnosis from zero. Say so on the card, because the card is the
+            # only thing the next executor reads.
+            if attempt.infrastructure:
+                reason = (
+                    "Direct Claude executor was terminated by the control "
+                    "plane (infrastructure), not by a failure of the work. "
+                    "Resume from the preserved workspace and evidence; do not "
+                    "restart from zero.\n\n"
+                ) + attempt.evidence
+            else:
+                reason = (
+                    "Direct Claude executor failed or timed out.\n\n"
+                    + attempt.evidence
+                )
             ok = kb.block_task(
                 conn,
                 task_id,

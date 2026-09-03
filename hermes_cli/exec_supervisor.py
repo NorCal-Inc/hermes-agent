@@ -78,6 +78,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,6 +119,36 @@ TERMINAL_STATUSES = (
 #: allowed to look like a completion to the Gauntlet lifecycle.
 SUCCESS_STATUSES = (STATUS_COMPLETED,)
 
+#: Terminal statuses in which the *infrastructure* ended the executor, not the
+#: work. A non-success is not automatically an implementation failure: the
+#: control plane's own runtime cap, lease/liveness reconciliation, orphan
+#: policy and operator terminations all kill a process that may have been
+#: making perfect progress. Callers use this to decide what a non-success
+#: MEANS — in particular whether it may consume an ordinary implementation
+#: retry budget (it may not; see ``is_infrastructure_termination``).
+#:
+#: ``STATUS_FAILED`` is deliberately absent: that is the one non-success that
+#: genuinely reports the executor's own exit code. It only stays trustworthy
+#: because ``_settle`` reclassifies a signalled death away from it — see
+#: ``_note_termination_intent``.
+INFRASTRUCTURE_STATUSES = (
+    STATUS_TIMED_OUT,
+    STATUS_CONTROLLER_LOST,
+    STATUS_STALE,
+    STATUS_TERMINATED,
+)
+
+
+def is_infrastructure_termination(status: Optional[str]) -> bool:
+    """Whether a terminal status means "infrastructure ended it", not "it failed".
+
+    The distinction is the whole point of classifying separately: an
+    infrastructure termination is a fact about the control plane, so scoring it
+    against the implementation — a failure counter, a circuit breaker, a
+    retry budget — charges the work for something the work did not do.
+    """
+    return status in INFRASTRUCTURE_STATUSES
+
 OWNERSHIP_CONTROLLER = "controller"
 OWNERSHIP_SUPERVISOR = "supervisor"
 VALID_OWNERSHIP = (OWNERSHIP_CONTROLLER, OWNERSHIP_SUPERVISOR)
@@ -145,9 +176,150 @@ DEFAULT_MAX_RUNTIME_SECONDS = 3600
 #: A live executor whose owner has not reported progress for this long is
 #: called stale and reconciled. Generous: an agentic executor can legitimately
 #: be silent for a long time, and a false positive kills real work.
+#:
+#: This is a LIVENESS bound, not a runtime bound, and it is subordinate to the
+#: authorized runtime cap — see ``THE TIMEOUT HIERARCHY`` below.
 DEFAULT_STALE_HEARTBEAT_SECONDS = 1800
 #: Grace period between SIGTERM and SIGKILL when terminating a process group.
 DEFAULT_TERMINATE_GRACE_SECONDS = 10
+
+#: How often the controller re-proves its executor is alive and renews the
+#: lease. Small relative to ``DEFAULT_STALE_HEARTBEAT_SECONDS`` so a single
+#: missed tick (a slow write, a busy DB) cannot look like death.
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60
+#: How often the same pump bridges that proven liveness up to the BOARD
+#: (``tasks.last_heartbeat_at``). Deliberately coarser than the execution
+#: heartbeat: ``kanban_db.heartbeat_worker`` appends a durable task event on
+#: every call, and a 60 s cadence would write ~60 rows an hour per card for no
+#: extra safety — the board's own windows are measured in hours.
+DEFAULT_BOARD_HEARTBEAT_INTERVAL_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# THE TIMEOUT HIERARCHY — one authoritative order, highest authority first
+# ---------------------------------------------------------------------------
+#
+# 1. **Authorized task runtime** — ``tasks.max_runtime_seconds``, chosen by
+#    whoever authorized the work. Carried into ``executions.max_runtime_s`` by
+#    ``recovery_lane`` and bounded (never raised) by ``policy.max_runtime_seconds``
+#    /``per_executor_max_runtime``. This is the ONLY timer permitted to decide
+#    that an executor has had enough wall-clock time. Enforced by reconcile
+#    Rule 3 (``runtime_cap_exceeded``) and by ``kanban_db.enforce_max_runtime``.
+#
+# 2. **Executor attempt bound** — the ``timeout=`` a lane passes to
+#    ``run_supervised``. It is the same number as (1) when the task sets one;
+#    ``recovery_lane.DEFAULT_ATTEMPT_TIMEOUT_SECONDS`` only applies when the
+#    task named none. It may not exceed (1) after policy resolution.
+#
+# 3. **Transport / lease / liveness timers** — the supervisor's
+#    ``stale_heartbeat_seconds``, the dispatcher's claim TTL
+#    (``kanban_db.DEFAULT_CLAIM_TTL_SECONDS``), a gateway turn lease. These
+#    exist to detect an owner that has *stopped existing*, not to cap work.
+#    **They are strictly subordinate to (1): none of them may end an execution
+#    before its authorized runtime has actually elapsed.**
+#
+# Three independent mechanisms hold the ordering, because the inversion had
+# three independent causes and fixing any one of them alone leaves the ceiling
+# standing:
+#
+#   * ``_stale_heartbeat_bound`` floors the level-3 window at the level-1 cap,
+#     so a liveness timer can never expire before the authorization does;
+#   * ``LivenessPump`` gives ``heartbeat_at`` an emitter for the first time, so
+#     the level-3 window measures silence instead of age;
+#   * ``stale_reap_permitted`` refuses to treat "never observed" as "dead",
+#     so an execution nothing happens to be watching is not reaped for it.
+#
+# Regressions: ``tests/hermes_cli/test_exec_timeout_hierarchy.py`` (precedence
+# and classification) and ``tests/hermes_cli/test_exec_heartbeat_liveness.py``
+# (emission, uninitialized timestamps, dead-task reaping).
+#
+# It is written down because the inversion is not hypothetical. On 2026-09-03,
+# execution ``x_3b16666deaab836e`` (task t_aef6bbe1) was authorized for 3600 s
+# and killed by Rule 5 at 1804 s — a level-3 timer overruling a level-1
+# authorization at exactly half its budget; ``x_82459f3ab85d41ab``
+# (t_db21ca59) died the same way at 1804 s the same afternoon. Both could,
+# because ``heartbeat()`` had no call site anywhere in the codebase:
+# ``heartbeat_at`` was frozen at ``started_at`` for every execution ever
+# recorded, and "no progress in 1800 s" degenerated into "older than 1800 s".
+# The same absence at board level is why all 26 ``claim_extended`` records
+# carry ``last_heartbeat_at: null``.
+
+
+def _stale_heartbeat_bound(
+    record: "ExecutionRecord", policy: "ExecutionPolicy"
+) -> int:
+    """Seconds of silence before this execution may be reconciled as stale.
+
+    Returns 0 when stale-heartbeat reconciliation is disabled.
+
+    Two cases, and the difference between them is whether the number being
+    compared is an OBSERVATION or a seed:
+
+    * **A real heartbeat exists.** ``heartbeat_at`` was written by
+      :class:`LivenessPump` after re-proving the process against /proc, so
+      silence since then is evidence that the owner stopped proving liveness —
+      the executor died, changed identity, or was abandoned. That is precisely
+      what a level-3 window is for, and it is allowed to fire on its own
+      cadence. It is not capping the authorization; it is reporting a death.
+
+    * **No heartbeat has ever been recorded.** ``heartbeat_at == started_at``
+      is a seed, so ``now - heartbeat_at`` is just the execution's age and the
+      window degenerates into a second, shorter, unauthorized runtime cap —
+      the 2026-09-03 inversion. Here the window is floored at the authorized
+      cap so it cannot preempt it, and Rule 3 (level 1) ends the execution
+      instead, classified as a runtime timeout rather than as staleness.
+
+    The floor is deliberately kept as a second line even though
+    :func:`stale_reap_permitted` already refuses to reap a live unobserved
+    process: the floor holds when liveness cannot be *confirmed* either way
+    (no /proc, an unreadable entry), which is exactly when the wrong answer is
+    least recoverable.
+    """
+    configured = int(policy.stale_heartbeat_seconds or 0)
+    if configured <= 0:
+        return 0
+    if has_recorded_heartbeat(record):
+        return configured
+    cap = int(record.max_runtime_s or policy.max_runtime_seconds or 0)
+    return max(configured, cap)
+
+
+def has_recorded_heartbeat(record: "ExecutionRecord") -> bool:
+    """Whether anything has EVER advanced this execution's heartbeat.
+
+    ``create_execution`` seeds ``heartbeat_at = started_at``, so the two being
+    equal is not "the heartbeat is 0 s old" — it is "no heartbeat has ever been
+    recorded". The distinction is the entire difference between a silent
+    executor and an unobserved one, and collapsing it is what let a liveness
+    rule reap a demonstrably live process: with no emitter anywhere in the
+    codebase, ``now - heartbeat_at`` degenerated into ``now - started_at`` and
+    "no progress for 1800 s" silently became "older than 1800 s".
+    """
+    return bool(
+        record.heartbeat_at
+        and record.started_at
+        and int(record.heartbeat_at) > int(record.started_at)
+    )
+
+
+def stale_reap_permitted(record: "ExecutionRecord") -> bool:
+    """Whether staleness alone may end this execution.
+
+    An uninitialized heartbeat is an absence of evidence, not evidence of
+    death. When the recorded PID still resolves to the same process, the
+    control plane is looking straight at a live executor and the ONLY thing it
+    knows is that nobody ever reported on it — which is a fact about the
+    observer, not the observed. Reaping on that is how a working 1804 s repair
+    run was killed while its own /proc entry was still there to check.
+
+    So: reap on staleness only once a real heartbeat has existed and then
+    stopped (the genuine "it went quiet" signal), or once liveness can no
+    longer be confirmed. Neither branch weakens the wedged-executor bound —
+    Rule 3, the level-1 authorized runtime cap, is what ends a live executor
+    that has had its time, and it runs before this.
+    """
+    if has_recorded_heartbeat(record):
+        return True
+    return not identity_matches(record.pid, record.proc_key)
 
 DEFAULT_ALLOWED_EXECUTORS = ("claude", "codex", "shell")
 
@@ -969,6 +1141,255 @@ def heartbeat(conn: sqlite3.Connection, execution_id: str, *, now: Optional[int]
 
 
 # ---------------------------------------------------------------------------
+# LIVENESS — a heartbeat that can fail, and therefore means something
+# ---------------------------------------------------------------------------
+#
+# ``heartbeat()`` above is the unconditional write. It is deliberately NOT the
+# thing an owner calls on a timer: a timestamp that advances whenever a timer
+# fires records that the timer is running, not that the executor is. The
+# reconciler then reads it as evidence of a live executor and the whole
+# staleness mechanism becomes a self-licking loop.
+#
+# Everything below writes only after re-proving liveness against the kernel,
+# from the DURABLE record rather than from the caller's memory:
+#
+#   * the row is re-read (``get_execution``) — a caller holding a stale
+#     ``ExecutionRecord`` cannot heartbeat a row that has since settled;
+#   * the recorded PID must still resolve to the SAME process fingerprint
+#     (``identity_matches`` → /proc starttime), so a recycled PID or an
+#     unrelated process squatting the number proves nothing;
+#   * ``heartbeat()``'s own ``status IN (active)`` predicate is the last gate.
+#
+# A refusal is a normal outcome and is counted, not raised. The pump's exit
+# event reports emitted-vs-refused precisely so "the heartbeat kept flowing"
+# is falsifiable after the fact instead of assumed.
+
+
+def heartbeat_if_live(
+    conn: sqlite3.Connection, execution_id: str, *, now: Optional[int] = None
+) -> bool:
+    """Advance ``heartbeat_at`` only on re-proven process liveness.
+
+    Returns True when a heartbeat was actually written. False means the
+    execution is terminal, has no PID, or the PID no longer belongs to the
+    recorded executor — in every one of those cases the correct behaviour is
+    to leave the timestamp where it is and let reconciliation act on it.
+    """
+    record = get_execution(conn, execution_id)
+    if record is None or record.is_terminal:
+        return False
+    if record.pid is None:
+        return False
+    if not identity_matches(record.pid, record.proc_key):
+        return False
+    return heartbeat(conn, execution_id, now=now)
+
+
+def bridge_board_heartbeat(
+    conn: sqlite3.Connection, task_id: str, *, execution_id: str
+) -> bool:
+    """Carry proven executor liveness up to the board's own watchdog.
+
+    The board watchdogs (``kanban_db.release_stale_claims``,
+    ``detect_stale_running``) read ``tasks.last_heartbeat_at``, which for an
+    ordinary Hermes agent worker is kept fresh as a side effect of API traffic
+    (``run_agent._touch_activity``, #31752). A gateway-launched Claude executor
+    is a foreign CLI process: it never calls a kanban tool, never touches that
+    column, and so presents as "never sent a heartbeat" for its entire life.
+    That is what made every ``claim_extended`` record on 2026-09-03 carry
+    ``last_heartbeat_at: null``.
+
+    The run identity is read from the TASK ROW, never accepted from the
+    caller: ``current_run_id`` and ``claim_lock`` are the authoritative answer
+    to "which attempt is this and who owns it", and a caller passing a
+    remembered run id is exactly how a heartbeat lands on the wrong attempt
+    after a reclaim. Nothing is written unless the card is still ``running``
+    and still carries a run.
+
+    Liveness is not progress, and this function does not pretend otherwise —
+    it is called only from a pump that has just re-proven the process against
+    /proc. The bound on a live-but-wedged executor remains the level-1
+    authorized runtime (``enforce_max_runtime``), never the lease.
+    """
+    try:
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return False
+    if row is None or row["status"] != "running":
+        return False
+    run_id = row["current_run_id"]
+    if run_id is None:
+        return False
+    touched = False
+    with contextlib.suppress(Exception):
+        touched = kb.heartbeat_worker(
+            conn, task_id, note=f"executor liveness [{execution_id}]",
+            expected_run_id=int(run_id),
+        )
+    if row["claim_lock"]:
+        with contextlib.suppress(Exception):
+            kb.heartbeat_claim(conn, task_id, claimer=row["claim_lock"])
+    return touched
+
+
+class LivenessPump:
+    """Background prover: while the child lives, its liveness is recorded.
+
+    One thread, one private connection. The connection is private because
+    ``sqlite3`` objects are not shareable across threads by default and because
+    the controller's own connection is mid-``communicate()`` for the entire
+    lifetime of the pump — sharing it would serialise the heartbeat behind a
+    call that by definition does not return until the work is over.
+
+    Failure is contained by construction: every iteration is wrapped, the
+    thread is a daemon, and :meth:`stop` is idempotent and always joins with a
+    bound. A heartbeat mechanism that can wedge its own controller is worse
+    than none, because it fails in the direction of a hang rather than a reap.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        *,
+        task_id: Optional[str] = None,
+        interval: Optional[int] = None,
+        board_interval: Optional[int] = None,
+        connect=None,
+    ):
+        # Resolved from the module globals at construction, not bound as
+        # default arguments: a default argument freezes the value at import
+        # time, which would make the cadence unobservable to a test and
+        # unchangeable by an operator who edits the constant.
+        if interval is None:
+            interval = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        if board_interval is None:
+            board_interval = DEFAULT_BOARD_HEARTBEAT_INTERVAL_SECONDS
+        self.execution_id = execution_id
+        self.task_id = task_id
+        self.interval = max(1, int(interval))
+        self.board_interval = max(self.interval, int(board_interval or 0) or self.interval)
+        self._connect = connect or kb.connect
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        #: Counters, reported on the exit event. ``refused`` is the
+        #: load-bearing one: a pump that emitted N and refused 0 proves the
+        #: executor was continuously live, and a single refusal means liveness
+        #: could not be re-proven — a death the reconciler has not seen yet.
+        #:
+        #: ``errors`` is kept SEPARATE on purpose. A busy database is not a
+        #: dead executor, and folding the two together would leave the exit
+        #: event unable to answer the only question anyone reads it for.
+        self.emitted = 0
+        self.refused = 0
+        self.errors = 0
+        self.board_emitted = 0
+        #: Whether the lifecycle events have been written. Set on the first
+        #: iteration rather than at construction — see :meth:`_run`.
+        self._announced = False
+
+    # -- lifecycle -------------------------------------------------------
+
+    def start(self) -> "LivenessPump":
+        if self._thread is not None:
+            return self
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"hermes-liveness-{self.execution_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            with contextlib.suppress(Exception):
+                thread.join(timeout=timeout)
+
+    def __enter__(self) -> "LivenessPump":
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    # -- body ------------------------------------------------------------
+
+    def _run(self) -> None:
+        conn = None
+        try:
+            conn = self._connect()
+        except Exception:
+            _log.debug("liveness pump: could not open a connection", exc_info=True)
+            return
+        last_board = 0.0
+        try:
+            # Wait FIRST. The record's heartbeat_at is already ``started_at``
+            # at this point, so an immediate write would add nothing except a
+            # row that looks like evidence.
+            while not self._stop.wait(self.interval):
+                # Lifecycle events are written on the FIRST iteration, not at
+                # construction. Most executions on this board are gate commands
+                # and short shell runs that finish inside one interval and have
+                # no liveness story to tell; announcing a pump that then does
+                # nothing would add two ``execution_events`` rows to every one
+                # of them and dilute the rows that do mean something.
+                if not self._announced:
+                    self._announced = True
+                    self._note(conn, "heartbeat_pump_started", {
+                        "interval_seconds": self.interval,
+                        "board_interval_seconds": self.board_interval,
+                    })
+                try:
+                    if heartbeat_if_live(conn, self.execution_id):
+                        self.emitted += 1
+                    else:
+                        self.refused += 1
+                        # The executor is gone or the row has settled. Stop
+                        # rather than spin: continuing would only produce more
+                        # refusals, and the reconciler owns what happens next.
+                        break
+                    now = time.monotonic()
+                    if self.task_id and (now - last_board) >= self.board_interval:
+                        last_board = now
+                        if bridge_board_heartbeat(
+                            conn, self.task_id, execution_id=self.execution_id
+                        ):
+                            self.board_emitted += 1
+                except Exception:
+                    # Transient — a locked database, a closed connection.
+                    # Counted apart from a refusal and NOT a reason to stop:
+                    # the executor may be perfectly alive, and giving up here
+                    # would recreate the frozen heartbeat this pump exists to
+                    # end. Persistent failure still ends the execution, via
+                    # the reconciler, on the timestamp the pump stopped moving.
+                    self.errors += 1
+                    _log.debug("liveness pump: iteration failed", exc_info=True)
+        finally:
+            if self._announced:
+                with contextlib.suppress(Exception):
+                    self._note(conn, "heartbeat_pump_stopped", self.counters())
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+    def counters(self) -> dict:
+        return {
+            "emitted": self.emitted,
+            "refused": self.refused,
+            "errors": self.errors,
+            "board_emitted": self.board_emitted,
+        }
+
+    def _note(self, conn, kind: str, payload: dict) -> None:
+        with contextlib.suppress(Exception):
+            _append_execution_event(conn, self.execution_id, kind, payload)
+
+
+# ---------------------------------------------------------------------------
 # Creating the durable record — always before the process
 # ---------------------------------------------------------------------------
 
@@ -1075,19 +1496,139 @@ def _attach_process(
     pid: int,
     pgid: Optional[int],
     proc_key: Optional[str],
-    now: Optional[int] = None,
+    now: Optional[int] = None,  # retained for call compatibility; unused
 ) -> None:
-    """Bind the started process to its already-durable record."""
-    ts = now if now is not None else _now()
+    """Bind the started process to its already-durable record.
+
+    Deliberately does NOT touch ``heartbeat_at``. It used to, and that write
+    was quietly corrosive. ``create_execution`` seeds ``heartbeat_at ==
+    started_at``, so every consumer asking "has anything ever *observed* this
+    execution?" reads that equality — and an attach landing one second after
+    the insert (a coin flip, not a rare race: the fork/exec plus the /proc read
+    routinely cross a second boundary) left ``heartbeat_at = started_at + 1``
+    and made a never-observed execution indistinguishable from an observed one.
+
+    Caught 2026-09-03 on this repair's own run. ``x_aa58cda6a1ec6e03`` carried
+    ``heartbeat_at = started_at + 1`` with no heartbeat emitter in its process
+    at all, while ``x_a3fc33cfbd6d41c6``, launched on the same board in the
+    same minute, had them exactly equal. A liveness protection keyed on that
+    comparison would have covered one and not the other for no reason but
+    scheduling luck — the worst kind of safety mechanism, the one that works
+    most of the time.
+
+    Nothing is lost by removing it: the attach is already recorded by the
+    ``started`` event and by ``status``/``pid``/``proc_key``, and
+    reconciliation keeps its own sightings in ``last_observed_at``.
+    ``heartbeat_at`` now has exactly one writer — :func:`heartbeat`, reached
+    through :func:`heartbeat_if_live` — which is what makes
+    :func:`has_recorded_heartbeat` exact rather than approximately right.
+    """
     with kb.write_txn(conn):
         conn.execute(
-            "UPDATE executions SET pid = ?, pgid = ?, proc_key = ?, status = ?, "
-            "heartbeat_at = ? WHERE id = ? AND status = ?",
-            (pid, pgid, proc_key, STATUS_RUNNING, ts, execution_id, STATUS_LAUNCHING),
+            "UPDATE executions SET pid = ?, pgid = ?, proc_key = ?, status = ? "
+            "WHERE id = ? AND status = ?",
+            (pid, pgid, proc_key, STATUS_RUNNING, execution_id, STATUS_LAUNCHING),
         )
         _append_execution_event(
             conn, execution_id, "started", {"pid": pid, "pgid": pgid}
         )
+
+
+#: Recorded before the supervisor signals a process group, so the reason the
+#: group is about to die outlives the race to write the terminal row.
+TERMINATION_INTENT_EVENT = "terminating"
+
+
+def _note_termination_intent(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    *,
+    status: str,
+    reason: str,
+    now: Optional[int] = None,
+) -> None:
+    """Record WHY the supervisor is about to kill this group, before killing it.
+
+    Without this the classification is decided by a race. ``terminate_process_group``
+    signals and then waits out the SIGTERM grace window before its caller can
+    settle the row; the controller's own ``proc.communicate()`` reaps the child
+    the instant it dies and settles first, with the only evidence it has — a
+    non-zero exit code. So a supervisor-initiated kill was recorded as
+    ``failed/nonzero_exit``, indistinguishable from the executor failing on its
+    own. That is exactly what happened to x_3b16666deaab836e on 2026-09-03.
+
+    Writing the intent first makes the classification a fact rather than a
+    race outcome: whichever settler wins, ``_settle`` reads this back and
+    records the infrastructure status. Best-effort — a failure to log an intent
+    must never stop a termination.
+    """
+    with contextlib.suppress(Exception):
+        _append_execution_event(
+            conn,
+            execution_id,
+            TERMINATION_INTENT_EVENT,
+            {"intended_status": status, "reason": reason, "at": now or _now()},
+        )
+
+
+#: Recorded when Rule 5 declines to reap an execution that looks stale only
+#: because nothing ever heartbeated it. Written at most once per execution.
+STALE_SUPPRESSED_EVENT = "stale_reap_suppressed"
+
+
+def _note_stale_suppressed(
+    conn: sqlite3.Connection,
+    record: "ExecutionRecord",
+    *,
+    now: Optional[int] = None,
+) -> None:
+    """Say out loud that a stale-looking but live executor was spared.
+
+    Silence here would be its own defect: the operator would see an execution
+    sail past the liveness window with no record of the decision, which is
+    indistinguishable from the rule having been removed. Emitted once —
+    reconciliation runs every dispatcher tick, so an unconditional append would
+    produce one row a minute for the rest of the execution's life.
+    """
+    with contextlib.suppress(Exception):
+        seen = conn.execute(
+            "SELECT 1 FROM execution_events "
+            "WHERE execution_id = ? AND kind = ? LIMIT 1",
+            (record.id, STALE_SUPPRESSED_EVENT),
+        ).fetchone()
+        if seen is not None:
+            return
+        ts = now or _now()
+        _append_execution_event(
+            conn, record.id, STALE_SUPPRESSED_EVENT,
+            {
+                "reason": "no_heartbeat_ever_recorded_and_process_confirmed_live",
+                "runtime_seconds": record.runtime_seconds(ts),
+                "heartbeat_at": record.heartbeat_at,
+                "started_at": record.started_at,
+                "pid": record.pid,
+                "max_runtime_s": record.max_runtime_s,
+            },
+        )
+
+
+def _termination_intent(
+    conn: sqlite3.Connection, execution_id: str
+) -> Optional[tuple[str, str]]:
+    """The most recent recorded ``(intended_status, reason)``, if any."""
+    with contextlib.suppress(Exception):
+        row = conn.execute(
+            "SELECT payload FROM execution_events "
+            "WHERE execution_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+            (execution_id, TERMINATION_INTENT_EVENT),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+        status = payload.get("intended_status")
+        if status in TERMINAL_STATUSES:
+            return status, str(payload.get("reason") or "supervisor_terminated")
+    return None
 
 
 def _settle(
@@ -1104,7 +1645,20 @@ def _settle(
     The ``status IN (active)`` predicate is inside the UPDATE, so two racing
     settlers (the synchronous waiter and a reconciliation pass) cannot both
     write a terminal state: the loser's rowcount is 0 and it reports False.
+
+    A ``failed/nonzero_exit`` settlement is reclassified when the supervisor
+    has already recorded a termination intent for this execution: the exit code
+    the waiter is holding is then the supervisor's own signal coming back, not
+    the executor's verdict on its work. The intent wins because it is the only
+    one of the two that knows *who* ended the process. See
+    ``_note_termination_intent``.
     """
+    if status == STATUS_FAILED and reason == "nonzero_exit":
+        intent = _termination_intent(conn, execution_id)
+        if intent is not None:
+            intended_status, intended_reason = intent
+            status = intended_status
+            reason = f"{intended_reason}; observed exit {exit_code}"
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"{status!r} is not a terminal execution status")
     _assert_record_is_secret_free({"termination_reason": reason})
@@ -1428,8 +1982,32 @@ def run_supervised(
         )
         execution_id = record.id
 
+        # Requirement of the timeout hierarchy: a bound may reduce the
+        # authorized runtime, but never *silently*. ``resolve_max_runtime``
+        # clamps by design (a caller may only ask for less), and on 2026-09-03
+        # that clamp quietly turned a task authorized for 7200 s into an
+        # execution authorized for 3600 s with nothing anywhere recording that
+        # it had happened — so the operator reading the card saw 7200 and the
+        # reconciler enforced 3600. Recording it makes the two reconcilable.
+        if timeout and int(timeout) > effective_timeout:
+            with contextlib.suppress(Exception):
+                _append_execution_event(
+                    conn, execution_id, "runtime_clamped",
+                    {
+                        "requested_seconds": int(timeout),
+                        "effective_seconds": effective_timeout,
+                        "policy_max_runtime_seconds": policy.max_runtime_seconds,
+                        "per_executor_max_runtime": (
+                            policy.per_executor_max_runtime.get(
+                                launcher.executor_type
+                            )
+                        ),
+                    },
+                )
+
         proc: Optional[subprocess.Popen] = None
         proc_key: Optional[str] = None
+        pump: Optional[LivenessPump] = None
         stdout = ""
         stderr = ""
         settled_status: Optional[str] = None
@@ -1464,6 +2042,21 @@ def run_supervised(
                 conn, execution_id, pid=proc.pid, pgid=pgid, proc_key=proc_key
             )
 
+            # The heartbeat this module documented but never had. ``communicate``
+            # below is ONE blocking call for the whole authorized runtime, so the
+            # "synchronous waiter advances the heartbeat" claim in the schema was
+            # never true: there is no moment between the call and its return at
+            # which the waiter could write anything. Without a second thread the
+            # only honest options are a frozen ``heartbeat_at`` (what shipped,
+            # and what let a 1800 s liveness window kill a 3600 s authorization
+            # at 1804 s on 2026-09-03) or a fake one.
+            #
+            # Started here rather than before ``_attach_process`` because the
+            # pump's whole contract is re-proving the recorded PID against the
+            # kernel, and until the attach commits there is no recorded PID to
+            # prove anything about.
+            pump = LivenessPump(execution_id, task_id=task_id).start()
+
             try:
                 stdout, stderr = proc.communicate(timeout=effective_timeout)
                 stdout, stderr = (stdout or ""), (stderr or "")
@@ -1487,6 +2080,12 @@ def run_supervised(
             settled_reason = "controller_exception"
             raise
         finally:
+            # Before settling: a pump still running against a row about to go
+            # terminal is harmless (``heartbeat`` is gated on an active status)
+            # but pointless, and stopping first keeps the exit event's counters
+            # inside the execution's own lifetime.
+            if pump is not None:
+                pump.stop()
             final = _finalise_controller_execution(
                 conn,
                 execution_id,
@@ -1577,6 +2176,19 @@ def _finalise_controller_execution(
         )
 
     if still_running:
+        # The fourth group-signalling path, and the last one outside the
+        # classification mechanism until the independent ``codex_verify``
+        # review of t_f9b3b48b pointed it out. The controller is giving up
+        # ownership — a synchronous timeout, an exception, an interrupt — and
+        # kills the group on its way out. That is infrastructure ending the
+        # work, so the intent is recorded here for the same reason as on the
+        # reconcile rules: whatever exit code comes back from the signal must
+        # not be settled as the executor's own verdict.
+        _note_termination_intent(
+            conn, execution_id,
+            status=(status if status in INFRASTRUCTURE_STATUSES else STATUS_TERMINATED),
+            reason=reason or "controller_finalised_live_process",
+        )
         outcome = terminate_process_group(
             pid=proc.pid,
             pgid=record.pgid,
@@ -1984,7 +2596,12 @@ def _reconcile_one(
     runtime = record.runtime_seconds(now)
     cap = record.max_runtime_s or policy.max_runtime_seconds
     if cap and runtime > cap:
-        # Rule 3.
+        # Rule 3 — the level-1 timer, and the only one allowed to decide an
+        # executor has had enough wall-clock time.
+        _note_termination_intent(
+            conn, record.id, status=STATUS_TIMED_OUT,
+            reason=f"runtime_cap_exceeded ({runtime}s > {cap}s)", now=now,
+        )
         outcome = terminate_process_group(
             pid=pid,
             pgid=record.pgid,
@@ -2014,6 +2631,10 @@ def _reconcile_one(
             else:
                 result.untouched.append(record.id)
             return
+        _note_termination_intent(
+            conn, record.id, status=STATUS_CONTROLLER_LOST,
+            reason="controller_dead", now=now,
+        )
         outcome = terminate_process_group(
             pid=pid,
             pgid=record.pgid,
@@ -2043,9 +2664,33 @@ def _reconcile_one(
         )
         return
 
-    stale_after = policy.stale_heartbeat_seconds
+    # Rule 5 — the level-3 liveness timer. It ends an execution only on
+    # evidence that liveness stopped being PROVEN, never on age:
+    #
+    #   * for a never-heartbeated execution the window is floored at the
+    #     level-1 authorized cap (``_stale_heartbeat_bound``) and the reap is
+    #     refused outright while the process is confirmably live
+    #     (``stale_reap_permitted``), so Rule 3 above owns the ending and
+    #     classifies it ``timed_out``;
+    #   * for an execution that WAS heartbeated and then went quiet the window
+    #     is the configured one, and firing is correct — that is an owner that
+    #     stopped proving liveness, which is the only thing this rule is for.
+    #     It is how an abandoned supervisor-owned execution is caught, since
+    #     Rule 4 covers only controller-owned rows.
+    stale_after = _stale_heartbeat_bound(record, policy)
     if stale_after and (now - (record.heartbeat_at or record.started_at)) > stale_after:
-        # Rule 5.
+        if not stale_reap_permitted(record):
+            # Live, ours, and never heartbeated. Not a corpse — an unobserved
+            # executor. Record the suppression ONCE (this runs on every
+            # dispatcher tick; an unbounded event stream would bury the signal
+            # it exists to raise) and leave the process alone.
+            _note_stale_suppressed(conn, record, now=now)
+            _observe(conn, record.id, now)
+            result.untouched.append(record.id)
+            return
+        _note_termination_intent(
+            conn, record.id, status=STATUS_STALE, reason="stale_heartbeat", now=now,
+        )
         outcome = terminate_process_group(
             pid=pid,
             pgid=record.pgid,
@@ -2090,6 +2735,9 @@ def terminate_execution(
         raise ExecutionNotFound(f"no execution {execution_id!r} on this board")
     if record.is_terminal:
         return record
+    _note_termination_intent(
+        conn, execution_id, status=STATUS_TERMINATED, reason=reason,
+    )
     outcome = terminate_process_group(
         pid=record.pid,
         pgid=record.pgid,
@@ -2217,6 +2865,11 @@ def route_task_from_execution(
         STATUS_RECOVERED: "crashed",
     }
     outcome = outcome_map.get(record.status, "crashed")
+    # Route into recovery either way — the card genuinely needs re-running —
+    # but do not spend an implementation retry on a termination the control
+    # plane itself decided. ``STATUS_FAILED``/``STATUS_RECOVERED`` still carry
+    # the executor's own exit code and still count.
+    infrastructure = is_infrastructure_termination(record.status)
     try:
         kb._record_task_failure(
             conn,
@@ -2224,9 +2877,13 @@ def route_task_from_execution(
             f"execution {record.id} ended {record.status}"
             + (f" ({record.termination_reason})" if record.termination_reason else ""),
             outcome=outcome,
+            infrastructure=infrastructure,
             event_payload_extra={
                 "execution_id": record.id,
                 "execution_status": record.status,
+                "failure_class": (
+                    "infrastructure" if infrastructure else "implementation"
+                ),
             },
         )
     except Exception:

@@ -2449,9 +2449,10 @@ CREATE TABLE IF NOT EXISTS executions (
     ownership          TEXT NOT NULL,
     max_runtime_s      INTEGER,
     started_at         INTEGER NOT NULL,
-    -- Last progress signal from an owner actively watching the child.
-    -- Advanced by the synchronous waiter and by explicit heartbeat() calls,
-    -- NEVER by reconciliation — a reconciler that refreshed it would make
+    -- Last LIVENESS PROOF from an owner actively watching the child.
+    -- Advanced only by ``exec_supervisor.LivenessPump``, which re-reads this
+    -- row and re-matches the recorded pid against /proc before every write,
+    -- and NEVER by reconciliation — a reconciler that refreshed it would make
     -- every abandoned job look permanently fresh.
     --
     -- Seeded equal to ``started_at``, so equality means "never heartbeated",
@@ -7859,6 +7860,32 @@ def claim_review_task(
                     },
                 )
             return None
+        # Verifier independence, enforced at SELECTION rather than only at
+        # verdict time. Once this phase has a ``verification_blocked_self_review``
+        # on record, the refused identity can no longer open a review run for
+        # this subject at all. Before this, the refusal was invisible to the
+        # claim path: the review dispatcher re-selected the same assignee every
+        # tick and manufactured the identical refusal (t_00690780, runs
+        # 1624/1625). Refusing the claim is what actually breaks that loop and
+        # leaves the task parked in ``review`` for an independent verifier —
+        # e.g. a ``codex_verify`` child — to pick up.
+        claim_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if claim_row is not None and claim_row["assignee"]:
+            candidate = _canonical_assignee(claim_row["assignee"])
+            refused = _self_review_refused_implementers(conn, task_id)
+            if candidate in refused:
+                _emit_once_this_phase(
+                    conn, task_id, "review_claim_rejected_self_review",
+                    {
+                        "candidate": candidate,
+                        "refused_identities": sorted(refused),
+                        "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                    },
+                )
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -8879,6 +8906,270 @@ def _review_requested_implementer(
     return implementer
 
 
+# ---------------------------------------------------------------------------
+# Self-review refusal: durable exclusion + independent-verifier return path
+# ---------------------------------------------------------------------------
+#
+# A correct self-review refusal is a GOVERNANCE outcome, not an execution
+# failure — but before this block the board could not tell the two apart, and
+# the difference is what broke the live chain t_00690780 -> t_db0af7e0 on
+# 2026-09-03:
+#
+#   1. ``complete_task``/``record_verification`` refused the same-identity
+#      verdict correctly (events 9865/9867/9872/9879/9882), but the refusal
+#      left no state anyone could select on. The dispatcher re-claimed the
+#      review lane with the SAME assignee ('default') three runs in a row and
+#      got the identical refusal each time.
+#   2. Each of those reviewer runs then exited non-zero, so the crash path fed
+#      ``_record_task_failure`` and the refusals were charged to the subject's
+#      ORDINARY implementation retry budget — ``gave_up`` at 2/2 (event 9884)
+#      for a task whose implementation had actually succeeded and whose
+#      evidence packet (four attachments, 55 KB audit matrix) was intact.
+#   3. The dependent governance card t_db0af7e0 received ``linked_task_gave_up``
+#      (event 9886) while parked in ``todo`` behind an unsatisfiable
+#      dependency. The failure was written onto a card that could never be
+#      promoted, claimed or run — Erika was told about a decision she had no
+#      mechanical way to make.
+#
+# The three helpers below are the state the board was missing. They read only
+# the event log (no new columns, no migration) and scope everything to the
+# CURRENT verification phase, so a re-review after ``request_changes`` starts
+# from a clean slate.
+
+# A refusal only excludes an identity for the phase it happened in. The phase
+# boundary is the latest ``review_requested`` event: ``request_review`` emits
+# it on every handoff, so a task routed back for repair and re-submitted gets a
+# fresh boundary and the previous phase's exclusions stop applying.
+def _verification_phase_floor(conn: sqlite3.Connection, task_id: str) -> int:
+    """Return the event id that opens the current verification phase."""
+    row = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row["id"]) if row is not None else 0
+
+
+def _self_review_refused_implementers(
+    conn: sqlite3.Connection, task_id: str
+) -> set[str]:
+    """Identities refused as self-reviewers in the current verification phase.
+
+    Derived from the ``verification_blocked_self_review`` audit events the
+    refusal paths already emit — the historical events are the source of
+    truth, so this reads correctly against boards that recorded refusals
+    before this repair existed (t_00690780 among them).
+    """
+    floor = _verification_phase_floor(conn, task_id)
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'verification_blocked_self_review' "
+        "AND id > ?",
+        (task_id, floor),
+    ).fetchall()
+    refused: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        for key in ("implementer", "verifier"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                refused.add(_canonical_assignee(value))
+    return refused
+
+
+def _independent_verification_required(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Whether a self-review refusal is on record for the current phase."""
+    return bool(_self_review_refused_implementers(conn, task_id))
+
+
+def _emit_once_this_phase(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> bool:
+    """Append ``kind`` only if it is not already on record for this phase.
+
+    The review dispatcher re-evaluates every parked task on every tick. A
+    refusal that emitted an event per tick would bury the real history under
+    thousands of duplicates — the opposite of the durable, readable state this
+    repair is for. Returns True when the event was actually written.
+    """
+    floor = _verification_phase_floor(conn, task_id)
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND id > ? "
+        "LIMIT 1",
+        (task_id, kind, floor),
+    ).fetchone()
+    if existing is not None:
+        return False
+    _append_event(conn, task_id, kind, payload, run_id=run_id)
+    return True
+
+
+# An independent verifier reports its verdict in prose; the subject task needs
+# a machine-readable one. The contract is a single anchored line —
+# ``VERDICT: PASS`` / ``FAIL`` / ``BLOCKER`` — matched case-insensitively and
+# tolerant of Markdown bold, which is how Codex actually formats it.
+VERIFIER_VERDICT_PASS = "PASS"
+VERIFIER_VERDICT_FAIL = "FAIL"
+VERIFIER_VERDICT_BLOCKER = "BLOCKER"
+
+_VERIFIER_VERDICT_RE = re.compile(
+    r"^[\s>*_-]*(?:\*\*|__)?VERDICT(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"
+    r"(PASS|FAIL|BLOCKER)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_verifier_verdict(*texts: Optional[str]) -> Optional[str]:
+    """Extract the single verdict declared across ``texts``.
+
+    Fails closed on purpose: no verdict line, or two lines that disagree,
+    both return ``None``. Guessing which of two contradictory verdicts the
+    verifier meant is exactly the kind of inference that must never bless a
+    task, so an ambiguous report is routed for a human decision instead.
+    """
+    found: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _VERIFIER_VERDICT_RE.finditer(str(text)):
+            found.add(match.group(1).upper())
+    if len(found) != 1:
+        return None
+    return found.pop()
+
+
+def _return_verifier_verdict_to_subjects(
+    conn: sqlite3.Connection,
+    verifier_task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+) -> None:
+    """Return an independent verifier's verdict to the subject(s) it verified.
+
+    Called post-commit from :func:`complete_task` for ``codex_verify`` tasks
+    only. Without this the lane was a one-way street: the verifier child could
+    be dispatched (``_EVIDENCE_READY_PARENT_SQL`` made that possible) and could
+    complete with a correct verdict, and the subject it verified never heard
+    about it — it stayed parked at ``verification_state='pending'`` forever.
+
+    Routing, all of it fail-closed:
+
+    * ``PASS``    -> :func:`record_verification` (which still enforces verifier
+                     independence and the regression gate; a refusal there
+                     leaves the subject parked and emits its own event).
+    * ``FAIL``    -> :func:`record_verification` with ``passed=False``, which
+                     routes the subject back for repair.
+    * ``BLOCKER`` -> no verdict is written. The subject cannot be blessed and
+                     must not be silently failed either; it stays in the review
+                     lane with a durable event + comment for its governor.
+    * missing/ambiguous -> same as ``BLOCKER``, plus a distinct event naming
+                     the parse failure so the gap is diagnosable.
+
+    Never raises into the completion path: the verifier's own completion is
+    already durable by the time this runs, and a return-path fault must not
+    un-complete it.
+    """
+    try:
+        row = conn.execute(
+            "SELECT executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
+        ).fetchone()
+        if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+            return
+        subjects = parent_ids(conn, verifier_task_id)
+        if not subjects:
+            return
+        verdict = _parse_verifier_verdict(summary, result)
+        verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+        for subject_id in subjects:
+            srow = conn.execute(
+                "SELECT status, verification_state FROM tasks WHERE id = ?",
+                (subject_id,),
+            ).fetchone()
+            if srow is None:
+                continue
+            if srow["verification_state"] != VERIFICATION_PENDING:
+                # Someone already rendered a verdict for this phase. Record
+                # that the return path fired and stop — never overwrite a
+                # verdict that is already on the ledger.
+                with write_txn(conn):
+                    _append_event(
+                        conn, subject_id, "verifier_verdict_skipped",
+                        {
+                            "verifier_task": verifier_task_id,
+                            "verdict": verdict,
+                            "reason": "subject is not awaiting a verdict",
+                            "verification_state": srow["verification_state"],
+                        },
+                    )
+                continue
+            if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL):
+                passed = verdict == VERIFIER_VERDICT_PASS
+                ok, detail = record_verification(
+                    conn,
+                    subject_id,
+                    passed=passed,
+                    verifier=verifier_identity,
+                    evidence={
+                        "source": "codex_verify_return_path",
+                        "verifier_task": verifier_task_id,
+                    },
+                    reason=(
+                        None if passed else
+                        f"independent verifier {verifier_task_id} returned FAIL"
+                    ),
+                )
+                with write_txn(conn):
+                    _append_event(
+                        conn, subject_id, "verifier_verdict_returned",
+                        {
+                            "verifier_task": verifier_task_id,
+                            "verdict": verdict,
+                            "recorded": bool(ok),
+                            "detail": detail,
+                        },
+                    )
+                continue
+            # BLOCKER, or no parseable verdict at all.
+            kind = (
+                "verification_blocker_returned"
+                if verdict == VERIFIER_VERDICT_BLOCKER
+                else "verifier_verdict_unreadable"
+            )
+            note = (
+                f"Independent verifier {verifier_task_id} reported "
+                f"{verdict or 'no machine-readable verdict'}. No verdict was "
+                f"written; this task stays in verification and needs a "
+                f"governance decision."
+            )
+            with write_txn(conn):
+                _append_event(
+                    conn, subject_id, kind,
+                    {
+                        "verifier_task": verifier_task_id,
+                        "verdict": verdict,
+                    },
+                )
+                add_comment(conn, subject_id, "verifier-return-path", note)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning(
+            "verifier verdict return failed for %s: %s", verifier_task_id, exc
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -9283,6 +9574,13 @@ def complete_task(
                     },
                     run_id=run_id,
                 )
+    # An independent verifier's completion is only half the transaction: the
+    # subject it verified has to hear the verdict. Post-commit, in its own
+    # txn(s), so the verifier's own completion is durable first and a fault in
+    # the return path can never roll it back. No-op for every other task.
+    _return_verifier_verdict_to_subjects(
+        conn, task_id, summary=summary, result=result,
+    )
     # Successful completion — wipe the consecutive-failures counter.
     # Failure history stays on the event log for audit; the counter
     # just tracks "is there a current pathology the breaker should
@@ -10643,6 +10941,22 @@ def record_verification(
         # that parked this phase — see ``_review_requested_implementer``.
         implementer = _review_requested_implementer(conn, task_id, row["assignee"])
         if verifier and implementer and verifier == implementer:
+            # Emit the same audit event ``complete_task``'s implicit path
+            # emits. It is not decoration: it is the durable record the
+            # selection guard in ``claim_review_task`` and the retry carve-out
+            # in ``_record_task_failure`` both read. A refusal that leaves no
+            # event is a refusal the rest of the board cannot act on, which is
+            # how the same identity was re-selected three times on t_00690780.
+            # ``return`` (not raise) so this commits with the rest of the txn.
+            _append_event(
+                conn, task_id, "verification_blocked_self_review",
+                {
+                    "verifier": verifier,
+                    "implementer": implementer,
+                    "source": "record_verification",
+                },
+                run_id=review_run_id,
+            )
             return False, (
                 f"verifier {verifier!r} matches the implementer "
                 f"{implementer!r}; doctrine_verification.md requires an "
@@ -13487,11 +13801,19 @@ def enforce_max_runtime(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
                 timed_out.append(tid)
-        # Increment the unified failure counter. Outside the write_txn
-        # above because ``_record_task_failure`` opens its own. If the
-        # breaker trips, this flips the retried task to ``blocked`` and
-        # emits a ``gave_up`` event on top of the ``timed_out`` we
-        # already emitted.
+        # Record the non-success and re-queue. Outside the write_txn above
+        # because ``_record_task_failure`` opens its own.
+        #
+        # ``infrastructure=True``: this is the level-1 runtime timer firing —
+        # the control plane deciding the worker has had its authorized time,
+        # not the work reporting that it failed. Charging it to the ordinary
+        # implementation retry budget spends a retry on the clock, and at the
+        # threshold it would trip the breaker and ``gave_up`` a task whose only
+        # offence was being long. Found by the independent ``codex_verify``
+        # review of t_f9b3b48b, which correctly observed that repairing only
+        # ``exec_supervisor.route_task_from_execution`` left this second
+        # infrastructure-timeout path still charging. The ``timed_out`` event
+        # is emitted above either way, so nothing about the timeout is hidden.
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
@@ -13499,10 +13821,12 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                infrastructure=True,
                 event_payload_extra={
                     "pid": pid,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    "failure_class": "infrastructure",
                 },
             )
     return timed_out
@@ -13530,7 +13854,15 @@ def detect_stale_running(
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
     2. Its ``last_heartbeat_at`` is older than
-       ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
+       ``_STALE_HEARTBEAT_GAP_SECONDS``, or is NULL *and* the worker PID can
+       no longer be confirmed alive.
+
+    The NULL qualifier in (2) is load-bearing. A NULL heartbeat with a live
+    PID is an unobserved worker, not a dead one, and reaping it is how live
+    gateway-launched Claude executors were killed on 2026-09-03 — that lane's
+    executor is a foreign CLI process that cannot write this column at all.
+    Such a task is passed over with a one-per-run ``stale_reap_suppressed``
+    event; ``enforce_max_runtime`` remains its upper bound.
 
     On reclaim the task is restored to its source phase, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -13575,6 +13907,40 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        # NULL heartbeat + demonstrably live worker is NOT a stale worker.
+        # ``last_heartbeat_at IS NULL`` says nothing about the worker; it says
+        # nothing ever reported on it. For a gateway-launched Claude executor
+        # that was the permanent steady state until 2026-09-03 — the executor
+        # is a foreign CLI process with no kanban tools, so it could not touch
+        # this column even while working perfectly. Reaping on an absence of
+        # evidence is what killed live repair runs; the level-1 bound
+        # (``enforce_max_runtime``) still ends a worker that has had its time,
+        # and a worker that ever DID heartbeat and then went quiet still falls
+        # through to the reclaim below.
+        if last_hb is None and pid and _pid_alive(pid):
+            run_id = _current_run_id(conn, tid)
+            # Once per run: this scan repeats every dispatcher tick for the
+            # whole remaining life of a long task, and an unbounded event
+            # stream would bury the one row that matters.
+            already = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                "AND run_id IS ? LIMIT 1",
+                (tid, "stale_reap_suppressed", run_id),
+            ).fetchone()
+            if already is None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, tid, "stale_reap_suppressed",
+                        {
+                            "reason": "no_heartbeat_ever_recorded_and_worker_alive",
+                            "elapsed_seconds": int(elapsed),
+                            "timeout_seconds": stale_timeout_seconds,
+                            "worker_pid": int(pid),
+                        },
+                        run_id=run_id,
+                    )
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
@@ -14406,6 +14772,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    infrastructure: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -14465,7 +14832,50 @@ def _record_task_failure(
             if release_claim
             else ("review" if row["status"] == "review" else "ready")
         )
-        failures = int(row["consecutive_failures"]) + 1
+        # A reviewer run that ended because the board correctly refused a
+        # same-identity verdict is a GOVERNANCE refusal, not an execution
+        # failure, and must not be charged to the subject's ordinary
+        # implementation retry budget. On t_00690780 it was: two reviewer runs
+        # exited non-zero after `verification_blocked_self_review`, the crash
+        # path counted both, and the breaker tripped at 2/2 (`gave_up`, event
+        # 9884) on a task whose implementation had succeeded and whose evidence
+        # packet was intact. The board then had to be told the work "gave up".
+        #
+        # Scope is deliberately narrow: only a run that retries from the REVIEW
+        # lane, and only while a refusal is on record for the CURRENT
+        # verification phase. An implementation-lane crash still counts, and so
+        # does a review-lane crash with no refusal behind it (a genuinely
+        # broken reviewer). The counter is left exactly as it was — preserved,
+        # not reset — so real prior failures keep their weight.
+        governance_refusal = (
+            retry_status == "review"
+            and _independent_verification_required(conn, task_id)
+        )
+        # An INFRASTRUCTURE termination is the second thing that is not an
+        # implementation failure, and it is charged for exactly the same
+        # reason the governance refusal was: the counter sits at the end of
+        # every non-success path and cannot see what caused the non-success.
+        # A runtime cap, a lease/liveness reap, an orphan-policy kill or an
+        # operator terminate ends a process that may have been making perfect
+        # progress — nothing about it is evidence that the work is wrong, so
+        # spending an implementation retry on it charges the work for the
+        # control plane's decision. On t_aef6bbe1 the control plane's own
+        # stale-heartbeat rule killed the executor 1804 s into an authorized
+        # 3600 s, and the only thing distinguishing that from a bad patch was
+        # a classification the counter never received. Callers that know the
+        # cause pass ``infrastructure=True``; see
+        # ``exec_supervisor.is_infrastructure_termination``, which is the one
+        # place that decides.
+        #
+        # Same shape as the refusal carve-out: the counter is PRESERVED, not
+        # reset, so genuine prior failures keep their weight, and the breaker
+        # cannot trip on this pass.
+        not_implementation_failure = governance_refusal or infrastructure
+        if not_implementation_failure:
+            failures = int(row["consecutive_failures"])
+            force_trip = False
+        else:
+            failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -14479,7 +14889,9 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        if not not_implementation_failure and (
+            force_trip or failures >= effective_limit
+        ):
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -14635,6 +15047,7 @@ def _record_task_failure(
                     "last_failure_error = ? WHERE id = ?",
                     (failures, error[:500], task_id),
                 )
+            run_id = None
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
@@ -14656,6 +15069,52 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+            if infrastructure:
+                # Same reasoning as the refusal marker below: a counter that
+                # silently declines to increment is indistinguishable from a
+                # broken counter. This is the falsifiable record that an
+                # infrastructure termination was classified as such and kept
+                # off the implementation retry budget.
+                _append_event(
+                    conn, task_id, "infrastructure_failure_not_counted",
+                    {
+                        "outcome": outcome,
+                        "retry_status": retry_status,
+                        "consecutive_failures": failures,
+                        "error": error[:500],
+                        **(event_payload_extra or {}),
+                    },
+                    run_id=run_id,
+                )
+            if governance_refusal:
+                # Say out loud what was NOT counted, and why. Silently
+                # declining to increment a counter is indistinguishable from
+                # a bug in six months; this is the falsifiable record that the
+                # carve-out fired, plus the once-per-phase routing marker that
+                # tells a governor the subject is parked awaiting an
+                # independent verifier rather than stuck.
+                _append_event(
+                    conn, task_id, "self_review_refusal_not_counted",
+                    {
+                        "outcome": outcome,
+                        "retry_status": retry_status,
+                        "consecutive_failures": failures,
+                        "refused_identities": sorted(
+                            _self_review_refused_implementers(conn, task_id)
+                        ),
+                        "error": error[:500],
+                    },
+                    run_id=run_id,
+                )
+                _emit_once_this_phase(
+                    conn, task_id, "independent_verification_required",
+                    {
+                        "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                        "refused_identities": sorted(
+                            _self_review_refused_implementers(conn, task_id)
+                        ),
+                    },
+                )
     return blocked
 
 

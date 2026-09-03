@@ -5188,29 +5188,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Erika and Claude on the same doctrine/vault/Kanban starting line and
         # prevents the agent from having to rediscover current-task state with
         # recall/tmux/session forensics. --ignore-rules intentionally skips it.
+        # Default to "not booted": --ignore-rules is a deliberate operator
+        # override, and a session that skipped the gates has not passed them.
+        self.shared_boot_complete = False
+        self.shared_boot_failure = "shared boot skipped (--ignore-rules)"
         if not self.ignore_rules:
-            try:
-                _shared_boot_proc = subprocess.run(
-                    ["/home/chris/.local/bin/hermes-shared-boot-context"],
-                    capture_output=True, text=True, timeout=45, check=False,
-                )
-                _shared_boot_prompt = (
-                    _shared_boot_proc.stdout or _shared_boot_proc.stderr or ""
-                ).strip()
-                if _shared_boot_proc.returncode != 0 or not _shared_boot_prompt:
-                    _shared_boot_prompt = (
-                        "<shared-boot-state>\n"
-                        "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
-                        f"Shared boot generator failed rc={_shared_boot_proc.returncode}.\n"
-                        "</shared-boot-state>"
-                    )
-            except Exception as _shared_boot_exc:
-                _shared_boot_prompt = (
-                    "<shared-boot-state>\n"
-                    "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
-                    f"Shared boot generator exception: {_shared_boot_exc}\n"
-                    "</shared-boot-state>"
-                )
+            # One shared chokepoint (hermes_cli.norcal_boot) runs the canonical
+            # generator for this fresh session and evaluates the gate with the
+            # same exact-line parser the Claude/Codex entry points use. A zero
+            # exit code alone is NOT a passed gate: the generator exits 0 on a
+            # degraded boot unless invoked with --gate-exit-code. Fail closed in
+            # prompt space rather than refusing to start the CLI.
+            from hermes_cli.norcal_boot import build_session_boot_prompt
+
+            _shared_boot = build_session_boot_prompt()
+            _shared_boot_prompt = _shared_boot.prompt
+            self.shared_boot_complete = _shared_boot.complete
+            self.shared_boot_failure = _shared_boot.failure
             # Erika's canonical runtime contract lives under ~/.hermes and is
             # intentionally outside the /home/chris CWD discovery boundary.
             # Load it explicitly for the Christopher-facing executive surface
