@@ -379,6 +379,204 @@ EXECUTOR_LANE_CLAUDE_RECOVERY = "claude_recovery"
 VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_RECOVERY}
 
 # ---------------------------------------------------------------------------
+# ACTOR PROVENANCE — who created this card, structurally
+# ---------------------------------------------------------------------------
+#
+# ``tasks.created_by`` is a free-text PROFILE NAME, and that is the whole
+# defect. Both paths that can write it collapse onto the same string:
+#
+#   * ``hermes_cli/kanban.py`` (CLI ``kanban create``) writes
+#     ``_profile_author()`` — ``HERMES_PROFILE_NAME``/``HERMES_PROFILE``, or
+#     the active profile name.
+#   * ``tools/kanban_tools.py`` (the agent-facing ``kanban_create`` tool)
+#     writes ``HERMES_PROFILE`` or the literal ``"worker"``.
+#
+# So a card carrying ``created_by='claude-code'`` may have been typed by
+# Christopher through an interactive session, or emitted by a governed
+# automated executor running under the same profile name. The string cannot
+# tell them apart, and no amount of parsing it will ever make it able to: it
+# records WHICH PROFILE, never WHICH KIND OF ACTOR. An acceptance test that
+# infers "a human relayed this" from the identity string is therefore
+# asserting something the data does not contain — it will pass on a card no
+# human ever touched.
+#
+# The fix is to stop inferring and start recording. Five structured, nullable
+# columns are written at creation and never re-derived afterwards:
+#
+#   ``actor_kind``      one of VALID_ACTOR_KINDS — the discriminator
+#   ``actor_id``        canonical identity WITHIN that kind (still free text,
+#                       but no longer required to carry the kind as well)
+#   ``actor_lane``      executor lane of the CREATING actor. Distinct from
+#                       ``tasks.executor_lane``, which is the lane the new
+#                       card will RUN in. A codex_verify run filing a repair
+#                       card for a claude lane has different values in the
+#                       two, and conflating them loses the relay.
+#   ``actor_run_id``    the creating actor's run/session/execution id
+#   ``creation_cause``  one of VALID_CREATION_CAUSES — WHY the card exists
+#
+# ``NULL`` on every pre-existing row, and nothing is backfilled: inventing a
+# provenance for history nobody observed is the same fabrication the columns
+# exist to prevent. Cards created before this migration answer "provenance
+# not recorded", which is the truth, and is exactly what keeps ``t_aef6bbe1``
+# and ``t_f9b3b48b`` usable as preserved evidence of the defect.
+
+#: A human drove this creation through an interactive session — the human is
+#: in the loop for THIS card, and the identity in ``actor_id`` is a relay, not
+#: an author. The only kind that may satisfy a "manual relay" test.
+ACTOR_KIND_HUMAN_INTERACTIVE = "human_interactive"
+#: A governed automated executor created this card from inside its own
+#: dispatched run. No human saw the card before it existed.
+ACTOR_KIND_GOVERNED_AUTOMATION = "governed_automation"
+#: The control plane itself (dispatcher, recovery lane, reconciliation sweep).
+#: Neither a human nor a governed executor authored it.
+ACTOR_KIND_SYSTEM = "system"
+#: Explicitly recorded absence. Distinct from NULL, which means "this row
+#: predates provenance recording"; ``unknown`` means "recorded, and the
+#: creating path genuinely could not establish a kind".
+ACTOR_KIND_UNKNOWN = "unknown"
+VALID_ACTOR_KINDS = {
+    ACTOR_KIND_HUMAN_INTERACTIVE,
+    ACTOR_KIND_GOVERNED_AUTOMATION,
+    ACTOR_KIND_SYSTEM,
+    ACTOR_KIND_UNKNOWN,
+}
+
+#: Kinds in which a human is mechanically in the loop for this specific card.
+#: Acceptance decisions test membership here, never a string identity.
+HUMAN_IN_LOOP_ACTOR_KINDS = frozenset({ACTOR_KIND_HUMAN_INTERACTIVE})
+
+#: A human relayed an instruction through an interactive session.
+CREATION_CAUSE_MANUAL_RELAY = "manual_relay"
+#: Routine automated creation inside a governed run (an executor filing
+#: follow-on work it was authorized to file).
+CREATION_CAUSE_AUTOMATED = "automated"
+#: A repair/recovery card generated because something else failed or was found
+#: defective. These are the cards that must never be orphaned.
+CREATION_CAUSE_RECOVERY = "recovery"
+#: An independent-verification card spawned for a subject's evidence packet.
+CREATION_CAUSE_VERIFICATION = "verification"
+CREATION_CAUSE_UNKNOWN = "unknown"
+VALID_CREATION_CAUSES = {
+    CREATION_CAUSE_MANUAL_RELAY,
+    CREATION_CAUSE_AUTOMATED,
+    CREATION_CAUSE_RECOVERY,
+    CREATION_CAUSE_VERIFICATION,
+    CREATION_CAUSE_UNKNOWN,
+}
+
+#: Env var a caller may set to assert its own actor kind explicitly. Only
+#: consulted when it names a valid kind; a junk value is ignored rather than
+#: stored, because a junk provenance is worse than a derived one.
+ENV_ACTOR_KIND = "HERMES_ACTOR_KIND"
+#: Env var carrying the human's identity when a session is a manual relay.
+ENV_ACTOR_ID = "HERMES_ACTOR_ID"
+
+# ---------------------------------------------------------------------------
+# GOVERNANCE RELATIONS — machine-readable, and deliberately NOT task_links
+# ---------------------------------------------------------------------------
+#
+# ``task_links`` is the DEPENDENCY graph: ``parent`` must reach ``done``
+# before ``child`` may be promoted (``_parents_satisfied``), and roughly twenty
+# call sites across dispatch, promotion, fan-out and archival read it with
+# exactly that meaning. Every governance relation this repair needs points the
+# WRONG WAY for those semantics:
+#
+#   * a repair's SUBJECT is the thing the repair fixes. Gating the repair on
+#     the subject completing parks the repair forever — the subject is usually
+#     blocked precisely because it needs the repair.
+#   * a repair's UMBRELLA is the containing programme of work. Gating the
+#     repair on the umbrella finishing is the same deadlock, one level up.
+#
+# Overloading ``task_links`` with a ``relation`` column would therefore mean
+# teaching every one of those call sites to filter, in order to express
+# something the dependency graph was never about. A separate additive table
+# leaves the dependency graph's meaning untouched and makes the governance
+# edges independently queryable. Nothing reads ``task_relations`` for
+# readiness, by construction.
+#
+# ``from_task_id`` is always the card making the assertion (the repair);
+# ``to_task_id`` is the card it points at. The direction is not symmetric and
+# is never inferred.
+
+#: ``from`` repairs ``to``. The machine-readable answer to "what is this repair
+#: card actually about?" — the thing ``t_aef6bbe1`` and ``t_f9b3b48b`` state
+#: only in prose.
+RELATION_REPAIRS = "repairs"
+#: ``from`` is contained by the umbrella/recovery programme ``to``.
+RELATION_UMBRELLA = "umbrella"
+#: ``from`` cites ``to`` as durable evidence. Non-governing and never gating —
+#: it exists so an evidence pointer is discoverable without rewriting the scope
+#: of the card being pointed at.
+RELATION_EVIDENCE = "evidence"
+VALID_TASK_RELATIONS = {
+    RELATION_REPAIRS,
+    RELATION_UMBRELLA,
+    RELATION_EVIDENCE,
+}
+
+#: Relations a governed repair card MUST carry, established in the same
+#: transaction that inserts the card. See :func:`create_repair_task`.
+REQUIRED_REPAIR_RELATIONS = (RELATION_REPAIRS, RELATION_UMBRELLA)
+
+# ---------------------------------------------------------------------------
+# OBSERVATION TIMERS — the 600-second recheck, mechanically
+# ---------------------------------------------------------------------------
+#
+# Christopher, 2026-09-03 03:34:05, verbatim:
+#
+#   "A 10-minute stall timer is reasonable here, but it should mean **recheck,
+#   not declare stalled**."
+#
+# and the correcting session's own one-line summary of the error:
+# **"a clock produced a verdict instead of a question."**
+#
+# That ruling was written into ``vault/Skills/ops/claude-session-hygiene.md``
+# as a convention, and a convention is exactly what failed. Three distinct
+# failure shapes, all observed on 2026-09-03, none of which a prompt can
+# prevent:
+#
+#   1. **The timer ended at its own emission.** A watcher whose job was to
+#      recheck every 600 s emitted once and returned, so the second recheck
+#      never existed. Nothing on disk recorded that one was owed.
+#   2. **The timer silently disappeared.** A watcher was stopped (or believed
+#      stopped) and no replacement armed; the observation simply stopped
+#      happening, and its absence was indistinguishable from "nothing to
+#      report".
+#   3. **A stopped watcher kept running.** ``TaskStop`` reported success while
+#      PIDs 18339 and 22963 stayed live, and one consumed a half-corrected
+#      probe and emitted a false CONTINUITY-OK. Process presence was not
+#      evidence of observation, and process absence was not evidence of its
+#      end.
+#
+# All three share one cause: the timer's state lived in a process. The fix is
+# to move it into the board. ``observation_timers.next_due_at`` is written
+# before a tick is emitted and re-armed inside the same transaction, so:
+#
+#   * due-ness is computed from the clock and the row, never from whether an
+#     observer is alive (kills shape 3);
+#   * an emitter that dies right after emitting leaves a timer still armed for
+#     the next interval (kills shape 1);
+#   * a timer only leaves observation through :func:`close_observation_timer`,
+#     which demands an explicit reason and writes it down (kills shape 2).
+#
+# The verdict-once guarantee is a ``WHERE verdict_emitted_at IS NULL``
+# predicate, and duplicate suppression is the ``(timer_id, seq)`` primary key.
+# Both are database constraints, so neither depends on a caller behaving.
+
+#: The mandated evidence-recheck interval, in seconds. Fixed at 600 by
+#: Christopher's 2026-09-03 ruling — "Not 900, not a number reasoned out from a
+#: dispatcher tick. Use 600." It is a constant rather than a config key on
+#: purpose: a tunable interval is how "use 600" degrades back into a
+#: convention, and the tuning always happens in the direction of less
+#: observation.
+MANDATORY_OBSERVATION_INTERVAL_SECONDS = 600
+
+#: A timer that is still observing. Ticks are only ever emitted in this state.
+OBSERVATION_STATE_OBSERVING = "observing"
+#: A timer explicitly retired with a recorded reason. Terminal.
+OBSERVATION_STATE_CLOSED = "closed"
+
+# ---------------------------------------------------------------------------
 # Terminal disposition — HOW a task stopped, not just THAT it stopped
 # ---------------------------------------------------------------------------
 #
@@ -1521,6 +1719,20 @@ class Task:
     # an overtaken card was never completed, and conflating the two would put
     # fabricated completions into every time-to-complete metric.
     disposition_at: Optional[int] = None
+    # Structured actor provenance — see the ACTOR PROVENANCE block near
+    # VALID_ACTOR_KINDS. ``None`` means "not recorded" (a pre-migration row),
+    # which is NOT the same as ACTOR_KIND_UNKNOWN ("recorded, and the creating
+    # path could not establish a kind"). Never infer any of these from
+    # ``created_by``; that inference is the defect.
+    actor_kind: Optional[str] = None
+    actor_id: Optional[str] = None
+    # Lane of the actor that CREATED this card, not the lane it runs in.
+    actor_lane: Optional[str] = None
+    actor_run_id: Optional[str] = None
+    creation_cause: Optional[str] = None
+    # Identity accountable for this card's recovery decision. Set by
+    # ``create_repair_task``; None on ordinary cards.
+    recovery_owner: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1649,6 +1861,30 @@ class Task:
             disposition_at=(
                 int(row["disposition_at"])
                 if "disposition_at" in keys and row["disposition_at"] is not None
+                else None
+            ),
+            actor_kind=(
+                row["actor_kind"] if "actor_kind" in keys and row["actor_kind"] else None
+            ),
+            actor_id=(
+                row["actor_id"] if "actor_id" in keys and row["actor_id"] else None
+            ),
+            actor_lane=(
+                row["actor_lane"] if "actor_lane" in keys and row["actor_lane"] else None
+            ),
+            actor_run_id=(
+                row["actor_run_id"]
+                if "actor_run_id" in keys and row["actor_run_id"]
+                else None
+            ),
+            creation_cause=(
+                row["creation_cause"]
+                if "creation_cause" in keys and row["creation_cause"]
+                else None
+            ),
+            recovery_owner=(
+                row["recovery_owner"]
+                if "recovery_owner" in keys and row["recovery_owner"]
                 else None
             ),
         )
@@ -1889,13 +2125,106 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- When the disposition was recorded. Deliberately not ``completed_at``:
     -- an overtaken card was never completed and must not enter
     -- time-to-complete metrics as if it had been.
-    disposition_at       INTEGER
+    disposition_at       INTEGER,
+    -- Structured actor provenance, written once at creation and never
+    -- re-derived. NULL on every row that predates the columns; nothing is
+    -- backfilled. See the ACTOR PROVENANCE block near VALID_ACTOR_KINDS for
+    -- why ``created_by`` cannot answer these questions.
+    actor_kind           TEXT,
+    actor_id             TEXT,
+    -- Executor lane of the CREATING actor, not of this task. ``executor_lane``
+    -- above is the lane this card will run in; the two differ whenever one
+    -- lane files work for another.
+    actor_lane           TEXT,
+    actor_run_id         TEXT,
+    creation_cause       TEXT,
+    -- Identity accountable for this card's recovery decision, recorded
+    -- structurally so "who owns this repair?" is answerable without reading
+    -- the body. Required by ``create_repair_task``; NULL elsewhere.
+    recovery_owner       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Governance relations. Deliberately separate from ``task_links``: this table
+-- never participates in readiness/promotion, so a repair can point at the
+-- subject it fixes without being gated on that subject finishing. See the
+-- GOVERNANCE RELATIONS block near VALID_TASK_RELATIONS.
+CREATE TABLE IF NOT EXISTS task_relations (
+    from_task_id TEXT NOT NULL,
+    to_task_id   TEXT NOT NULL,
+    relation     TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    created_by   TEXT,
+    PRIMARY KEY (from_task_id, to_task_id, relation)
+);
+
+-- Durable observation timers. The 600-second recheck was a CONVENTION carried
+-- in prompts and watcher scripts, which means it lived exactly as long as the
+-- process holding it: a watcher that exited, was hot-swapped, or emitted its
+-- verdict and returned took the timer with it, and nothing on disk knew a
+-- recheck was ever owed. These two tables move the timer into the same durable
+-- store as the work it observes, so due-ness is a fact about the clock and the
+-- board rather than about whether some process is still alive.
+--
+-- ``next_due_at`` is the whole mechanism: it is written before any tick is
+-- emitted and re-armed in the same transaction, so an emitter that dies
+-- immediately after emitting leaves a timer that is still armed, and an
+-- emitter that dies before emitting leaves one that is still due.
+CREATE TABLE IF NOT EXISTS observation_timers (
+    id                 TEXT PRIMARY KEY,
+    task_id            TEXT NOT NULL,
+    -- Free-text label for WHAT is being observed. Never consulted by the
+    -- due-time logic; it exists so a board can carry more than one timer per
+    -- card without them being confusable.
+    kind               TEXT NOT NULL,
+    -- Always MANDATORY_OBSERVATION_INTERVAL_SECONDS. Stored per-row anyway so
+    -- an existing timer keeps its contracted interval if the constant is ever
+    -- changed, rather than silently re-phasing every armed timer on a board.
+    interval_seconds   INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL,
+    -- The next instant at which a tick is OWED. Monotonically advanced, never
+    -- recomputed from "now" — see advance semantics in emit_observation_tick.
+    next_due_at        INTEGER NOT NULL,
+    -- Count of ticks emitted. Also the seq of the NEXT tick minus one, so the
+    -- first emission is seq 1 and is the contracted verdict.
+    tick_count         INTEGER NOT NULL DEFAULT 0,
+    last_tick_at       INTEGER,
+    -- Set exactly once, by a conditional UPDATE that requires it to be NULL.
+    -- That predicate is what makes "the verdict is emitted once" a database
+    -- constraint rather than a caller's promise.
+    verdict_emitted_at INTEGER,
+    -- 'observing' or 'closed'. A timer NEVER transitions to closed as a side
+    -- effect of emitting; only close_observation_timer does it, and only with
+    -- an explicit reason.
+    state              TEXT NOT NULL DEFAULT 'observing',
+    closed_at          INTEGER,
+    closed_reason      TEXT,
+    -- Accountable identity, resolved from persisted ownership at arm time.
+    owner              TEXT
+);
+
+-- Append-only tick ledger. ``PRIMARY KEY (timer_id, seq)`` is the duplicate
+-- suppression: two racing emitters, or one emitter retried after a crash that
+-- happened between the INSERT and the commit, cannot both land seq N.
+CREATE TABLE IF NOT EXISTS observation_ticks (
+    timer_id   TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    -- The due instant this tick discharges, not the instant it was emitted.
+    -- They differ whenever the observer was down; the gap is the evidence.
+    due_at     INTEGER NOT NULL,
+    emitted_at INTEGER NOT NULL,
+    -- Intervals whose due time passed with no observer running. 0 in normal
+    -- operation; non-zero is a recorded outage, not a silently skipped tick.
+    missed     INTEGER NOT NULL DEFAULT 0,
+    -- 1 on seq 1 only: the contracted one-time verdict emission.
+    verdict    INTEGER NOT NULL DEFAULT 0,
+    payload    TEXT,
+    PRIMARY KEY (timer_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -2124,6 +2453,13 @@ CREATE TABLE IF NOT EXISTS executions (
     -- Advanced by the synchronous waiter and by explicit heartbeat() calls,
     -- NEVER by reconciliation — a reconciler that refreshed it would make
     -- every abandoned job look permanently fresh.
+    --
+    -- Seeded equal to ``started_at``, so equality means "never heartbeated",
+    -- not "0 s old". Between the column's introduction and 2026-09-03 that was
+    -- true of every row on every board: ``heartbeat()`` had no call site, and
+    -- the staleness rule that reads this column was therefore measuring age.
+    -- ``exec_supervisor.has_recorded_heartbeat`` is the only correct way to
+    -- ask whether a value here is a real observation.
     heartbeat_at       INTEGER NOT NULL,
     -- Last time reconciliation observed this row. Separate from the
     -- heartbeat precisely so "the supervisor is running" and "the executor
@@ -2176,12 +2512,237 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_relations_from        ON task_relations(from_task_id, relation);
+CREATE INDEX IF NOT EXISTS idx_relations_to          ON task_relations(to_task_id, relation);
+-- The due-scan's only index. Ordered state-first so the scan reads just the
+-- armed timers; a closed timer must never cost anything to skip.
+CREATE INDEX IF NOT EXISTS idx_obs_timers_due        ON observation_timers(state, next_due_at);
+CREATE INDEX IF NOT EXISTS idx_obs_timers_task       ON observation_timers(task_id, state);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- ---------------------------------------------------------------------------
+-- Observation-timer invariants, enforced by the database itself
+-- ---------------------------------------------------------------------------
+--
+-- The Python guards in ``arm_observation_timer`` and ``emit_observation_tick``
+-- only bind callers that go through them. Independent ``codex_verify`` review
+-- of this repair's first draft made the point precisely: with the check living
+-- only in Python, a direct ``INSERT`` could mint a 900-second "observation
+-- timer" that reads, at query time, exactly like a correctly armed one — which
+-- is the convention-shaped failure this whole mechanism replaces, re-entering
+-- through the back door.
+--
+-- Triggers rather than ``CHECK`` constraints on purpose: a CHECK can only be
+-- attached when the table is created, so it would silently skip every board
+-- that already has ``observation_timers``. ``CREATE TRIGGER IF NOT EXISTS``
+-- applies to existing boards on the next init, which is where the live rows
+-- are.
+
+-- 600 is written as a literal because SQL cannot read the Python constant.
+-- MANDATORY_OBSERVATION_INTERVAL_SECONDS must match it; the regression
+-- ``test_the_database_rejects_a_non_600_interval`` fails if they ever diverge.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_interval_insert
+BEFORE INSERT ON observation_timers
+FOR EACH ROW WHEN NEW.interval_seconds != 600
+BEGIN
+    SELECT RAISE(ABORT, 'observation interval is fixed at 600 seconds');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_interval_update
+BEFORE UPDATE OF interval_seconds ON observation_timers
+FOR EACH ROW WHEN NEW.interval_seconds != 600
+BEGIN
+    SELECT RAISE(ABORT, 'observation interval is fixed at 600 seconds');
+END;
+
+-- The verdict is emitted once, for the lifetime of the timer. Clearing or
+-- rewriting the stamp is how a restarted observer would get to re-announce,
+-- so the column is append-once at the storage layer and not merely in the
+-- emission path.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_verdict_once
+BEFORE UPDATE OF verdict_emitted_at ON observation_timers
+FOR EACH ROW WHEN OLD.verdict_emitted_at IS NOT NULL
+                  AND NEW.verdict_emitted_at IS NOT OLD.verdict_emitted_at
+BEGIN
+    SELECT RAISE(ABORT, 'the observation verdict may only be emitted once');
+END;
+
+-- A closed timer is terminal. Re-opening one would resurrect an observation
+-- whose end was already recorded and reasoned about, and it would do so
+-- without a new ``observation_timer_armed`` event to make it discoverable.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_no_reopen
+BEFORE UPDATE OF state ON observation_timers
+FOR EACH ROW WHEN OLD.state = 'closed' AND NEW.state != 'closed'
+BEGIN
+    SELECT RAISE(ABORT, 'a closed observation timer cannot be re-opened');
+END;
+
+-- A tick is a statement about what was reported at a due instant. Rewriting
+-- one would let an emitter change what it already said.
+CREATE TRIGGER IF NOT EXISTS trg_obs_ticks_append_only_update
+BEFORE UPDATE ON observation_ticks
+BEGIN
+    SELECT RAISE(ABORT, 'observation ticks are append-only');
+END;
+
+-- The five triggers below close the raw-SQL holes the 2026-09-03 independent
+-- codex_verify review found. Each one had the same shape: the *emission path*
+-- upheld an invariant that the *storage layer* did not, so the guarantee held
+-- only for callers who went through the API. A control that a direct INSERT
+-- can walk around is a convention with a docstring, which is the exact class
+-- of defect this whole card exists to close.
+
+-- (1) The verdict is emitted once PER TIMER, not once per emitter's good
+-- intentions. ``PRIMARY KEY (timer_id, seq)`` alone permitted a second
+-- verdict row at any other sequence number. Both halves are enforced: a
+-- verdict may only ride seq 1, and only one may exist.
+CREATE TRIGGER IF NOT EXISTS trg_obs_ticks_verdict_once_insert
+BEFORE INSERT ON observation_ticks
+FOR EACH ROW WHEN NEW.verdict != 0
+                  AND (NEW.seq != 1
+                       OR EXISTS (SELECT 1 FROM observation_ticks t
+                                  WHERE t.timer_id = NEW.timer_id
+                                    AND t.verdict != 0))
+BEGIN
+    SELECT RAISE(ABORT,
+        'the observation verdict is exactly one tick, at seq 1, per timer');
+END;
+
+-- (2) A timer is inserted ARMED or not at all. Without this, a row could be
+-- born already carrying a tick count, a spent verdict stamp, a closed state
+-- or a due time off the 600 s grid — a timer that looks like it has already
+-- done work it never did. ``arm_observation_timer`` writes exactly this shape,
+-- so the trigger constrains forgery, not the legitimate path.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_arm_shape
+BEFORE INSERT ON observation_timers
+FOR EACH ROW WHEN NEW.state != 'observing'
+                  OR NEW.tick_count != 0
+                  OR NEW.last_tick_at IS NOT NULL
+                  OR NEW.verdict_emitted_at IS NOT NULL
+                  OR NEW.closed_at IS NOT NULL
+                  OR NEW.closed_reason IS NOT NULL
+                  OR NEW.next_due_at != NEW.created_at + 600
+BEGIN
+    SELECT RAISE(ABORT,
+        'an observation timer is inserted armed: observing, 0 ticks, no verdict, no closure, first tick due one full interval out');
+END;
+
+-- (3) Closing carries its reason at the storage layer. ``state='closed'`` with
+-- a null ``closed_at`` or a blank reason is a timer that stopped and did not
+-- say why — failure shape 2, arrived at by UPDATE instead of by silence.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_closure_reasoned
+BEFORE UPDATE OF state ON observation_timers
+FOR EACH ROW WHEN NEW.state = 'closed'
+                  AND (NEW.closed_at IS NULL
+                       OR TRIM(COALESCE(NEW.closed_reason, '')) = '')
+BEGIN
+    SELECT RAISE(ABORT,
+        'closing an observation timer requires closed_at and a reason');
+END;
+
+-- (4) …and the reason cannot be erased afterwards, which is the same hole
+-- reached in two statements instead of one.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_closure_reason_immutable
+BEFORE UPDATE OF closed_at, closed_reason ON observation_timers
+FOR EACH ROW WHEN OLD.state = 'closed'
+                  AND (NEW.closed_at IS NULL
+                       OR TRIM(COALESCE(NEW.closed_reason, '')) = '')
+BEGIN
+    SELECT RAISE(ABORT,
+        'a closed observation timer keeps its closed_at and reason');
+END;
+
+-- (5) An observing timer cannot be deleted, and its ledger cannot be purged
+-- out from under it. DELETE was previously left open on the reasoning that
+-- purging an old ledger is legitimate maintenance — true, but it also meant
+-- ``DELETE FROM observation_timers`` made a live observation vanish with no
+-- record anywhere, which is precisely the disappearance the 600 s control was
+-- built to make impossible. Retention still works: close the timer first, with
+-- a reason, and both deletes are permitted. The task-deletion cascade in
+-- ``_delete_observation_timers_for_task`` does exactly that.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_no_delete_while_observing
+BEFORE DELETE ON observation_timers
+FOR EACH ROW WHEN OLD.state != 'closed'
+BEGIN
+    SELECT RAISE(ABORT,
+        'close an observation timer with a reason before deleting it');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_obs_ticks_no_delete_while_observing
+BEFORE DELETE ON observation_ticks
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM observation_timers
+                          WHERE id = OLD.timer_id AND state != 'closed')
+BEGIN
+    SELECT RAISE(ABORT,
+        'the ledger of an observing timer is not purgeable');
+END;
+
+-- The two below close what the SECOND independent codex_verify review found
+-- (2026-09-03, execution x_4662551c5e9a293f) after the six above were added.
+
+-- (7) ONE observing timer per (task, kind). The verdict-once trigger above is
+-- scoped to a timer, so "the verdict is emitted once" was only ever true per
+-- timer — and nothing stopped a second timer being armed on the same card with
+-- the same kind, each emitting its own seq-1 verdict. Two live 'recheck'
+-- observations on one card are not redundancy; they are two clocks that
+-- disagree, and a reader cannot tell which one the contract meant.
+--
+-- A partial unique index rather than a trigger: it is declarative, it is
+-- enforced on every writer including raw SQL, and scoping it to
+-- state='observing' leaves any number of CLOSED timers in the history, which
+-- is what makes re-arming after a recorded closure still legal. Re-arming is
+-- deliberately still allowed to produce a new verdict: a new observation is a
+-- new question, and the previous one's closure reason is on its row.
+--
+-- The index is NOT created here. It is created by
+-- ``_migrate_observation_timer_uniqueness`` after that function has resolved
+-- any pre-existing duplicates, because duplicates were legal until this change
+-- and `CREATE UNIQUE INDEX` inside ``executescript(SCHEMA_SQL)`` would abort
+-- the whole schema pass on a board that has them — turning a hardening into an
+-- init failure. Found by the third independent review.
+
+-- (8) A timer cannot be deleted while the card it observes still exists. The
+-- review's objection to the delete guard was that "close with a reason, then
+-- delete" erases the very reason it just demanded. That is now impossible for a
+-- live card: the only way a timer row leaves the board is as a cascade of its
+-- own card's deletion, which removes the card's whole history by design and by
+-- authorization. Deleting a card is a destructive operation the operator asked
+-- for; ending an observation quietly while its subject is still on the board is
+-- not, and that is the case this closes.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_no_delete_while_task_lives
+BEFORE DELETE ON observation_timers
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT,
+        'an observation timer outlives everything but its own card');
+END;
+
+-- (9) A timer's identity is immutable. Found by the THIRD independent
+-- codex_verify review (2026-09-03, execution x_66018ca656f32298), and it
+-- defeated the guard directly above it: repoint ``task_id`` at a card that does
+-- not exist, and the "no delete while its card lives" check passes, taking the
+-- only durable copy of the closure reason with it. The same move re-homes a
+-- timer onto an unrelated card, or slips it past the (task_id, kind) uniqueness
+-- index by changing either key.
+--
+-- Every field named here identifies WHICH observation this is. None of them is
+-- something a legitimate caller edits: arming writes them once, emitting
+-- touches only the tick counters, and closing touches only the closure columns.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_identity_immutable
+BEFORE UPDATE OF id, task_id, kind, created_at ON observation_timers
+FOR EACH ROW WHEN NEW.id IS NOT OLD.id
+                  OR NEW.task_id IS NOT OLD.task_id
+                  OR NEW.kind IS NOT OLD.kind
+                  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT,
+        'an observation timer cannot be re-homed or re-identified');
+END;
 """
 
 
@@ -3114,6 +3675,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _migrate_observation_timer_uniqueness(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -3154,6 +3716,65 @@ def connect_closing(
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_observation_timer_uniqueness(conn: sqlite3.Connection) -> None:
+    """Resolve duplicate observing timers, then enforce one per (task, kind).
+
+    Runs after ``SCHEMA_SQL``, not inside it. Two concurrent observing timers of
+    the same kind on one card were legal until 2026-09-03 — that is the defect
+    the index closes — so a board upgraded from before then can legitimately
+    contain them. ``CREATE UNIQUE INDEX`` on such a board raises, and inside
+    ``executescript(SCHEMA_SQL)`` that aborts the entire schema pass: a
+    hardening would present as a board that no longer opens. The third
+    independent review found this, and it is the more dangerous kind of bug,
+    because it fires on exactly the boards that had the problem.
+
+    Duplicates are **closed, oldest kept**, with an explicit reason — never
+    deleted. The surviving timer is the one that has been observing longest, so
+    the resolution keeps the earliest continuous observation rather than the
+    most recent arming, and the closure reason says which migration ended the
+    others. Idempotent: on a clean board both statements are no-ops.
+
+    The index keys on ``LOWER(TRIM(kind))``, not on ``kind``. Normalising in
+    ``arm_observation_timer`` binds callers of the API; a raw
+    ``INSERT ... kind='Recheck'`` alongside an existing ``'recheck'`` was still
+    two logically identical observations, each owed its own verdict — found by
+    the fourth independent review. An expression index moves the normalisation
+    into the constraint, where raw SQL cannot get around it.
+
+    **Nothing here is caught and shrugged off.** Only a genuinely absent
+    ``observation_timers`` table is tolerated (a board whose schema pass has not
+    run); every other failure propagates, because an ``OperationalError``
+    swallowed here would mark the path initialised with the uniqueness
+    constraint silently absent for the life of the process — enforcement that
+    reads as present and is not, which is the exact failure class this whole
+    card exists to close.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'observation_timers'"
+    ).fetchone():
+        return
+    conn.execute(
+        "UPDATE observation_timers SET state = ?, closed_at = ?, "
+        "    closed_reason = 'superseded_by_uniqueness_migration' "
+        "WHERE state = ? AND id NOT IN ("
+        "    SELECT id FROM ("
+        "        SELECT id, MIN(created_at) FROM observation_timers "
+        "        WHERE state = ? "
+        "        GROUP BY task_id, LOWER(TRIM(kind))))",
+        (
+            OBSERVATION_STATE_CLOSED, int(time.time()),
+            OBSERVATION_STATE_OBSERVING, OBSERVATION_STATE_OBSERVING,
+        ),
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_obs_timer_one_observing_per_task_kind "
+        "ON observation_timers (task_id, LOWER(TRIM(kind))) "
+        "WHERE state = 'observing'"
+    )
 
 
 def init_db(
@@ -3406,6 +4027,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "disposition_at", "disposition_at INTEGER"
         )
 
+    # Structured actor provenance. Every one of these is NULL on every legacy
+    # row and NOTHING is backfilled — deliberately. ``created_by`` cannot be
+    # translated into an ``actor_kind`` after the fact (that translation is
+    # precisely the string inference this repair exists to abolish), so a
+    # migrated board answers "provenance not recorded" for its history and
+    # records it properly from the next creation onward. The orphan
+    # reproductions this repair preserves as evidence (t_aef6bbe1,
+    # t_f9b3b48b) depend on that: retro-stamping them would destroy the
+    # very evidence they are kept for.
+    for _prov_col in (
+        "actor_kind",
+        "actor_id",
+        "actor_lane",
+        "actor_run_id",
+        "creation_cause",
+        "recovery_owner",
+    ):
+        if _prov_col not in cols:
+            _add_column_if_missing(conn, "tasks", _prov_col, f"{_prov_col} TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3427,6 +4068,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_disposition "
         "ON tasks(terminal_disposition)"
+    )
+    # Same ordering rule: created here, after the additive provenance columns
+    # exist, never in SCHEMA_SQL — a legacy board would abort the whole init
+    # script on an index over a column the ALTER TABLE below has not added
+    # yet. "How many cards came from governed automation vs a human relay?"
+    # is the query this serves.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_actor_kind "
+        "ON tasks(actor_kind, creation_cause)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -3961,6 +4611,195 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+@dataclass(frozen=True)
+class ActorProvenance:
+    """Structured record of WHO created a card and WHY.
+
+    Immutable on purpose: provenance is a fact about a moment, and a mutable
+    provenance object invites exactly the after-the-fact reinterpretation that
+    made ``created_by`` useless.
+    """
+
+    kind: str = ACTOR_KIND_UNKNOWN
+    #: Identity within ``kind``. For a human relay this is the human (or the
+    #: session relaying for them); for automation, the executor identity.
+    actor_id: Optional[str] = None
+    #: Executor lane of the CREATING actor (not of the card being created).
+    lane: Optional[str] = None
+    #: Run / execution / session id of the creating actor's own run.
+    run_id: Optional[str] = None
+    cause: str = CREATION_CAUSE_UNKNOWN
+
+    def __post_init__(self) -> None:
+        if self.kind not in VALID_ACTOR_KINDS:
+            raise ValueError(
+                f"actor kind must be one of {sorted(VALID_ACTOR_KINDS)}, "
+                f"got {self.kind!r}"
+            )
+        if self.cause not in VALID_CREATION_CAUSES:
+            raise ValueError(
+                f"creation cause must be one of {sorted(VALID_CREATION_CAUSES)}, "
+                f"got {self.cause!r}"
+            )
+
+    @property
+    def human_in_loop(self) -> bool:
+        """Whether a human was mechanically in the loop for this creation.
+
+        The single predicate every acceptance decision should use. It reads a
+        recorded enum, so it cannot be satisfied by an identity string that
+        merely looks human.
+        """
+        return self.kind in HUMAN_IN_LOOP_ACTOR_KINDS
+
+    def as_dict(self) -> dict:
+        return {
+            "actor_kind": self.kind,
+            "actor_id": self.actor_id,
+            "actor_lane": self.lane,
+            "actor_run_id": self.run_id,
+            "creation_cause": self.cause,
+        }
+
+
+def resolve_actor_provenance(
+    *,
+    kind: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    lane: Optional[str] = None,
+    run_id: Optional[str] = None,
+    cause: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> ActorProvenance:
+    """Derive provenance from explicit arguments, falling back to the env.
+
+    The env fallback is mechanical, not a guess about identity:
+
+    * ``HERMES_KANBAN_TASK`` is injected by ``build_worker_env`` into every
+      dispatched executor and by nothing else. Its presence means "this
+      process IS a governed run", which is a fact about the process, not an
+      inference from a name — so it is the discriminator, and the reason a
+      governed automation cannot masquerade as a human relay simply by being
+      configured with a human-sounding profile.
+    * ``HERMES_ACTOR_KIND`` lets a caller assert its own kind explicitly and
+      wins over the derivation. A value outside :data:`VALID_ACTOR_KINDS` is
+      IGNORED rather than stored: a junk provenance is worse than a derived
+      one, because it looks authoritative.
+
+    An interactive surface with no governed-run env is recorded as
+    ``human_interactive``/``manual_relay`` — the case ``t_fb23ac0a`` is: a
+    card Christopher relayed through an interactive Claude session, which
+    ``created_by='claude-code'`` cannot distinguish from automation running
+    under the same profile.
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+
+    governed_task = (environ.get("HERMES_KANBAN_TASK") or "").strip()
+    declared = (environ.get(ENV_ACTOR_KIND) or "").strip()
+
+    if kind is None:
+        if declared in VALID_ACTOR_KINDS:
+            kind = declared
+        elif governed_task:
+            kind = ACTOR_KIND_GOVERNED_AUTOMATION
+        else:
+            kind = ACTOR_KIND_HUMAN_INTERACTIVE
+
+    if actor_id is None:
+        actor_id = (
+            (environ.get(ENV_ACTOR_ID) or "").strip()
+            or (environ.get("HERMES_PROFILE_NAME") or "").strip()
+            or (environ.get("HERMES_PROFILE") or "").strip()
+            or None
+        )
+
+    if lane is None:
+        # The creating run's own lane. Only a governed run has one; an
+        # interactive surface correctly records None rather than borrowing
+        # the lane of the card it is about to create.
+        lane = (environ.get("HERMES_EXECUTOR_LANE") or "").strip() or None
+
+    if run_id is None:
+        # Most specific identifier first. An execution id pins one supervised
+        # process; a run id pins one attempt at a task; a session id pins the
+        # conversation. All three are stable and machine-readable, unlike the
+        # profile name.
+        for key in (
+            "HERMES_EXECUTION_ID",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_SESSION_ID",
+        ):
+            candidate = (environ.get(key) or "").strip()
+            if candidate:
+                run_id = candidate
+                break
+
+    if cause is None:
+        cause = (
+            CREATION_CAUSE_MANUAL_RELAY
+            if kind == ACTOR_KIND_HUMAN_INTERACTIVE
+            else CREATION_CAUSE_AUTOMATED
+        )
+
+    return ActorProvenance(
+        kind=kind,
+        actor_id=actor_id,
+        lane=lane,
+        run_id=run_id,
+        cause=cause,
+    )
+
+
+def task_provenance(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Structured provenance for ``task_id``, or ``None`` if the card is gone.
+
+    Always returns every key, so a caller can distinguish "not recorded"
+    (values ``None``, a pre-migration row) from a recorded ``unknown``.
+    ``created_by`` is included for audit continuity only — no caller should
+    branch on it, and the regressions assert that branching on it fails.
+    """
+    row = conn.execute(
+        "SELECT created_by, actor_kind, actor_id, actor_lane, actor_run_id, "
+        "creation_cause, recovery_owner, executor_lane, session_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "created_by": row["created_by"],
+        "actor_kind": row["actor_kind"],
+        "actor_id": row["actor_id"],
+        "actor_lane": row["actor_lane"],
+        "actor_run_id": row["actor_run_id"],
+        "creation_cause": row["creation_cause"],
+        "recovery_owner": row["recovery_owner"],
+        "executor_lane": row["executor_lane"],
+        "session_id": row["session_id"],
+    }
+
+
+def is_human_relayed(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a human was in the loop when this card was created.
+
+    Fails CLOSED on an unrecorded provenance: a pre-migration row returns
+    ``False``, because "we did not record it" is not evidence a human relayed
+    it. The alternative — inferring from ``created_by`` — is the defect.
+    """
+    prov = task_provenance(conn, task_id)
+    if not prov:
+        return False
+    return prov.get("actor_kind") in HUMAN_IN_LOOP_ACTOR_KINDS
+
+
+def is_governed_automation(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a governed automated executor created this card."""
+    prov = task_provenance(conn, task_id)
+    if not prov:
+        return False
+    return prov.get("actor_kind") == ACTOR_KIND_GOVERNED_AUTOMATION
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3992,6 +4831,10 @@ def create_task(
     executor_lane: Optional[str] = None,
     recovery_gate_cmd: Optional[str] = None,
     gauntlet: Optional[bool] = None,
+    provenance: Optional[ActorProvenance] = None,
+    recovery_owner: Optional[str] = None,
+    repairs_task_id: Optional[str] = None,
+    umbrella_task_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4031,10 +4874,76 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``provenance`` records WHO created this card and WHY, structurally. When
+    omitted it is derived from the process environment by
+    :func:`resolve_actor_provenance` — deriving is safe because the derivation
+    reads mechanical facts about the process (is there a governed run around
+    it?), never the identity string. It is stored alongside, and never
+    instead of, ``created_by``: the string stays for audit continuity, but
+    nothing may branch on it. See the ACTOR PROVENANCE block.
+
+    ``recovery_owner`` names the identity accountable for this card's recovery
+    decision, and ``repairs_task_id``/``umbrella_task_id`` are the subject and
+    umbrella a governed repair card must point at.
+
+    **A card that declares itself a repair is refused unless all three are
+    present, and the relations are established in this same transaction.**
+    Anything that marks the card as a repair arms the requirement — a
+    ``recovery`` creation cause, a ``recovery_owner``, or either linkage id.
+    The guard lives HERE, at the creation boundary, rather than only in
+    :func:`create_repair_task`, because a guard that only one helper honours
+    is not a guard: ``tools/kanban_tools.py`` and every other caller reaches
+    ``create_task`` directly, so a recovery-tagged card could otherwise be
+    minted with no subject and no umbrella just by not using the helper. That
+    bypass was found by independent ``codex_verify`` review of this repair's
+    first draft, which created exactly such an orphan.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    # Resolve before any validation that can raise, so a rejected creation
+    # never half-populates provenance state, and so every successful creation
+    # carries it — there is no path through this function that produces a card
+    # with no recorded actor kind.
+    if provenance is None:
+        provenance = resolve_actor_provenance()
+    recovery_owner = (recovery_owner or "").strip() or None
+    repairs_task_id = (repairs_task_id or "").strip() or None
+    umbrella_task_id = (umbrella_task_id or "").strip() or None
+    # Any one of these declares "this card is a governed repair", and each is
+    # sufficient on its own: a caller that names an owner but no subject is as
+    # much an orphan as one that names a subject but no owner. Arming on the
+    # union means the requirement cannot be dodged by supplying a partial set.
+    declares_repair = (
+        provenance.cause == CREATION_CAUSE_RECOVERY
+        or recovery_owner is not None
+        or repairs_task_id is not None
+        or umbrella_task_id is not None
+    )
+    if declares_repair:
+        # Normalise the cause so the card is queryable as recovery work
+        # however it was declared — otherwise ``orphaned_repair_tasks`` and
+        # every other cause-based query would miss it.
+        if provenance.cause != CREATION_CAUSE_RECOVERY:
+            provenance = ActorProvenance(
+                kind=provenance.kind,
+                actor_id=provenance.actor_id,
+                lane=provenance.lane,
+                run_id=provenance.run_id,
+                cause=CREATION_CAUSE_RECOVERY,
+            )
+        for label, value in (
+            ("recovery_owner", recovery_owner),
+            ("repairs_task_id", repairs_task_id),
+            ("umbrella_task_id", umbrella_task_id),
+        ):
+            if not value:
+                raise RecoveryLinkageError(
+                    f"a governed repair task requires {label}; refusing to "
+                    f"create an unlinked recovery card "
+                    f"(cause={provenance.cause!r})"
+                )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -4362,8 +5271,11 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         executor_lane, recovery_gate_cmd,
-                        gauntlet_enforced
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        gauntlet_enforced,
+                        actor_kind, actor_id, actor_lane, actor_run_id,
+                        creation_cause, recovery_owner
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4392,6 +5304,12 @@ def create_task(
                         executor_lane,
                         recovery_gate_cmd,
                         1 if gauntlet_enforced else 0,
+                        provenance.kind,
+                        provenance.actor_id,
+                        provenance.lane,
+                        provenance.run_id,
+                        provenance.cause,
+                        recovery_owner,
                     ),
                 )
                 for pid in parents:
@@ -4399,6 +5317,42 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if declares_repair:
+                    # Same transaction as the INSERT above. When this runs
+                    # standalone the enclosing write_txn is a real
+                    # BEGIN IMMEDIATE/COMMIT; when composed under
+                    # create_repair_task it is a savepoint inside that outer
+                    # transaction. Either way a raise below unwinds the card
+                    # with the linkage, so there is no committed state in
+                    # which the card exists unlinked.
+                    for relation, target in (
+                        (RELATION_REPAIRS, repairs_task_id),
+                        (RELATION_UMBRELLA, umbrella_task_id),
+                    ):
+                        try:
+                            add_task_relation(
+                                conn, task_id, target, relation,
+                                created_by=recovery_owner,
+                            )
+                        except ValueError as exc:
+                            # An unknown or self-referential endpoint. Re-raise
+                            # as the linkage error so every fail-closed path
+                            # out of this function has one type.
+                            raise RecoveryLinkageError(
+                                f"cannot establish {relation} linkage to "
+                                f"{target!r}: {exc}"
+                            ) from exc
+                    # Read back from the table, not from the calls above. An
+                    # INSERT OR IGNORE that inserted nothing returns cleanly,
+                    # so a caller's own success flag is not evidence that the
+                    # board holds the link.
+                    still_missing = missing_repair_relations(conn, task_id)
+                    if still_missing:
+                        raise RecoveryLinkageError(
+                            f"repair task {task_id} is missing required "
+                            f"relation(s) {still_missing}; rolling back so no "
+                            f"orphan card is created"
+                        )
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -4421,6 +5375,12 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "executor_lane": executor_lane,
+                        # Provenance goes on the event too, not only the row.
+                        # The row can be UPDATEd; the event log is append-only,
+                        # so this is the copy that survives a later mutation
+                        # and the one an audit reads.
+                        **provenance.as_dict(),
+                        "recovery_owner": recovery_owner,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4822,6 +5782,1123 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Governance relations + atomic repair creation
+# ---------------------------------------------------------------------------
+
+
+class RecoveryLinkageError(RuntimeError):
+    """A governed repair card could not be linked to its required relations.
+
+    Raised from inside :func:`create_repair_task`'s single write transaction,
+    which is the entire point: the exception unwinds the transaction that also
+    inserted the card, so a repair that cannot be linked is never created at
+    all. Callers see either a fully-linked repair or no repair.
+    """
+
+
+def add_task_relation(
+    conn: sqlite3.Connection,
+    from_task_id: str,
+    to_task_id: str,
+    relation: str,
+    *,
+    created_by: Optional[str] = None,
+) -> bool:
+    """Record a governance relation ``from -> to``. Returns True if new.
+
+    Safe to compose under a caller's transaction (``allow_nested=True``), so a
+    creation path can insert the card and its relations under ONE commit. That
+    composability is load-bearing, not a convenience: it is what makes the
+    orphan window in :func:`create_repair_task` structurally absent rather
+    than merely narrow.
+
+    Never touches ``task_links``, so it can never change readiness, promotion
+    or dependency gating for either card. That is what lets an evidence
+    pointer be added to a live card (``t_c5c2929d``) without rewriting or
+    re-scoping it.
+    """
+    if relation not in VALID_TASK_RELATIONS:
+        raise ValueError(
+            f"relation must be one of {sorted(VALID_TASK_RELATIONS)}, "
+            f"got {relation!r}"
+        )
+    if from_task_id == to_task_id:
+        raise ValueError("a task cannot hold a governance relation to itself")
+    with write_txn(conn, allow_nested=True):
+        missing = _find_missing_parents(conn, [from_task_id, to_task_id])
+        if missing:
+            raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO task_relations "
+            "(from_task_id, to_task_id, relation, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (from_task_id, to_task_id, relation, int(time.time()), created_by),
+        )
+        added = cur.rowcount > 0
+        if added:
+            payload = {
+                "from": from_task_id,
+                "to": to_task_id,
+                "relation": relation,
+            }
+            # Both ends get the event. A relation only one side can see is how
+            # a governance edge goes unnoticed — the subject and the umbrella
+            # must be able to discover the repair from their own event log,
+            # not only by being queried for.
+            _append_event(conn, from_task_id, "relation_added", payload)
+            _append_event(
+                conn, to_task_id, "relation_received", dict(payload),
+            )
+        return added
+
+
+def task_relations(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    relation: Optional[str] = None,
+    direction: str = "from",
+) -> list[dict]:
+    """Governance relations for ``task_id``.
+
+    ``direction='from'`` returns edges this card asserts; ``'to'`` returns
+    edges pointed AT it; ``'both'`` returns the union.
+    """
+    if direction not in ("from", "to", "both"):
+        raise ValueError("direction must be 'from', 'to' or 'both'")
+    clauses = []
+    params: list[Any] = []
+    if direction in ("from", "both"):
+        clauses.append("from_task_id = ?")
+        params.append(task_id)
+    if direction in ("to", "both"):
+        clauses.append("to_task_id = ?")
+        params.append(task_id)
+    sql = (
+        "SELECT from_task_id, to_task_id, relation, created_at, created_by "
+        "FROM task_relations WHERE (" + " OR ".join(clauses) + ")"
+    )
+    if relation is not None:
+        sql += " AND relation = ?"
+        params.append(relation)
+    sql += " ORDER BY created_at, relation, to_task_id"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def relation_targets(
+    conn: sqlite3.Connection, task_id: str, relation: str
+) -> list[str]:
+    """The ``to`` ids this card points at with ``relation``."""
+    return [
+        r["to_task_id"]
+        for r in task_relations(conn, task_id, relation=relation)
+    ]
+
+
+def missing_repair_relations(
+    conn: sqlite3.Connection, task_id: str
+) -> list[str]:
+    """Required repair relations this card does NOT have. Empty == linked.
+
+    Read back from the table rather than trusted from the caller's own
+    bookkeeping — an INSERT that silently did nothing (``INSERT OR IGNORE``
+    against a row that was concurrently deleted, a partially-applied
+    statement) is exactly the failure mode a caller's in-memory success flag
+    cannot see.
+    """
+    present = {
+        r["relation"]
+        for r in task_relations(conn, task_id)
+        if r["relation"] in REQUIRED_REPAIR_RELATIONS
+    }
+    return [rel for rel in REQUIRED_REPAIR_RELATIONS if rel not in present]
+
+
+def orphaned_repair_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Repair/recovery cards that carry no required governance relation.
+
+    Diagnostic, not a guard: cards created BEFORE this repair are expected to
+    appear here and are preserved exactly as they are. It exists so the
+    orphan population is countable instead of anecdotal.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE creation_cause = ? ORDER BY created_at",
+        (CREATION_CAUSE_RECOVERY,),
+    ).fetchall()
+    return [
+        r["id"] for r in rows if missing_repair_relations(conn, r["id"])
+    ]
+
+
+def create_repair_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    subject_id: str,
+    owner: str,
+    umbrella_id: str,
+    body: Optional[str] = None,
+    evidence_ids: Iterable[str] = (),
+    provenance: Optional[ActorProvenance] = None,
+    **create_kwargs: Any,
+) -> str:
+    """Create a governed repair card, atomically linked or not created at all.
+
+    The defect this closes: a repair card whose subject, owner and umbrella
+    exist only as prose in its body. ``t_aef6bbe1`` and ``t_f9b3b48b`` are
+    both that shape — each states in words what it repairs, and neither is
+    reachable from its subject by any query. Nothing is wrong with either
+    card's text; the problem is that a governor cannot ask the board "what is
+    repairing this?" and get an answer, so a repair can be lost simply by
+    nobody remembering to look for it.
+
+    Prose is insufficient for a second, sharper reason. A relation added in a
+    *later* call than the insert has a window — however short — in which the
+    card exists and is unlinked. A crash, a lock timeout, a killed executor,
+    or an exception in the linking code leaves a permanently orphaned card
+    that looks like real work. Both the insert and every required relation
+    therefore run inside ONE ``write_txn``, and the linkage is READ BACK from
+    the table before that transaction commits. Any failure — a missing
+    subject, a blank owner, a relation that did not land — raises
+    :class:`RecoveryLinkageError` and unwinds the whole transaction, including
+    the card. The orphan window is not narrowed; it does not exist.
+
+    That enforcement lives in :func:`create_task`, not here, and this function
+    is a convenience over it rather than the thing that makes it safe. The
+    distinction matters: an earlier draft enforced only in this helper, and
+    independent review immediately minted an orphan by calling ``create_task``
+    directly with ``creation_cause='recovery'``. A rule only one door honours
+    is not a rule.
+
+    ``evidence_ids`` add non-governing :data:`RELATION_EVIDENCE` pointers.
+    They are best-effort by design and do NOT gate creation: an evidence
+    pointer is a citation, and failing to create a repair because a citation
+    target is gone would be the fail-closed rule applied where it does not
+    belong.
+    """
+    if provenance is None:
+        # A repair card's cause is 'recovery' whoever asked for it. The KIND
+        # still comes from the environment — a human-relayed repair and an
+        # automation-generated one are genuinely different provenance, and
+        # this is the distinction Defect A exists to preserve.
+        base = resolve_actor_provenance()
+        provenance = ActorProvenance(
+            kind=base.kind,
+            actor_id=base.actor_id,
+            lane=base.lane,
+            run_id=base.run_id,
+            cause=CREATION_CAUSE_RECOVERY,
+        )
+
+    owner = (owner or "").strip()
+    evidence = tuple(e for e in evidence_ids if e)
+
+    # ONE transaction. Everything below either commits together or leaves the
+    # board exactly as it was.
+    #
+    # The subject/owner/umbrella requirement and the linkage itself are NOT
+    # re-implemented here — ``create_task`` enforces them at the creation
+    # boundary, so the guarantee holds for every caller rather than only for
+    # users of this helper. This function adds what is specific to a repair
+    # card: the non-governing evidence citations and the ``repair_linked``
+    # summary event.
+    with write_txn(conn):
+        task_id = create_task(
+            conn,
+            title=title,
+            body=body,
+            provenance=provenance,
+            recovery_owner=owner or None,
+            repairs_task_id=subject_id,
+            umbrella_task_id=umbrella_id,
+            **create_kwargs,
+        )
+        for evidence_id in evidence:
+            # Citations, not governance. A dud id is dropped rather than
+            # allowed to veto a repair the board actually needs.
+            with contextlib.suppress(ValueError):
+                add_task_relation(
+                    conn, task_id, evidence_id, RELATION_EVIDENCE,
+                    created_by=owner,
+                )
+        # Read back, inside the transaction, before it can commit. This is the
+        # difference between "we called the linker" and "the board holds the
+        # link" — only the second one is evidence.
+        still_missing = missing_repair_relations(conn, task_id)
+        if still_missing:
+            raise RecoveryLinkageError(
+                f"repair task {task_id} is missing required relation(s) "
+                f"{still_missing}; rolling back so no orphan card is created"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "repair_linked",
+            {
+                "subject": subject_id,
+                "umbrella": umbrella_id,
+                "owner": owner,
+                "evidence": list(evidence),
+                "relations": [
+                    r["relation"] for r in task_relations(conn, task_id)
+                ],
+            },
+        )
+    return task_id
+
+
+# ---------------------------------------------------------------------------
+# SESSION-INDEPENDENT OWNERSHIP
+# ---------------------------------------------------------------------------
+#
+# ``tasks.session_id`` names the interactive session a card was created in. It
+# is genuinely useful provenance and it is NOT an ownership key, because it has
+# no lifetime guarantee: the session ends, the SSH connection drops, the
+# Claude/Codex process is reaped, and the string keeps pointing at something
+# that no longer exists. Any code that answers "who owns this?" by resolving a
+# session — or worse, by checking whether a process is still alive — returns
+# "nobody" the moment the session ends, and a card whose owner is nobody is a
+# card no recovery lane will route and no governor will chase.
+#
+# The columns that answer ownership are all written once, at creation, and are
+# facts about a moment rather than about a live process:
+#
+#   recovery_owner  the identity accountable for a repair's recovery decision
+#   actor_id        the creating actor's identity within its kind
+#   assignee        the profile the card is dispatched to
+#   created_by      legacy free-text author (last resort, audit only)
+#
+# :func:`resolve_task_ownership` walks that list in order and reports WHICH one
+# answered, so an ambiguous or degraded resolution is visible instead of
+# silently plausible. It reads only persisted rows: no ``os.environ``, no
+# process table, no session registry. That is the property the regressions in
+# ``tests/hermes_cli/test_kanban_session_independent_ownership.py`` pin — the
+# resolution is byte-identical before and after the originating session is
+# destroyed, because nothing in the resolution ever consulted it.
+
+#: Ownership sources, most authoritative first. Order is the contract: a repair
+#: card's accountable identity is its ``recovery_owner``, not the profile it
+#: happens to be dispatched to.
+OWNERSHIP_SOURCE_ORDER = ("recovery_owner", "actor_id", "assignee", "created_by")
+
+#: Sources that are structured provenance written by this control plane.
+#: ``created_by`` is deliberately absent: it resolves, but it is the free-text
+#: profile string Defect A proved cannot distinguish a human relay from
+#: automation, so a card that can only be owned through it is reported as
+#: degraded rather than as cleanly owned.
+STRUCTURED_OWNERSHIP_SOURCES = frozenset({"recovery_owner", "actor_id", "assignee"})
+
+#: Degraded reasons that make the recorded owner *untrustworthy*, as opposed to
+#: merely *incomplete*. This distinction is the whole of the enforced boundary,
+#: and it is not a stylistic one:
+#:
+#: * **Untrustworthy** — the string might name the wrong actor. Acting on it
+#:   produces a false attribution, which is worse than refusing, because a
+#:   confident wrong owner is indistinguishable at read time from a right one.
+#:   These FAIL CLOSED at :func:`require_resolvable_ownership`.
+#: * **Incomplete** — the string names the right actor, but the record around
+#:   it is thin (a pre-migration card with no ``actor_kind``, a card with no
+#:   lane recorded). These are reported and carried forward, because refusing
+#:   them would strand the legacy board, and the legacy board is where the
+#:   preserved failure evidence lives.
+#:
+#: The 2026-09-03 independent review rejected the earlier boundary, which
+#: passed *every* degraded record including a ``created_by``-only one. The
+#: read-only census that justified tightening it rather than agonising over
+#: the trade-off: of the 34 live cards on the board that day, 34 resolved
+#: through ``assignee`` and **zero** through ``created_by``, so promoting
+#: ``owner_only_from_created_by`` to blocking strands nothing that exists.
+#: 33 of the 34 carry ``provenance_not_recorded`` and 10 carry
+#: ``no_executor_lane``, which is why those two stay advisory — enforcing them
+#: would strand almost the entire board.
+ATTRIBUTION_BLOCKING_REASONS = frozenset({
+    "no_owner_recorded",
+    "owner_only_from_created_by",
+})
+
+
+@dataclass(frozen=True)
+class TaskOwnership:
+    """Everything needed to govern a card, resolved from persisted state alone.
+
+    Frozen because an ownership answer is a reading of the board at a moment;
+    a mutable one invites a caller to "correct" a degraded resolution in
+    memory and then act as though the board said so.
+    """
+
+    task_id: str
+    #: The accountable identity, or ``None`` when nothing on the row answers.
+    owner: Optional[str]
+    #: Which column in :data:`OWNERSHIP_SOURCE_ORDER` supplied ``owner``.
+    #: ``None`` when unowned. Callers that care about attribution quality test
+    #: this rather than the string, for the same reason acceptance tests read
+    #: ``actor_kind`` rather than ``created_by``.
+    owner_source: Optional[str]
+    #: Lane this card RUNS in.
+    executor_lane: Optional[str]
+    #: Lane of the actor that CREATED it. Differs whenever one lane files work
+    #: for another — a codex_verify run filing a claude repair, for instance.
+    actor_lane: Optional[str]
+    actor_kind: Optional[str]
+    actor_id: Optional[str]
+    actor_run_id: Optional[str]
+    creation_cause: Optional[str]
+    #: Provenance only. Present in the record so an auditor can see which
+    #: session a card came from; never consulted to resolve ``owner``.
+    session_id: Optional[str]
+    #: Dependency parents (``task_links``) — the return path a child's result
+    #: must travel back up.
+    parent_ids: tuple[str, ...]
+    #: Governance relations (``task_relations``).
+    repairs: tuple[str, ...]
+    umbrella: tuple[str, ...]
+    evidence: tuple[str, ...]
+    #: Reasons ownership is not cleanly resolvable. Empty == clean.
+    degraded_reasons: tuple[str, ...] = ()
+
+    @property
+    def resolved(self) -> bool:
+        """Whether an accountable identity exists at all."""
+        return self.owner is not None
+
+    @property
+    def structurally_owned(self) -> bool:
+        """Whether the owner came from structured provenance, not free text."""
+        return self.owner_source in STRUCTURED_OWNERSHIP_SOURCES
+
+    @property
+    def blocking_reasons(self) -> tuple[str, ...]:
+        """Degradations that make the owner untrustworthy rather than thin.
+
+        See :data:`ATTRIBUTION_BLOCKING_REASONS`. Empty means the recorded
+        owner may be acted on; non-empty means acting on it would be a guess
+        wearing a name.
+        """
+        return tuple(
+            r for r in self.degraded_reasons if r in ATTRIBUTION_BLOCKING_REASONS
+        )
+
+    @property
+    def attributable(self) -> bool:
+        """Whether the owner can be acted on without risking false attribution.
+
+        Weaker than :attr:`governable` (which additionally wants a lane and a
+        complete provenance record) and stronger than :attr:`resolved` (which
+        only wants some string). This is the predicate the enforced boundary
+        uses, because it is the one that separates "we do not know enough
+        about this card" from "we might name the wrong actor".
+        """
+        return self.resolved and not self.blocking_reasons
+
+    @property
+    def governable(self) -> bool:
+        """Whether a governor can act on this card without guessing.
+
+        Requires an owner AND a lane to route to AND no recorded degradation —
+        an owner with nowhere to run is not governable, it just looks it.
+
+        **Advisory, not a gate.** Every card created before the provenance
+        columns reads ``False`` here (``provenance_not_recorded``), and on the
+        live board as of 2026-09-03 that is 33 of its 34 live cards. Wiring
+        this into a routing or dispatch guard would therefore strand almost the
+        whole existing board, including the preserved failure evidence.
+
+        The *enforced* boundary is :func:`require_resolvable_ownership`, which
+        sits between this property and :attr:`resolved`: it fails closed on an
+        ownerless card **and** on an untrustworthy attribution, and passes a
+        merely incomplete one. See :attr:`attributable`.
+        """
+        return (
+            self.resolved
+            and self.executor_lane is not None
+            and not self.degraded_reasons
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "owner": self.owner,
+            "owner_source": self.owner_source,
+            "executor_lane": self.executor_lane,
+            "actor_lane": self.actor_lane,
+            "actor_kind": self.actor_kind,
+            "actor_id": self.actor_id,
+            "actor_run_id": self.actor_run_id,
+            "creation_cause": self.creation_cause,
+            "session_id": self.session_id,
+            "parent_ids": list(self.parent_ids),
+            "repairs": list(self.repairs),
+            "umbrella": list(self.umbrella),
+            "evidence": list(self.evidence),
+            "degraded_reasons": list(self.degraded_reasons),
+            "resolved": self.resolved,
+            "structurally_owned": self.structurally_owned,
+            "blocking_reasons": list(self.blocking_reasons),
+            "attributable": self.attributable,
+            "governable": self.governable,
+        }
+
+
+class OwnershipUnresolvable(RuntimeError):
+    """A card could not be given an accountable owner from persisted state."""
+
+
+def resolve_task_ownership(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[TaskOwnership]:
+    """Resolve ownership for ``task_id`` from persisted state only.
+
+    Returns ``None`` if the card does not exist. Never raises for a merely
+    degraded card: "this is owned badly" and "this card is gone" are different
+    answers and collapsing them loses the one a governor can act on.
+
+    **Reads no live state.** Not the process table, not a session registry,
+    not the environment. That is not an implementation detail — it is the
+    guarantee. The resolution a caller gets while the originating session is
+    live and the one it gets an hour after that session was destroyed are the
+    same bytes, because the session was never an input.
+    """
+    row = conn.execute(
+        "SELECT id, assignee, created_by, session_id, executor_lane, "
+        "actor_kind, actor_id, actor_lane, actor_run_id, creation_cause, "
+        "recovery_owner "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    candidates = {
+        "recovery_owner": row["recovery_owner"],
+        "actor_id": row["actor_id"],
+        "assignee": row["assignee"],
+        "created_by": row["created_by"],
+    }
+    owner: Optional[str] = None
+    owner_source: Optional[str] = None
+    for source in OWNERSHIP_SOURCE_ORDER:
+        value = (candidates.get(source) or "").strip()
+        if value:
+            owner, owner_source = value, source
+            break
+
+    degraded: list[str] = []
+    if owner is None:
+        degraded.append("no_owner_recorded")
+    elif owner_source not in STRUCTURED_OWNERSHIP_SOURCES:
+        # Resolvable, but only through the string that cannot distinguish an
+        # actor kind. Say so rather than reporting a clean owner.
+        degraded.append("owner_only_from_created_by")
+    elif owner_source == "assignee":
+        # Structured — the control plane writes it — but it answers "where does
+        # this run?" rather than "who is accountable for it?". The second
+        # independent review (2026-09-03) was right that treating a dispatch
+        # target as an accountable actor is a category error, and it is a
+        # separate one from the ``created_by`` free-text problem.
+        #
+        # It is reported and NOT blocking, on the same evidence that made
+        # ``created_by`` blocking: all 34 live cards resolve through
+        # ``assignee``, so refusing it strands the entire board. The honest
+        # position is therefore to stop calling it clean, not to pretend the
+        # board can do without it. See ATTRIBUTION_BLOCKING_REASONS.
+        degraded.append("owner_only_from_assignee")
+    if row["actor_kind"] is None:
+        # A pre-migration card. Nothing is backfilled — inventing a kind is
+        # the fabrication the provenance columns exist to prevent — so the
+        # degradation is reported and the card stays exactly as it is.
+        degraded.append("provenance_not_recorded")
+    if not (row["executor_lane"] or "").strip():
+        degraded.append("no_executor_lane")
+
+    cause = row["creation_cause"]
+    rel = {
+        r: tuple(relation_targets(conn, task_id, r))
+        for r in (RELATION_REPAIRS, RELATION_UMBRELLA, RELATION_EVIDENCE)
+    }
+    if cause == CREATION_CAUSE_RECOVERY:
+        # A repair card whose subject or umbrella is missing cannot be
+        # returned to anything. This is the orphan condition, restated as an
+        # ownership fact so one predicate covers both.
+        for relation in REQUIRED_REPAIR_RELATIONS:
+            if not rel[relation]:
+                degraded.append(f"repair_missing_{relation}")
+
+    return TaskOwnership(
+        task_id=row["id"],
+        owner=owner,
+        owner_source=owner_source,
+        executor_lane=(row["executor_lane"] or None),
+        actor_lane=(row["actor_lane"] or None),
+        actor_kind=(row["actor_kind"] or None),
+        actor_id=(row["actor_id"] or None),
+        actor_run_id=(row["actor_run_id"] or None),
+        creation_cause=(cause or None),
+        session_id=(row["session_id"] or None),
+        parent_ids=tuple(parent_ids(conn, task_id)),
+        repairs=rel[RELATION_REPAIRS],
+        umbrella=rel[RELATION_UMBRELLA],
+        evidence=rel[RELATION_EVIDENCE],
+        degraded_reasons=tuple(degraded),
+    )
+
+
+def require_resolvable_ownership(
+    conn: sqlite3.Connection, task_id: str
+) -> TaskOwnership:
+    """Ownership for ``task_id``, or raise. Fails closed.
+
+    The boundary form, for the paths where proceeding without an accountable
+    identity is what creates the orphan in the first place: arming an
+    observation timer, routing a recovery, returning a verifier verdict.
+
+    It refuses two things, and passes a third:
+
+    * an **unowned** card — nothing on the row names anyone;
+    * an **untrustworthy** one — the only thing naming an owner is the
+      free-text ``created_by``, which cannot distinguish a human relay from
+      automation running under the same profile, so routing on it risks
+      attributing the card to the wrong actor entirely;
+    * a merely **incomplete** one still passes, carrying its degradation
+      forward in :attr:`TaskOwnership.degraded_reasons`.
+
+    The middle case used to pass, and the 2026-09-03 independent review was
+    right that it hollowed the boundary out: a guard that admits an owner it
+    has just finished describing as unreliable is not a guard. See
+    :data:`ATTRIBUTION_BLOCKING_REASONS` for why the third case is treated
+    differently and for the live-board census showing this costs nothing.
+    """
+    ownership = resolve_task_ownership(conn, task_id)
+    if ownership is None:
+        raise OwnershipUnresolvable(f"unknown task {task_id!r}")
+    if not ownership.resolved:
+        raise OwnershipUnresolvable(
+            f"task {task_id!r} has no accountable owner in persisted state "
+            f"(checked {', '.join(OWNERSHIP_SOURCE_ORDER)}); refusing to "
+            f"proceed with an ownerless card"
+        )
+    if ownership.blocking_reasons:
+        raise OwnershipUnresolvable(
+            f"task {task_id!r} has no trustworthy accountable owner "
+            f"({', '.join(ownership.blocking_reasons)}); refusing to proceed "
+            f"on an attribution that may name the wrong actor"
+        )
+    return ownership
+
+
+def unowned_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Live cards for which :func:`resolve_task_ownership` finds no owner.
+
+    Diagnostic, like :func:`orphaned_repair_tasks`: it makes the ownerless
+    population countable rather than anecdotal, and it deliberately does not
+    repair anything it finds.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'archived') "
+        "ORDER BY created_at"
+    ).fetchall()
+    out = []
+    for r in rows:
+        ownership = resolve_task_ownership(conn, r["id"])
+        if ownership is not None and not ownership.resolved:
+            out.append(r["id"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# OBSERVATION TIMERS — durable 600s recheck
+# ---------------------------------------------------------------------------
+#
+# Rationale and the three failure shapes this replaces are in the OBSERVATION
+# TIMERS block near MANDATORY_OBSERVATION_INTERVAL_SECONDS. What follows is the
+# mechanism.
+
+
+class ObservationIntervalError(ValueError):
+    """An observation timer was armed at an interval other than 600 seconds."""
+
+
+class ObservationTimerNotFound(KeyError):
+    """No such observation timer on this board."""
+
+
+def _new_observation_timer_id() -> str:
+    return "obs_" + secrets.token_hex(4)
+
+
+def _delete_observation_timers_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Cascade a task deletion into its timers and their tick ledgers.
+
+    Called from inside the caller's transaction, like every other cascade in
+    the delete paths. Without it a deleted card leaves an armed timer behind
+    that is due forever and points at nothing — the exact "observation
+    outlives the thing observed" shape, arrived at from the other direction.
+
+    **The timers are CLOSED, with a reason, before they are deleted.** They
+    used to be dropped outright, which meant a live observation could end with
+    no recorded cause anywhere — the disappearance this control exists to
+    prevent, reached through the delete path instead of the emit path. The
+    close is not decorative: ``trg_obs_timer_no_delete_while_observing``
+    refuses the DELETE until it has happened, so the ordering below is
+    enforced by the database rather than by this function remembering to.
+
+    No ``observation_timer_closed`` event is appended, and that is deliberate
+    rather than an omission: both callers delete the card's whole
+    ``task_events`` history in the same transaction, so the event would be
+    written into a log that ceases to exist a few statements later. The
+    durable record of a purge is the caller's own deletion path, not a
+    tombstone on a row that is going away.
+    """
+    conn.execute(
+        "UPDATE observation_timers "
+        "SET state = ?, closed_at = ?, closed_reason = 'task_deleted' "
+        "WHERE task_id = ? AND state != ?",
+        (
+            OBSERVATION_STATE_CLOSED, int(time.time()), task_id,
+            OBSERVATION_STATE_CLOSED,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM observation_ticks WHERE timer_id IN "
+        "(SELECT id FROM observation_timers WHERE task_id = ?)",
+        (task_id,),
+    )
+    conn.execute("DELETE FROM observation_timers WHERE task_id = ?", (task_id,))
+
+
+@dataclass(frozen=True)
+class ObservationTimer:
+    """One armed (or retired) observation timer, read from the board."""
+
+    id: str
+    task_id: str
+    kind: str
+    interval_seconds: int
+    created_at: int
+    next_due_at: int
+    tick_count: int
+    last_tick_at: Optional[int]
+    verdict_emitted_at: Optional[int]
+    state: str
+    closed_at: Optional[int]
+    closed_reason: Optional[str]
+    owner: Optional[str]
+
+    @property
+    def observing(self) -> bool:
+        return self.state == OBSERVATION_STATE_OBSERVING
+
+    @property
+    def verdict_emitted(self) -> bool:
+        return self.verdict_emitted_at is not None
+
+    def is_due(self, now: Optional[int] = None) -> bool:
+        """Whether a tick is owed as of ``now``.
+
+        A function of the clock and this row. Deliberately not a function of
+        whether any observer process exists — that conflation is failure shape
+        3 (a stopped watcher that kept running, and a running watcher believed
+        stopped), and it is why process presence is never consulted here.
+        """
+        return self.observing and (
+            (int(time.time()) if now is None else int(now)) >= self.next_due_at
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "kind": self.kind,
+            "interval_seconds": self.interval_seconds,
+            "created_at": self.created_at,
+            "next_due_at": self.next_due_at,
+            "tick_count": self.tick_count,
+            "last_tick_at": self.last_tick_at,
+            "verdict_emitted_at": self.verdict_emitted_at,
+            "state": self.state,
+            "closed_at": self.closed_at,
+            "closed_reason": self.closed_reason,
+            "owner": self.owner,
+        }
+
+
+@dataclass(frozen=True)
+class ObservationTick:
+    """One emitted recheck."""
+
+    timer_id: str
+    task_id: str
+    seq: int
+    #: The due instant discharged, not the instant of emission.
+    due_at: int
+    emitted_at: int
+    #: Whole intervals whose due time passed with nothing running. Non-zero is
+    #: a recorded observer outage; it is never a silently dropped recheck.
+    missed: int
+    #: True on the contracted one-time verdict emission only.
+    verdict: bool
+    payload: Optional[dict]
+
+    @property
+    def late_seconds(self) -> int:
+        return max(0, self.emitted_at - self.due_at)
+
+    def as_dict(self) -> dict:
+        return {
+            "timer_id": self.timer_id,
+            "task_id": self.task_id,
+            "seq": self.seq,
+            "due_at": self.due_at,
+            "emitted_at": self.emitted_at,
+            "missed": self.missed,
+            "verdict": self.verdict,
+            "late_seconds": self.late_seconds,
+            "payload": self.payload,
+        }
+
+
+def _observation_timer_from_row(row: sqlite3.Row) -> ObservationTimer:
+    return ObservationTimer(
+        id=row["id"],
+        task_id=row["task_id"],
+        kind=row["kind"],
+        interval_seconds=int(row["interval_seconds"]),
+        created_at=int(row["created_at"]),
+        next_due_at=int(row["next_due_at"]),
+        tick_count=int(row["tick_count"]),
+        last_tick_at=row["last_tick_at"],
+        verdict_emitted_at=row["verdict_emitted_at"],
+        state=row["state"],
+        closed_at=row["closed_at"],
+        closed_reason=row["closed_reason"],
+        owner=row["owner"],
+    )
+
+
+def arm_observation_timer(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str = "recheck",
+    interval_seconds: int = MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+    owner: Optional[str] = None,
+    now: Optional[int] = None,
+) -> ObservationTimer:
+    """Arm a durable observation timer on ``task_id``.
+
+    ``interval_seconds`` must equal
+    :data:`MANDATORY_OBSERVATION_INTERVAL_SECONDS`. Any other value raises
+    :class:`ObservationIntervalError` — the parameter exists so the refusal is
+    explicit and testable, not so the interval can be tuned. "A number reasoned
+    out from a dispatcher tick" is precisely what the ruling forbade, and a
+    silently-accepted 900 would be indistinguishable at read time from a
+    correctly armed timer.
+
+    ``owner`` defaults to the card's resolved accountable identity. Arming
+    fails closed on an ownerless card: a timer nobody owns is an alarm nobody
+    answers, which is worse than no timer because it looks like coverage.
+
+    The timer is armed for ``now + interval``, so the first tick is owed one
+    full interval after arming rather than immediately.
+    """
+    # Normalised before it becomes half of a uniqueness key. Free-text 'kind'
+    # let 'recheck', 'Recheck' and ' recheck ' name three different observations
+    # of the same thing and slip past the (task_id, kind) index — found by the
+    # third independent review. Normalising at the one place timers are created
+    # is the fix; the column stays free-text because 'kind' is a label, not an
+    # enum, and constraining its vocabulary is a different decision.
+    kind = (kind or "").strip().lower() or "recheck"
+    interval = int(interval_seconds)
+    if interval != MANDATORY_OBSERVATION_INTERVAL_SECONDS:
+        raise ObservationIntervalError(
+            f"observation interval is fixed at "
+            f"{MANDATORY_OBSERVATION_INTERVAL_SECONDS}s by the 2026-09-03 "
+            f"ruling; refusing {interval}s"
+        )
+    now = int(time.time()) if now is None else int(now)
+    # Fails closed on an unknown or ownerless card, before any row is written.
+    ownership = require_resolvable_ownership(conn, task_id)
+    owner = (owner or "").strip() or ownership.owner
+    timer_id = _new_observation_timer_id()
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT INTO observation_timers "
+            "(id, task_id, kind, interval_seconds, created_at, next_due_at, "
+            " tick_count, state, owner) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                timer_id, task_id, kind, interval, now, now + interval,
+                OBSERVATION_STATE_OBSERVING, owner,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "observation_timer_armed",
+            {
+                "timer_id": timer_id,
+                "kind": kind,
+                "interval_seconds": interval,
+                "next_due_at": now + interval,
+                "owner": owner,
+            },
+        )
+    result = get_observation_timer(conn, timer_id)
+    assert result is not None  # just inserted, inside a committed txn
+    return result
+
+
+def get_observation_timer(
+    conn: sqlite3.Connection, timer_id: str
+) -> Optional[ObservationTimer]:
+    row = conn.execute(
+        "SELECT * FROM observation_timers WHERE id = ?", (timer_id,)
+    ).fetchone()
+    return None if row is None else _observation_timer_from_row(row)
+
+
+def task_observation_timers(
+    conn: sqlite3.Connection, task_id: str, *, state: Optional[str] = None
+) -> list[ObservationTimer]:
+    sql = "SELECT * FROM observation_timers WHERE task_id = ?"
+    params: list[Any] = [task_id]
+    if state is not None:
+        sql += " AND state = ?"
+        params.append(state)
+    sql += " ORDER BY created_at, id"
+    return [
+        _observation_timer_from_row(r) for r in conn.execute(sql, params).fetchall()
+    ]
+
+
+def due_observation_timers(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[ObservationTimer]:
+    """Every armed timer whose next tick is owed as of ``now``.
+
+    The scan is over persisted rows and the clock. A timer armed by a process
+    that has since died is returned here exactly like one whose armer is still
+    running, because the row is the timer — that equivalence is the point.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT * FROM observation_timers "
+        "WHERE state = ? AND next_due_at <= ? "
+        "ORDER BY next_due_at, id",
+        (OBSERVATION_STATE_OBSERVING, now),
+    ).fetchall()
+    return [_observation_timer_from_row(r) for r in rows]
+
+
+def emit_observation_tick(
+    conn: sqlite3.Connection,
+    timer_id: str,
+    *,
+    payload: Optional[dict] = None,
+    now: Optional[int] = None,
+) -> Optional[ObservationTick]:
+    """Emit the owed recheck for ``timer_id`` and RE-ARM in the same statement.
+
+    Returns the tick, or ``None`` when nothing was owed — the timer is not due,
+    is closed, or another emitter already discharged this due instant.
+
+    Three properties, each carried by a database constraint rather than by a
+    caller's discipline:
+
+    * **Continues observing.** ``next_due_at`` is advanced to the next future
+      boundary and ``state`` is left untouched, inside the transaction that
+      writes the tick. There is no code path here that closes a timer, so an
+      emitter cannot end observation by emitting — failure shape 1.
+    * **Verdict exactly once.** The CAS below matches on ``tick_count``, so
+      only one emitter can ever produce ``seq == 1``; ``verdict_emitted_at`` is
+      additionally written only where it ``IS NULL``.
+    * **Duplicates suppressed.** ``observation_ticks`` is keyed
+      ``(timer_id, seq)``, and the guarded UPDATE means two racing emitters
+      compute different ``seq`` values only if one of them already committed.
+      The loser's ``rowcount`` is 0 and it emits nothing.
+
+    Phase is preserved across an observer outage: the next due time is derived
+    from the due instant being discharged, never from ``now``. So an observer
+    that was down for 40 minutes emits ONE tick recording ``missed=3`` and
+    stays on its original 600 s boundaries, rather than emitting a burst of
+    four or silently re-phasing to a new grid.
+    """
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT * FROM observation_timers WHERE id = ?", (timer_id,)
+        ).fetchone()
+        if row is None:
+            raise ObservationTimerNotFound(timer_id)
+        if row["state"] != OBSERVATION_STATE_OBSERVING:
+            return None
+        due_at = int(row["next_due_at"])
+        if now < due_at:
+            return None
+        interval = int(row["interval_seconds"])
+        observed_ticks = int(row["tick_count"])
+        # Full intervals that elapsed BEYOND the one being discharged.
+        missed = (now - due_at) // interval
+        next_due = due_at + (missed + 1) * interval
+        seq = observed_ticks + 1
+        # The verdict is owed while none has been recorded. Reading the column
+        # rather than testing ``seq == 1`` keeps the guarantee anchored to
+        # persisted state.
+        verdict = row["verdict_emitted_at"] is None
+        cur = conn.execute(
+            "UPDATE observation_timers "
+            "SET next_due_at = ?, tick_count = ?, last_tick_at = ?, "
+            "    verdict_emitted_at = CASE "
+            "        WHEN verdict_emitted_at IS NULL AND ? = 1 THEN ? "
+            "        ELSE verdict_emitted_at END "
+            "WHERE id = ? AND state = ? AND next_due_at = ? AND tick_count = ?",
+            (
+                next_due, seq, now,
+                1 if verdict else 0, now,
+                timer_id, OBSERVATION_STATE_OBSERVING, due_at, observed_ticks,
+            ),
+        )
+        if cur.rowcount == 0:
+            # Another emitter discharged this due instant between the SELECT
+            # and the UPDATE. It emitted; this call must not.
+            return None
+        conn.execute(
+            "INSERT INTO observation_ticks "
+            "(timer_id, seq, due_at, emitted_at, missed, verdict, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                timer_id, seq, due_at, now, int(missed), 1 if verdict else 0,
+                json.dumps(payload, ensure_ascii=False) if payload else None,
+            ),
+        )
+        _append_event(
+            conn,
+            row["task_id"],
+            "observation_tick",
+            {
+                "timer_id": timer_id,
+                "seq": seq,
+                "due_at": due_at,
+                "emitted_at": now,
+                "missed": int(missed),
+                "verdict": verdict,
+                "next_due_at": next_due,
+                # Named for what it is. The ruling's own wording: a 600s tick
+                # re-gathers evidence and restates the open question. Labelling
+                # it anything that declares — 'stalled', 'DEFECT-ADVISORY' — is
+                # the same mistake wearing a different word.
+                "emission": "recheck",
+            },
+        )
+    return ObservationTick(
+        timer_id=timer_id,
+        task_id=row["task_id"],
+        seq=seq,
+        due_at=due_at,
+        emitted_at=now,
+        missed=int(missed),
+        verdict=verdict,
+        payload=payload,
+    )
+
+
+def run_observation_cycle(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[ObservationTick]:
+    """Discharge every owed recheck once. Closes nothing.
+
+    The driver an observer process calls on each pass. It is deliberately
+    idempotent per due instant and deliberately incapable of retiring a timer:
+    an observer that runs this and then exits leaves every timer armed for its
+    next interval, which is what makes the observation survive the observer.
+    """
+    now = int(time.time()) if now is None else int(now)
+    ticks: list[ObservationTick] = []
+    for timer in due_observation_timers(conn, now=now):
+        tick = emit_observation_tick(conn, timer.id, now=now)
+        if tick is not None:
+            ticks.append(tick)
+    return ticks
+
+
+def close_observation_timer(
+    conn: sqlite3.Connection,
+    timer_id: str,
+    *,
+    reason: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Retire a timer. Returns False if it was already closed.
+
+    ``reason`` is mandatory and must be non-empty. A timer that can be retired
+    without saying why is a timer that can vanish quietly, which is failure
+    shape 2 — the observation stopped and its absence read as "nothing to
+    report". The reason is written to the row and to the card's append-only
+    event log, so the end of an observation is as discoverable as its start.
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError(
+            "closing an observation timer requires an explicit reason; a "
+            "timer must never be able to disappear silently"
+        )
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT task_id, state FROM observation_timers WHERE id = ?",
+            (timer_id,),
+        ).fetchone()
+        if row is None:
+            raise ObservationTimerNotFound(timer_id)
+        cur = conn.execute(
+            "UPDATE observation_timers SET state = ?, closed_at = ?, "
+            "closed_reason = ? WHERE id = ? AND state = ?",
+            (
+                OBSERVATION_STATE_CLOSED, now, reason, timer_id,
+                OBSERVATION_STATE_OBSERVING,
+            ),
+        )
+        if cur.rowcount == 0:
+            return False
+        _append_event(
+            conn,
+            row["task_id"],
+            "observation_timer_closed",
+            {"timer_id": timer_id, "reason": reason, "closed_at": now},
+        )
+    return True
+
+
+def observation_ticks(
+    conn: sqlite3.Connection, timer_id: str
+) -> list[ObservationTick]:
+    """Every tick this timer has emitted, oldest first."""
+    timer_row = conn.execute(
+        "SELECT task_id FROM observation_timers WHERE id = ?", (timer_id,)
+    ).fetchone()
+    if timer_row is None:
+        raise ObservationTimerNotFound(timer_id)
+    rows = conn.execute(
+        "SELECT * FROM observation_ticks WHERE timer_id = ? ORDER BY seq",
+        (timer_id,),
+    ).fetchall()
+    return [
+        ObservationTick(
+            timer_id=timer_id,
+            task_id=timer_row["task_id"],
+            seq=int(r["seq"]),
+            due_at=int(r["due_at"]),
+            emitted_at=int(r["emitted_at"]),
+            missed=int(r["missed"]),
+            verdict=bool(r["verdict"]),
+            payload=json.loads(r["payload"]) if r["payload"] else None,
+        )
+        for r in rows
+    ]
 
 
 def task_graph_contexts(
@@ -10369,11 +12446,25 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
+        # Governance relations cascade with the row for the same reason the
+        # dependency links do: a relation whose endpoint no longer exists is
+        # not evidence, it is a dangling pointer that makes the linkage
+        # read-back report a link the board cannot honour.
+        conn.execute(
+            "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # Timers cascade AFTER the card row, not before it, because
+        # ``trg_obs_timer_no_delete_while_task_lives`` refuses to let a timer be
+        # deleted while its subject is still on the board. ``delete_task``
+        # already had this order; this path did not, and the trigger is what
+        # makes the difference load-bearing instead of stylistic.
+        _delete_observation_timers_for_task(conn, task_id)
         return cur.rowcount == 1
 
 
@@ -10392,10 +12483,15 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute(
+            "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_observation_timers_for_task(conn, task_id)
     recompute_ready(conn)
     return True
 
@@ -10897,6 +12993,39 @@ class DispatchResult:
 
     Empty dict when the pass found nothing to do or could not run.
     """
+    observation_ticks: list[dict] = field(default_factory=list)
+    """Recheck emissions discharged this tick by :func:`run_observation_cycle`.
+
+    Each entry is :meth:`ObservationTick.as_dict`. This is the mechanical
+    driver for the mandatory 600-second observation timer: the interval, the
+    one-time verdict and the continued observation all live in
+    ``observation_timers`` / ``observation_ticks`` and are enforced by database
+    constraints, but *something* has to look at the clock, and before this
+    pass existed nothing in the running control plane did. A timer whose only
+    driver is a prompt ("remember to re-check in ten minutes") or a held-open
+    session is the convention the 2026-09-03 ruling forbade, not a control.
+
+    Deliberately additive and observational: the pass emits an
+    ``observation_tick`` event on the card and re-arms the timer for its next
+    600 s boundary. It closes nothing, changes no task status, and cannot
+    retire a timer — see :func:`emit_observation_tick`. An empty list is the
+    steady state (no timer owed a recheck this tick), NOT a failure signal."""
+    unowned: list[str] = field(default_factory=list)
+    """Live cards :func:`resolve_task_ownership` can give no accountable owner.
+
+    Observability ONLY — nothing is reclaimed, reassigned or blocked to produce
+    it, for the reason spelled out on :attr:`TaskOwnership.governable`: every
+    pre-provenance card would fail a hard gate, so a gate here would strand the
+    board including its preserved failure evidence. The enforced boundary stays
+    :func:`require_resolvable_ownership` at the points that create new
+    obligations.
+
+    It is computed on the tick rather than left to a diagnostic command because
+    "did this card lose its owner when its session died?" must be answerable
+    from persisted state on a schedule nobody has to remember — an ownerless
+    card that only a human running an audit would ever notice is exactly the
+    silently-ownerless card the 2026-09-03 ruling forbade. Empty is the goal
+    state; non-empty is operator-actionable."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -12443,6 +14572,50 @@ def _record_task_failure(
                     f"{failures} consecutive failures and needs a human "
                     f"decision: {error[:500]}",
                 )
+                # Notifying a card that cannot run is not notification. A
+                # dependent parked in ``todo`` behind this now-dead dependency
+                # is gated by ``_parents_satisfied``, so ``recompute_ready``
+                # will never promote it, no dispatcher will ever claim it, and
+                # the event + comment above land somewhere nothing can act on.
+                # That is exactly what happened to t_db0af7e0: it took
+                # ``linked_task_gave_up`` (event 9886) while sitting in 'todo'
+                # with block_kind='dependency', and became ungovernable — Erika
+                # owned a recovery decision she had no mechanical route to make.
+                #
+                # Move it into the same governable state this function just
+                # gave the failing task itself: blocked/needs_input, which is a
+                # real human-decision bucket with ``unblock_task`` as its exit.
+                # Only cards that are genuinely parked move — a dependent that
+                # is running, in review, already terminal, claimed, or
+                # irreversibly disposed is left completely alone.
+                rel_row = conn.execute(
+                    "SELECT status, block_kind FROM tasks WHERE id = ?",
+                    (related_id,),
+                ).fetchone()
+                woken = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'needs_input' "
+                    "WHERE id = ? AND status IN ('todo', 'ready', 'blocked') "
+                    "AND claim_lock IS NULL "
+                    "AND " + _not_irreversibly_disposed_sql(),
+                    (related_id,),
+                )
+                if woken.rowcount == 1:
+                    _append_event(
+                        conn, related_id, "dependency_failure_needs_decision",
+                        {
+                            "task_id": task_id,
+                            "relation": relation,
+                            "from_status": (
+                                rel_row["status"] if rel_row else None
+                            ),
+                            "from_block_kind": (
+                                rel_row["block_kind"] if rel_row else None
+                            ),
+                            "status": "blocked",
+                            "block_kind": "needs_input",
+                        },
+                    )
             blocked = True
         else:
             # Below threshold.
@@ -13197,6 +15370,46 @@ def _dispatch_once_locked(
     except Exception:
         _log.exception(
             "kanban dispatch: execution reconciliation failed (tick continues)"
+        )
+
+    # Mandatory 600-second observation. Same pre-early-return position and the
+    # same reason as the two passes above: a saturated or memory-pressured host
+    # is exactly when an observation is worth having, so the tick that would
+    # discharge it must not be the one that gets skipped.
+    #
+    # This is the whole mechanical enforcement of the 600 s control. The
+    # durability, the exact interval, the emit-the-verdict-once rule and the
+    # keep-observing-afterwards rule are all carried by ``observation_timers``
+    # and its CHECK constraints and triggers; what they cannot do is notice
+    # that a due instant has passed. Before this pass, nothing in a running
+    # process did — ``run_observation_cycle`` existed with no production
+    # caller, which meant the timer fired only when a model or a human
+    # remembered to drive it. That is a convention, and a convention is what
+    # the ruling replaced.
+    #
+    # Arming stays an explicit governed act (:func:`arm_observation_timer`);
+    # only FIRING is automatic. The failure being closed here is an
+    # observation that stopped at its verdict or quietly vanished, not an
+    # observation that was never requested.
+    try:
+        result.observation_ticks = [
+            tick.as_dict() for tick in run_observation_cycle(conn)
+        ]
+    except Exception:
+        _log.exception(
+            "kanban dispatch: observation cycle failed (tick continues)"
+        )
+
+    # Session-independent ownership census. Reads persisted rows only — never
+    # the process table, a session registry or the environment — so the answer
+    # is identical whether the originating session is live or was destroyed an
+    # hour ago. Observational; see DispatchResult.unowned for why it is not a
+    # gate.
+    try:
+        result.unowned = unowned_tasks(conn)
+    except Exception:
+        _log.exception(
+            "kanban dispatch: ownership census failed (tick continues)"
         )
 
     # Count tasks already running so max_spawn enforces concurrency rather

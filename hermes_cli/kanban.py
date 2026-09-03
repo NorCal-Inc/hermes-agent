@@ -3480,6 +3480,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "observation_ticks": res.observation_ticks,
+            "unowned": res.unowned,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -3496,6 +3498,21 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    # Rechecks discharged by the mandatory 600 s observation timers. Printed
+    # even when zero is the steady state would be noise, so only non-empty.
+    if res.observation_ticks:
+        print(f"Rechecks:     {len(res.observation_ticks)}")
+        for t in res.observation_ticks:
+            kind = "verdict" if t.get("verdict") else "recheck"
+            missed = t.get("missed") or 0
+            late = f", missed {missed}" if missed else ""
+            print(
+                f"  - {t.get('task_id')}  {kind} #{t.get('seq')} "
+                f"(due {t.get('due_at')}{late})"
+            )
+    if res.unowned:
+        print(f"Unowned:      {len(res.unowned)}")
+        print(f"  {', '.join(res.unowned)}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
