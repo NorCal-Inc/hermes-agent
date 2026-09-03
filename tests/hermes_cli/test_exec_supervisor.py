@@ -411,6 +411,40 @@ class TestSynchronousCeiling:
             record = ex.get_execution(conn, result.execution_id)
         assert record.ownership == ex.OWNERSHIP_SUPERVISOR
 
+    def test_codex_verifier_is_supervisor_owned_below_sync_ceiling(
+        self, kanban_home, workroot, policy, monkeypatch
+    ):
+        """Verifier survival must not depend on the launching model session.
+
+        Regression for 2026-09-03: x_3caa572cb0b2367c was a durable Codex
+        verifier but was controller-owned because its 1500 s bound sat below
+        the sync ceiling. When the parent Claude run hit its cap, controller
+        loss caused reconciliation to reap the verifier as collateral.
+        ``codex.verify`` is therefore supervisor-owned from creation regardless
+        of duration.
+        """
+        monkeypatch.setitem(
+            ex.LAUNCHERS,
+            "codex.verify",
+            ex.Launcher(
+                "codex.verify", "codex",
+                lambda spec: [sys.executable, "-c", "pass"],
+            ),
+        )
+        result = ex.run_supervised(
+            command_class="codex.verify",
+            spec={"prompt": "verify"},
+            cwd=str(workroot),
+            timeout=1,
+            policy=policy,
+        )
+        assert result.succeeded
+        assert result.ownership == ex.OWNERSHIP_SUPERVISOR
+        with kb.connect_closing() as conn:
+            record = ex.get_execution(conn, result.execution_id)
+        assert record is not None
+        assert record.ownership == ex.OWNERSHIP_SUPERVISOR
+
     def test_background_launch_is_supervisor_owned_and_returns_immediately(
         self, kanban_home, workroot, policy
     ):
