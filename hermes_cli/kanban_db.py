@@ -7638,8 +7638,21 @@ _EVIDENCE_READY_PARENT_SQL = """
            AND v.kind = :verdict_kind
            AND v.state = :pending
     )
-    AND EXISTS (
-        SELECT 1 FROM task_attachments a WHERE a.task_id = p.id
+    AND (
+        EXISTS (
+            SELECT 1 FROM task_attachments a WHERE a.task_id = p.id
+        )
+        OR EXISTS (
+            SELECT 1
+              FROM task_links src_link
+              JOIN tasks src ON src.id = src_link.parent_id
+             WHERE src_link.child_id = p.id
+               AND src.status IN ('done', 'archived')
+               AND src.verification_state = :verified
+               AND EXISTS (
+                   SELECT 1 FROM task_attachments sa WHERE sa.task_id = src.id
+               )
+        )
     )
 """
 
@@ -7670,6 +7683,7 @@ _PARENT_GATE_PARAMS = {
     "verify_lane": EXECUTOR_LANE_CODEX_VERIFY,
     "pending": VERIFICATION_PENDING,
     "verdict_kind": LEDGER_KIND_VERDICT,
+    "verified": VERIFICATION_VERIFIED,
 }
 
 

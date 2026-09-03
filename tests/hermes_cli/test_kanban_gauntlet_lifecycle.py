@@ -1380,6 +1380,56 @@ class TestEvidenceReadyVerifierDependency:
             assert len(rejected) == 1
             assert rejected[0][1]["reason"] == "parents_not_done"
 
+    def test_verifier_accepts_verified_dependency_evidence(self, kanban_home):
+        """A governance synthesis may inherit falsifiable evidence from a verified dependency.
+
+        Live regression: t_db0af7e0 had a pending review verdict and a durable
+        synthesis, while its directly linked executor t_00690780 was already
+        done/verified with the evidence packet attached. Requiring a duplicate
+        attachment on the synthesis card deadlocked its codex_verify child.
+        """
+        with kb.connect_closing() as conn:
+            source = kb.create_task(
+                conn, title="verified evidence source", assignee="default",
+                gauntlet=True,
+            )
+            claimed = kb.claim_task(conn, source)
+            assert claimed is not None
+            kb.add_attachment(
+                conn, source, filename="matrix.md",
+                stored_path=f"/tmp/{source}/matrix.md", size=1234,
+                uploaded_by="claude-lane",
+            )
+            assert kb.request_review(
+                conn, source, summary="evidence complete",
+                expected_run_id=claimed.current_run_id,
+            )
+            ok, detail = kb.record_verification(
+                conn, source, passed=True, verifier="atlas",
+            )
+            assert ok is True, detail
+            assert kb.complete_task(conn, source, summary="verified") is True
+
+            parent = kb.create_task(
+                conn, title="governance synthesis", assignee="erika",
+                parents=[source], gauntlet=True,
+            )
+            kb.recompute_ready(conn)
+            synthesis = kb.claim_task(conn, parent)
+            assert synthesis is not None
+            assert kb.request_review(
+                conn, parent, summary="synthesized verified dependency evidence",
+                expected_run_id=synthesis.current_run_id,
+            )
+            assert kb.list_attachments(conn, parent) == []
+
+            verifier = self._verifier_child(conn, parent)
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "ready"
+            claimed_verifier = kb.claim_task(conn, verifier)
+            assert claimed_verifier is not None
+            assert claimed_verifier.status == "running"
+
     def test_no_evidence_packet_keeps_verifier_gated(self, kanban_home):
         """Verification-pending alone is not enough: with nothing attached
         there is nothing falsifiable for the verifier to check."""
