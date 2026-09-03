@@ -84,6 +84,12 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "gauntlet_enforced": t.gauntlet_enforced,
         "verification_state": t.verification_state,
         "regression_required": t.regression_required,
+        # How the card ended, when it ended for a reason worth naming.
+        # 'completed' = this executor did the work; 'overtaken_by_events' =
+        # the objective was satisfied elsewhere and the work was never run.
+        "terminal_disposition": t.terminal_disposition,
+        "disposition_reason": t.disposition_reason,
+        "disposition_at": t.disposition_at,
     }
 
 
@@ -996,6 +1002,56 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    # --- reconcile-overtaken ---
+    p_overtaken = sub.add_parser(
+        "reconcile-overtaken",
+        help=(
+            "Close a card whose objective was satisfied by intervening "
+            "events, without claiming it was executed"
+        ),
+        description=(
+            "Records the terminal disposition OVERTAKEN_BY_EVENTS. The card "
+            "becomes terminal (no redispatch, no longer gates dependents, out "
+            "of active-work views) while its title, body, steps, runs, "
+            "verdicts, comments, attachments, counters and event history are "
+            "left exactly as they are. No result and no completion timestamp "
+            "are written: the work was not done, and reporting must be able "
+            "to tell that apart from work that was."
+        ),
+    )
+    p_overtaken.add_argument("task_id")
+    p_overtaken.add_argument(
+        "--reason",
+        required=True,
+        help="Why the objective is already satisfied (recorded, required)",
+    )
+    p_overtaken.add_argument(
+        "--evidence",
+        required=True,
+        help=(
+            "The verified intervening event that satisfied it — commit, run, "
+            "command output, task id (recorded, required)"
+        ),
+    )
+    p_overtaken.add_argument(
+        "--superseded-by",
+        dest="superseded_by",
+        nargs="+",
+        default=None,
+        help="Task ids / commits / refs that superseded this card",
+    )
+    p_overtaken.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the reconciliation without mutating state",
+    )
+    p_overtaken.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1396,6 +1452,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "lessons":  _cmd_lessons,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "reconcile-overtaken": _cmd_reconcile_overtaken,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1461,6 +1518,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "archive",
+    "reconcile-overtaken",
     "dispatch",
     "daemon",
     "repair",
@@ -2014,6 +2072,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if task.terminal_disposition:
+        # Printed immediately under status because it qualifies it: an
+        # archived card that was overtaken reads very differently from one an
+        # operator archived as noise, and the difference must not require
+        # opening the event log.
+        print(f"  disposition: {task.terminal_disposition.upper()}")
+        if task.terminal_disposition == kb.DISPOSITION_OVERTAKEN_BY_EVENTS:
+            print("               (objective satisfied elsewhere; NOT executed)")
+        if task.disposition_reason:
+            for line in task.disposition_reason.splitlines():
+                print(f"               {line}" if line else "")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -3264,6 +3333,62 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_reconcile_overtaken(args: argparse.Namespace) -> int:
+    """Record the OVERTAKEN_BY_EVENTS terminal disposition on one card."""
+    actor = _profile_author()
+    dry_run = bool(getattr(args, "dry_run", False))
+    refs = list(getattr(args, "superseded_by", None) or [])
+    with kb.connect_closing() as conn:
+        ok, err = kb.reconcile_overtaken_by_events(
+            conn,
+            args.task_id,
+            actor=actor,
+            reason=args.reason,
+            evidence=args.evidence,
+            superseded_by=refs,
+            dry_run=dry_run,
+        )
+        task = kb.get_task(conn, args.task_id) if ok and not dry_run else None
+
+    if getattr(args, "json", False):
+        payload: dict[str, Any] = {
+            "task_id": args.task_id,
+            "reconciled": ok,
+            "dry_run": dry_run,
+            "actor": actor,
+            "reason": args.reason,
+            "evidence": args.evidence,
+            "superseded_by": refs,
+            # Stated outright rather than left to be inferred from the absence
+            # of a result: this card's steps were not performed.
+            "executed": False,
+            "error": err,
+        }
+        if task is not None:
+            payload["status"] = task.status
+            payload["terminal_disposition"] = task.terminal_disposition
+            payload["disposition_at"] = task.disposition_at
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if not ok:
+        print(
+            f"cannot reconcile {args.task_id}: {err}", file=sys.stderr,
+        )
+        return 1
+    if dry_run:
+        print(
+            f"Would reconcile {args.task_id} -> archived "
+            f"[{kb.DISPOSITION_OVERTAKEN_BY_EVENTS}] (dry)"
+        )
+        return 0
+    print(
+        f"Reconciled {args.task_id} -> archived "
+        f"[{kb.DISPOSITION_OVERTAKEN_BY_EVENTS}]; not executed, history preserved"
+    )
+    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

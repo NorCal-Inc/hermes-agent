@@ -378,6 +378,106 @@ EXECUTOR_LANE_CODEX_VERIFY = "codex_verify"
 EXECUTOR_LANE_CLAUDE_RECOVERY = "claude_recovery"
 VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_RECOVERY}
 
+# ---------------------------------------------------------------------------
+# Terminal disposition — HOW a task stopped, not just THAT it stopped
+# ---------------------------------------------------------------------------
+#
+# ``status`` says where a card sits. It does not say why the card will never
+# run again, and two very different endings collapse into the same bucket:
+#
+#   * this executor did the work and it was verified   -> 'completed'
+#   * the objective was already satisfied by verified
+#     intervening events, so the work must not be run  -> 'overtaken_by_events'
+#
+# Before this column the only ways to record the second case were to mark the
+# card ``done`` (fabricating an execution success that never happened, and
+# poisoning every "what did we complete?" report) or to leave it ``blocked``
+# forever (where hygiene sweeps, dashboards and dependency gating all keep
+# treating dead work as live). Neither is honest and neither is machine
+# readable. ``tasks.terminal_disposition`` is: a nullable, explicit, queryable
+# field that reporting can group by and that guards can test in SQL.
+#
+# Placement rules, deliberately narrow:
+#
+#   * NULL is every ordinary card, including every pre-existing row. Nothing is
+#     backfilled, so done/blocked/archived semantics are untouched for callers
+#     that never look at the column.
+#   * ``complete_task`` stamps 'completed' as part of its own guarded UPDATE,
+#     so "finished by this executor" becomes positively asserted rather than
+#     inferred from ``status='done'``.
+#   * 'overtaken_by_events' is written ONLY by
+#     :func:`reconcile_overtaken_by_events`, which refuses to touch ``result``,
+#     ``completed_at``, the body, the runs, the verdict ledger or the event
+#     history. It parks the card in ``archived`` — terminal everywhere the
+#     board already understands terminality — and records a mandatory rationale
+#     plus the evidence that satisfied the objective.
+#
+# Terminality is then enforced twice over: by the status the card lands in, and
+# by a disposition predicate on every transition that could put work back in
+# flight (claim, review-claim, promote, unblock, reopen, complete, dispatch
+# selection). The second guard is the load-bearing one — a racy or
+# hand-written UPDATE that flips status back to 'ready' still cannot get the
+# card dispatched, because the disposition survives the status change.
+DISPOSITION_COMPLETED = "completed"
+DISPOSITION_OVERTAKEN_BY_EVENTS = "overtaken_by_events"
+VALID_TERMINAL_DISPOSITIONS = {
+    DISPOSITION_COMPLETED,
+    DISPOSITION_OVERTAKEN_BY_EVENTS,
+}
+
+# ...but NOT every ending is final, and conflating the two breaks the board.
+#
+# ``done`` is deliberately reversible here: a reviewer requests changes, an
+# ancestor is reopened and invalidates its descendants, an operator re-queues a
+# card that turned out not to be finished. So 'completed' is an assertion about
+# the LAST completion, not a promise there will never be another; it is
+# re-stamped by the next completion and cleared by
+# ``invalidate_descendants_for_parent_reopen`` alongside ``completed_at``.
+# Gating re-entry on it would freeze every legitimately reopened card — caught
+# by the review-lifecycle regressions, which reopen a completed card with a
+# direct UPDATE precisely to prove the guards do not depend on callers going
+# through the Python paths.
+#
+# 'overtaken_by_events' is the opposite: the objective is satisfied, so there
+# is nothing left to redo, ever. Only dispositions listed here stop a card
+# re-entering work or satisfy a dependency on their own. The SQL predicate is
+# derived from this set rather than written out per call site, so the two can
+# never drift; the values are module constants, never caller input.
+IRREVERSIBLE_DISPOSITIONS = frozenset({DISPOSITION_OVERTAKEN_BY_EVENTS})
+
+_IRREVERSIBLE_DISPOSITION_SQL_LIST = ", ".join(
+    f"'{d}'" for d in sorted(IRREVERSIBLE_DISPOSITIONS)
+)
+
+
+def _not_irreversibly_disposed_sql(alias: str = "") -> str:
+    """SQL predicate: this row may still enter (or re-enter) work.
+
+    ``alias`` qualifies the column for queries that join ``tasks`` under a
+    name (``"p"`` for the parent-gating queries). The ``IS NULL`` arm is
+    required, not decorative: under SQL three-valued logic a bare
+    ``NOT IN`` over a NULL column evaluates to NULL, which would silently
+    drop every ordinary card from the result.
+    """
+    col = f"{alias}.terminal_disposition" if alias else "terminal_disposition"
+    return (
+        f"({col} IS NULL "
+        f"OR {col} NOT IN ({_IRREVERSIBLE_DISPOSITION_SQL_LIST}))"
+    )
+
+# Statuses a card may be reconciled as overtaken-by-events FROM.
+#
+# ``running`` is excluded because a live worker owns the row; reconciling under
+# it would race the worker's own terminal write. ``done`` is excluded because
+# it already carries a real completion — relabelling that as "satisfied
+# elsewhere" would destroy the very distinction this field exists to make.
+# ``archived`` IS included: an operator who archived a card before this feature
+# existed can still attach the honest machine-readable reason after the fact,
+# which is a pure annotation (the card is already terminal).
+RECONCILABLE_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "blocked", "review", "archived",
+}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1407,6 +1507,20 @@ class Task:
     # such a PASS. See the REGRESSION EVIDENCE comment near
     # VERIFICATION_REGRESSION.
     regression_required: bool = False
+    # How this task stopped, when it stopped for a reason worth naming:
+    # None (ordinary/live card) | 'completed' (this executor did the work) |
+    # 'overtaken_by_events' (the objective was satisfied elsewhere and the
+    # work must not be run). See VALID_TERMINAL_DISPOSITIONS.
+    terminal_disposition: Optional[str] = None
+    # Mandatory rationale + evidence recorded alongside a non-'completed'
+    # disposition. Never a substitute for ``result``: ``result`` means "this
+    # executor produced this outcome", which is exactly the claim an
+    # overtaken card must not make.
+    disposition_reason: Optional[str] = None
+    # When the disposition was recorded. Deliberately NOT ``completed_at`` —
+    # an overtaken card was never completed, and conflating the two would put
+    # fabricated completions into every time-to-complete metric.
+    disposition_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1521,6 +1635,21 @@ class Task:
                 bool(row["regression_required"])
                 if "regression_required" in keys and row["regression_required"]
                 else False
+            ),
+            terminal_disposition=(
+                row["terminal_disposition"]
+                if "terminal_disposition" in keys and row["terminal_disposition"]
+                else None
+            ),
+            disposition_reason=(
+                row["disposition_reason"]
+                if "disposition_reason" in keys and row["disposition_reason"]
+                else None
+            ),
+            disposition_at=(
+                int(row["disposition_at"])
+                if "disposition_at" in keys and row["disposition_at"] is not None
+                else None
             ),
         )
 
@@ -1743,7 +1872,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- in the same UPDATE ... WHERE as verification_state, so a repaired card
     -- with no regression evidence cannot reach 'done' even when every Python
     -- pre-check is bypassed.
-    regression_required  INTEGER NOT NULL DEFAULT 0
+    regression_required  INTEGER NOT NULL DEFAULT 0,
+    -- Terminal disposition: NULL for every ordinary/live card,
+    -- 'completed' when THIS executor did the work (stamped by
+    -- complete_task's own guarded UPDATE), 'overtaken_by_events' when the
+    -- objective was satisfied by verified intervening events and the work
+    -- must never run. Non-NULL is tested directly in the WHERE clause of
+    -- every transition that could put the card back in flight, so
+    -- terminality survives a status change made by a racing or
+    -- hand-written writer. See VALID_TERMINAL_DISPOSITIONS.
+    terminal_disposition TEXT,
+    -- Mandatory rationale + evidence for a non-'completed' disposition.
+    -- Kept separate from ``result`` on purpose: ``result`` asserts this
+    -- executor produced the outcome, which an overtaken card must not claim.
+    disposition_reason   TEXT,
+    -- When the disposition was recorded. Deliberately not ``completed_at``:
+    -- an overtaken card was never completed and must not enter
+    -- time-to-complete metrics as if it had been.
+    disposition_at       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3238,6 +3384,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "regression_required INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "terminal_disposition" not in cols:
+        # NULL on every legacy row, and nothing is backfilled. In particular
+        # existing ``done`` cards are NOT retro-stamped 'completed': the
+        # column asserts a fact about how a card ended, and inventing that
+        # fact for history nobody observed is the same class of fabrication
+        # this feature exists to prevent. Cards completed after the migration
+        # get the stamp from ``complete_task``; older ones stay NULL and are
+        # simply reported as "disposition not recorded".
+        _add_column_if_missing(
+            conn, "tasks", "terminal_disposition", "terminal_disposition TEXT"
+        )
+
+    if "disposition_reason" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "disposition_reason", "disposition_reason TEXT"
+        )
+
+    if "disposition_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "disposition_at", "disposition_at INTEGER"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3251,6 +3419,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    # Reporting groups by disposition ("what did we actually complete vs what
+    # was overtaken?") and the dispatch guards filter on IS NULL, so both
+    # shapes want the index. Partial would be cheaper for the guard but
+    # useless for the report; a plain index serves both.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_disposition "
+        "ON tasks(terminal_disposition)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -4352,7 +4528,12 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    terminal_disposition: Optional[str] = None,
 ) -> list[Task]:
+    """List tasks. ``terminal_disposition`` filters on how cards ended (one of
+    :data:`VALID_TERMINAL_DISPOSITIONS`); pass it with ``include_archived=True``
+    to report on overtaken cards, which are archived by construction.
+    """
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
@@ -4375,6 +4556,14 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
+    if terminal_disposition is not None:
+        if terminal_disposition not in VALID_TERMINAL_DISPOSITIONS:
+            raise ValueError(
+                "terminal_disposition must be one of "
+                f"{sorted(VALID_TERMINAL_DISPOSITIONS)}"
+            )
+        query += " AND terminal_disposition = ?"
+        params.append(terminal_disposition)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if order_by is not None:
@@ -5266,7 +5455,11 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            # An irreversibly disposed card is terminal; auto-promotion must
+            # never pull it back into the ready column, whatever its status
+            # says.
+            f"AND {_not_irreversibly_disposed_sql()}"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -5372,12 +5565,25 @@ _EVIDENCE_READY_PARENT_SQL = """
     )
 """
 
+# A parent carrying an IRREVERSIBLE disposition is satisfied regardless of the
+# status column. In practice the two agree — reconciliation parks the card in
+# ``archived``, which was already terminal here — but stating it explicitly is
+# what makes the guarantee "this card is terminal for dependency resolution"
+# a property of the disposition rather than a side effect of where it happened
+# to land. A child must never wait forever on a parent whose objective is
+# already satisfied.
+#
+# Only irreversible dispositions count, which is exactly why the distinction
+# exists: a 'completed' parent that was reopened is back to gating its
+# children, and reading 'completed' as permanent satisfaction here would let a
+# child run against a parent whose work is being redone.
 _UNSATISFIED_PARENTS_SQL = f"""
     SELECT 1
       FROM task_links l
       JOIN tasks p ON p.id = l.parent_id
      WHERE l.child_id = :child
        AND p.status NOT IN ('done', 'archived')
+       AND {_not_irreversibly_disposed_sql("p")}
        AND NOT COALESCE(({_EVIDENCE_READY_PARENT_SQL}), 0)
      LIMIT 1
 """
@@ -5475,6 +5681,14 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               -- Redispatch guard. A card whose objective was satisfied
+               -- elsewhere has nothing left to do, ever. Testing it HERE
+               -- (not only in the dispatcher's SELECT) is what makes the
+               -- guarantee mechanical: even if some other writer flips
+               -- status back to 'ready', the claim still cannot succeed.
+               -- 'completed' is deliberately NOT a bar — done is reversible
+               -- and a reopened card must be runnable again.
+               AND """ + _not_irreversibly_disposed_sql() + """
             """,
             (lock, expires, now, task_id),
         )
@@ -5578,6 +5792,8 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               -- Redispatch guard; see the same predicate in claim_task.
+               AND """ + _not_irreversibly_disposed_sql() + """
             """,
             (lock, expires, now, task_id),
         )
@@ -6842,7 +7058,13 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       -- Positively assert "this executor did the work",
+                       -- instead of leaving reporting to infer it from
+                       -- status='done'. This is the other half of the
+                       -- distinction 'overtaken_by_events' draws.
+                       terminal_disposition = ?,
+                       disposition_at = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    -- Gauntlet: EXECUTING -> COMPLETED is unreachable unless a
@@ -6852,8 +7074,13 @@ def complete_task(
                    -- clears regression_required).
                    AND (? = 0 OR (verification_state = 'verified'
                                   AND regression_required = 0))
+                   -- A card whose objective was satisfied elsewhere can
+                   -- never be completed as if this executor had done it.
+                   -- Re-completing a reopened 'completed' card is fine and
+                   -- just re-stamps the disposition.
+                   AND """ + _not_irreversibly_disposed_sql() + """
                 """,
-                (result, now, task_id, verified_guard),
+                (result, now, DISPOSITION_COMPLETED, now, task_id, verified_guard),
             )
         else:
             cur = conn.execute(
@@ -6866,15 +7093,22 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       -- See the no-CAS branch above.
+                       terminal_disposition = ?,
+                       disposition_at = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                    -- Gauntlet: see the no-CAS branch above.
                    AND (? = 0 OR (verification_state = 'verified'
                                   AND regression_required = 0))
+                   AND """ + _not_irreversibly_disposed_sql() + """
                 """,
-                (result, now, task_id, int(expected_run_id), verified_guard),
+                (
+                    result, now, DISPOSITION_COMPLETED, now,
+                    task_id, int(expected_run_id), verified_guard,
+                ),
             )
         if cur.rowcount != 1:
             return False
@@ -9070,10 +9304,23 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, terminal_disposition FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+
+    # Checked before the status check so the operator gets the real reason
+    # ("this card is terminal") rather than the generic status complaint.
+    # ``--force`` deliberately does NOT override it: force exists to bypass
+    # dependency gating, not to un-terminate a card whose objective is
+    # already satisfied. Only IRREVERSIBLE dispositions bar promotion — a
+    # reopened 'completed' card is ordinary work again.
+    if row["terminal_disposition"] in IRREVERSIBLE_DISPOSITIONS:
+        return False, (
+            f"task {task_id} is terminal "
+            f"(disposition {row['terminal_disposition']!r}); it cannot be "
+            f"promoted back into the queue"
+        )
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -9084,14 +9331,18 @@ def promote_task(
 
     if not force:
         parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
+            "SELECT t.id, t.status, t.terminal_disposition FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
+            # Same terminality rule as _parents_satisfied: an irreversibly
+            # disposed parent is done blocking anything, whatever its status
+            # column says.
             if p["status"] not in ("done", "archived")
+            and p["terminal_disposition"] not in IRREVERSIBLE_DISPOSITIONS
         ]
         if unsatisfied:
             return False, (
@@ -9163,7 +9414,11 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.status NOT IN ('done', 'archived') "
+        # Same terminality rule as _UNSATISFIED_PARENTS_SQL: an irreversibly
+        # disposed parent never runs again, so it can never stop being
+        # satisfied.
+        f"AND {_not_irreversibly_disposed_sql('p')} LIMIT 1",
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
@@ -9279,7 +9534,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled') "
+            # An irreversible disposition survives an unblock attempt: a card
+            # whose objective was satisfied elsewhere must not be resumable by
+            # the ordinary blocked-card recovery path (or by a cron running
+            # it).
+            f"AND {_not_irreversibly_disposed_sql()}",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -9346,7 +9606,10 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
             + assignee_sql
-            + " WHERE id = ? AND status = 'review'",
+            # An irreversible disposition survives a review reopen too — same
+            # reason as unblock_task.
+            + " WHERE id = ? AND status = 'review' AND "
+            + _not_irreversibly_disposed_sql(),
             params,
         )
         if cur.rowcount != 1:
@@ -9469,11 +9732,29 @@ def invalidate_descendants_for_parent_reopen(
                 )
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
+            #
+            # The disposition is cleared here for exactly the same reason
+            # ``completed_at`` is: this row is being un-completed, so the
+            # assertion "this executor finished it" stops being true and must
+            # not be left sitting on a card that is going back out for rework.
+            # (It is not load-bearing for redispatch — 'completed' is a
+            # reversible ending, see IRREVERSIBLE_DISPOSITIONS — but a stale
+            # completion stamp would still misreport in the disposition
+            # counts.) The clear is scoped to 'completed': an
+            # 'overtaken_by_events' card is never revived by an ancestor
+            # reopen (its status is 'archived', which this loop skips), and
+            # scoping it here means even a future caller that widened the
+            # status filter could not resurrect one by accident.
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
-                (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0, "
+                "terminal_disposition = CASE WHEN terminal_disposition = ? "
+                "                            THEN NULL ELSE terminal_disposition END, "
+                "disposition_at = CASE WHEN terminal_disposition = ? "
+                "                      THEN NULL ELSE disposition_at END "
+                "WHERE id = ?",
+                (DISPOSITION_COMPLETED, DISPOSITION_COMPLETED, row["id"]),
             )
             _append_event(
                 conn,
@@ -9886,6 +10167,188 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def reconcile_overtaken_by_events(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+    evidence: str,
+    superseded_by: Optional[Iterable[str]] = None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str]]:
+    """Close a card whose objective was satisfied by intervening events.
+
+    The sanctioned path from "this card is safely blocked forever because the
+    world moved on" to a real terminal state, WITHOUT claiming an execution
+    that never happened. Returns ``(True, None)`` on success and
+    ``(False, refusal_reason)`` when refused — the same shape as
+    :func:`promote_task`, so CLI and API callers handle both alike.
+
+    What it writes (all of it additive):
+
+    * ``status = 'archived'`` — terminal in every place the board already
+      understands terminality: dependency gating, the dispatcher's ready and
+      review queries, ``board_stats``, ``list_tasks``' default filter, the
+      assignee workload counts and the hygiene sweep's
+      ``blocked/ready/todo/triage`` candidate scan.
+    * ``terminal_disposition = 'overtaken_by_events'`` — the machine-readable
+      fact, and the fail-closed half of the redispatch guard. Status alone
+      would let a racing writer flip the card back into a runnable column;
+      the disposition is tested in the WHERE clause of ``claim_task``,
+      ``claim_review_task``, ``unblock_task``, ``reopen_review_task``,
+      ``complete_task``, ``promote_task`` and ``check_respawn_guard``, so it
+      survives that.
+    * ``disposition_reason`` / ``disposition_at`` — the mandatory rationale
+      plus evidence, and when it was recorded.
+    * one ``reconciled_overtaken_by_events`` audit event carrying
+      ``executed: false``, and one comment saying the same in prose.
+
+    What it deliberately does NOT write, because each would be a fabrication
+    or a loss:
+
+    * ``title`` / ``body`` — the original contract, including every step that
+      is now historically obsolete, stays visible and unedited. Obsolete steps
+      are never marked executed; the disposition explains why they were not
+      run, which is a different and honest claim.
+    * ``result`` and ``completed_at`` — both mean "this executor produced this
+      outcome at this time". Neither is true here, and writing them would put
+      a phantom completion into every report and time-to-complete metric.
+    * ``consecutive_failures``, ``block_recurrences``, ``block_kind``,
+      ``verification_state``, ``regression_required``, ``gauntlet_enforced`` —
+      counters and verification state are history, not bookkeeping to tidy.
+    * runs, verdict-ledger rows, comments, attachments, dependency links and
+      prior events — untouched. An in-flight run (only reachable from a status
+      this function accepts if a previous transition leaked the pointer) is
+      closed as ``reclaimed``, never ``completed``.
+
+    The workspace is intentionally left on disk: unlike a completion, nobody
+    has finished with it, and it may hold the investigation that produced the
+    evidence. ``hermes kanban gc`` reaps archived-task workspaces on its own
+    schedule.
+
+    ``reason`` and ``evidence`` are both required and must be non-empty. The
+    whole point of the disposition is that it is justified; an unexplained one
+    would be indistinguishable from quietly deleting inconvenient work.
+    """
+    who = (actor or "").strip()
+    why = (reason or "").strip()
+    proof = (evidence or "").strip()
+    if not who:
+        return False, "actor is required"
+    if not why:
+        return False, "reason is required (why the objective is already satisfied)"
+    if not proof:
+        return False, (
+            "evidence is required (what verified intervening event satisfied it)"
+        )
+    refs = [str(r).strip() for r in (superseded_by or []) if str(r).strip()]
+
+    row = conn.execute(
+        "SELECT status, terminal_disposition FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if row["terminal_disposition"] in IRREVERSIBLE_DISPOSITIONS:
+        return False, (
+            f"task {task_id} already has terminal disposition "
+            f"{row['terminal_disposition']!r}"
+        )
+    # A stale 'completed' stamp is NOT a bar. It means the card was completed
+    # once and then reopened; if the world moved on while it sat reopened,
+    # overtaken-by-events is the honest ending and the stamp is overwritten.
+    # The ``done`` status check below is what protects a live completion.
+    prior_status = row["status"]
+    if prior_status not in RECONCILABLE_STATUSES:
+        # 'running' and 'done' are the two exclusions; spell out which one so
+        # the operator knows whether to stop a worker or leave the card alone.
+        detail = (
+            "stop or reclaim the worker first"
+            if prior_status == "running"
+            else "it already records a real completion by this executor"
+        )
+        return False, (
+            f"task {task_id} is {prior_status!r} and cannot be reconciled as "
+            f"overtaken by events: {detail}"
+        )
+    if dry_run:
+        return True, None
+
+    now = int(time.time())
+    payload: dict[str, Any] = {
+        "actor": who,
+        "reason": why,
+        "evidence": proof,
+        "prior_status": prior_status,
+        "disposition": DISPOSITION_OVERTAKEN_BY_EVENTS,
+        # Read by anything summarising the card. States the negative claim
+        # outright so no consumer has to infer it from the absence of a
+        # result: the card's steps were NOT performed.
+        "executed": False,
+    }
+    if refs:
+        payload["superseded_by"] = refs
+
+    with write_txn(conn):
+        # Never 'completed'. If a run pointer leaked from an earlier
+        # transition, close it as reclaimed so the runs invariant holds
+        # without inventing an attempt that succeeded.
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary="task reconciled as overtaken by events (not executed)",
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status               = 'archived',
+                   terminal_disposition = ?,
+                   disposition_reason   = ?,
+                   disposition_at       = ?,
+                   claim_lock           = NULL,
+                   claim_expires        = NULL,
+                   worker_pid           = NULL
+             WHERE id = ?
+               AND status = ?
+               AND """ + _not_irreversibly_disposed_sql() + """
+            """,
+            (
+                DISPOSITION_OVERTAKEN_BY_EVENTS,
+                f"{why}\n\nEvidence: {proof}"
+                + (f"\nSuperseded by: {', '.join(refs)}" if refs else ""),
+                now,
+                task_id,
+                prior_status,
+            ),
+        )
+        if cur.rowcount != 1:
+            # Status moved under us between the read and the write.
+            return False, f"task {task_id} changed state during reconciliation"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                who,
+                "OVERTAKEN_BY_EVENTS — closed without execution. The steps in "
+                "this card were NOT performed; its objective was satisfied by "
+                f"intervening events.\n\nReason: {why}\n\nEvidence: {proof}"
+                + (f"\n\nSuperseded by: {', '.join(refs)}" if refs else ""),
+                now,
+            ),
+        )
+        _append_event(
+            conn, task_id, "reconciled_overtaken_by_events", payload,
+            run_id=run_id,
+        )
+    # A disposed parent no longer gates its children — promote anything this
+    # just freed instead of waiting for the next dispatcher tick, exactly as
+    # archive_task does.
+    recompute_ready(conn)
+    return True, None
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -12143,11 +12606,23 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, terminal_disposition FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
+
+    # 0. Irreversible terminal disposition. Checked first: retry logic must
+    #    never re-spawn a card whose objective is already satisfied, and
+    #    unlike every other reason below this one never clears with time.
+    #    Named distinctly so a dispatcher log reads "terminal_disposition",
+    #    not a misleading "recent_success" — which in the overtaken case
+    #    would be a fabricated success claim. 'completed' is not a guard
+    #    reason here: ``recent_success`` already covers the "we just finished
+    #    this" case, and it has the deliberate re-queue bypass that a
+    #    reopened card needs.
+    if row["terminal_disposition"] in IRREVERSIBLE_DISPOSITIONS:
+        return "terminal_disposition"
 
     now = int(time.time())
 
@@ -12253,6 +12728,10 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
+        # Mirrors the dispatcher's own ready query. Without this a disposed
+        # card would make the health check report "real spawnable work is
+        # waiting" for work the dispatcher will correctly never spawn.
+        f"    AND {_not_irreversibly_disposed_sql()}"
     ).fetchall()
     if not rows:
         return False
@@ -12279,6 +12758,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
+        f"    AND {_not_irreversibly_disposed_sql()}"
     ).fetchall()
     if not rows:
         return False
@@ -12784,6 +13264,11 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee, executor_lane FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        # Irreversible disposition = never dispatch again. claim_task
+        # enforces this too; filtering here as well keeps a disposed card out
+        # of the spawn budget accounting instead of burning a slot on a claim
+        # that is guaranteed to fail.
+        f"AND {_not_irreversibly_disposed_sql()} "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -12793,6 +13278,7 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
+            f"AND {_not_irreversibly_disposed_sql()} "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
@@ -14232,6 +14718,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
+
+    ``by_terminal_disposition`` is the reporting half of the terminal
+    disposition contract: it counts the WHOLE board, archived rows included,
+    so "how many cards did we actually complete?" and "how many were closed
+    because the world moved on?" are two different, separately readable
+    numbers instead of one undifferentiated pile. ``by_status`` and
+    ``by_assignee`` still exclude archived rows exactly as before, so an
+    overtaken card leaves the active-work view entirely — which is the point.
     """
     by_status: dict[str, int] = {}
     for row in conn.execute(
@@ -14257,9 +14751,18 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    by_disposition: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT terminal_disposition AS d, COUNT(*) AS n FROM tasks "
+        "WHERE terminal_disposition IS NOT NULL "
+        "GROUP BY terminal_disposition"
+    ):
+        by_disposition[row["d"]] = int(row["n"])
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
+        "by_terminal_disposition": by_disposition,
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
     }

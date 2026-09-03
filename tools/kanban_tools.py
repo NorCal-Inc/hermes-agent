@@ -549,6 +549,14 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    # How the card ended. 'completed' = this executor did the
+                    # work; 'overtaken_by_events' = the objective was
+                    # satisfied elsewhere and the steps were never run. An
+                    # agent reading a card must be able to tell those apart
+                    # without inferring it from a NULL result.
+                    "terminal_disposition": t.terminal_disposition,
+                    "disposition_reason": t.disposition_reason,
+                    "disposition_at": t.disposition_at,
                 }
 
             def _run_dict(r):
