@@ -15987,9 +15987,20 @@ def _dispatch_once_locked(
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
             return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+        for row in review_rows:
+            assignee = row["assignee"]
+            if not assignee or not _rpe(assignee):
+                continue
+            # A reviewer identity already refused for this verification phase
+            # cannot consume the reserved review slot. The claim path would
+            # deterministically reject it, so reserving capacity for it starves
+            # genuinely runnable READY work (observed live on t_30e58898 while
+            # default self-review cards sat in REVIEW).
+            candidate = _canonical_assignee(assignee)
+            if candidate in _self_review_refused_implementers(conn, row["id"]):
+                continue
+            return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():

@@ -290,6 +290,42 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     assert len(res.spawned) == 2
 
 
+def test_self_review_refusal_releases_reserved_slot(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A deterministically refused review must not starve runnable READY work.
+
+    Live regression: with one effective spawn slot, a REVIEW card assigned to
+    ``default`` had already recorded a self-review refusal. The reservation
+    logic still treated it as spawnable, reduced ready_budget to zero, then the
+    review claim correctly refused it. Result: zero workers spawned while the
+    independent codex verifier remained READY.
+    """
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawns: list = []
+    with kb.connect() as conn:
+        ready_id = kb.create_task(conn, title="independent verifier", assignee="alice")
+        review_id = _park_in_review(conn, "refused-self-review", "default")
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, review_id, "verification_blocked_self_review",
+                {"verifier": "default", "implementer": "default"},
+            )
+
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
+        )
+
+    spawned_ids = [s[0] for s in res.spawned]
+    assert spawned_ids == [ready_id]
+    assert review_id not in spawned_ids
+
+
 def test_review_budget_still_bounded_by_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
