@@ -1579,8 +1579,24 @@ class TestSelfReviewBlockedImplementationHandoff:
         self, kanban_home,
     ):
         with kb.connect_closing() as conn:
-            parent = self._blocked_parent(conn)
+            parent = kb.create_task(
+                conn, title="governed decision", assignee="default", gauntlet=True,
+            )
+            run = kb.claim_task(conn, parent)
             implementation, _ = self._governed_chain(conn, parent)
+            kb.add_attachment(
+                conn, parent, filename="DECISION-EVIDENCE.md",
+                stored_path=f"/tmp/{parent}/DECISION-EVIDENCE.md", size=128,
+            )
+            assert kb.request_review(
+                conn, parent, summary="decision ready for independent review",
+                reviewer="default", expected_run_id=run.current_run_id,
+            )
+            ok, detail = kb.record_verification(
+                conn, parent, passed=True, verifier="default",
+            )
+            assert ok is False
+            assert "matches the implementer" in detail
             assert kb.get_task(conn, implementation).status == "todo"
             assert kb.recompute_ready(conn) >= 1
             assert kb.get_task(conn, implementation).status == "ready"
@@ -1602,10 +1618,10 @@ class TestSelfReviewBlockedImplementationHandoff:
                 conn, parent, filename="DECISION-EVIDENCE.md",
                 stored_path=f"/tmp/{parent}/DECISION-EVIDENCE.md", size=128,
             )
-            assert kb.request_review(
-                conn, parent, summary="decision ready for independent review",
-                reviewer="default", expected_run_id=implementation_run,
-            )
+            implementation, verifier = self._governed_chain(conn, parent)
+            assert kb.request_review(conn, parent,
+                summary="decision ready for independent review", reviewer="default",
+                expected_run_id=implementation_run)
 
             review_task = kb.claim_review_task(conn, parent, claimer="same-identity")
             assert review_task is not None
@@ -1623,7 +1639,6 @@ class TestSelfReviewBlockedImplementationHandoff:
             ).fetchone()
             assert blocker["run_id"] == review_run
 
-            implementation, verifier = self._governed_chain(conn, parent)
             assert kb.recompute_ready(conn) == 1
             assert kb.get_task(conn, implementation).status == "ready"
             assert kb.get_task(conn, verifier).status == "todo"
@@ -1647,12 +1662,82 @@ class TestSelfReviewBlockedImplementationHandoff:
             assert kb.get_task(conn, ordinary).status == "todo"
             assert kb.get_task(conn, unverified_implementation).status == "todo"
 
+    def test_topology_created_after_self_review_denial_remains_blocked(
+        self, kanban_home,
+    ):
+        """A denial cannot retroactively authorize a newly constructed graph."""
+        with kb.connect_closing() as conn:
+            parent = self._blocked_parent(conn)
+            implementation, verifier = self._governed_chain(conn, parent)
+
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, implementation).status == "todo"
+            assert kb.get_task(conn, verifier).status == "todo"
+            assert kb.claim_task(conn, implementation) is None
+
+    def test_stale_self_review_denial_cannot_authorize_later_pending_phase(
+        self, kanban_home,
+    ):
+        """A phase-one denial is not spendable by phase two's handoff."""
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(
+                conn, title="governed decision", assignee="default", gauntlet=True,
+            )
+            first_run = kb.claim_task(conn, parent).current_run_id
+            implementation, verifier = self._governed_chain(conn, parent)
+            kb.add_attachment(
+                conn, parent, filename="DECISION-EVIDENCE.md",
+                stored_path=f"/tmp/{parent}/DECISION-EVIDENCE.md", size=128,
+            )
+            assert kb.request_review(
+                conn, parent, summary="phase one", reviewer="default",
+                expected_run_id=first_run,
+            )
+            ok, detail = kb.record_verification(
+                conn, parent, passed=True, verifier="default",
+            )
+            assert ok is False
+            assert "matches the implementer" in detail
+
+            review = kb.claim_review_task(conn, parent, claimer="rework-router")
+            assert review is not None
+            changed, _ = kb.request_changes(
+                conn, parent, reason="start a later implementation phase",
+                expected_run_id=review.current_run_id,
+            )
+            assert changed is True
+            second_run = kb.claim_task(conn, parent).current_run_id
+            assert kb.request_review(
+                conn, parent, summary="phase two", reviewer="default",
+                expected_run_id=second_run,
+            )
+
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, implementation).status == "todo"
+            assert kb.get_task(conn, verifier).status == "todo"
+            assert kb.claim_task(conn, implementation) is None
+
     def test_codex_verifier_waits_for_implementation_evidence_handoff(
         self, kanban_home,
     ):
         with kb.connect_closing() as conn:
-            parent = self._blocked_parent(conn)
+            parent = kb.create_task(
+                conn, title="governed decision", assignee="default", gauntlet=True,
+            )
+            parent_run = kb.claim_task(conn, parent).current_run_id
             implementation, verifier = self._governed_chain(conn, parent)
+            kb.add_attachment(
+                conn, parent, filename="DECISION-EVIDENCE.md",
+                stored_path=f"/tmp/{parent}/DECISION-EVIDENCE.md", size=128,
+            )
+            assert kb.request_review(
+                conn, parent, summary="decision ready for independent review",
+                reviewer="default", expected_run_id=parent_run,
+            )
+            ok, _ = kb.record_verification(
+                conn, parent, passed=True, verifier="default",
+            )
+            assert ok is False
             kb.recompute_ready(conn)
             run = kb.claim_task(conn, implementation)
             assert run is not None

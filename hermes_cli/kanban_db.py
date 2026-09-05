@@ -5579,10 +5579,31 @@ _GOVERNED_IMPLEMENTATION_HANDOFF_SQL = """
          WHERE pv.task_id = p.id
            AND pv.kind = :verdict_kind
            AND pv.state = :pending
+           -- Only the ledger head can describe the materialised pending
+           -- phase.  Older pending rows are audit history, not reusable
+           -- authority for a later handoff.
+           AND pv.id = (
+               SELECT MAX(head.id) FROM task_verifications head
+                WHERE head.task_id = p.id
+                  AND head.kind = :verdict_kind
+           )
            AND EXISTS (
-               SELECT 1 FROM task_events blocked
-                WHERE blocked.task_id = p.id
+               SELECT 1
+                 FROM task_events requested
+                 JOIN task_events blocked ON blocked.task_id = requested.task_id
+                WHERE requested.task_id = p.id
+                  AND requested.kind = 'review_requested'
+                  AND requested.run_id = pv.run_id
+                  -- Bind the ledger phase to its exact/latest durable
+                  -- handoff, rather than merely another event for the same
+                  -- implementation run.
+                  AND requested.id = (
+                      SELECT MAX(latest.id) FROM task_events latest
+                       WHERE latest.task_id = p.id
+                         AND latest.kind = 'review_requested'
+                  )
                   AND blocked.kind = 'verification_blocked_self_review'
+                  AND requested.id < blocked.id
                   AND (
                       -- Parked ``record_verification`` refusals are anchored
                       -- directly to the implementation run that opened pv.
@@ -5593,14 +5614,9 @@ _GOVERNED_IMPLEMENTATION_HANDOFF_SQL = """
                           -- run back to this exact implementation handoff by
                           -- the ordered, durable event chain rather than by
                           -- identity or current task state.
-                          SELECT 1
-                            FROM task_events requested
-                            JOIN task_events claimed
-                              ON claimed.task_id = requested.task_id
+                          SELECT 1 FROM task_events claimed
+                           WHERE claimed.task_id = requested.task_id
                              AND claimed.run_id = blocked.run_id
-                           WHERE requested.task_id = p.id
-                             AND requested.kind = 'review_requested'
-                             AND requested.run_id = pv.run_id
                              AND claimed.kind = 'claimed'
                              AND json_valid(claimed.payload)
                              AND json_extract(
@@ -5623,6 +5639,11 @@ _GOVERNED_IMPLEMENTATION_HANDOFF_SQL = """
                SELECT 1 FROM json_each(created.payload, '$.parents') ep
                 WHERE ep.value = p.id
            )
+           AND created.id < (
+               SELECT MAX(requested.id) FROM task_events requested
+                WHERE requested.task_id = p.id
+                  AND requested.kind = 'review_requested'
+           )
     )
     AND EXISTS (
         SELECT 1
@@ -5640,6 +5661,11 @@ _GOVERNED_IMPLEMENTATION_HANDOFF_SQL = """
                   AND EXISTS (
                       SELECT 1 FROM json_each(vc.payload, '$.parents') vp
                        WHERE vp.value = :child
+                  )
+                  AND vc.id < (
+                      SELECT MAX(requested.id) FROM task_events requested
+                       WHERE requested.task_id = p.id
+                         AND requested.kind = 'review_requested'
                   )
            )
     )
