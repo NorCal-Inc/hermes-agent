@@ -5621,25 +5621,19 @@ class TurnRunner:
             # NorCal shared boot: Erika/Hermes and Claude consume the same live
             # doctrine/vault starting line while retaining separate role files.
             # Fail closed in prompt space rather than taking the gateway down.
-            try:
-                _shared_boot_proc = subprocess.run(
-                    ["/home/chris/.local/bin/hermes-shared-boot-context"],
-                    capture_output=True, text=True, timeout=45, check=False,
-                )
-                _shared_boot_prompt = (_shared_boot_proc.stdout or _shared_boot_proc.stderr or "").strip()
-                if _shared_boot_proc.returncode != 0 or not _shared_boot_prompt:
-                    _shared_boot_prompt = (
-                        "<shared-boot-state>\n"
-                        "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
-                        f"Shared boot generator failed rc={_shared_boot_proc.returncode}.\n"
-                        "</shared-boot-state>"
-                    )
-            except Exception as _shared_boot_exc:
-                _shared_boot_prompt = (
-                    "<shared-boot-state>\n"
-                    "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
-                    f"Shared boot generator exception: {_shared_boot_exc}\n"
-                    "</shared-boot-state>"
+            # One shared chokepoint (hermes_cli.norcal_boot) runs the canonical
+            # generator for this fresh session and evaluates the gate with the
+            # same exact-line parser the Claude/Codex entry points use. A zero
+            # exit code alone is NOT a passed gate: the generator exits 0 on a
+            # degraded boot unless invoked with --gate-exit-code.
+            from hermes_cli.norcal_boot import build_session_boot_prompt
+
+            _shared_boot = build_session_boot_prompt()
+            _shared_boot_prompt = _shared_boot.prompt
+            if not _shared_boot.complete:
+                logger.error(
+                    "Fresh session %s created under a DEGRADED shared boot gate: %s",
+                    ctx.session_key, _shared_boot.failure,
                 )
             # Default-profile Erika needs the same canonical runtime contract
             # as local interactive CLI. It lives under ~/.hermes, outside normal

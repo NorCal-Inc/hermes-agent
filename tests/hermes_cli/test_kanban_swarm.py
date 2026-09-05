@@ -9,6 +9,15 @@ from hermes_cli.kanban_swarm import (
 )
 
 
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities below ("worker", "alice", "reviewer") are synthetic and are not
+# profile directories on disk, so this module declares the registry-patching
+# fixture that already exists for exactly that reason. The gate itself is
+# pinned in test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
+
+
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:

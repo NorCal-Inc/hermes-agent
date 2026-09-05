@@ -312,7 +312,68 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     # something really happened to the card.
     "execution_refused",
     "execution_reconcile_failed",
+    # Supervisory alarm bookkeeping. Every one of these is written BY the
+    # watchdogs that read this clock, so counting them as progress would make
+    # each alarm silence its own successor: the card would look freshly touched
+    # for exactly as long as nobody was touching it. ``observation_timer_armed``
+    # and ``observation_tick`` are here for the same reason — arming the
+    # 300-second recheck that watches a stalled card must not reset the
+    # staleness the recheck exists to watch.
+    "NO_LIFECYCLE_PROGRESS",
+    "ORPHAN_VERIFIER_RESULT",
+    "supervisory_alarm_routed",
+    "supervisory_alarm_undeliverable",
+    "lifecycle_stall_cleared",
+    "observation_timer_armed",
+    "observation_tick",
 )
+
+# ---------------------------------------------------------------------------
+# Supervisory alarm vocabulary (orphan verifiers, lifecycle stalls)
+# ---------------------------------------------------------------------------
+#
+# Both watchdogs added with these names answer the question the Gauntlet could
+# not answer on 2026-09-03: "who is told when the chain stops moving on its
+# own?" Before them, ``detect_stale_gauntlet_work`` wrote an audit event nobody
+# was subscribed to, and a ``codex_verify`` card with no subject wrote its
+# verdict into a card nobody would ever read again. Seven of the fourteen
+# verifier cards on the live board are that second shape.
+#
+# The two contract events are SHOUTED because they are the machine-readable
+# names the governance contract names directly; everything else this module
+# emits is lower_snake bookkeeping.
+ORPHAN_VERIFIER_RESULT_EVENT = "ORPHAN_VERIFIER_RESULT"
+NO_LIFECYCLE_PROGRESS_EVENT = "NO_LIFECYCLE_PROGRESS"
+SUPERVISORY_ALARM_ROUTED_EVENT = "supervisory_alarm_routed"
+SUPERVISORY_ALARM_UNDELIVERABLE_EVENT = "supervisory_alarm_undeliverable"
+LIFECYCLE_STALL_CLEARED_EVENT = "lifecycle_stall_cleared"
+
+#: ``observation_timers.kind`` used for the 10-minute stall recheck. Distinct
+#: from a governed ``recheck`` timer so closing one never closes the other, and
+#: so the (task_id, kind) uniqueness index keeps exactly one per card.
+LIFECYCLE_STALL_TIMER_KIND = "lifecycle_stall_recheck"
+
+#: ``observation_timers.kind`` for the 10-minute recheck that paces the
+#: UNROUTABLE alarm. Distinct from :data:`LIFECYCLE_STALL_TIMER_KIND` for the
+#: same reason that one is distinct from a governed ``recheck``: retiring one
+#: observation must never retire another, and the ``(task_id, kind)``
+#: uniqueness index keeps exactly one of each per card.
+#:
+#: This timer exists because the alarm it paces is raised from
+#: :func:`_ensure_independent_verifier_child`, which the dispatcher calls on
+#: EVERY tick for a card parked in review — not from a sweep carrying its own
+#: episode de-duplication the way :func:`sweep_lifecycle_stall_alarms` is.
+#: Without a durable clock of its own, that call site re-alarms once per tick,
+#: forever. Observed live 2026-09-04: three subjects x 3 events/min routed to
+#: Erika's Telegram from 06:55:48 onward, unbounded, with no way for a
+#: supervisor to distinguish a new fact from the same one restated.
+UNROUTABLE_VERIFICATION_TIMER_KIND = "independent_verification_recheck"
+
+#: The governing supervisor these alarms are addressed to. Erika governs
+#: execution under ``hierarchy.md``; the substrate maintainer repairs the
+#: mechanism and does not adjudicate what a breach means. Overridable via
+#: ``kanban.supervisory_profile`` for boards with a different governor.
+SUPERVISORY_PROFILE_DEFAULT = "erika"
 
 # Conservative defaults, mirroring ``kanban.dispatch_stale_timeout_seconds``:
 # four hours of no lifecycle progress before a card is called abandoned, and
@@ -377,6 +438,202 @@ EXECUTOR_LANE_CLAUDE = "claude"
 EXECUTOR_LANE_CODEX_VERIFY = "codex_verify"
 EXECUTOR_LANE_CLAUDE_RECOVERY = "claude_recovery"
 VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_RECOVERY}
+
+# ---------------------------------------------------------------------------
+# ACTOR PROVENANCE — who created this card, structurally
+# ---------------------------------------------------------------------------
+#
+# ``tasks.created_by`` is a free-text PROFILE NAME, and that is the whole
+# defect. Both paths that can write it collapse onto the same string:
+#
+#   * ``hermes_cli/kanban.py`` (CLI ``kanban create``) writes
+#     ``_profile_author()`` — ``HERMES_PROFILE_NAME``/``HERMES_PROFILE``, or
+#     the active profile name.
+#   * ``tools/kanban_tools.py`` (the agent-facing ``kanban_create`` tool)
+#     writes ``HERMES_PROFILE`` or the literal ``"worker"``.
+#
+# So a card carrying ``created_by='claude-code'`` may have been typed by
+# Christopher through an interactive session, or emitted by a governed
+# automated executor running under the same profile name. The string cannot
+# tell them apart, and no amount of parsing it will ever make it able to: it
+# records WHICH PROFILE, never WHICH KIND OF ACTOR. An acceptance test that
+# infers "a human relayed this" from the identity string is therefore
+# asserting something the data does not contain — it will pass on a card no
+# human ever touched.
+#
+# The fix is to stop inferring and start recording. Five structured, nullable
+# columns are written at creation and never re-derived afterwards:
+#
+#   ``actor_kind``      one of VALID_ACTOR_KINDS — the discriminator
+#   ``actor_id``        canonical identity WITHIN that kind (still free text,
+#                       but no longer required to carry the kind as well)
+#   ``actor_lane``      executor lane of the CREATING actor. Distinct from
+#                       ``tasks.executor_lane``, which is the lane the new
+#                       card will RUN in. A codex_verify run filing a repair
+#                       card for a claude lane has different values in the
+#                       two, and conflating them loses the relay.
+#   ``actor_run_id``    the creating actor's run/session/execution id
+#   ``creation_cause``  one of VALID_CREATION_CAUSES — WHY the card exists
+#
+# ``NULL`` on every pre-existing row, and nothing is backfilled: inventing a
+# provenance for history nobody observed is the same fabrication the columns
+# exist to prevent. Cards created before this migration answer "provenance
+# not recorded", which is the truth, and is exactly what keeps ``t_aef6bbe1``
+# and ``t_f9b3b48b`` usable as preserved evidence of the defect.
+
+#: A human drove this creation through an interactive session — the human is
+#: in the loop for THIS card, and the identity in ``actor_id`` is a relay, not
+#: an author. The only kind that may satisfy a "manual relay" test.
+ACTOR_KIND_HUMAN_INTERACTIVE = "human_interactive"
+#: A governed automated executor created this card from inside its own
+#: dispatched run. No human saw the card before it existed.
+ACTOR_KIND_GOVERNED_AUTOMATION = "governed_automation"
+#: The control plane itself (dispatcher, recovery lane, reconciliation sweep).
+#: Neither a human nor a governed executor authored it.
+ACTOR_KIND_SYSTEM = "system"
+#: Explicitly recorded absence. Distinct from NULL, which means "this row
+#: predates provenance recording"; ``unknown`` means "recorded, and the
+#: creating path genuinely could not establish a kind".
+ACTOR_KIND_UNKNOWN = "unknown"
+VALID_ACTOR_KINDS = {
+    ACTOR_KIND_HUMAN_INTERACTIVE,
+    ACTOR_KIND_GOVERNED_AUTOMATION,
+    ACTOR_KIND_SYSTEM,
+    ACTOR_KIND_UNKNOWN,
+}
+
+#: Kinds in which a human is mechanically in the loop for this specific card.
+#: Acceptance decisions test membership here, never a string identity.
+HUMAN_IN_LOOP_ACTOR_KINDS = frozenset({ACTOR_KIND_HUMAN_INTERACTIVE})
+
+#: A human relayed an instruction through an interactive session.
+CREATION_CAUSE_MANUAL_RELAY = "manual_relay"
+#: Routine automated creation inside a governed run (an executor filing
+#: follow-on work it was authorized to file).
+CREATION_CAUSE_AUTOMATED = "automated"
+#: A repair/recovery card generated because something else failed or was found
+#: defective. These are the cards that must never be orphaned.
+CREATION_CAUSE_RECOVERY = "recovery"
+#: An independent-verification card spawned for a subject's evidence packet.
+CREATION_CAUSE_VERIFICATION = "verification"
+CREATION_CAUSE_UNKNOWN = "unknown"
+VALID_CREATION_CAUSES = {
+    CREATION_CAUSE_MANUAL_RELAY,
+    CREATION_CAUSE_AUTOMATED,
+    CREATION_CAUSE_RECOVERY,
+    CREATION_CAUSE_VERIFICATION,
+    CREATION_CAUSE_UNKNOWN,
+}
+
+#: Env var a caller may set to assert its own actor kind explicitly. Only
+#: consulted when it names a valid kind; a junk value is ignored rather than
+#: stored, because a junk provenance is worse than a derived one.
+ENV_ACTOR_KIND = "HERMES_ACTOR_KIND"
+#: Env var carrying the human's identity when a session is a manual relay.
+ENV_ACTOR_ID = "HERMES_ACTOR_ID"
+
+# ---------------------------------------------------------------------------
+# GOVERNANCE RELATIONS — machine-readable, and deliberately NOT task_links
+# ---------------------------------------------------------------------------
+#
+# ``task_links`` is the DEPENDENCY graph: ``parent`` must reach ``done``
+# before ``child`` may be promoted (``_parents_satisfied``), and roughly twenty
+# call sites across dispatch, promotion, fan-out and archival read it with
+# exactly that meaning. Every governance relation this repair needs points the
+# WRONG WAY for those semantics:
+#
+#   * a repair's SUBJECT is the thing the repair fixes. Gating the repair on
+#     the subject completing parks the repair forever — the subject is usually
+#     blocked precisely because it needs the repair.
+#   * a repair's UMBRELLA is the containing programme of work. Gating the
+#     repair on the umbrella finishing is the same deadlock, one level up.
+#
+# Overloading ``task_links`` with a ``relation`` column would therefore mean
+# teaching every one of those call sites to filter, in order to express
+# something the dependency graph was never about. A separate additive table
+# leaves the dependency graph's meaning untouched and makes the governance
+# edges independently queryable. Nothing reads ``task_relations`` for
+# readiness, by construction.
+#
+# ``from_task_id`` is always the card making the assertion (the repair);
+# ``to_task_id`` is the card it points at. The direction is not symmetric and
+# is never inferred.
+
+#: ``from`` repairs ``to``. The machine-readable answer to "what is this repair
+#: card actually about?" — the thing ``t_aef6bbe1`` and ``t_f9b3b48b`` state
+#: only in prose.
+RELATION_REPAIRS = "repairs"
+#: ``from`` is contained by the umbrella/recovery programme ``to``.
+RELATION_UMBRELLA = "umbrella"
+#: ``from`` cites ``to`` as durable evidence. Non-governing and never gating —
+#: it exists so an evidence pointer is discoverable without rewriting the scope
+#: of the card being pointed at.
+RELATION_EVIDENCE = "evidence"
+VALID_TASK_RELATIONS = {
+    RELATION_REPAIRS,
+    RELATION_UMBRELLA,
+    RELATION_EVIDENCE,
+}
+
+#: Relations a governed repair card MUST carry, established in the same
+#: transaction that inserts the card. See :func:`create_repair_task`.
+REQUIRED_REPAIR_RELATIONS = (RELATION_REPAIRS, RELATION_UMBRELLA)
+
+# ---------------------------------------------------------------------------
+# OBSERVATION TIMERS — the 300-second recheck, mechanically
+# ---------------------------------------------------------------------------
+#
+# Christopher, 2026-09-03 03:34:05, verbatim:
+#
+#   "A 10-minute stall timer is reasonable here, but it should mean **recheck,
+#   not declare stalled**."
+#
+# and the correcting session's own one-line summary of the error:
+# **"a clock produced a verdict instead of a question."**
+#
+# That ruling was written into ``vault/Skills/ops/claude-session-hygiene.md``
+# as a convention, and a convention is exactly what failed. Three distinct
+# failure shapes, all observed on 2026-09-03, none of which a prompt can
+# prevent:
+#
+#   1. **The timer ended at its own emission.** A watcher whose job was to
+#      recheck every 300 s emitted once and returned, so the second recheck
+#      never existed. Nothing on disk recorded that one was owed.
+#   2. **The timer silently disappeared.** A watcher was stopped (or believed
+#      stopped) and no replacement armed; the observation simply stopped
+#      happening, and its absence was indistinguishable from "nothing to
+#      report".
+#   3. **A stopped watcher kept running.** ``TaskStop`` reported success while
+#      PIDs 18339 and 22963 stayed live, and one consumed a half-corrected
+#      probe and emitted a false CONTINUITY-OK. Process presence was not
+#      evidence of observation, and process absence was not evidence of its
+#      end.
+#
+# All three share one cause: the timer's state lived in a process. The fix is
+# to move it into the board. ``observation_timers.next_due_at`` is written
+# before a tick is emitted and re-armed inside the same transaction, so:
+#
+#   * due-ness is computed from the clock and the row, never from whether an
+#     observer is alive (kills shape 3);
+#   * an emitter that dies right after emitting leaves a timer still armed for
+#     the next interval (kills shape 1);
+#   * a timer only leaves observation through :func:`close_observation_timer`,
+#     which demands an explicit reason and writes it down (kills shape 2).
+#
+# The verdict-once guarantee is a ``WHERE verdict_emitted_at IS NULL``
+# predicate, and duplicate suppression is the ``(timer_id, seq)`` primary key.
+# Both are database constraints, so neither depends on a caller behaving.
+
+#: The mandated evidence-recheck interval, in seconds. Updated to 300 by
+#: Christopher's 2026-09-05 ruling: all Gauntlet task supervision/recheck
+#: timers are five minutes. It remains a constant so callers cannot silently
+#: drift to a longer observation interval.
+MANDATORY_OBSERVATION_INTERVAL_SECONDS = 300
+
+#: A timer that is still observing. Ticks are only ever emitted in this state.
+OBSERVATION_STATE_OBSERVING = "observing"
+#: A timer explicitly retired with a recorded reason. Terminal.
+OBSERVATION_STATE_CLOSED = "closed"
 
 # ---------------------------------------------------------------------------
 # Terminal disposition — HOW a task stopped, not just THAT it stopped
@@ -1521,6 +1778,20 @@ class Task:
     # an overtaken card was never completed, and conflating the two would put
     # fabricated completions into every time-to-complete metric.
     disposition_at: Optional[int] = None
+    # Structured actor provenance — see the ACTOR PROVENANCE block near
+    # VALID_ACTOR_KINDS. ``None`` means "not recorded" (a pre-migration row),
+    # which is NOT the same as ACTOR_KIND_UNKNOWN ("recorded, and the creating
+    # path could not establish a kind"). Never infer any of these from
+    # ``created_by``; that inference is the defect.
+    actor_kind: Optional[str] = None
+    actor_id: Optional[str] = None
+    # Lane of the actor that CREATED this card, not the lane it runs in.
+    actor_lane: Optional[str] = None
+    actor_run_id: Optional[str] = None
+    creation_cause: Optional[str] = None
+    # Identity accountable for this card's recovery decision. Set by
+    # ``create_repair_task``; None on ordinary cards.
+    recovery_owner: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1649,6 +1920,30 @@ class Task:
             disposition_at=(
                 int(row["disposition_at"])
                 if "disposition_at" in keys and row["disposition_at"] is not None
+                else None
+            ),
+            actor_kind=(
+                row["actor_kind"] if "actor_kind" in keys and row["actor_kind"] else None
+            ),
+            actor_id=(
+                row["actor_id"] if "actor_id" in keys and row["actor_id"] else None
+            ),
+            actor_lane=(
+                row["actor_lane"] if "actor_lane" in keys and row["actor_lane"] else None
+            ),
+            actor_run_id=(
+                row["actor_run_id"]
+                if "actor_run_id" in keys and row["actor_run_id"]
+                else None
+            ),
+            creation_cause=(
+                row["creation_cause"]
+                if "creation_cause" in keys and row["creation_cause"]
+                else None
+            ),
+            recovery_owner=(
+                row["recovery_owner"]
+                if "recovery_owner" in keys and row["recovery_owner"]
                 else None
             ),
         )
@@ -1889,13 +2184,106 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- When the disposition was recorded. Deliberately not ``completed_at``:
     -- an overtaken card was never completed and must not enter
     -- time-to-complete metrics as if it had been.
-    disposition_at       INTEGER
+    disposition_at       INTEGER,
+    -- Structured actor provenance, written once at creation and never
+    -- re-derived. NULL on every row that predates the columns; nothing is
+    -- backfilled. See the ACTOR PROVENANCE block near VALID_ACTOR_KINDS for
+    -- why ``created_by`` cannot answer these questions.
+    actor_kind           TEXT,
+    actor_id             TEXT,
+    -- Executor lane of the CREATING actor, not of this task. ``executor_lane``
+    -- above is the lane this card will run in; the two differ whenever one
+    -- lane files work for another.
+    actor_lane           TEXT,
+    actor_run_id         TEXT,
+    creation_cause       TEXT,
+    -- Identity accountable for this card's recovery decision, recorded
+    -- structurally so "who owns this repair?" is answerable without reading
+    -- the body. Required by ``create_repair_task``; NULL elsewhere.
+    recovery_owner       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Governance relations. Deliberately separate from ``task_links``: this table
+-- never participates in readiness/promotion, so a repair can point at the
+-- subject it fixes without being gated on that subject finishing. See the
+-- GOVERNANCE RELATIONS block near VALID_TASK_RELATIONS.
+CREATE TABLE IF NOT EXISTS task_relations (
+    from_task_id TEXT NOT NULL,
+    to_task_id   TEXT NOT NULL,
+    relation     TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    created_by   TEXT,
+    PRIMARY KEY (from_task_id, to_task_id, relation)
+);
+
+-- Durable observation timers. The 300-second recheck was a CONVENTION carried
+-- in prompts and watcher scripts, which means it lived exactly as long as the
+-- process holding it: a watcher that exited, was hot-swapped, or emitted its
+-- verdict and returned took the timer with it, and nothing on disk knew a
+-- recheck was ever owed. These two tables move the timer into the same durable
+-- store as the work it observes, so due-ness is a fact about the clock and the
+-- board rather than about whether some process is still alive.
+--
+-- ``next_due_at`` is the whole mechanism: it is written before any tick is
+-- emitted and re-armed in the same transaction, so an emitter that dies
+-- immediately after emitting leaves a timer that is still armed, and an
+-- emitter that dies before emitting leaves one that is still due.
+CREATE TABLE IF NOT EXISTS observation_timers (
+    id                 TEXT PRIMARY KEY,
+    task_id            TEXT NOT NULL,
+    -- Free-text label for WHAT is being observed. Never consulted by the
+    -- due-time logic; it exists so a board can carry more than one timer per
+    -- card without them being confusable.
+    kind               TEXT NOT NULL,
+    -- Always MANDATORY_OBSERVATION_INTERVAL_SECONDS. Stored per-row anyway so
+    -- an existing timer keeps its contracted interval if the constant is ever
+    -- changed, rather than silently re-phasing every armed timer on a board.
+    interval_seconds   INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL,
+    -- The next instant at which a tick is OWED. Monotonically advanced, never
+    -- recomputed from "now" — see advance semantics in emit_observation_tick.
+    next_due_at        INTEGER NOT NULL,
+    -- Count of ticks emitted. Also the seq of the NEXT tick minus one, so the
+    -- first emission is seq 1 and is the contracted verdict.
+    tick_count         INTEGER NOT NULL DEFAULT 0,
+    last_tick_at       INTEGER,
+    -- Set exactly once, by a conditional UPDATE that requires it to be NULL.
+    -- That predicate is what makes "the verdict is emitted once" a database
+    -- constraint rather than a caller's promise.
+    verdict_emitted_at INTEGER,
+    -- 'observing' or 'closed'. A timer NEVER transitions to closed as a side
+    -- effect of emitting; only close_observation_timer does it, and only with
+    -- an explicit reason.
+    state              TEXT NOT NULL DEFAULT 'observing',
+    closed_at          INTEGER,
+    closed_reason      TEXT,
+    -- Accountable identity, resolved from persisted ownership at arm time.
+    owner              TEXT
+);
+
+-- Append-only tick ledger. ``PRIMARY KEY (timer_id, seq)`` is the duplicate
+-- suppression: two racing emitters, or one emitter retried after a crash that
+-- happened between the INSERT and the commit, cannot both land seq N.
+CREATE TABLE IF NOT EXISTS observation_ticks (
+    timer_id   TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    -- The due instant this tick discharges, not the instant it was emitted.
+    -- They differ whenever the observer was down; the gap is the evidence.
+    due_at     INTEGER NOT NULL,
+    emitted_at INTEGER NOT NULL,
+    -- Intervals whose due time passed with no observer running. 0 in normal
+    -- operation; non-zero is a recorded outage, not a silently skipped tick.
+    missed     INTEGER NOT NULL DEFAULT 0,
+    -- 1 on seq 1 only: the contracted one-time verdict emission.
+    verdict    INTEGER NOT NULL DEFAULT 0,
+    payload    TEXT,
+    PRIMARY KEY (timer_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -2120,10 +2508,18 @@ CREATE TABLE IF NOT EXISTS executions (
     ownership          TEXT NOT NULL,
     max_runtime_s      INTEGER,
     started_at         INTEGER NOT NULL,
-    -- Last progress signal from an owner actively watching the child.
-    -- Advanced by the synchronous waiter and by explicit heartbeat() calls,
-    -- NEVER by reconciliation — a reconciler that refreshed it would make
+    -- Last LIVENESS PROOF from an owner actively watching the child.
+    -- Advanced only by ``exec_supervisor.LivenessPump``, which re-reads this
+    -- row and re-matches the recorded pid against /proc before every write,
+    -- and NEVER by reconciliation — a reconciler that refreshed it would make
     -- every abandoned job look permanently fresh.
+    --
+    -- Seeded equal to ``started_at``, so equality means "never heartbeated",
+    -- not "0 s old". Between the column's introduction and 2026-09-03 that was
+    -- true of every row on every board: ``heartbeat()`` had no call site, and
+    -- the staleness rule that reads this column was therefore measuring age.
+    -- ``exec_supervisor.has_recorded_heartbeat`` is the only correct way to
+    -- ask whether a value here is a real observation.
     heartbeat_at       INTEGER NOT NULL,
     -- Last time reconciliation observed this row. Separate from the
     -- heartbeat precisely so "the supervisor is running" and "the executor
@@ -2176,12 +2572,236 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_relations_from        ON task_relations(from_task_id, relation);
+CREATE INDEX IF NOT EXISTS idx_relations_to          ON task_relations(to_task_id, relation);
+-- The due-scan's only index. Ordered state-first so the scan reads just the
+-- armed timers; a closed timer must never cost anything to skip.
+CREATE INDEX IF NOT EXISTS idx_obs_timers_due        ON observation_timers(state, next_due_at);
+CREATE INDEX IF NOT EXISTS idx_obs_timers_task       ON observation_timers(task_id, state);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- ---------------------------------------------------------------------------
+-- Observation-timer invariants, enforced by the database itself
+-- ---------------------------------------------------------------------------
+--
+-- The Python guards in ``arm_observation_timer`` and ``emit_observation_tick``
+-- only bind callers that go through them. Independent ``codex_verify`` review
+-- of this repair's first draft made the point precisely: with the check living
+-- only in Python, a direct ``INSERT`` could mint a 900-second "observation
+-- timer" that reads, at query time, exactly like a correctly armed one — which
+-- is the convention-shaped failure this whole mechanism replaces, re-entering
+-- through the back door.
+--
+-- Triggers rather than ``CHECK`` constraints on purpose: a CHECK can only be
+-- attached when the table is created, so it would silently skip every board
+-- that already has ``observation_timers``. ``CREATE TRIGGER IF NOT EXISTS``
+-- applies to existing boards on the next init, which is where the live rows
+-- are.
+
+-- 300 is written as a literal because SQL cannot read the Python constant.
+-- MANDATORY_OBSERVATION_INTERVAL_SECONDS must match it.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_interval_insert
+BEFORE INSERT ON observation_timers
+FOR EACH ROW WHEN NEW.interval_seconds != 300
+BEGIN
+    SELECT RAISE(ABORT, 'observation interval is fixed at 300 seconds');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_interval_update
+BEFORE UPDATE OF interval_seconds ON observation_timers
+FOR EACH ROW WHEN NEW.interval_seconds != 300
+BEGIN
+    SELECT RAISE(ABORT, 'observation interval is fixed at 300 seconds');
+END;
+
+-- The verdict is emitted once, for the lifetime of the timer. Clearing or
+-- rewriting the stamp is how a restarted observer would get to re-announce,
+-- so the column is append-once at the storage layer and not merely in the
+-- emission path.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_verdict_once
+BEFORE UPDATE OF verdict_emitted_at ON observation_timers
+FOR EACH ROW WHEN OLD.verdict_emitted_at IS NOT NULL
+                  AND NEW.verdict_emitted_at IS NOT OLD.verdict_emitted_at
+BEGIN
+    SELECT RAISE(ABORT, 'the observation verdict may only be emitted once');
+END;
+
+-- A closed timer is terminal. Re-opening one would resurrect an observation
+-- whose end was already recorded and reasoned about, and it would do so
+-- without a new ``observation_timer_armed`` event to make it discoverable.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_no_reopen
+BEFORE UPDATE OF state ON observation_timers
+FOR EACH ROW WHEN OLD.state = 'closed' AND NEW.state != 'closed'
+BEGIN
+    SELECT RAISE(ABORT, 'a closed observation timer cannot be re-opened');
+END;
+
+-- A tick is a statement about what was reported at a due instant. Rewriting
+-- one would let an emitter change what it already said.
+CREATE TRIGGER IF NOT EXISTS trg_obs_ticks_append_only_update
+BEFORE UPDATE ON observation_ticks
+BEGIN
+    SELECT RAISE(ABORT, 'observation ticks are append-only');
+END;
+
+-- The five triggers below close the raw-SQL holes the 2026-09-03 independent
+-- codex_verify review found. Each one had the same shape: the *emission path*
+-- upheld an invariant that the *storage layer* did not, so the guarantee held
+-- only for callers who went through the API. A control that a direct INSERT
+-- can walk around is a convention with a docstring, which is the exact class
+-- of defect this whole card exists to close.
+
+-- (1) The verdict is emitted once PER TIMER, not once per emitter's good
+-- intentions. ``PRIMARY KEY (timer_id, seq)`` alone permitted a second
+-- verdict row at any other sequence number. Both halves are enforced: a
+-- verdict may only ride seq 1, and only one may exist.
+CREATE TRIGGER IF NOT EXISTS trg_obs_ticks_verdict_once_insert
+BEFORE INSERT ON observation_ticks
+FOR EACH ROW WHEN NEW.verdict != 0
+                  AND (NEW.seq != 1
+                       OR EXISTS (SELECT 1 FROM observation_ticks t
+                                  WHERE t.timer_id = NEW.timer_id
+                                    AND t.verdict != 0))
+BEGIN
+    SELECT RAISE(ABORT,
+        'the observation verdict is exactly one tick, at seq 1, per timer');
+END;
+
+-- (2) A timer is inserted ARMED or not at all. Without this, a row could be
+-- born already carrying a tick count, a spent verdict stamp, a closed state
+-- or a due time off the 300 s grid — a timer that looks like it has already
+-- done work it never did. ``arm_observation_timer`` writes exactly this shape,
+-- so the trigger constrains forgery, not the legitimate path.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_arm_shape
+BEFORE INSERT ON observation_timers
+FOR EACH ROW WHEN NEW.state != 'observing'
+                  OR NEW.tick_count != 0
+                  OR NEW.last_tick_at IS NOT NULL
+                  OR NEW.verdict_emitted_at IS NOT NULL
+                  OR NEW.closed_at IS NOT NULL
+                  OR NEW.closed_reason IS NOT NULL
+                  OR NEW.next_due_at != NEW.created_at + 300
+BEGIN
+    SELECT RAISE(ABORT,
+        'an observation timer is inserted armed: observing, 0 ticks, no verdict, no closure, first tick due one full interval out');
+END;
+
+-- (3) Closing carries its reason at the storage layer. ``state='closed'`` with
+-- a null ``closed_at`` or a blank reason is a timer that stopped and did not
+-- say why — failure shape 2, arrived at by UPDATE instead of by silence.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_closure_reasoned
+BEFORE UPDATE OF state ON observation_timers
+FOR EACH ROW WHEN NEW.state = 'closed'
+                  AND (NEW.closed_at IS NULL
+                       OR TRIM(COALESCE(NEW.closed_reason, '')) = '')
+BEGIN
+    SELECT RAISE(ABORT,
+        'closing an observation timer requires closed_at and a reason');
+END;
+
+-- (4) …and the reason cannot be erased afterwards, which is the same hole
+-- reached in two statements instead of one.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_closure_reason_immutable
+BEFORE UPDATE OF closed_at, closed_reason ON observation_timers
+FOR EACH ROW WHEN OLD.state = 'closed'
+                  AND (NEW.closed_at IS NULL
+                       OR TRIM(COALESCE(NEW.closed_reason, '')) = '')
+BEGIN
+    SELECT RAISE(ABORT,
+        'a closed observation timer keeps its closed_at and reason');
+END;
+
+-- (5) An observing timer cannot be deleted, and its ledger cannot be purged
+-- out from under it. DELETE was previously left open on the reasoning that
+-- purging an old ledger is legitimate maintenance — true, but it also meant
+-- ``DELETE FROM observation_timers`` made a live observation vanish with no
+-- record anywhere, which is precisely the disappearance the 300 s control was
+-- built to make impossible. Retention still works: close the timer first, with
+-- a reason, and both deletes are permitted. The task-deletion cascade in
+-- ``_delete_observation_timers_for_task`` does exactly that.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_no_delete_while_observing
+BEFORE DELETE ON observation_timers
+FOR EACH ROW WHEN OLD.state != 'closed'
+BEGIN
+    SELECT RAISE(ABORT,
+        'close an observation timer with a reason before deleting it');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_obs_ticks_no_delete_while_observing
+BEFORE DELETE ON observation_ticks
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM observation_timers
+                          WHERE id = OLD.timer_id AND state != 'closed')
+BEGIN
+    SELECT RAISE(ABORT,
+        'the ledger of an observing timer is not purgeable');
+END;
+
+-- The two below close what the SECOND independent codex_verify review found
+-- (2026-09-03, execution x_4662551c5e9a293f) after the six above were added.
+
+-- (7) ONE observing timer per (task, kind). The verdict-once trigger above is
+-- scoped to a timer, so "the verdict is emitted once" was only ever true per
+-- timer — and nothing stopped a second timer being armed on the same card with
+-- the same kind, each emitting its own seq-1 verdict. Two live 'recheck'
+-- observations on one card are not redundancy; they are two clocks that
+-- disagree, and a reader cannot tell which one the contract meant.
+--
+-- A partial unique index rather than a trigger: it is declarative, it is
+-- enforced on every writer including raw SQL, and scoping it to
+-- state='observing' leaves any number of CLOSED timers in the history, which
+-- is what makes re-arming after a recorded closure still legal. Re-arming is
+-- deliberately still allowed to produce a new verdict: a new observation is a
+-- new question, and the previous one's closure reason is on its row.
+--
+-- The index is NOT created here. It is created by
+-- ``_migrate_observation_timer_uniqueness`` after that function has resolved
+-- any pre-existing duplicates, because duplicates were legal until this change
+-- and `CREATE UNIQUE INDEX` inside ``executescript(SCHEMA_SQL)`` would abort
+-- the whole schema pass on a board that has them — turning a hardening into an
+-- init failure. Found by the third independent review.
+
+-- (8) A timer cannot be deleted while the card it observes still exists. The
+-- review's objection to the delete guard was that "close with a reason, then
+-- delete" erases the very reason it just demanded. That is now impossible for a
+-- live card: the only way a timer row leaves the board is as a cascade of its
+-- own card's deletion, which removes the card's whole history by design and by
+-- authorization. Deleting a card is a destructive operation the operator asked
+-- for; ending an observation quietly while its subject is still on the board is
+-- not, and that is the case this closes.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_no_delete_while_task_lives
+BEFORE DELETE ON observation_timers
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT,
+        'an observation timer outlives everything but its own card');
+END;
+
+-- (9) A timer's identity is immutable. Found by the THIRD independent
+-- codex_verify review (2026-09-03, execution x_66018ca656f32298), and it
+-- defeated the guard directly above it: repoint ``task_id`` at a card that does
+-- not exist, and the "no delete while its card lives" check passes, taking the
+-- only durable copy of the closure reason with it. The same move re-homes a
+-- timer onto an unrelated card, or slips it past the (task_id, kind) uniqueness
+-- index by changing either key.
+--
+-- Every field named here identifies WHICH observation this is. None of them is
+-- something a legitimate caller edits: arming writes them once, emitting
+-- touches only the tick counters, and closing touches only the closure columns.
+CREATE TRIGGER IF NOT EXISTS trg_obs_timer_identity_immutable
+BEFORE UPDATE OF id, task_id, kind, created_at ON observation_timers
+FOR EACH ROW WHEN NEW.id IS NOT OLD.id
+                  OR NEW.task_id IS NOT OLD.task_id
+                  OR NEW.kind IS NOT OLD.kind
+                  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT,
+        'an observation timer cannot be re-homed or re-identified');
+END;
 """
 
 
@@ -3114,6 +3734,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _migrate_observation_timer_uniqueness(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -3154,6 +3775,65 @@ def connect_closing(
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_observation_timer_uniqueness(conn: sqlite3.Connection) -> None:
+    """Resolve duplicate observing timers, then enforce one per (task, kind).
+
+    Runs after ``SCHEMA_SQL``, not inside it. Two concurrent observing timers of
+    the same kind on one card were legal until 2026-09-03 — that is the defect
+    the index closes — so a board upgraded from before then can legitimately
+    contain them. ``CREATE UNIQUE INDEX`` on such a board raises, and inside
+    ``executescript(SCHEMA_SQL)`` that aborts the entire schema pass: a
+    hardening would present as a board that no longer opens. The third
+    independent review found this, and it is the more dangerous kind of bug,
+    because it fires on exactly the boards that had the problem.
+
+    Duplicates are **closed, oldest kept**, with an explicit reason — never
+    deleted. The surviving timer is the one that has been observing longest, so
+    the resolution keeps the earliest continuous observation rather than the
+    most recent arming, and the closure reason says which migration ended the
+    others. Idempotent: on a clean board both statements are no-ops.
+
+    The index keys on ``LOWER(TRIM(kind))``, not on ``kind``. Normalising in
+    ``arm_observation_timer`` binds callers of the API; a raw
+    ``INSERT ... kind='Recheck'`` alongside an existing ``'recheck'`` was still
+    two logically identical observations, each owed its own verdict — found by
+    the fourth independent review. An expression index moves the normalisation
+    into the constraint, where raw SQL cannot get around it.
+
+    **Nothing here is caught and shrugged off.** Only a genuinely absent
+    ``observation_timers`` table is tolerated (a board whose schema pass has not
+    run); every other failure propagates, because an ``OperationalError``
+    swallowed here would mark the path initialised with the uniqueness
+    constraint silently absent for the life of the process — enforcement that
+    reads as present and is not, which is the exact failure class this whole
+    card exists to close.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'observation_timers'"
+    ).fetchone():
+        return
+    conn.execute(
+        "UPDATE observation_timers SET state = ?, closed_at = ?, "
+        "    closed_reason = 'superseded_by_uniqueness_migration' "
+        "WHERE state = ? AND id NOT IN ("
+        "    SELECT id FROM ("
+        "        SELECT id, MIN(created_at) FROM observation_timers "
+        "        WHERE state = ? "
+        "        GROUP BY task_id, LOWER(TRIM(kind))))",
+        (
+            OBSERVATION_STATE_CLOSED, int(time.time()),
+            OBSERVATION_STATE_OBSERVING, OBSERVATION_STATE_OBSERVING,
+        ),
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_obs_timer_one_observing_per_task_kind "
+        "ON observation_timers (task_id, LOWER(TRIM(kind))) "
+        "WHERE state = 'observing'"
+    )
 
 
 def init_db(
@@ -3406,6 +4086,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "disposition_at", "disposition_at INTEGER"
         )
 
+    # Structured actor provenance. Every one of these is NULL on every legacy
+    # row and NOTHING is backfilled — deliberately. ``created_by`` cannot be
+    # translated into an ``actor_kind`` after the fact (that translation is
+    # precisely the string inference this repair exists to abolish), so a
+    # migrated board answers "provenance not recorded" for its history and
+    # records it properly from the next creation onward. The orphan
+    # reproductions this repair preserves as evidence (t_aef6bbe1,
+    # t_f9b3b48b) depend on that: retro-stamping them would destroy the
+    # very evidence they are kept for.
+    for _prov_col in (
+        "actor_kind",
+        "actor_id",
+        "actor_lane",
+        "actor_run_id",
+        "creation_cause",
+        "recovery_owner",
+    ):
+        if _prov_col not in cols:
+            _add_column_if_missing(conn, "tasks", _prov_col, f"{_prov_col} TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3427,6 +4127,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_disposition "
         "ON tasks(terminal_disposition)"
+    )
+    # Same ordering rule: created here, after the additive provenance columns
+    # exist, never in SCHEMA_SQL — a legacy board would abort the whole init
+    # script on an index over a column the ALTER TABLE below has not added
+    # yet. "How many cards came from governed automation vs a human relay?"
+    # is the query this serves.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_actor_kind "
+        "ON tasks(actor_kind, creation_cause)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -3952,13 +4661,303 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
+PROFILE_ASSIGNEE_ALIASES: dict[str, str] = {
+    "paris": "paris_worker",
+}
+
+
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
+    """Normalize assignee names and resolve stable operator-facing aliases."""
     if assignee is None:
         return None
     from hermes_cli.profiles import normalize_profile_name
 
-    return normalize_profile_name(assignee)
+    normalized = normalize_profile_name(assignee)
+    return PROFILE_ASSIGNEE_ALIASES.get(normalized, normalized)
+
+
+def _assert_assignee_dispatchable(assignee: Optional[str], *, context: str) -> None:
+    """Raise ``ValueError`` unless *assignee* names something that can dispatch.
+
+    ONE vocabulary for every path that writes the ``assignee`` column: an
+    existing Hermes profile, or one of the two recognized legacy shorthand
+    tokens ("claude", "atlas"). ``None`` (deliberately unassigned) passes.
+
+    This gate lived only in :func:`assign_task` until D8. The asymmetry was
+    the defect: ``hermes kanban assign <id> w`` raised, while
+    ``hermes kanban add --assignee w`` succeeded and minted a row that the
+    dispatcher can never spawn — it fails profile resolution at spawn time,
+    is counted as ``skipped_nonspawnable``, and the card then sits in
+    ``ready``/``todo`` forever with no error anyone reads (t_820fca96:
+    claimed -> gave_up "worker crashed"/spawn_failed -> promoted, repeat).
+    Five distinct non-existent assignees reached the live board across 8
+    rows this way. Validating at the write is the only place the caller is
+    still around to be told.
+
+    ``context`` names the calling operation so the message points at the
+    argument the caller actually passed.
+    """
+    if assignee is None:
+        return
+    if assignee in (EXECUTOR_LANE_CLAUDE, "atlas"):
+        return
+    # Imported inside the function so a monkeypatched ``profiles.profile_exists``
+    # (the ``all_assignees_spawnable`` test fixture) is honoured at call time,
+    # matching how ``assign_task`` has always resolved it.
+    from hermes_cli.profiles import profile_exists as _profile_exists
+
+    if not _profile_exists(assignee):
+        raise ValueError(
+            f"{context}: {assignee!r} is not an existing Hermes profile and "
+            f"not a recognized shorthand ({EXECUTOR_LANE_CLAUDE!r} or "
+            f"'atlas'). A task assigned to a non-existent profile can never "
+            f"be spawned. Run 'hermes profiles list' for valid names; "
+            f"executor-lane identifiers (e.g. {EXECUTOR_LANE_CODEX_VERIFY!r}, "
+            f"{EXECUTOR_LANE_CLAUDE_RECOVERY!r}) must be set via "
+            f"executor_lane, never assignee."
+        )
+
+
+# The two compatibility shorthand tokens and the executor lane each one names.
+# Exact tokens only — nothing is ever inferred from a task's title, body or
+# skills (see the EXECUTOR_LANE_* module docs above).
+SHORTHAND_ASSIGNEE_LANES: dict[str, str] = {
+    EXECUTOR_LANE_CLAUDE: EXECUTOR_LANE_CLAUDE,
+    "atlas": EXECUTOR_LANE_CODEX_VERIFY,
+}
+
+
+def _normalize_shorthand_lane(
+    assignee: Optional[str], executor_lane: Optional[str]
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Translate a shorthand assignee token into (carrier profile, lane).
+
+    Returns ``(assignee, executor_lane, from_token)``; ``from_token`` is the
+    shorthand that was translated, or ``None`` when nothing changed.
+
+    ``assignee='atlas'`` and ``assignee='claude'`` name LANES, not Hermes
+    profiles — ``~/.hermes/profiles/atlas/`` does not exist and
+    ``profile_exists('atlas')`` is False. So a row left carrying the raw token
+    is unclaimable in *every* lane: the ready loop skips it as
+    ``skipped_nonspawnable`` and so does the review loop. Before this helper
+    the translation lived inline in exactly two places — ``create_task`` and
+    the ready-queue dispatch loop, the latter guarded by ``status = 'ready'``
+    — so a task moved to a shorthand while in any OTHER status (``review``
+    being the live case) never normalized and stalled permanently with no
+    exception and no dispatcher signal. Live casualties: t_6b7d5845 (35.7h in
+    'review', 8 consecutive ``gauntlet_stale`` events) and t_06e046f1 (16.8h,
+    4 events) — the latter stalled while correctly trying to escape an
+    Erika-reviews-Erika loop, i.e. the dead end swallowed the very manoeuvre
+    that breaks a self-review deadlock. Defect D5, evidence packet for
+    t_db0af7e0.
+
+    Every write that can put an assignee on a row calls this, so normalization
+    is a property of the ASSIGNMENT rather than of whichever status the row
+    happens to be sitting in. ``_assert_assignee_dispatchable`` above is the
+    companion gate: it decides whether a token may be written at all, this
+    decides what it means once it is.
+    """
+    lane = SHORTHAND_ASSIGNEE_LANES.get(assignee or "")
+    from_token: Optional[str] = None
+    if lane is not None and executor_lane is None:
+        from_token = assignee
+        executor_lane = lane
+    if executor_lane in {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY}:
+        # Both lanes ride the spawnable default profile as a carrier, only far
+        # enough to reach cli.py's pre-agent executor bypass.
+        if assignee != "default":
+            from_token = from_token or assignee
+            assignee = "default"
+    return assignee, executor_lane, from_token
+
+
+@dataclass(frozen=True)
+class ActorProvenance:
+    """Structured record of WHO created a card and WHY.
+
+    Immutable on purpose: provenance is a fact about a moment, and a mutable
+    provenance object invites exactly the after-the-fact reinterpretation that
+    made ``created_by`` useless.
+    """
+
+    kind: str = ACTOR_KIND_UNKNOWN
+    #: Identity within ``kind``. For a human relay this is the human (or the
+    #: session relaying for them); for automation, the executor identity.
+    actor_id: Optional[str] = None
+    #: Executor lane of the CREATING actor (not of the card being created).
+    lane: Optional[str] = None
+    #: Run / execution / session id of the creating actor's own run.
+    run_id: Optional[str] = None
+    cause: str = CREATION_CAUSE_UNKNOWN
+
+    def __post_init__(self) -> None:
+        if self.kind not in VALID_ACTOR_KINDS:
+            raise ValueError(
+                f"actor kind must be one of {sorted(VALID_ACTOR_KINDS)}, "
+                f"got {self.kind!r}"
+            )
+        if self.cause not in VALID_CREATION_CAUSES:
+            raise ValueError(
+                f"creation cause must be one of {sorted(VALID_CREATION_CAUSES)}, "
+                f"got {self.cause!r}"
+            )
+
+    @property
+    def human_in_loop(self) -> bool:
+        """Whether a human was mechanically in the loop for this creation.
+
+        The single predicate every acceptance decision should use. It reads a
+        recorded enum, so it cannot be satisfied by an identity string that
+        merely looks human.
+        """
+        return self.kind in HUMAN_IN_LOOP_ACTOR_KINDS
+
+    def as_dict(self) -> dict:
+        return {
+            "actor_kind": self.kind,
+            "actor_id": self.actor_id,
+            "actor_lane": self.lane,
+            "actor_run_id": self.run_id,
+            "creation_cause": self.cause,
+        }
+
+
+def resolve_actor_provenance(
+    *,
+    kind: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    lane: Optional[str] = None,
+    run_id: Optional[str] = None,
+    cause: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> ActorProvenance:
+    """Derive provenance from explicit arguments, falling back to the env.
+
+    The env fallback is mechanical, not a guess about identity:
+
+    * ``HERMES_KANBAN_TASK`` is injected by ``build_worker_env`` into every
+      dispatched executor and by nothing else. Its presence means "this
+      process IS a governed run", which is a fact about the process, not an
+      inference from a name — so it is the discriminator, and the reason a
+      governed automation cannot masquerade as a human relay simply by being
+      configured with a human-sounding profile.
+    * ``HERMES_ACTOR_KIND`` lets a caller assert its own kind explicitly and
+      wins over the derivation. A value outside :data:`VALID_ACTOR_KINDS` is
+      IGNORED rather than stored: a junk provenance is worse than a derived
+      one, because it looks authoritative.
+
+    An interactive surface with no governed-run env is recorded as
+    ``human_interactive``/``manual_relay`` — the case ``t_fb23ac0a`` is: a
+    card Christopher relayed through an interactive Claude session, which
+    ``created_by='claude-code'`` cannot distinguish from automation running
+    under the same profile.
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+
+    governed_task = (environ.get("HERMES_KANBAN_TASK") or "").strip()
+    declared = (environ.get(ENV_ACTOR_KIND) or "").strip()
+
+    if kind is None:
+        if declared in VALID_ACTOR_KINDS:
+            kind = declared
+        elif governed_task:
+            kind = ACTOR_KIND_GOVERNED_AUTOMATION
+        else:
+            kind = ACTOR_KIND_HUMAN_INTERACTIVE
+
+    if actor_id is None:
+        actor_id = (
+            (environ.get(ENV_ACTOR_ID) or "").strip()
+            or (environ.get("HERMES_PROFILE_NAME") or "").strip()
+            or (environ.get("HERMES_PROFILE") or "").strip()
+            or None
+        )
+
+    if lane is None:
+        # The creating run's own lane. Only a governed run has one; an
+        # interactive surface correctly records None rather than borrowing
+        # the lane of the card it is about to create.
+        lane = (environ.get("HERMES_EXECUTOR_LANE") or "").strip() or None
+
+    if run_id is None:
+        # Most specific identifier first. An execution id pins one supervised
+        # process; a run id pins one attempt at a task; a session id pins the
+        # conversation. All three are stable and machine-readable, unlike the
+        # profile name.
+        for key in (
+            "HERMES_EXECUTION_ID",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_SESSION_ID",
+        ):
+            candidate = (environ.get(key) or "").strip()
+            if candidate:
+                run_id = candidate
+                break
+
+    if cause is None:
+        cause = (
+            CREATION_CAUSE_MANUAL_RELAY
+            if kind == ACTOR_KIND_HUMAN_INTERACTIVE
+            else CREATION_CAUSE_AUTOMATED
+        )
+
+    return ActorProvenance(
+        kind=kind,
+        actor_id=actor_id,
+        lane=lane,
+        run_id=run_id,
+        cause=cause,
+    )
+
+
+def task_provenance(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Structured provenance for ``task_id``, or ``None`` if the card is gone.
+
+    Always returns every key, so a caller can distinguish "not recorded"
+    (values ``None``, a pre-migration row) from a recorded ``unknown``.
+    ``created_by`` is included for audit continuity only — no caller should
+    branch on it, and the regressions assert that branching on it fails.
+    """
+    row = conn.execute(
+        "SELECT created_by, actor_kind, actor_id, actor_lane, actor_run_id, "
+        "creation_cause, recovery_owner, executor_lane, session_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "created_by": row["created_by"],
+        "actor_kind": row["actor_kind"],
+        "actor_id": row["actor_id"],
+        "actor_lane": row["actor_lane"],
+        "actor_run_id": row["actor_run_id"],
+        "creation_cause": row["creation_cause"],
+        "recovery_owner": row["recovery_owner"],
+        "executor_lane": row["executor_lane"],
+        "session_id": row["session_id"],
+    }
+
+
+def is_human_relayed(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a human was in the loop when this card was created.
+
+    Fails CLOSED on an unrecorded provenance: a pre-migration row returns
+    ``False``, because "we did not record it" is not evidence a human relayed
+    it. The alternative — inferring from ``created_by`` — is the defect.
+    """
+    prov = task_provenance(conn, task_id)
+    if not prov:
+        return False
+    return prov.get("actor_kind") in HUMAN_IN_LOOP_ACTOR_KINDS
+
+
+def is_governed_automation(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a governed automated executor created this card."""
+    prov = task_provenance(conn, task_id)
+    if not prov:
+        return False
+    return prov.get("actor_kind") == ACTOR_KIND_GOVERNED_AUTOMATION
 
 
 def create_task(
@@ -3992,6 +4991,10 @@ def create_task(
     executor_lane: Optional[str] = None,
     recovery_gate_cmd: Optional[str] = None,
     gauntlet: Optional[bool] = None,
+    provenance: Optional[ActorProvenance] = None,
+    recovery_owner: Optional[str] = None,
+    repairs_task_id: Optional[str] = None,
+    umbrella_task_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4031,10 +5034,76 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``provenance`` records WHO created this card and WHY, structurally. When
+    omitted it is derived from the process environment by
+    :func:`resolve_actor_provenance` — deriving is safe because the derivation
+    reads mechanical facts about the process (is there a governed run around
+    it?), never the identity string. It is stored alongside, and never
+    instead of, ``created_by``: the string stays for audit continuity, but
+    nothing may branch on it. See the ACTOR PROVENANCE block.
+
+    ``recovery_owner`` names the identity accountable for this card's recovery
+    decision, and ``repairs_task_id``/``umbrella_task_id`` are the subject and
+    umbrella a governed repair card must point at.
+
+    **A card that declares itself a repair is refused unless all three are
+    present, and the relations are established in this same transaction.**
+    Anything that marks the card as a repair arms the requirement — a
+    ``recovery`` creation cause, a ``recovery_owner``, or either linkage id.
+    The guard lives HERE, at the creation boundary, rather than only in
+    :func:`create_repair_task`, because a guard that only one helper honours
+    is not a guard: ``tools/kanban_tools.py`` and every other caller reaches
+    ``create_task`` directly, so a recovery-tagged card could otherwise be
+    minted with no subject and no umbrella just by not using the helper. That
+    bypass was found by independent ``codex_verify`` review of this repair's
+    first draft, which created exactly such an orphan.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    # Resolve before any validation that can raise, so a rejected creation
+    # never half-populates provenance state, and so every successful creation
+    # carries it — there is no path through this function that produces a card
+    # with no recorded actor kind.
+    if provenance is None:
+        provenance = resolve_actor_provenance()
+    recovery_owner = (recovery_owner or "").strip() or None
+    repairs_task_id = (repairs_task_id or "").strip() or None
+    umbrella_task_id = (umbrella_task_id or "").strip() or None
+    # Any one of these declares "this card is a governed repair", and each is
+    # sufficient on its own: a caller that names an owner but no subject is as
+    # much an orphan as one that names a subject but no owner. Arming on the
+    # union means the requirement cannot be dodged by supplying a partial set.
+    declares_repair = (
+        provenance.cause == CREATION_CAUSE_RECOVERY
+        or recovery_owner is not None
+        or repairs_task_id is not None
+        or umbrella_task_id is not None
+    )
+    if declares_repair:
+        # Normalise the cause so the card is queryable as recovery work
+        # however it was declared — otherwise ``orphaned_repair_tasks`` and
+        # every other cause-based query would miss it.
+        if provenance.cause != CREATION_CAUSE_RECOVERY:
+            provenance = ActorProvenance(
+                kind=provenance.kind,
+                actor_id=provenance.actor_id,
+                lane=provenance.lane,
+                run_id=provenance.run_id,
+                cause=CREATION_CAUSE_RECOVERY,
+            )
+        for label, value in (
+            ("recovery_owner", recovery_owner),
+            ("repairs_task_id", repairs_task_id),
+            ("umbrella_task_id", umbrella_task_id),
+        ):
+            if not value:
+                raise RecoveryLinkageError(
+                    f"a governed repair task requires {label}; refusing to "
+                    f"create an unlinked recovery card "
+                    f"(cause={provenance.cause!r})"
+                )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -4085,12 +5154,7 @@ def create_task(
     # Claude executor lane, not a Hermes profile named "claude". Persist the
     # spawnable default profile as the dispatcher carrier; cli.py exits into
     # Claude before any Hermes agent/tool loop is built.
-    if assignee == "claude" and executor_lane is None:
-        executor_lane = EXECUTOR_LANE_CLAUDE
-    elif assignee == "atlas" and executor_lane is None:
-        executor_lane = EXECUTOR_LANE_CODEX_VERIFY
-    if executor_lane in {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY}:
-        assignee = "default"
+    assignee, executor_lane, _ = _normalize_shorthand_lane(assignee, executor_lane)
 
     if executor_lane is not None and executor_lane not in VALID_EXECUTOR_LANES:
         raise ValueError(
@@ -4107,6 +5171,35 @@ def create_task(
             "recovery_gate_cmd is only valid with "
             f"executor_lane={EXECUTOR_LANE_CLAUDE_RECOVERY!r}"
         )
+    # A verifier with no subject is a verdict with no destination. The whole
+    # return path (``_return_verifier_verdict_to_subjects``) resolves its
+    # subjects through ``parent_ids``, so a ``codex_verify`` card created with
+    # no parent cannot deliver a PASS, a FAIL or a BLOCKER to anyone — it runs,
+    # renders a correct verdict, completes, and the work it judged stays parked
+    # forever. That is not hypothetical: on the live board seven of fourteen
+    # verifier cards are exactly this shape, including two that closed a
+    # production deployment.
+    #
+    # Refused HERE, at the creation boundary, and read back again inside the
+    # creating transaction below — for the reason the repair-linkage guard
+    # already learned the hard way: a rule only ``create_repair_task`` honoured
+    # was bypassed by the first independent review that called ``create_task``
+    # directly. Every door, or it is not a rule.
+    if executor_lane == EXECUTOR_LANE_CODEX_VERIFY and not [
+        p for p in parents if p
+    ]:
+        raise VerifierLinkageError(
+            "an independent verifier task requires at least one parent naming "
+            "the subject it verifies; refusing to create an orphan "
+            f"{EXECUTOR_LANE_CODEX_VERIFY!r} card whose verdict could not be "
+            "returned to anyone"
+        )
+    # D8: the same gate ``assign_task`` has always applied. Deliberately AFTER
+    # the shorthand -> executor_lane rewrite above, so "claude"/"atlas" still
+    # create the (assignee="default", executor_lane=...) pair they always did,
+    # and only genuinely undispatchable names are refused. An unassigned card
+    # (assignee=None) is still legal — triage cards are created that way.
+    _assert_assignee_dispatchable(assignee, context="cannot create task")
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -4362,8 +5455,11 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         executor_lane, recovery_gate_cmd,
-                        gauntlet_enforced
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        gauntlet_enforced,
+                        actor_kind, actor_id, actor_lane, actor_run_id,
+                        creation_cause, recovery_owner
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4392,6 +5488,12 @@ def create_task(
                         executor_lane,
                         recovery_gate_cmd,
                         1 if gauntlet_enforced else 0,
+                        provenance.kind,
+                        provenance.actor_id,
+                        provenance.lane,
+                        provenance.run_id,
+                        provenance.cause,
+                        recovery_owner,
                     ),
                 )
                 for pid in parents:
@@ -4399,6 +5501,64 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if declares_repair:
+                    # Same transaction as the INSERT above. When this runs
+                    # standalone the enclosing write_txn is a real
+                    # BEGIN IMMEDIATE/COMMIT; when composed under
+                    # create_repair_task it is a savepoint inside that outer
+                    # transaction. Either way a raise below unwinds the card
+                    # with the linkage, so there is no committed state in
+                    # which the card exists unlinked.
+                    for relation, target in (
+                        (RELATION_REPAIRS, repairs_task_id),
+                        (RELATION_UMBRELLA, umbrella_task_id),
+                    ):
+                        try:
+                            add_task_relation(
+                                conn, task_id, target, relation,
+                                created_by=recovery_owner,
+                            )
+                        except ValueError as exc:
+                            # An unknown or self-referential endpoint. Re-raise
+                            # as the linkage error so every fail-closed path
+                            # out of this function has one type.
+                            raise RecoveryLinkageError(
+                                f"cannot establish {relation} linkage to "
+                                f"{target!r}: {exc}"
+                            ) from exc
+                    # Read back from the table, not from the calls above. An
+                    # INSERT OR IGNORE that inserted nothing returns cleanly,
+                    # so a caller's own success flag is not evidence that the
+                    # board holds the link.
+                    still_missing = missing_repair_relations(conn, task_id)
+                    if still_missing:
+                        raise RecoveryLinkageError(
+                            f"repair task {task_id} is missing required "
+                            f"relation(s) {still_missing}; rolling back so no "
+                            f"orphan card is created"
+                        )
+                if executor_lane == EXECUTOR_LANE_CODEX_VERIFY:
+                    # Read the linkage back from ``task_links``, in the same
+                    # transaction that wrote it and before it can commit. The
+                    # early refusal above checked the caller's ARGUMENT; this
+                    # checks the BOARD. ``INSERT OR IGNORE`` above returns
+                    # cleanly when it inserted nothing (a parent id that does
+                    # not exist, a FK that did not hold), so the argument being
+                    # non-empty is not evidence that the edge landed.
+                    #
+                    # Owner is checked here too, and for a different failure:
+                    # a linked verifier whose accountable identity cannot be
+                    # resolved produces a verdict that reaches a subject with
+                    # nobody answerable for acting on it. Both are refused as
+                    # one error type so every fail-closed exit from this
+                    # function stays diagnosable.
+                    missing_verifier = missing_verifier_linkage(conn, task_id)
+                    if missing_verifier:
+                        raise VerifierLinkageError(
+                            f"verifier task {task_id} is missing required "
+                            f"linkage {missing_verifier}; rolling back so no "
+                            f"orphan verifier is created"
+                        )
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -4421,6 +5581,12 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "executor_lane": executor_lane,
+                        # Provenance goes on the event too, not only the row.
+                        # The row can be UPDATEd; the event log is append-only,
+                        # so this is the copy that survives a later mutation
+                        # and the one an audit reads.
+                        **provenance.as_dict(),
+                        "recovery_owner": recovery_owner,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4592,30 +5758,34 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     ("claude", "atlas"). Executor-lane identifiers such as
     ``EXECUTOR_LANE_CODEX_VERIFY`` ("codex_verify") or
     ``EXECUTOR_LANE_CLAUDE_RECOVERY`` belong in the ``executor_lane``
-    column, never in ``assignee`` — writing one here previously produced
-    a task that silently could never be claimed: the shorthand
-    auto-normalization that converts "claude"/"atlas" into
-    (assignee="default", executor_lane=...) only runs for status='ready'
-    rows during ready-queue dispatch, so a task reassigned this way while
-    already in another status (e.g. 'review') stalled with no error and
-    no dispatcher signal (see t_500a3503, t_f2d639a3 evidence packet).
-    """
-    profile = _canonical_assignee(profile)
-    if profile is not None and profile not in (EXECUTOR_LANE_CLAUDE, "atlas"):
-        from hermes_cli.profiles import profile_exists as _profile_exists
+    column, never in ``assignee``.
 
-        if not _profile_exists(profile):
-            raise ValueError(
-                f"cannot assign {task_id!r} to {profile!r}: not an existing "
-                f"Hermes profile and not a recognized shorthand "
-                f"({EXECUTOR_LANE_CLAUDE!r} or 'atlas'). Executor-lane "
-                f"identifiers (e.g. {EXECUTOR_LANE_CODEX_VERIFY!r}, "
-                f"{EXECUTOR_LANE_CLAUDE_RECOVERY!r}) must be set via "
-                f"executor_lane, never assignee."
-            )
+    The two legacy shorthands ARE accepted and are normalized here, in the
+    same call, to (assignee="default", executor_lane=...) — see
+    :func:`_normalize_shorthand_lane`. That normalization used to happen only
+    at create time and lazily during ready-queue dispatch (``status='ready'``
+    rows only), so a task reassigned to "atlas"/"claude" while already in
+    another status — 'review' in every observed case — kept the raw token,
+    failed ``profile_exists`` in both dispatch loops, and stalled forever with
+    no exception and no dispatcher signal (t_500a3503 / t_f2d639a3 packet;
+    t_6b7d5845 and t_06e046f1 as live casualties, defect D5). The
+    ``profile_exists`` gate already ran on every status; the translation now
+    does too.
+    """
+    requested = _canonical_assignee(profile)
+    # Shared with create_task and request_review since D8 — one vocabulary for
+    # every writer of the assignee column, so the gate cannot be true on one
+    # path and absent on another (that asymmetry WAS the defect).
+    _assert_assignee_dispatchable(requested, context=f"cannot assign {task_id!r}")
+    # An explicit shorthand assignment is unambiguous lane intent (this
+    # signature has no executor_lane parameter to conflict with), so it sets
+    # the lane outright rather than deferring to whatever lane the row carries.
+    profile, lane, from_token = _normalize_shorthand_lane(requested, None)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, executor_lane "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -4624,21 +5794,56 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        if row["assignee"] != profile:
+        lane_sql = ", executor_lane = ?" if from_token is not None else ""
+        lane_params: tuple[Any, ...] = (lane,) if from_token is not None else ()
+        # Compare the whole executor identity, not just the profile string: a
+        # task already on assignee='default' that is being moved onto the
+        # codex_verify lane IS a reassignment, and must not inherit the
+        # previous executor's failure streak just because the carrier profile
+        # name happens to be unchanged.
+        changed = row["assignee"] != profile or (
+            from_token is not None and row["executor_lane"] != lane
+        )
+        if changed:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
-                (profile, task_id),
+                "last_failure_error = NULL" + lane_sql + " WHERE id = ?",
+                (profile, *lane_params, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+            conn.execute(
+                "UPDATE tasks SET assignee = ?" + lane_sql + " WHERE id = ?",
+                (profile, *lane_params, task_id),
+            )
+        if from_token is not None:
+            # Same event kind the ready-queue dispatcher emits, so the audit
+            # trail reads identically whichever path did the translation.
+            _append_event(
+                conn, task_id, "executor_lane_normalized",
+                {
+                    "from_assignee": from_token,
+                    "assignee": profile,
+                    "executor_lane": lane,
+                    "source": "assign_task",
+                    "status": row["status"],
+                },
+            )
+        _append_event(
+            conn, task_id, "assigned",
+            {"assignee": profile, "requested": requested, "executor_lane": lane}
+            if from_token is not None
+            else {"assignee": profile},
+        )
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
-    notify_task_updated(conn, task_id, ("assignee",))
+    notify_task_updated(
+        conn,
+        task_id,
+        ("assignee", "executor_lane") if from_token is not None else ("assignee",),
+    )
     return True
 
 
@@ -4822,6 +6027,1184 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Governance relations + atomic repair creation
+# ---------------------------------------------------------------------------
+
+
+class RecoveryLinkageError(RuntimeError):
+    """A governed repair card could not be linked to its required relations.
+
+    Raised from inside :func:`create_repair_task`'s single write transaction,
+    which is the entire point: the exception unwinds the transaction that also
+    inserted the card, so a repair that cannot be linked is never created at
+    all. Callers see either a fully-linked repair or no repair.
+    """
+
+
+def add_task_relation(
+    conn: sqlite3.Connection,
+    from_task_id: str,
+    to_task_id: str,
+    relation: str,
+    *,
+    created_by: Optional[str] = None,
+) -> bool:
+    """Record a governance relation ``from -> to``. Returns True if new.
+
+    Safe to compose under a caller's transaction (``allow_nested=True``), so a
+    creation path can insert the card and its relations under ONE commit. That
+    composability is load-bearing, not a convenience: it is what makes the
+    orphan window in :func:`create_repair_task` structurally absent rather
+    than merely narrow.
+
+    Never touches ``task_links``, so it can never change readiness, promotion
+    or dependency gating for either card. That is what lets an evidence
+    pointer be added to a live card (``t_c5c2929d``) without rewriting or
+    re-scoping it.
+    """
+    if relation not in VALID_TASK_RELATIONS:
+        raise ValueError(
+            f"relation must be one of {sorted(VALID_TASK_RELATIONS)}, "
+            f"got {relation!r}"
+        )
+    if from_task_id == to_task_id:
+        raise ValueError("a task cannot hold a governance relation to itself")
+    with write_txn(conn, allow_nested=True):
+        missing = _find_missing_parents(conn, [from_task_id, to_task_id])
+        if missing:
+            raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO task_relations "
+            "(from_task_id, to_task_id, relation, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (from_task_id, to_task_id, relation, int(time.time()), created_by),
+        )
+        added = cur.rowcount > 0
+        if added:
+            payload = {
+                "from": from_task_id,
+                "to": to_task_id,
+                "relation": relation,
+            }
+            # Both ends get the event. A relation only one side can see is how
+            # a governance edge goes unnoticed — the subject and the umbrella
+            # must be able to discover the repair from their own event log,
+            # not only by being queried for.
+            _append_event(conn, from_task_id, "relation_added", payload)
+            _append_event(
+                conn, to_task_id, "relation_received", dict(payload),
+            )
+        return added
+
+
+def task_relations(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    relation: Optional[str] = None,
+    direction: str = "from",
+) -> list[dict]:
+    """Governance relations for ``task_id``.
+
+    ``direction='from'`` returns edges this card asserts; ``'to'`` returns
+    edges pointed AT it; ``'both'`` returns the union.
+    """
+    if direction not in ("from", "to", "both"):
+        raise ValueError("direction must be 'from', 'to' or 'both'")
+    clauses = []
+    params: list[Any] = []
+    if direction in ("from", "both"):
+        clauses.append("from_task_id = ?")
+        params.append(task_id)
+    if direction in ("to", "both"):
+        clauses.append("to_task_id = ?")
+        params.append(task_id)
+    sql = (
+        "SELECT from_task_id, to_task_id, relation, created_at, created_by "
+        "FROM task_relations WHERE (" + " OR ".join(clauses) + ")"
+    )
+    if relation is not None:
+        sql += " AND relation = ?"
+        params.append(relation)
+    sql += " ORDER BY created_at, relation, to_task_id"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def relation_targets(
+    conn: sqlite3.Connection, task_id: str, relation: str
+) -> list[str]:
+    """The ``to`` ids this card points at with ``relation``."""
+    return [
+        r["to_task_id"]
+        for r in task_relations(conn, task_id, relation=relation)
+    ]
+
+
+def missing_repair_relations(
+    conn: sqlite3.Connection, task_id: str
+) -> list[str]:
+    """Required repair relations this card does NOT have. Empty == linked.
+
+    Read back from the table rather than trusted from the caller's own
+    bookkeeping — an INSERT that silently did nothing (``INSERT OR IGNORE``
+    against a row that was concurrently deleted, a partially-applied
+    statement) is exactly the failure mode a caller's in-memory success flag
+    cannot see.
+    """
+    present = {
+        r["relation"]
+        for r in task_relations(conn, task_id)
+        if r["relation"] in REQUIRED_REPAIR_RELATIONS
+    }
+    return [rel for rel in REQUIRED_REPAIR_RELATIONS if rel not in present]
+
+
+class VerifierLinkageError(RuntimeError):
+    """An independent verifier card could not be linked to its subject/owner.
+
+    The verifier analogue of :class:`RecoveryLinkageError`, and raised the same
+    way: from inside the write transaction that also inserted the card, so the
+    exception unwinds the card along with the linkage. Callers see either a
+    verifier whose verdict has somewhere to go, or no verifier at all.
+    """
+
+
+def verifier_subject_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Subjects a verifier card renders its verdict on.
+
+    A thin, NAMED alias for :func:`parent_ids`, and worth its own name because
+    the parent edge means something different on a verifier than it does
+    anywhere else on the board. Everywhere else a parent is a dependency the
+    child waits for; on a ``codex_verify`` card the parent is the SUBJECT under
+    review — which is why ``_EVIDENCE_READY_PARENT_SQL`` lets a verifier child
+    run against a parent that is not finished. Reading the linkage through this
+    function keeps the guard, the watchdog and
+    :func:`_return_verifier_verdict_to_subjects` anchored to one definition.
+    """
+    return parent_ids(conn, task_id)
+
+
+def missing_verifier_linkage(
+    conn: sqlite3.Connection, task_id: str
+) -> list[str]:
+    """Required verifier linkage this card does NOT have. Empty == linked.
+
+    ``"subject"`` — no parent edge, so a verdict has no destination.
+    ``"owner"``   — ownership does not resolve, so a returned verdict has
+    nobody accountable for acting on it. Both are read back from persisted
+    state; neither trusts the caller's arguments.
+    """
+    missing: list[str] = []
+    if not verifier_subject_ids(conn, task_id):
+        missing.append("subject")
+    ownership = resolve_task_ownership(conn, task_id)
+    if ownership is None or not ownership.owner:
+        missing.append("owner")
+    return missing
+
+
+def orphaned_verifier_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Independent-verifier cards that name no subject.
+
+    Diagnostic, not a guard, and deliberately so: every verifier created before
+    this repair that predates the creation-boundary check is expected to appear
+    here and is preserved EXACTLY as it is. Rewriting history to make the
+    census look clean would destroy the only evidence that the defect was real
+    — on the live board this returns seven of fourteen verifier cards, two of
+    which closed a production deployment with a verdict nothing consumed.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE executor_lane = ? ORDER BY created_at, id",
+        (EXECUTOR_LANE_CODEX_VERIFY,),
+    ).fetchall()
+    return [r["id"] for r in rows if not verifier_subject_ids(conn, r["id"])]
+
+
+def orphaned_repair_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Repair/recovery cards that carry no required governance relation.
+
+    Diagnostic, not a guard: cards created BEFORE this repair are expected to
+    appear here and are preserved exactly as they are. It exists so the
+    orphan population is countable instead of anecdotal.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE creation_cause = ? ORDER BY created_at",
+        (CREATION_CAUSE_RECOVERY,),
+    ).fetchall()
+    return [
+        r["id"] for r in rows if missing_repair_relations(conn, r["id"])
+    ]
+
+
+def create_repair_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    subject_id: str,
+    owner: str,
+    umbrella_id: str,
+    body: Optional[str] = None,
+    evidence_ids: Iterable[str] = (),
+    provenance: Optional[ActorProvenance] = None,
+    **create_kwargs: Any,
+) -> str:
+    """Create a governed repair card, atomically linked or not created at all.
+
+    The defect this closes: a repair card whose subject, owner and umbrella
+    exist only as prose in its body. ``t_aef6bbe1`` and ``t_f9b3b48b`` are
+    both that shape — each states in words what it repairs, and neither is
+    reachable from its subject by any query. Nothing is wrong with either
+    card's text; the problem is that a governor cannot ask the board "what is
+    repairing this?" and get an answer, so a repair can be lost simply by
+    nobody remembering to look for it.
+
+    Prose is insufficient for a second, sharper reason. A relation added in a
+    *later* call than the insert has a window — however short — in which the
+    card exists and is unlinked. A crash, a lock timeout, a killed executor,
+    or an exception in the linking code leaves a permanently orphaned card
+    that looks like real work. Both the insert and every required relation
+    therefore run inside ONE ``write_txn``, and the linkage is READ BACK from
+    the table before that transaction commits. Any failure — a missing
+    subject, a blank owner, a relation that did not land — raises
+    :class:`RecoveryLinkageError` and unwinds the whole transaction, including
+    the card. The orphan window is not narrowed; it does not exist.
+
+    That enforcement lives in :func:`create_task`, not here, and this function
+    is a convenience over it rather than the thing that makes it safe. The
+    distinction matters: an earlier draft enforced only in this helper, and
+    independent review immediately minted an orphan by calling ``create_task``
+    directly with ``creation_cause='recovery'``. A rule only one door honours
+    is not a rule.
+
+    ``evidence_ids`` add non-governing :data:`RELATION_EVIDENCE` pointers.
+    They are best-effort by design and do NOT gate creation: an evidence
+    pointer is a citation, and failing to create a repair because a citation
+    target is gone would be the fail-closed rule applied where it does not
+    belong.
+    """
+    if provenance is None:
+        # A repair card's cause is 'recovery' whoever asked for it. The KIND
+        # still comes from the environment — a human-relayed repair and an
+        # automation-generated one are genuinely different provenance, and
+        # this is the distinction Defect A exists to preserve.
+        base = resolve_actor_provenance()
+        provenance = ActorProvenance(
+            kind=base.kind,
+            actor_id=base.actor_id,
+            lane=base.lane,
+            run_id=base.run_id,
+            cause=CREATION_CAUSE_RECOVERY,
+        )
+
+    owner = (owner or "").strip()
+    evidence = tuple(e for e in evidence_ids if e)
+
+    # ONE transaction. Everything below either commits together or leaves the
+    # board exactly as it was.
+    #
+    # The subject/owner/umbrella requirement and the linkage itself are NOT
+    # re-implemented here — ``create_task`` enforces them at the creation
+    # boundary, so the guarantee holds for every caller rather than only for
+    # users of this helper. This function adds what is specific to a repair
+    # card: the non-governing evidence citations and the ``repair_linked``
+    # summary event.
+    with write_txn(conn):
+        task_id = create_task(
+            conn,
+            title=title,
+            body=body,
+            provenance=provenance,
+            recovery_owner=owner or None,
+            repairs_task_id=subject_id,
+            umbrella_task_id=umbrella_id,
+            **create_kwargs,
+        )
+        for evidence_id in evidence:
+            # Citations, not governance. A dud id is dropped rather than
+            # allowed to veto a repair the board actually needs.
+            with contextlib.suppress(ValueError):
+                add_task_relation(
+                    conn, task_id, evidence_id, RELATION_EVIDENCE,
+                    created_by=owner,
+                )
+        # Read back, inside the transaction, before it can commit. This is the
+        # difference between "we called the linker" and "the board holds the
+        # link" — only the second one is evidence.
+        still_missing = missing_repair_relations(conn, task_id)
+        if still_missing:
+            raise RecoveryLinkageError(
+                f"repair task {task_id} is missing required relation(s) "
+                f"{still_missing}; rolling back so no orphan card is created"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "repair_linked",
+            {
+                "subject": subject_id,
+                "umbrella": umbrella_id,
+                "owner": owner,
+                "evidence": list(evidence),
+                "relations": [
+                    r["relation"] for r in task_relations(conn, task_id)
+                ],
+            },
+        )
+    return task_id
+
+
+# ---------------------------------------------------------------------------
+# SESSION-INDEPENDENT OWNERSHIP
+# ---------------------------------------------------------------------------
+#
+# ``tasks.session_id`` names the interactive session a card was created in. It
+# is genuinely useful provenance and it is NOT an ownership key, because it has
+# no lifetime guarantee: the session ends, the SSH connection drops, the
+# Claude/Codex process is reaped, and the string keeps pointing at something
+# that no longer exists. Any code that answers "who owns this?" by resolving a
+# session — or worse, by checking whether a process is still alive — returns
+# "nobody" the moment the session ends, and a card whose owner is nobody is a
+# card no recovery lane will route and no governor will chase.
+#
+# The columns that answer ownership are all written once, at creation, and are
+# facts about a moment rather than about a live process:
+#
+#   recovery_owner  the identity accountable for a repair's recovery decision
+#   actor_id        the creating actor's identity within its kind
+#   assignee        the profile the card is dispatched to
+#   created_by      legacy free-text author (last resort, audit only)
+#
+# :func:`resolve_task_ownership` walks that list in order and reports WHICH one
+# answered, so an ambiguous or degraded resolution is visible instead of
+# silently plausible. It reads only persisted rows: no ``os.environ``, no
+# process table, no session registry. That is the property the regressions in
+# ``tests/hermes_cli/test_kanban_session_independent_ownership.py`` pin — the
+# resolution is byte-identical before and after the originating session is
+# destroyed, because nothing in the resolution ever consulted it.
+
+#: Ownership sources, most authoritative first. Order is the contract: a repair
+#: card's accountable identity is its ``recovery_owner``, not the profile it
+#: happens to be dispatched to.
+OWNERSHIP_SOURCE_ORDER = ("recovery_owner", "actor_id", "assignee", "created_by")
+
+#: Sources that are structured provenance written by this control plane.
+#: ``created_by`` is deliberately absent: it resolves, but it is the free-text
+#: profile string Defect A proved cannot distinguish a human relay from
+#: automation, so a card that can only be owned through it is reported as
+#: degraded rather than as cleanly owned.
+STRUCTURED_OWNERSHIP_SOURCES = frozenset({"recovery_owner", "actor_id", "assignee"})
+
+#: Degraded reasons that make the recorded owner *untrustworthy*, as opposed to
+#: merely *incomplete*. This distinction is the whole of the enforced boundary,
+#: and it is not a stylistic one:
+#:
+#: * **Untrustworthy** — the string might name the wrong actor. Acting on it
+#:   produces a false attribution, which is worse than refusing, because a
+#:   confident wrong owner is indistinguishable at read time from a right one.
+#:   These FAIL CLOSED at :func:`require_resolvable_ownership`.
+#: * **Incomplete** — the string names the right actor, but the record around
+#:   it is thin (a pre-migration card with no ``actor_kind``, a card with no
+#:   lane recorded). These are reported and carried forward, because refusing
+#:   them would strand the legacy board, and the legacy board is where the
+#:   preserved failure evidence lives.
+#:
+#: The 2026-09-03 independent review rejected the earlier boundary, which
+#: passed *every* degraded record including a ``created_by``-only one. The
+#: read-only census that justified tightening it rather than agonising over
+#: the trade-off: of the 34 live cards on the board that day, 34 resolved
+#: through ``assignee`` and **zero** through ``created_by``, so promoting
+#: ``owner_only_from_created_by`` to blocking strands nothing that exists.
+#: 33 of the 34 carry ``provenance_not_recorded`` and 10 carry
+#: ``no_executor_lane``, which is why those two stay advisory — enforcing them
+#: would strand almost the entire board.
+ATTRIBUTION_BLOCKING_REASONS = frozenset({
+    "no_owner_recorded",
+    "owner_only_from_created_by",
+})
+
+
+@dataclass(frozen=True)
+class TaskOwnership:
+    """Everything needed to govern a card, resolved from persisted state alone.
+
+    Frozen because an ownership answer is a reading of the board at a moment;
+    a mutable one invites a caller to "correct" a degraded resolution in
+    memory and then act as though the board said so.
+    """
+
+    task_id: str
+    #: The accountable identity, or ``None`` when nothing on the row answers.
+    owner: Optional[str]
+    #: Which column in :data:`OWNERSHIP_SOURCE_ORDER` supplied ``owner``.
+    #: ``None`` when unowned. Callers that care about attribution quality test
+    #: this rather than the string, for the same reason acceptance tests read
+    #: ``actor_kind`` rather than ``created_by``.
+    owner_source: Optional[str]
+    #: Lane this card RUNS in.
+    executor_lane: Optional[str]
+    #: Lane of the actor that CREATED it. Differs whenever one lane files work
+    #: for another — a codex_verify run filing a claude repair, for instance.
+    actor_lane: Optional[str]
+    actor_kind: Optional[str]
+    actor_id: Optional[str]
+    actor_run_id: Optional[str]
+    creation_cause: Optional[str]
+    #: Provenance only. Present in the record so an auditor can see which
+    #: session a card came from; never consulted to resolve ``owner``.
+    session_id: Optional[str]
+    #: Dependency parents (``task_links``) — the return path a child's result
+    #: must travel back up.
+    parent_ids: tuple[str, ...]
+    #: Governance relations (``task_relations``).
+    repairs: tuple[str, ...]
+    umbrella: tuple[str, ...]
+    evidence: tuple[str, ...]
+    #: Reasons ownership is not cleanly resolvable. Empty == clean.
+    degraded_reasons: tuple[str, ...] = ()
+
+    @property
+    def resolved(self) -> bool:
+        """Whether an accountable identity exists at all."""
+        return self.owner is not None
+
+    @property
+    def structurally_owned(self) -> bool:
+        """Whether the owner came from structured provenance, not free text."""
+        return self.owner_source in STRUCTURED_OWNERSHIP_SOURCES
+
+    @property
+    def blocking_reasons(self) -> tuple[str, ...]:
+        """Degradations that make the owner untrustworthy rather than thin.
+
+        See :data:`ATTRIBUTION_BLOCKING_REASONS`. Empty means the recorded
+        owner may be acted on; non-empty means acting on it would be a guess
+        wearing a name.
+        """
+        return tuple(
+            r for r in self.degraded_reasons if r in ATTRIBUTION_BLOCKING_REASONS
+        )
+
+    @property
+    def attributable(self) -> bool:
+        """Whether the owner can be acted on without risking false attribution.
+
+        Weaker than :attr:`governable` (which additionally wants a lane and a
+        complete provenance record) and stronger than :attr:`resolved` (which
+        only wants some string). This is the predicate the enforced boundary
+        uses, because it is the one that separates "we do not know enough
+        about this card" from "we might name the wrong actor".
+        """
+        return self.resolved and not self.blocking_reasons
+
+    @property
+    def governable(self) -> bool:
+        """Whether a governor can act on this card without guessing.
+
+        Requires an owner AND a lane to route to AND no recorded degradation —
+        an owner with nowhere to run is not governable, it just looks it.
+
+        **Advisory, not a gate.** Every card created before the provenance
+        columns reads ``False`` here (``provenance_not_recorded``), and on the
+        live board as of 2026-09-03 that is 33 of its 34 live cards. Wiring
+        this into a routing or dispatch guard would therefore strand almost the
+        whole existing board, including the preserved failure evidence.
+
+        The *enforced* boundary is :func:`require_resolvable_ownership`, which
+        sits between this property and :attr:`resolved`: it fails closed on an
+        ownerless card **and** on an untrustworthy attribution, and passes a
+        merely incomplete one. See :attr:`attributable`.
+        """
+        return (
+            self.resolved
+            and self.executor_lane is not None
+            and not self.degraded_reasons
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "owner": self.owner,
+            "owner_source": self.owner_source,
+            "executor_lane": self.executor_lane,
+            "actor_lane": self.actor_lane,
+            "actor_kind": self.actor_kind,
+            "actor_id": self.actor_id,
+            "actor_run_id": self.actor_run_id,
+            "creation_cause": self.creation_cause,
+            "session_id": self.session_id,
+            "parent_ids": list(self.parent_ids),
+            "repairs": list(self.repairs),
+            "umbrella": list(self.umbrella),
+            "evidence": list(self.evidence),
+            "degraded_reasons": list(self.degraded_reasons),
+            "resolved": self.resolved,
+            "structurally_owned": self.structurally_owned,
+            "blocking_reasons": list(self.blocking_reasons),
+            "attributable": self.attributable,
+            "governable": self.governable,
+        }
+
+
+class OwnershipUnresolvable(RuntimeError):
+    """A card could not be given an accountable owner from persisted state."""
+
+
+def resolve_task_ownership(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[TaskOwnership]:
+    """Resolve ownership for ``task_id`` from persisted state only.
+
+    Returns ``None`` if the card does not exist. Never raises for a merely
+    degraded card: "this is owned badly" and "this card is gone" are different
+    answers and collapsing them loses the one a governor can act on.
+
+    **Reads no live state.** Not the process table, not a session registry,
+    not the environment. That is not an implementation detail — it is the
+    guarantee. The resolution a caller gets while the originating session is
+    live and the one it gets an hour after that session was destroyed are the
+    same bytes, because the session was never an input.
+    """
+    row = conn.execute(
+        "SELECT id, assignee, created_by, session_id, executor_lane, "
+        "actor_kind, actor_id, actor_lane, actor_run_id, creation_cause, "
+        "recovery_owner "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    candidates = {
+        "recovery_owner": row["recovery_owner"],
+        "actor_id": row["actor_id"],
+        "assignee": row["assignee"],
+        "created_by": row["created_by"],
+    }
+    owner: Optional[str] = None
+    owner_source: Optional[str] = None
+    for source in OWNERSHIP_SOURCE_ORDER:
+        value = (candidates.get(source) or "").strip()
+        if value:
+            owner, owner_source = value, source
+            break
+
+    degraded: list[str] = []
+    if owner is None:
+        degraded.append("no_owner_recorded")
+    elif owner_source not in STRUCTURED_OWNERSHIP_SOURCES:
+        # Resolvable, but only through the string that cannot distinguish an
+        # actor kind. Say so rather than reporting a clean owner.
+        degraded.append("owner_only_from_created_by")
+    elif owner_source == "assignee":
+        # Structured — the control plane writes it — but it answers "where does
+        # this run?" rather than "who is accountable for it?". The second
+        # independent review (2026-09-03) was right that treating a dispatch
+        # target as an accountable actor is a category error, and it is a
+        # separate one from the ``created_by`` free-text problem.
+        #
+        # It is reported and NOT blocking, on the same evidence that made
+        # ``created_by`` blocking: all 34 live cards resolve through
+        # ``assignee``, so refusing it strands the entire board. The honest
+        # position is therefore to stop calling it clean, not to pretend the
+        # board can do without it. See ATTRIBUTION_BLOCKING_REASONS.
+        degraded.append("owner_only_from_assignee")
+    if row["actor_kind"] is None:
+        # A pre-migration card. Nothing is backfilled — inventing a kind is
+        # the fabrication the provenance columns exist to prevent — so the
+        # degradation is reported and the card stays exactly as it is.
+        degraded.append("provenance_not_recorded")
+    if not (row["executor_lane"] or "").strip():
+        degraded.append("no_executor_lane")
+
+    cause = row["creation_cause"]
+    rel = {
+        r: tuple(relation_targets(conn, task_id, r))
+        for r in (RELATION_REPAIRS, RELATION_UMBRELLA, RELATION_EVIDENCE)
+    }
+    if cause == CREATION_CAUSE_RECOVERY:
+        # A repair card whose subject or umbrella is missing cannot be
+        # returned to anything. This is the orphan condition, restated as an
+        # ownership fact so one predicate covers both.
+        for relation in REQUIRED_REPAIR_RELATIONS:
+            if not rel[relation]:
+                degraded.append(f"repair_missing_{relation}")
+
+    return TaskOwnership(
+        task_id=row["id"],
+        owner=owner,
+        owner_source=owner_source,
+        executor_lane=(row["executor_lane"] or None),
+        actor_lane=(row["actor_lane"] or None),
+        actor_kind=(row["actor_kind"] or None),
+        actor_id=(row["actor_id"] or None),
+        actor_run_id=(row["actor_run_id"] or None),
+        creation_cause=(cause or None),
+        session_id=(row["session_id"] or None),
+        parent_ids=tuple(parent_ids(conn, task_id)),
+        repairs=rel[RELATION_REPAIRS],
+        umbrella=rel[RELATION_UMBRELLA],
+        evidence=rel[RELATION_EVIDENCE],
+        degraded_reasons=tuple(degraded),
+    )
+
+
+def require_resolvable_ownership(
+    conn: sqlite3.Connection, task_id: str
+) -> TaskOwnership:
+    """Ownership for ``task_id``, or raise. Fails closed.
+
+    The boundary form, for the paths where proceeding without an accountable
+    identity is what creates the orphan in the first place: arming an
+    observation timer, routing a recovery, returning a verifier verdict.
+
+    It refuses two things, and passes a third:
+
+    * an **unowned** card — nothing on the row names anyone;
+    * an **untrustworthy** one — the only thing naming an owner is the
+      free-text ``created_by``, which cannot distinguish a human relay from
+      automation running under the same profile, so routing on it risks
+      attributing the card to the wrong actor entirely;
+    * a merely **incomplete** one still passes, carrying its degradation
+      forward in :attr:`TaskOwnership.degraded_reasons`.
+
+    The middle case used to pass, and the 2026-09-03 independent review was
+    right that it hollowed the boundary out: a guard that admits an owner it
+    has just finished describing as unreliable is not a guard. See
+    :data:`ATTRIBUTION_BLOCKING_REASONS` for why the third case is treated
+    differently and for the live-board census showing this costs nothing.
+    """
+    ownership = resolve_task_ownership(conn, task_id)
+    if ownership is None:
+        raise OwnershipUnresolvable(f"unknown task {task_id!r}")
+    if not ownership.resolved:
+        raise OwnershipUnresolvable(
+            f"task {task_id!r} has no accountable owner in persisted state "
+            f"(checked {', '.join(OWNERSHIP_SOURCE_ORDER)}); refusing to "
+            f"proceed with an ownerless card"
+        )
+    if ownership.blocking_reasons:
+        raise OwnershipUnresolvable(
+            f"task {task_id!r} has no trustworthy accountable owner "
+            f"({', '.join(ownership.blocking_reasons)}); refusing to proceed "
+            f"on an attribution that may name the wrong actor"
+        )
+    return ownership
+
+
+def unowned_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Live cards for which :func:`resolve_task_ownership` finds no owner.
+
+    Diagnostic, like :func:`orphaned_repair_tasks`: it makes the ownerless
+    population countable rather than anecdotal, and it deliberately does not
+    repair anything it finds.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'archived') "
+        "ORDER BY created_at"
+    ).fetchall()
+    out = []
+    for r in rows:
+        ownership = resolve_task_ownership(conn, r["id"])
+        if ownership is not None and not ownership.resolved:
+            out.append(r["id"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# OBSERVATION TIMERS — durable 600s recheck
+# ---------------------------------------------------------------------------
+#
+# Rationale and the three failure shapes this replaces are in the OBSERVATION
+# TIMERS block near MANDATORY_OBSERVATION_INTERVAL_SECONDS. What follows is the
+# mechanism.
+
+
+class ObservationIntervalError(ValueError):
+    """An observation timer was armed at an interval other than 300 seconds."""
+
+
+class ObservationTimerNotFound(KeyError):
+    """No such observation timer on this board."""
+
+
+def _new_observation_timer_id() -> str:
+    return "obs_" + secrets.token_hex(4)
+
+
+def _delete_observation_timers_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Cascade a task deletion into its timers and their tick ledgers.
+
+    Called from inside the caller's transaction, like every other cascade in
+    the delete paths. Without it a deleted card leaves an armed timer behind
+    that is due forever and points at nothing — the exact "observation
+    outlives the thing observed" shape, arrived at from the other direction.
+
+    **The timers are CLOSED, with a reason, before they are deleted.** They
+    used to be dropped outright, which meant a live observation could end with
+    no recorded cause anywhere — the disappearance this control exists to
+    prevent, reached through the delete path instead of the emit path. The
+    close is not decorative: ``trg_obs_timer_no_delete_while_observing``
+    refuses the DELETE until it has happened, so the ordering below is
+    enforced by the database rather than by this function remembering to.
+
+    No ``observation_timer_closed`` event is appended, and that is deliberate
+    rather than an omission: both callers delete the card's whole
+    ``task_events`` history in the same transaction, so the event would be
+    written into a log that ceases to exist a few statements later. The
+    durable record of a purge is the caller's own deletion path, not a
+    tombstone on a row that is going away.
+    """
+    conn.execute(
+        "UPDATE observation_timers "
+        "SET state = ?, closed_at = ?, closed_reason = 'task_deleted' "
+        "WHERE task_id = ? AND state != ?",
+        (
+            OBSERVATION_STATE_CLOSED, int(time.time()), task_id,
+            OBSERVATION_STATE_CLOSED,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM observation_ticks WHERE timer_id IN "
+        "(SELECT id FROM observation_timers WHERE task_id = ?)",
+        (task_id,),
+    )
+    conn.execute("DELETE FROM observation_timers WHERE task_id = ?", (task_id,))
+
+
+@dataclass(frozen=True)
+class ObservationTimer:
+    """One armed (or retired) observation timer, read from the board."""
+
+    id: str
+    task_id: str
+    kind: str
+    interval_seconds: int
+    created_at: int
+    next_due_at: int
+    tick_count: int
+    last_tick_at: Optional[int]
+    verdict_emitted_at: Optional[int]
+    state: str
+    closed_at: Optional[int]
+    closed_reason: Optional[str]
+    owner: Optional[str]
+
+    @property
+    def observing(self) -> bool:
+        return self.state == OBSERVATION_STATE_OBSERVING
+
+    @property
+    def verdict_emitted(self) -> bool:
+        return self.verdict_emitted_at is not None
+
+    def is_due(self, now: Optional[int] = None) -> bool:
+        """Whether a tick is owed as of ``now``.
+
+        A function of the clock and this row. Deliberately not a function of
+        whether any observer process exists — that conflation is failure shape
+        3 (a stopped watcher that kept running, and a running watcher believed
+        stopped), and it is why process presence is never consulted here.
+        """
+        return self.observing and (
+            (int(time.time()) if now is None else int(now)) >= self.next_due_at
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "kind": self.kind,
+            "interval_seconds": self.interval_seconds,
+            "created_at": self.created_at,
+            "next_due_at": self.next_due_at,
+            "tick_count": self.tick_count,
+            "last_tick_at": self.last_tick_at,
+            "verdict_emitted_at": self.verdict_emitted_at,
+            "state": self.state,
+            "closed_at": self.closed_at,
+            "closed_reason": self.closed_reason,
+            "owner": self.owner,
+        }
+
+
+@dataclass(frozen=True)
+class ObservationTick:
+    """One emitted recheck."""
+
+    timer_id: str
+    task_id: str
+    seq: int
+    #: The due instant discharged, not the instant of emission.
+    due_at: int
+    emitted_at: int
+    #: Whole intervals whose due time passed with nothing running. Non-zero is
+    #: a recorded observer outage; it is never a silently dropped recheck.
+    missed: int
+    #: True on the contracted one-time verdict emission only.
+    verdict: bool
+    payload: Optional[dict]
+
+    @property
+    def late_seconds(self) -> int:
+        return max(0, self.emitted_at - self.due_at)
+
+    def as_dict(self) -> dict:
+        return {
+            "timer_id": self.timer_id,
+            "task_id": self.task_id,
+            "seq": self.seq,
+            "due_at": self.due_at,
+            "emitted_at": self.emitted_at,
+            "missed": self.missed,
+            "verdict": self.verdict,
+            "late_seconds": self.late_seconds,
+            "payload": self.payload,
+        }
+
+
+def _observation_timer_from_row(row: sqlite3.Row) -> ObservationTimer:
+    return ObservationTimer(
+        id=row["id"],
+        task_id=row["task_id"],
+        kind=row["kind"],
+        interval_seconds=int(row["interval_seconds"]),
+        created_at=int(row["created_at"]),
+        next_due_at=int(row["next_due_at"]),
+        tick_count=int(row["tick_count"]),
+        last_tick_at=row["last_tick_at"],
+        verdict_emitted_at=row["verdict_emitted_at"],
+        state=row["state"],
+        closed_at=row["closed_at"],
+        closed_reason=row["closed_reason"],
+        owner=row["owner"],
+    )
+
+
+def arm_observation_timer(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str = "recheck",
+    interval_seconds: int = MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+    owner: Optional[str] = None,
+    now: Optional[int] = None,
+) -> ObservationTimer:
+    """Arm a durable observation timer on ``task_id``.
+
+    ``interval_seconds`` must equal
+    :data:`MANDATORY_OBSERVATION_INTERVAL_SECONDS`. Any other value raises
+    :class:`ObservationIntervalError` — the parameter exists so the refusal is
+    explicit and testable, not so the interval can be tuned. "A number reasoned
+    out from a dispatcher tick" is precisely what the ruling forbade, and a
+    silently-accepted 900 would be indistinguishable at read time from a
+    correctly armed timer.
+
+    ``owner`` defaults to the card's resolved accountable identity. Arming
+    fails closed on an ownerless card: a timer nobody owns is an alarm nobody
+    answers, which is worse than no timer because it looks like coverage.
+
+    The timer is armed for ``now + interval``, so the first tick is owed one
+    full interval after arming rather than immediately.
+    """
+    # Normalised before it becomes half of a uniqueness key. Free-text 'kind'
+    # let 'recheck', 'Recheck' and ' recheck ' name three different observations
+    # of the same thing and slip past the (task_id, kind) index — found by the
+    # third independent review. Normalising at the one place timers are created
+    # is the fix; the column stays free-text because 'kind' is a label, not an
+    # enum, and constraining its vocabulary is a different decision.
+    kind = (kind or "").strip().lower() or "recheck"
+    interval = int(interval_seconds)
+    if interval != MANDATORY_OBSERVATION_INTERVAL_SECONDS:
+        raise ObservationIntervalError(
+            f"observation interval is fixed at "
+            f"{MANDATORY_OBSERVATION_INTERVAL_SECONDS}s by the 2026-09-03 "
+            f"ruling; refusing {interval}s"
+        )
+    now = int(time.time()) if now is None else int(now)
+    # Fails closed on an unknown or ownerless card, before any row is written.
+    ownership = require_resolvable_ownership(conn, task_id)
+    owner = (owner or "").strip() or ownership.owner
+    timer_id = _new_observation_timer_id()
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT INTO observation_timers "
+            "(id, task_id, kind, interval_seconds, created_at, next_due_at, "
+            " tick_count, state, owner) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                timer_id, task_id, kind, interval, now, now + interval,
+                OBSERVATION_STATE_OBSERVING, owner,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "observation_timer_armed",
+            {
+                "timer_id": timer_id,
+                "kind": kind,
+                "interval_seconds": interval,
+                "next_due_at": now + interval,
+                "owner": owner,
+            },
+        )
+    result = get_observation_timer(conn, timer_id)
+    assert result is not None  # just inserted, inside a committed txn
+    return result
+
+
+def get_observation_timer(
+    conn: sqlite3.Connection, timer_id: str
+) -> Optional[ObservationTimer]:
+    row = conn.execute(
+        "SELECT * FROM observation_timers WHERE id = ?", (timer_id,)
+    ).fetchone()
+    return None if row is None else _observation_timer_from_row(row)
+
+
+def task_observation_timers(
+    conn: sqlite3.Connection, task_id: str, *, state: Optional[str] = None
+) -> list[ObservationTimer]:
+    sql = "SELECT * FROM observation_timers WHERE task_id = ?"
+    params: list[Any] = [task_id]
+    if state is not None:
+        sql += " AND state = ?"
+        params.append(state)
+    sql += " ORDER BY created_at, id"
+    return [
+        _observation_timer_from_row(r) for r in conn.execute(sql, params).fetchall()
+    ]
+
+
+def due_observation_timers(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[ObservationTimer]:
+    """Every armed timer whose next tick is owed as of ``now``.
+
+    The scan is over persisted rows and the clock. A timer armed by a process
+    that has since died is returned here exactly like one whose armer is still
+    running, because the row is the timer — that equivalence is the point.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT * FROM observation_timers "
+        "WHERE state = ? AND next_due_at <= ? "
+        "ORDER BY next_due_at, id",
+        (OBSERVATION_STATE_OBSERVING, now),
+    ).fetchall()
+    return [_observation_timer_from_row(r) for r in rows]
+
+
+def emit_observation_tick(
+    conn: sqlite3.Connection,
+    timer_id: str,
+    *,
+    payload: Optional[dict] = None,
+    now: Optional[int] = None,
+) -> Optional[ObservationTick]:
+    """Emit the owed recheck for ``timer_id`` and RE-ARM in the same statement.
+
+    Returns the tick, or ``None`` when nothing was owed — the timer is not due,
+    is closed, or another emitter already discharged this due instant.
+
+    Three properties, each carried by a database constraint rather than by a
+    caller's discipline:
+
+    * **Continues observing.** ``next_due_at`` is advanced to the next future
+      boundary and ``state`` is left untouched, inside the transaction that
+      writes the tick. There is no code path here that closes a timer, so an
+      emitter cannot end observation by emitting — failure shape 1.
+    * **Verdict exactly once.** The CAS below matches on ``tick_count``, so
+      only one emitter can ever produce ``seq == 1``; ``verdict_emitted_at`` is
+      additionally written only where it ``IS NULL``.
+    * **Duplicates suppressed.** ``observation_ticks`` is keyed
+      ``(timer_id, seq)``, and the guarded UPDATE means two racing emitters
+      compute different ``seq`` values only if one of them already committed.
+      The loser's ``rowcount`` is 0 and it emits nothing.
+
+    Phase is preserved across an observer outage: the next due time is derived
+    from the due instant being discharged, never from ``now``. So an observer
+    that was down for 40 minutes emits ONE tick recording ``missed=3`` and
+    stays on its original 300 s boundaries, rather than emitting a burst of
+    four or silently re-phasing to a new grid.
+    """
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT * FROM observation_timers WHERE id = ?", (timer_id,)
+        ).fetchone()
+        if row is None:
+            raise ObservationTimerNotFound(timer_id)
+        if row["state"] != OBSERVATION_STATE_OBSERVING:
+            return None
+        due_at = int(row["next_due_at"])
+        if now < due_at:
+            return None
+        interval = int(row["interval_seconds"])
+        observed_ticks = int(row["tick_count"])
+        # Full intervals that elapsed BEYOND the one being discharged.
+        missed = (now - due_at) // interval
+        next_due = due_at + (missed + 1) * interval
+        seq = observed_ticks + 1
+        # The verdict is owed while none has been recorded. Reading the column
+        # rather than testing ``seq == 1`` keeps the guarantee anchored to
+        # persisted state.
+        verdict = row["verdict_emitted_at"] is None
+        cur = conn.execute(
+            "UPDATE observation_timers "
+            "SET next_due_at = ?, tick_count = ?, last_tick_at = ?, "
+            "    verdict_emitted_at = CASE "
+            "        WHEN verdict_emitted_at IS NULL AND ? = 1 THEN ? "
+            "        ELSE verdict_emitted_at END "
+            "WHERE id = ? AND state = ? AND next_due_at = ? AND tick_count = ?",
+            (
+                next_due, seq, now,
+                1 if verdict else 0, now,
+                timer_id, OBSERVATION_STATE_OBSERVING, due_at, observed_ticks,
+            ),
+        )
+        if cur.rowcount == 0:
+            # Another emitter discharged this due instant between the SELECT
+            # and the UPDATE. It emitted; this call must not.
+            return None
+        conn.execute(
+            "INSERT INTO observation_ticks "
+            "(timer_id, seq, due_at, emitted_at, missed, verdict, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                timer_id, seq, due_at, now, int(missed), 1 if verdict else 0,
+                json.dumps(payload, ensure_ascii=False) if payload else None,
+            ),
+        )
+        _append_event(
+            conn,
+            row["task_id"],
+            "observation_tick",
+            {
+                "timer_id": timer_id,
+                "seq": seq,
+                "due_at": due_at,
+                "emitted_at": now,
+                "missed": int(missed),
+                "verdict": verdict,
+                "next_due_at": next_due,
+                # Named for what it is. The ruling's own wording: a 600s tick
+                # re-gathers evidence and restates the open question. Labelling
+                # it anything that declares — 'stalled', 'DEFECT-ADVISORY' — is
+                # the same mistake wearing a different word.
+                "emission": "recheck",
+            },
+        )
+    return ObservationTick(
+        timer_id=timer_id,
+        task_id=row["task_id"],
+        seq=seq,
+        due_at=due_at,
+        emitted_at=now,
+        missed=int(missed),
+        verdict=verdict,
+        payload=payload,
+    )
+
+
+def run_observation_cycle(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[ObservationTick]:
+    """Discharge every owed recheck once. Closes nothing.
+
+    The driver an observer process calls on each pass. It is deliberately
+    idempotent per due instant and deliberately incapable of retiring a timer:
+    an observer that runs this and then exits leaves every timer armed for its
+    next interval, which is what makes the observation survive the observer.
+    """
+    now = int(time.time()) if now is None else int(now)
+    ticks: list[ObservationTick] = []
+    for timer in due_observation_timers(conn, now=now):
+        tick = emit_observation_tick(conn, timer.id, now=now)
+        if tick is not None:
+            ticks.append(tick)
+    return ticks
+
+
+def close_observation_timer(
+    conn: sqlite3.Connection,
+    timer_id: str,
+    *,
+    reason: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Retire a timer. Returns False if it was already closed.
+
+    ``reason`` is mandatory and must be non-empty. A timer that can be retired
+    without saying why is a timer that can vanish quietly, which is failure
+    shape 2 — the observation stopped and its absence read as "nothing to
+    report". The reason is written to the row and to the card's append-only
+    event log, so the end of an observation is as discoverable as its start.
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError(
+            "closing an observation timer requires an explicit reason; a "
+            "timer must never be able to disappear silently"
+        )
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT task_id, state FROM observation_timers WHERE id = ?",
+            (timer_id,),
+        ).fetchone()
+        if row is None:
+            raise ObservationTimerNotFound(timer_id)
+        cur = conn.execute(
+            "UPDATE observation_timers SET state = ?, closed_at = ?, "
+            "closed_reason = ? WHERE id = ? AND state = ?",
+            (
+                OBSERVATION_STATE_CLOSED, now, reason, timer_id,
+                OBSERVATION_STATE_OBSERVING,
+            ),
+        )
+        if cur.rowcount == 0:
+            return False
+        _append_event(
+            conn,
+            row["task_id"],
+            "observation_timer_closed",
+            {"timer_id": timer_id, "reason": reason, "closed_at": now},
+        )
+    return True
+
+
+def observation_ticks(
+    conn: sqlite3.Connection, timer_id: str
+) -> list[ObservationTick]:
+    """Every tick this timer has emitted, oldest first."""
+    timer_row = conn.execute(
+        "SELECT task_id FROM observation_timers WHERE id = ?", (timer_id,)
+    ).fetchone()
+    if timer_row is None:
+        raise ObservationTimerNotFound(timer_id)
+    rows = conn.execute(
+        "SELECT * FROM observation_ticks WHERE timer_id = ? ORDER BY seq",
+        (timer_id,),
+    ).fetchall()
+    return [
+        ObservationTick(
+            timer_id=timer_id,
+            task_id=timer_row["task_id"],
+            seq=int(r["seq"]),
+            due_at=int(r["due_at"]),
+            emitted_at=int(r["emitted_at"]),
+            missed=int(r["missed"]),
+            verdict=bool(r["verdict"]),
+            payload=json.loads(r["payload"]) if r["payload"] else None,
+        )
+        for r in rows
+    ]
 
 
 def task_graph_contexts(
@@ -5414,6 +7797,40 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def finalize_stranded_verified_reviews(conn: sqlite3.Connection) -> int:
+    """Replay-safe finalizer for Gauntlet subjects already VERIFIED in review.
+
+    A verifier PASS can be durable before the gateway process that knows how to
+    auto-finalize it is loaded (restart/deploy boundary).  Such a card must not
+    require another model/human relay.  On each dispatcher tick, finish only
+    cards whose persisted state already authorizes ordinary guarded completion.
+    ``complete_task`` re-checks parents, Gauntlet verification, regression, and
+    terminal-disposition invariants, so this helper adds no bypass.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'review' "
+        "AND verification_state = ? "
+        "AND regression_required = 0 "
+        "AND terminal_disposition IS NULL",
+        (VERIFICATION_VERIFIED,),
+    ).fetchall()
+    completed = 0
+    for row in rows:
+        task_id = row["id"]
+        if not gauntlet_required(conn, task_id):
+            continue
+        if complete_task(
+            conn, task_id,
+            summary=(
+                "Replay finalization: persisted independent VERIFIED verdict "
+                "already authorizes guarded Gauntlet completion."
+            ),
+        ):
+            completed += 1
+    return completed
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -5552,7 +7969,39 @@ def recompute_ready(
 # such a parent eligible. That would invert the carve-out into a hole; the
 # COALESCE forces the unknown case back to "not evidence-ready", i.e. still
 # gated. Pinned by ``test_ordinary_child_still_requires_terminal_parent``.
-_EVIDENCE_READY_PARENT_SQL = """
+def _subject_has_evidence_sql(alias: str = "") -> str:
+    """SQL predicate: this subject carries evidence a verifier could check.
+
+    Either the subject holds an attachment of its own, or it inherits one from
+    a ``done``/``archived`` + ``verified`` source parent.
+
+    Factored out of :data:`_EVIDENCE_READY_PARENT_SQL` so the dispatch gate and
+    the pre-flight check in :func:`_ensure_independent_verifier_child` are the
+    *same* predicate rather than two hand-copied ones. That matters more than
+    tidiness: if the two ever disagree, the control plane resumes creating
+    verifier children it will never dispatch — the exact defect the pre-flight
+    exists to prevent — and it would do so silently.
+    """
+    subject = f"{alias}.id" if alias else "id"
+    return f"""
+    (EXISTS (
+        SELECT 1 FROM task_attachments a WHERE a.task_id = {subject}
+    )
+    OR EXISTS (
+        SELECT 1
+          FROM task_links src_link
+          JOIN tasks src ON src.id = src_link.parent_id
+         WHERE src_link.child_id = {subject}
+           AND src.status IN ('done', 'archived')
+           AND src.verification_state = :verified
+           AND EXISTS (
+               SELECT 1 FROM task_attachments sa WHERE sa.task_id = src.id
+           )
+    ))
+"""
+
+
+_EVIDENCE_READY_PARENT_SQL = f"""
     (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
     AND p.verification_state = :pending
     AND EXISTS (
@@ -5561,15 +8010,20 @@ _EVIDENCE_READY_PARENT_SQL = """
            AND v.kind = :verdict_kind
            AND v.state = :pending
     )
-    AND EXISTS (
-        SELECT 1 FROM task_attachments a WHERE a.task_id = p.id
-    )
+    AND {_subject_has_evidence_sql("p")}
 """
 
 # A review handoff can also be the governing parent of the implementation it
 # authorises. Requiring that parent to complete first is circular when the
 # handoff was refused solely by the independent-reviewer guard. This exception
 # is topology- and evidence-bound rather than inferred from title/body prose.
+#
+# The evidence arm below deliberately demands an attachment on the parent
+# ITSELF rather than reusing ``_subject_has_evidence_sql``. The inherited-
+# evidence widening in that helper is a property of the verifier carve-out
+# above; extending it to this carve-out would broaden the release beyond the
+# behaviour being merged, so this predicate keeps the narrower, strictly
+# fail-closed form.
 _GOVERNED_IMPLEMENTATION_HANDOFF_SQL = """
     (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :implement_lane
     AND (SELECT c.gauntlet_enforced FROM tasks c WHERE c.id = :child) = 1
@@ -5702,6 +8156,7 @@ _PARENT_GATE_PARAMS = {
     "implement_lane": EXECUTOR_LANE_CLAUDE,
     "pending": VERIFICATION_PENDING,
     "verdict_kind": LEDGER_KIND_VERDICT,
+    "verified": VERIFICATION_VERIFIED,
 }
 
 
@@ -5893,58 +8348,130 @@ def claim_review_task(
                     },
                 )
             return None
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
-               -- Redispatch guard; see the same predicate in claim_task.
-               AND """ + _not_irreversibly_disposed_sql() + """
-            """,
-            (lock, expires, now, task_id),
-        )
-        if cur.rowcount != 1:
-            return None
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
+        # Verifier independence, enforced at SELECTION rather than only at
+        # verdict time — and, for a Gauntlet-enforced subject, BEFORE the
+        # same-identity claim is attempted rather than after it has been
+        # refused once. See ``_review_claim_conflict``: it answers with the
+        # verdict gate's own predicate, so the review dispatcher can no longer
+        # re-select an identity the verdict gate is certain to refuse
+        # (t_00690780 runs 1624/1625; t_cbc133db 2026-09-03 22:50). Refusing
+        # the claim is what breaks that loop and leaves the task parked in
+        # ``review`` for the independent ``codex_verify`` child to pick up.
+        #
+        # Refusing is necessary and was not sufficient. ``request_review`` opens
+        # the independent route at the handoff, but a subject can arrive in
+        # ``review`` WITHOUT a fresh handoff — unblocked back into review by an
+        # operator or a recovery path, or parked by a ``request_review`` that ran
+        # before the routing repair existed. Those subjects were refused here on
+        # every dispatcher tick with nothing that could ever verify them: the
+        # live t_cbc133db shape, refused at 23:31:20 and then silent. So the
+        # refusal now also OPENS the route it demands, post-commit and
+        # idempotently, exactly as the handoff does.
+        refused: Optional[tuple[str, str]] = None
+        claim_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'review'",
             (task_id,),
         ).fetchone()
-        run_cur = conn.execute(
-            """
-            INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
+        if claim_row is not None and claim_row["assignee"]:
+            conflict = _review_claim_conflict(
+                conn, task_id, claim_row["assignee"]
+            )
+            if conflict is not None:
+                candidate, conflict_source = conflict
+                _emit_once_this_phase(
+                    conn, task_id, "review_claim_rejected_self_review",
+                    {
+                        "candidate": candidate,
+                        "conflict_source": conflict_source,
+                        "refused_identities": sorted(
+                            _self_review_refused_implementers(conn, task_id)
+                        ),
+                        "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                    },
+                )
+                refused = (candidate, conflict_source)
+        if refused is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'running',
+                       claim_lock    = ?,
+                       claim_expires = ?,
+                       started_at    = COALESCE(started_at, ?)
+                 WHERE id = ?
+                   AND status = 'review'
+                   AND claim_lock IS NULL
+                   -- Redispatch guard; see the same predicate in claim_task.
+                   AND """ + _not_irreversibly_disposed_sql() + """
+                """,
+                (lock, expires, now, task_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            trow = conn.execute(
+                "SELECT assignee, max_runtime_seconds, current_step_key "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            run_cur = conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, profile, step_key, status,
+                    claim_lock, claim_expires, max_runtime_seconds,
+                    started_at
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    trow["assignee"] if trow else None,
+                    trow["current_step_key"] if trow else None,
+                    lock,
+                    expires,
+                    trow["max_runtime_seconds"] if trow else None,
+                    now,
+                ),
+            )
+            run_id = run_cur.lastrowid
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (run_id, task_id),
+            )
+            _append_event(
+                conn, task_id, "claimed",
+                {"lock": lock, "expires": expires, "run_id": run_id,
+                 "source_status": "review"},
+                run_id=run_id,
+            )
+            return get_task(conn, task_id)
+    # Only a refusal reaches here; every other path returned inside the
+    # transaction above. The refusal is already durable, so opening the route
+    # is post-commit and best-effort for the same reason ``request_review``
+    # places it there: a fault while creating the verifier must not undo a
+    # correctly recorded refusal.
+    #
+    # Gauntlet-scoped: ``_review_claim_conflict`` also answers "refused" for an
+    # unenforced card, and the ``codex_verify`` child is a Gauntlet artifact.
+    if gauntlet_required(conn, task_id):
+        conflict_identity, conflict_source = refused
+        implementer = _review_requested_implementer(conn, task_id)
+        child_id = _ensure_independent_verifier_child(
+            conn, task_id, implementer=implementer,
         )
-        run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
-            run_id=run_id,
-        )
-        return get_task(conn, task_id)
+        with write_txn(conn):
+            _emit_once_this_phase(
+                conn, task_id, "independent_verification_required",
+                {
+                    "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                    "conflict_identity": conflict_identity,
+                    "conflict_source": conflict_source,
+                    "verifier_task": child_id,
+                    "source": "claim_review_task",
+                },
+            )
+        # Promote the child off the subject's evidence packet on this tick,
+        # not the next one.
+        recompute_ready(conn)
+    return None
 
 
 def _retry_status_for_run(
@@ -6913,6 +9440,1797 @@ def _review_requested_implementer(
     return implementer
 
 
+# ---------------------------------------------------------------------------
+# Verifier identity: registry validation + the independence identity set
+# ---------------------------------------------------------------------------
+#
+# Refusing ``verifier == implementer`` is necessary but it was never
+# sufficient, and three holes around it were all exercised on the live board:
+#
+#   (a) The verifier string was checked against NOTHING. Any token that merely
+#       DIFFERED from the implementer rendered a binding verdict — which is how
+#       the unregistered identity 'chatgpt-systems' closed t_023d2af6 and
+#       t_616527d7 (a live Logos Covenant production deployment). A verdict
+#       signed by an identity the system cannot resolve is not attributable to
+#       anyone, so it cannot be shown to be independent of anyone either.
+#   (b) A verifier of ``None`` skipped the comparison entirely — the guard read
+#       ``if verifier and implementer and ...``, so "pass no verifier" was a
+#       complete bypass, documented at the time as a concession to
+#       untracked/legacy callers. There are no such callers left: the CLI falls
+#       back to the acting profile (``kanban.py`` ``_profile_author``) and the
+#       codex_verify return path always signs. An unsigned verdict now fails
+#       closed.
+#   (c) Independence was tested against the ``review_requested`` implementer
+#       only, never against the task's own ``assignee``. See
+#       ``_phase_reviewer_identities`` for why that comparison needs a carve-out
+#       rather than being applied flat.
+#
+# Legitimate verifier identities are NOT all Hermes profiles, so this is an
+# allow-list and not a bare ``profile_exists`` call. The sanctioned independent
+# lane is ``codex_verify`` (compatibility shorthand ``atlas``): both are
+# EXECUTOR LANES, not profile directories — ``~/.hermes/profiles/atlas/`` does
+# not exist and is not supposed to. ``_return_verifier_verdict_to_subjects``
+# also signs verdicts as ``codex_verify:<verifier_task_id>``, so the LANE ROOT
+# is what has to match, not the whole string.
+VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset(VALID_EXECUTOR_LANES | {"atlas"})
+
+#: Registry classifications returned by :func:`_verifier_identity_status`.
+VERIFIER_IDENTITY_LANE = "lane"
+VERIFIER_IDENTITY_PROFILE = "profile"
+VERIFIER_IDENTITY_UNKNOWN = "unknown"
+VERIFIER_IDENTITY_UNCHECKED = "unchecked"
+
+
+def _verifier_identity_status(verifier: Optional[str]) -> tuple[str, Optional[str]]:
+    """Classify a verifier identity against the profile registry.
+
+    Returns ``(status, detail)``:
+
+    * ``"lane"``      — a recognized executor-lane identity (``codex_verify``,
+      ``codex_verify:t_abc123``, ``atlas``, ``claude_recovery``). Legitimate,
+      and deliberately not required to be a profile.
+    * ``"profile"``   — an existing Hermes profile (``profile_exists``).
+    * ``"unknown"``   — neither. The verdict must be refused.
+    * ``"unchecked"`` — the registry could not be consulted at all (import or
+      filesystem failure). Reported as itself so an unreadable registry is
+      visible rather than masquerading as either a clean pass or a false
+      accusation; callers let the verdict through and record the gap.
+    """
+    if not verifier or not str(verifier).strip():
+        return VERIFIER_IDENTITY_UNKNOWN, "no verifier identity supplied"
+    identity = str(verifier).strip()
+    # Lane-scoped verdicts are ``<lane>:<verifier_task_id>``; match the root.
+    lane_root = identity.split(":", 1)[0].strip().lower()
+    if lane_root in VERIFIER_LANE_IDENTITIES:
+        return VERIFIER_IDENTITY_LANE, lane_root
+    try:
+        from hermes_cli.profiles import profile_exists as _profile_exists
+    except Exception as exc:  # pragma: no cover - defensive
+        return VERIFIER_IDENTITY_UNCHECKED, f"profile registry unavailable: {exc}"
+    try:
+        exists = bool(_profile_exists(identity))
+    except Exception as exc:  # pragma: no cover - defensive
+        return VERIFIER_IDENTITY_UNCHECKED, f"profile lookup failed: {exc}"
+    if exists:
+        return VERIFIER_IDENTITY_PROFILE, identity
+    return VERIFIER_IDENTITY_UNKNOWN, (
+        f"{identity!r} is neither an existing Hermes profile nor a recognized "
+        f"verifier lane ({', '.join(sorted(VERIFIER_LANE_IDENTITIES))})"
+    )
+
+
+def _phase_reviewer_identities(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Identities explicitly installed as the CURRENT phase's reviewer.
+
+    ``verifier == tasks.assignee`` is normally self-verification, but it cannot
+    be refused flat, because the sanctioned independence recovery is precisely
+    to REASSIGN the parked task to an independent reviewer — after which the
+    reviewer legitimately IS the assignee. ``complete_task``'s implicit
+    approval path even derives its reviewer identity from ``tasks.assignee``
+    (see ``_review_run_verification``), so a flat comparison would refuse every
+    review-run approval on the board.
+
+    Two routes put someone in the reviewer seat on purpose, and only these two
+    earn the exception:
+
+    * ``review_requested.reviewer`` — ``request_review(reviewer=B)`` records B
+      on the handoff event and reassigns the row to B inside the same
+      transaction, emitting no separate ``assigned`` event.
+    * an ``assigned`` event AFTER the phase opened — the manual recovery route
+      (reclaim + assign) used on t_4edb5874 on 2026-09-03, when 'default' was
+      correctly blocked from reviewing itself and compliance_worker was handed
+      the review.
+
+    Anything else that arrives in ``tasks.assignee`` — a dispatcher-side
+    shorthand normalization, ``reopen_review_task``'s implementer restore, a
+    direct row edit — is not a reviewer installation and does not earn it.
+
+    The exception applies ONLY to the assignee-derived identity. The
+    ``review_requested`` implementer is never exempted, so this is strictly
+    additive: it can add refusals, never remove one.
+    """
+    floor = _verification_phase_floor(conn, task_id)
+    identities: set[str] = set()
+    if floor:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE id = ?", (floor,),
+        ).fetchone()
+        if row is not None and row["payload"]:
+            try:
+                payload = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            reviewer = payload.get("reviewer") if isinstance(payload, dict) else None
+            if isinstance(reviewer, str) and reviewer.strip():
+                identities.add(_canonical_assignee(reviewer))
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'assigned' AND id > ?",
+        (task_id, floor),
+    ):
+        if not row["payload"]:
+            continue
+        try:
+            payload = json.loads(row["payload"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        assignee = payload.get("assignee") if isinstance(payload, dict) else None
+        if isinstance(assignee, str) and assignee.strip():
+            identities.add(_canonical_assignee(assignee))
+    identities.discard(None)  # type: ignore[arg-type]
+    return identities
+
+
+def _verifier_independence_conflict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    verifier: Optional[str],
+    *,
+    implementer: Optional[str],
+    assignee: Optional[str],
+) -> Optional[tuple[str, str]]:
+    """Return ``(conflicting_identity, source)`` when *verifier* is not independent.
+
+    ``source`` is ``"implementer"`` (the identity recorded on the phase's
+    ``review_requested`` handoff) or ``"assignee"`` (the task's own assignee,
+    where that assignee was never installed as this phase's reviewer). Returns
+    ``None`` when the verifier is independent of both.
+    """
+    if not verifier:
+        return None
+    verifier = _canonical_assignee(verifier)
+    if implementer and verifier == implementer:
+        return implementer, "implementer"
+    assignee = _canonical_assignee(assignee) if assignee else None
+    if assignee and verifier == assignee:
+        if assignee not in _phase_reviewer_identities(conn, task_id):
+            return assignee, "assignee"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Self-review refusal: durable exclusion + independent-verifier return path
+# ---------------------------------------------------------------------------
+#
+# A correct self-review refusal is a GOVERNANCE outcome, not an execution
+# failure — but before this block the board could not tell the two apart, and
+# the difference is what broke the live chain t_00690780 -> t_db0af7e0 on
+# 2026-09-03:
+#
+#   1. ``complete_task``/``record_verification`` refused the same-identity
+#      verdict correctly (events 9865/9867/9872/9879/9882), but the refusal
+#      left no state anyone could select on. The dispatcher re-claimed the
+#      review lane with the SAME assignee ('default') three runs in a row and
+#      got the identical refusal each time.
+#   2. Each of those reviewer runs then exited non-zero, so the crash path fed
+#      ``_record_task_failure`` and the refusals were charged to the subject's
+#      ORDINARY implementation retry budget — ``gave_up`` at 2/2 (event 9884)
+#      for a task whose implementation had actually succeeded and whose
+#      evidence packet (four attachments, 55 KB audit matrix) was intact.
+#   3. The dependent governance card t_db0af7e0 received ``linked_task_gave_up``
+#      (event 9886) while parked in ``todo`` behind an unsatisfiable
+#      dependency. The failure was written onto a card that could never be
+#      promoted, claimed or run — Erika was told about a decision she had no
+#      mechanical way to make.
+#
+# The three helpers below are the state the board was missing. They read only
+# the event log (no new columns, no migration) and scope everything to the
+# CURRENT verification phase, so a re-review after ``request_changes`` starts
+# from a clean slate.
+
+# A refusal only excludes an identity for the phase it happened in. The phase
+# boundary is the latest ``review_requested`` event: ``request_review`` emits
+# it on every handoff, so a task routed back for repair and re-submitted gets a
+# fresh boundary and the previous phase's exclusions stop applying.
+def _verification_phase_floor(conn: sqlite3.Connection, task_id: str) -> int:
+    """Return the event id that opens the current verification phase."""
+    row = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row["id"]) if row is not None else 0
+
+
+def _self_review_refused_implementers(
+    conn: sqlite3.Connection, task_id: str
+) -> set[str]:
+    """Identities refused as self-reviewers in the current verification phase.
+
+    Derived from the ``verification_blocked_self_review`` audit events the
+    refusal paths already emit — the historical events are the source of
+    truth, so this reads correctly against boards that recorded refusals
+    before this repair existed (t_00690780 among them).
+    """
+    floor = _verification_phase_floor(conn, task_id)
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'verification_blocked_self_review' "
+        "AND id > ?",
+        (task_id, floor),
+    ).fetchall()
+    refused: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        for key in ("implementer", "verifier"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                refused.add(_canonical_assignee(value))
+    return refused
+
+
+def _independent_verification_required(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Whether a self-review refusal is on record for the current phase."""
+    return bool(_self_review_refused_implementers(conn, task_id))
+
+
+def _emit_once_this_phase(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> bool:
+    """Append ``kind`` only if it is not already on record for this phase.
+
+    The review dispatcher re-evaluates every parked task on every tick. A
+    refusal that emitted an event per tick would bury the real history under
+    thousands of duplicates — the opposite of the durable, readable state this
+    repair is for. Returns True when the event was actually written.
+    """
+    floor = _verification_phase_floor(conn, task_id)
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND id > ? "
+        "LIMIT 1",
+        (task_id, kind, floor),
+    ).fetchone()
+    if existing is not None:
+        return False
+    _append_event(conn, task_id, kind, payload, run_id=run_id)
+    return True
+
+
+# --- Review-lane SELECTION independence -------------------------------------
+#
+# The block above excludes an identity once it has ALREADY been refused. That
+# is one refusal too late for autonomous Gauntlet routing: the refusal it feeds
+# on can only be produced by attempting the self-review it exists to prevent.
+# Reproduced live on E2E governor t_cbc133db (2026-09-03 22:50) —
+# ``request_review(reviewer=None)`` left ``assignee='erika'``, the review
+# dispatcher re-selected Erika for her own review, ``complete_task`` refused it
+# correctly with ``verification_blocked_self_review``, and the card blocked
+# capability.
+#
+# So selection now asks the SAME question the verdict gate asks, before opening
+# the run rather than after: ``_verifier_independence_conflict`` is the single
+# predicate, shared verbatim, so selection and verdict cannot drift into
+# disagreeing about who is independent.
+#
+# Scope is deliberately narrow. Only Gauntlet-enforced subjects are pre-empted
+# (``gauntlet_required``); an ordinary board's ``request_review(reviewer=None)``
+# keeps its existing behaviour exactly, because on such a board a same-identity
+# review run is not refused at verdict time either and pre-empting it would
+# strand work that has always been allowed to close. The already-refused
+# exclusion below it stays unconditional — it applies to every board, since a
+# refusal on record means the verdict gate has already spoken.
+def _review_claim_conflict(
+    conn: sqlite3.Connection, task_id: str, assignee: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """Return ``(identity, source)`` when *assignee* may not review ``task_id``.
+
+    ``source`` is ``"refused"`` (this identity already has a
+    ``verification_blocked_self_review`` on record for the phase),
+    ``"implementer"`` or ``"assignee"`` (the two independence conflicts
+    :func:`_verifier_independence_conflict` distinguishes). ``None`` means the
+    identity may open a review run.
+
+    Read by :func:`claim_review_task` and by the dispatcher's review-slot
+    reservation, so a candidate the claim path will reject never consumes the
+    slot it reserved.
+
+    An identity deliberately installed as THIS phase's reviewer is never
+    pre-empted, even when it happens to equal the implementer. That is the
+    whole distinction the live defect turns on: ``request_review(reviewer=None)``
+    installs nobody and leaves the implementer in the seat by default, whereas
+    ``request_review(reviewer=X)`` / ``assign_task`` are a caller stating who
+    reviews. Selection defers to that statement; the VERDICT gate does not —
+    ``_verifier_independence_conflict`` still refuses an implementer-signed
+    verdict there, so an installed self-reviewer can still request changes or
+    escalate, and still cannot bless the work.
+    """
+    if not assignee:
+        return None
+    candidate = _canonical_assignee(assignee)
+    if candidate in _self_review_refused_implementers(conn, task_id):
+        return candidate, "refused"
+    if not gauntlet_required(conn, task_id):
+        return None
+    if candidate in _phase_reviewer_identities(conn, task_id):
+        return None
+    implementer = _review_requested_implementer(conn, task_id, assignee)
+    return _verifier_independence_conflict(
+        conn, task_id, candidate, implementer=implementer, assignee=assignee,
+    )
+
+
+def _open_verifier_child(
+    conn: sqlite3.Connection, subject_id: str
+) -> Optional[str]:
+    """Return an existing, still-live ``codex_verify`` child of ``subject_id``.
+
+    "Live" excludes ``done``/``archived`` children: a spent verifier card is
+    not a route to a verdict for the phase now open. Used to keep
+    :func:`_ensure_independent_verifier_child` idempotent — the architecture
+    already represents verifier work as a child, and a second one would put two
+    independent verdicts on the same phase.
+    """
+    row = conn.execute(
+        "SELECT c.id FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? AND c.executor_lane = ? "
+        "AND c.status NOT IN ('done', 'archived') "
+        "ORDER BY c.created_at ASC LIMIT 1",
+        (subject_id, EXECUTOR_LANE_CODEX_VERIFY),
+    ).fetchone()
+    return row["id"] if row is not None else None
+
+
+def _subject_evidence_is_dispatchable(
+    conn: sqlite3.Connection, subject_id: str
+) -> bool:
+    """Whether a verifier child parented to ``subject_id`` could ever start.
+
+    Runs the *same* evidence predicate the dependency gate runs
+    (:func:`_subject_has_evidence_sql`), so a True here means the gate will
+    promote the child and a False means it never will.
+    """
+    row = conn.execute(
+        f"SELECT 1 FROM tasks t WHERE t.id = :subject "
+        f"AND {_subject_has_evidence_sql('t')} LIMIT 1",
+        {"subject": subject_id, "verified": VERIFICATION_VERIFIED},
+    ).fetchone()
+    return row is not None
+
+
+def _unroutable_recheck_timer(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[ObservationTimer]:
+    """The card's live UNROUTABLE recheck timer, if one is armed.
+
+    Mirrors :func:`_stall_timer`; kept separate so the two observations retire
+    independently.
+    """
+    for timer in task_observation_timers(
+        conn, task_id, state=OBSERVATION_STATE_OBSERVING,
+    ):
+        if timer.kind == UNROUTABLE_VERIFICATION_TIMER_KIND:
+            return timer
+    return None
+
+
+def _unroutable_alarm_is_owed(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None
+) -> bool:
+    """Whether the UNROUTABLE alarm may speak again for ``task_id``.
+
+    Three cases, in the order they are decided:
+
+    * **No timer armed** — this is a new episode. Owed. (Also the path taken
+      when a previous episode was retired by :func:`_retire_unroutable_recheck`,
+      which is what makes a recurrence audible instead of permanently muted.)
+    * **Timer armed and due** — ten minutes have elapsed and the evidence is
+      still missing. The recheck is discharged via :func:`emit_observation_tick`
+      (which re-arms on the original 300 s grid rather than re-phasing to
+      ``now``) and the alarm is owed again.
+    * **Timer armed and not yet due** — the same unchanged fact inside the same
+      window. Not owed.
+
+    A card that cannot carry a timer at all (ownerless, so
+    :func:`arm_observation_timer` fails closed) degrades to once-ever via
+    :func:`_already_alarmed` rather than back to once-per-tick: losing the
+    recheck cadence must never cost more than the recheck.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    timer = _unroutable_recheck_timer(conn, task_id)
+    if timer is None:
+        if _already_alarmed(
+            conn, task_id, "independent_verification_unroutable"
+        ):
+            # Alarmed before, yet no timer survives. Either arming failed on an
+            # ownerless card, or the episode was explicitly retired. Retirement
+            # is the only path that deletes nothing and leaves the event behind,
+            # and it is distinguishable: it writes observation_timer_closed.
+            return _unroutable_episode_was_retired(conn, task_id)
+        return True
+    if int(timer.next_due_at) > now_ts:
+        return False
+    emit_observation_tick(
+        conn, timer.id,
+        payload={"observation": UNROUTABLE_VERIFICATION_TIMER_KIND},
+        now=now_ts,
+    )
+    return True
+
+
+def _unroutable_episode_was_retired(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """True when the last UNROUTABLE observation on ``task_id`` was retired.
+
+    Distinguishes "this card never could carry a timer" (stay quiet after the
+    single alarm already on the ledger) from "the previous episode resolved and
+    a new one has begun" (speak again).
+    """
+    row = conn.execute(
+        "SELECT state FROM observation_timers WHERE task_id = ? AND kind = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, UNROUTABLE_VERIFICATION_TIMER_KIND),
+    ).fetchone()
+    return row is not None and row["state"] == OBSERVATION_STATE_CLOSED
+
+
+def _arm_unroutable_recheck(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Arm the 300 s recheck for a new UNROUTABLE episode.
+
+    Returns ``(timer_id, error)``. Best-effort and never blocks the alarm, for
+    the same reason :func:`sweep_lifecycle_stall_alarms` arms best-effort: an
+    ownerless card cannot carry a timer, and an ownerless card stuck with no
+    routable verification is exactly one a supervisor must still hear about.
+    The refusal rides on the alarm payload rather than being swallowed.
+    """
+    if _unroutable_recheck_timer(conn, task_id) is not None:
+        return None, None
+    try:
+        return arm_observation_timer(
+            conn, task_id,
+            kind=UNROUTABLE_VERIFICATION_TIMER_KIND,
+            now=now,
+        ).id, None
+    except Exception as exc:
+        _log.warning(
+            "unroutable-verification recheck could not be armed on %s: %s",
+            task_id, exc,
+        )
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _retire_unroutable_recheck(
+    conn: sqlite3.Connection, task_id: str, *, reason: str
+) -> bool:
+    """Close the UNROUTABLE recheck once the condition it watched resolved.
+
+    The ACTIVE half of criterion (D)'s active/inactive handling for this alarm:
+    evidence arrived, or a verifier child is open, so there is a route now and
+    the observation has nothing left to watch. Best-effort — a failure to
+    retire must not break the dispatch path that just succeeded.
+    """
+    timer = _unroutable_recheck_timer(conn, task_id)
+    if timer is None:
+        return False
+    try:
+        return close_observation_timer(conn, timer.id, reason=reason)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning(
+            "unroutable-verification recheck could not be retired on %s: %s",
+            task_id, exc,
+        )
+        return False
+
+
+def _ensure_independent_verifier_child(
+    conn: sqlite3.Connection, subject_id: str, *, implementer: Optional[str]
+) -> Optional[str]:
+    """Open the independent verification route for a parked Gauntlet subject.
+
+    Returns the verifier child's id — the pre-existing one when there is one,
+    otherwise a newly created ``codex_verify`` card parented to the subject.
+
+    The child is created through the sanctioned ``assignee='atlas'`` shorthand
+    so :func:`_normalize_shorthand_lane` installs the (``default``,
+    ``codex_verify``) carrier pair exactly as every other lane write does, and
+    it inherits the dependency carve-out in ``_EVIDENCE_READY_PARENT_SQL``: it
+    becomes claimable off the subject's evidence packet rather than waiting for
+    the subject to reach ``done``, which it never can without this verdict.
+    Its PASS/FAIL then returns through :func:`_return_verifier_verdict_to_subjects`.
+
+    Best-effort by construction, and called post-commit: the review handoff it
+    follows is already durable, and a failure here must not un-park a subject
+    whose implementation succeeded. Failing to create the child fails CLOSED —
+    the subject stays in ``review`` with ``verification_state='pending'``,
+    ``independent_verification_required`` on its ledger, and no route by which
+    anything can bless it.
+
+    **A child that cannot be dispatched is not a route.** The dependency gate
+    promotes a verifier child only once its subject carries evidence, so
+    creating one for an evidence-less subject manufactures a card that is
+    permanently un-dispatchable: the board shows an open verifier, the
+    lifecycle shows nothing happening, and the two never resolve. Observed
+    live on ``t_cbc133db`` — refused at 23:31:20, then 78 minutes of no events
+    at all, with four delegated children gated behind it.
+
+    So the evidence is checked FIRST, against the same predicate the gate uses.
+    With no acceptable evidence there is nothing falsifiable to verify: no
+    child is created, ``independent_verification_unroutable`` goes on the
+    ledger, and it is routed to Erika immediately rather than waiting out the
+    four-hour staleness clock. The evidence gate itself is NOT loosened —
+    whether an implementer's ``request_review`` summary should count as
+    durable evidence changes what "falsifiable" means for delegation cards,
+    and that is a governance decision, not a code bypass.
+    """
+    existing = _open_verifier_child(conn, subject_id)
+    if existing is not None:
+        # Every Gauntlet verifier is itself Gauntlet work and therefore owns
+        # the same 300-second attempt ceiling. Historically verifier children
+        # inherited gauntlet_enforced through their parent but not the runtime
+        # cap, producing uncapped Atlas runs. Normalize old open children here
+        # and make creation below explicit so the defect cannot recur.
+        if gauntlet_required(conn, subject_id):
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET max_runtime_seconds = ? "
+                    "WHERE id = ? AND (max_runtime_seconds IS NULL "
+                    "OR max_runtime_seconds != ?)",
+                    (
+                        MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+                        existing,
+                        MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+                    ),
+                )
+                if cur.rowcount:
+                    _append_event(
+                        conn,
+                        existing,
+                        "gauntlet_runtime_inherited",
+                        {
+                            "max_runtime_seconds": MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+                            "subject": subject_id,
+                        },
+                    )
+        _retire_unroutable_recheck(conn, subject_id, reason="verifier_child_open")
+        return existing
+    if not _subject_evidence_is_dispatchable(conn, subject_id):
+        if not _unroutable_alarm_is_owed(conn, subject_id):
+            # Same unchanged fact, inside the same 10-minute window. Silence is
+            # the correct output: the first alarm is already durable on the
+            # ledger and already delivered, and restating it once per dispatcher
+            # tick is what teaches a supervisor to ignore the channel.
+            return None
+        timer_id, timer_error = _arm_unroutable_recheck(conn, subject_id)
+        with write_txn(conn):
+            _append_event(
+                conn, subject_id, "independent_verification_unroutable",
+                {
+                    "reason": "subject carries no evidence the dispatch gate accepts",
+                    "implementer": implementer,
+                    "lane": EXECUTOR_LANE_CODEX_VERIFY,
+                },
+            )
+        try:
+            route_supervisory_alarm(
+                conn,
+                subject_id,
+                kind="INDEPENDENT_VERIFICATION_UNROUTABLE",
+                payload={
+                    "subject": subject_id,
+                    "implementer": implementer,
+                    "detail": (
+                        "independent verification is required but the subject "
+                        "carries no attachment the dispatch gate will accept, "
+                        "so no verifier child can ever run — attach the "
+                        "evidence packet or decide the card another way"
+                    ),
+                    "recheck_timer_id": timer_id,
+                    "recheck_interval_seconds": (
+                        MANDATORY_OBSERVATION_INTERVAL_SECONDS
+                        if timer_id else None
+                    ),
+                    "recheck_error": timer_error,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            # The unroutable event is already durable; a failed *delivery*
+            # must not also lose the record of why nothing was created.
+            with write_txn(conn):
+                _append_event(
+                    conn, subject_id, "supervisory_alarm_delivery_failed",
+                    {
+                        "kind": "INDEPENDENT_VERIFICATION_UNROUTABLE",
+                        "error": str(exc)[:500],
+                    },
+                )
+        return None
+    # Evidence arrived. The condition the recheck was watching is resolved, so
+    # the observation is retired here rather than left to keep asking a settled
+    # question — and a LATER unroutable episode on the same card then gets a
+    # fresh timer and a fresh first alarm instead of being suppressed by the
+    # retired one.
+    _retire_unroutable_recheck(conn, subject_id, reason="evidence_present")
+    try:
+        child_id = create_task(
+            conn,
+            title=f"Independent verification: {subject_id}",
+            body=(
+                f"Independent Gauntlet verification of {subject_id}.\n\n"
+                f"The implementer ({implementer or 'unknown'}) cannot verify "
+                f"its own work, so this card carries the verdict instead.\n\n"
+                f"Review the evidence attached to {subject_id} and finish with "
+                f"a single anchored line — `VERDICT: PASS`, `VERDICT: FAIL` or "
+                f"`VERDICT: BLOCKER` — which is returned to the subject "
+                f"automatically."
+            ),
+            assignee="atlas",
+            parents=[subject_id],
+            created_by="kanban:request_review",
+            max_runtime_seconds=(
+                MANDATORY_OBSERVATION_INTERVAL_SECONDS
+                if gauntlet_required(conn, subject_id)
+                else None
+            ),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        with write_txn(conn):
+            _append_event(
+                conn, subject_id, "independent_verifier_child_failed",
+                {"error": str(exc)[:500], "lane": EXECUTOR_LANE_CODEX_VERIFY},
+            )
+        return None
+    with write_txn(conn):
+        _append_event(
+            conn, subject_id, "independent_verifier_child_created",
+            {
+                "verifier_task": child_id,
+                "lane": EXECUTOR_LANE_CODEX_VERIFY,
+                "implementer": implementer,
+            },
+        )
+    return child_id
+
+
+# An independent verifier reports its verdict in prose; the subject task needs
+# a machine-readable one. The contract is a single anchored line —
+# ``VERDICT: PASS`` / ``FAIL`` / ``BLOCKER`` — matched case-insensitively and
+# tolerant of Markdown bold, which is how Codex actually formats it.
+VERIFIER_VERDICT_PASS = "PASS"
+VERIFIER_VERDICT_FAIL = "FAIL"
+VERIFIER_VERDICT_BLOCKER = "BLOCKER"
+
+_VERIFIER_VERDICT_RE = re.compile(
+    r"^[\s>*_-]*(?:\*\*|__)?VERDICT(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"
+    r"(PASS|FAIL|BLOCKER)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# The same contract for the OTHER thing a verifier is asked to produce on a
+# repair leg: proof that the checks were re-run.
+#
+# After a FAIL, ``regression_required`` is armed and the next PASS must carry
+# falsifiable re-run evidence. The return path had no way to supply it, so an
+# automatic PASS on a repair leg was always refused with "regression evidence
+# is required ... e.g. `hermes kanban verify <id> --pass
+# --regression-evidence '{...}'`" — i.e. the lifecycle closed itself on a
+# first-pass verdict but demanded a human retype the proof on every recovered
+# one. That instruction IS the copy/paste relay the Gauntlet exists to remove,
+# and it appeared at exactly the point the run had already been hardest.
+#
+# The verifier is the party that actually re-ran the checks, so it is the
+# correct party to declare them. It does so on an anchored line, parsed like
+# the verdict:
+#
+#     REGRESSION: pytest -q tests/hermes_cli/ -> exit 0, 356 passed
+#
+# The gate is NOT weakened. ``_validate_regression_evidence`` still demands a
+# named check, a PASS with no REGRESSION line on an armed subject is still
+# refused, and the proof row still lands in the same transaction as the
+# verdict. What changes is only WHO may hand the proof over, and by what
+# route.
+# The label is matched with its common suffix because that is what verifiers
+# actually write. The original pattern accepted the bare word only, and live
+# production proved the cost of that on 2026-09-04: the codex verifier on
+# t_f8fd1752 declared
+#
+#     REGRESSION_EVIDENCE: {"checks":[...],"result":"PASS","subject":"..."}
+#
+# — a complete, contract-shaped proof — and `REGRESSION` followed by `_EVIDENCE`
+# does not reach the `[:=]`, so the declaration parsed as nothing, the PASS was
+# refused, and the subject re-entered repair. Twice in six minutes, with a third
+# verifier already dispatched: an unbounded loop in which the recovery leg can
+# never close no matter how cooperative the verifier is. That is precisely the
+# copy/paste relay this repair exists to remove, wearing a different hat.
+_VERIFIER_REGRESSION_RE = re.compile(
+    r"^[\s>*_-]*(?:\*\*|__)?REGRESSION(?:[ _-]?EVIDENCE)?(?:\*\*|__)?"
+    r"\s*[:=]\s*(?:\*\*|__)?"
+    r"(?P<detail>.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+# How deep a structured evidence value is searched for the name of a check.
+# Deep enough for the shapes verifiers actually emit (a list of names, a list
+# of {name, exit_code} records, a mapping of name -> result); shallow enough
+# that a pathological object cannot turn admission into a walk of the whole
+# document.
+_REGRESSION_CHECK_MAX_DEPTH = 4
+
+
+def _names_a_concrete_check(value: Any, _depth: int = 0) -> bool:
+    """True when ``value`` actually names a check or command that was re-run.
+
+    The validator's contract is deliberately minimal — an evidence key merely
+    has to be truthy — and truthiness is not the same question as "did the
+    verifier name something". ``{"checks": true}`` is truthy and names nothing;
+    so are ``{"checks": 1}`` and ``{"checks": {"result": "PASS"}}`` once the
+    booleans are dressed up. Admission is therefore decided here, on the parser
+    side, where an unfalsifiable declaration can still be discarded before it
+    becomes a ledger row. The validator is left exactly as it was: every
+    evidence dict built by hand or passed on the CLI is held to the same
+    contract it always was.
+
+    Concrete means a non-empty string somewhere the key points at — the name of
+    a command, a suite, a test, a check. Containers are searched to
+    ``_REGRESSION_CHECK_MAX_DEPTH``; ``bool``, ``None``, numbers and empty
+    containers name nothing at any depth — ``True`` in particular is not a
+    ``str``, so it falls through to the final ``False`` like any other bare
+    scalar despite being truthy.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    if _depth >= _REGRESSION_CHECK_MAX_DEPTH:
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_names_a_concrete_check(v, _depth + 1) for v in value)
+    if isinstance(value, dict):
+        return any(
+            _names_a_concrete_check(v, _depth + 1) for v in value.values()
+        )
+    return False
+
+
+def _parse_verifier_regression(*texts: Optional[str]) -> Optional[dict]:
+    """Extract the re-run proof an independent verifier declared, if any.
+
+    Returns an evidence dict shaped for :func:`_validate_regression_evidence`,
+    or ``None`` when the verifier declared nothing — in which case an armed
+    subject's PASS is refused exactly as before. Fails closed; never invents a
+    check that was not named.
+
+    Two declaration shapes, because verifiers use both:
+
+    * **A named command** — ``REGRESSION: pytest -q tests/foo.py -> exit 0``.
+      Wrapped as ``{"commands": [...]}``.
+    * **A JSON object** — ``REGRESSION_EVIDENCE: {"checks": [...]}``. Passed
+      through as the evidence itself, so the verifier's own structure survives
+      onto the ledger instead of being flattened into a quoted string.
+
+    The gate is not weakened by accepting the second shape. A JSON object is
+    held to :func:`_validate_regression_evidence` on its own merits, and one
+    that names no check is DISCARDED rather than re-wrapped as a command — the
+    re-wrap would be a laundering path, turning ``{"result": "PASS"}`` (a claim)
+    into ``{"commands": ['{"result": "PASS"}']}`` (a fact it never was). A
+    truncated or malformed object fails the same way, which is why anything
+    starting with ``{`` is never treated as a command string.
+
+    Admission is stricter than the validator on one point, and only here: an
+    accepted evidence key must actually name a check
+    (:func:`_names_a_concrete_check`). ``{"checks": true}`` clears the
+    validator's minimal truthiness test while naming nothing anyone could
+    re-run, and a verifier's free-text report is precisely where such a value
+    arrives unreviewed. It is discarded like any other unfalsifiable claim.
+    """
+    commands: list[str] = []
+    structured: dict = {}
+    for text in texts:
+        if not text:
+            continue
+        for match in _VERIFIER_REGRESSION_RE.finditer(str(text)):
+            detail = match.group("detail").strip().strip("*_`")
+            if not detail:
+                continue
+            if detail.startswith("{"):
+                try:
+                    parsed = json.loads(detail)
+                except (ValueError, TypeError):
+                    continue
+                ok, _ = _validate_regression_evidence(parsed)
+                if not ok:
+                    continue
+                if not any(
+                    _names_a_concrete_check(parsed.get(k))
+                    for k in REGRESSION_EVIDENCE_KEYS
+                ):
+                    continue
+                for key, value in parsed.items():
+                    if key not in structured:
+                        structured[key] = value
+                continue
+            if detail not in commands:
+                commands.append(detail)
+    if structured:
+        if commands:
+            merged = dict(structured)
+            merged.setdefault("commands", commands)
+            return merged
+        return structured
+    if not commands:
+        return None
+    return {"commands": commands}
+
+
+def _parse_verifier_verdict(*texts: Optional[str]) -> Optional[str]:
+    """Extract the single verdict declared across ``texts``.
+
+    Fails closed on purpose: no verdict line, or two lines that disagree,
+    both return ``None``. Guessing which of two contradictory verdicts the
+    verifier meant is exactly the kind of inference that must never bless a
+    task, so an ambiguous report is routed for a human decision instead.
+    """
+    found: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _VERIFIER_VERDICT_RE.finditer(str(text)):
+            found.add(match.group(1).upper())
+    if len(found) != 1:
+        return None
+    return found.pop()
+
+
+def _return_verifier_verdict_to_subjects(
+    conn: sqlite3.Connection,
+    verifier_task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+) -> None:
+    """Return an independent verifier's verdict to the subject(s) it verified.
+
+    Called post-commit from :func:`complete_task` for ``codex_verify`` tasks
+    only. Without this the lane was a one-way street: the verifier child could
+    be dispatched (``_EVIDENCE_READY_PARENT_SQL`` made that possible) and could
+    complete with a correct verdict, and the subject it verified never heard
+    about it — it stayed parked at ``verification_state='pending'`` forever.
+
+    Routing, all of it fail-closed:
+
+    * ``PASS``    -> :func:`record_verification` (which still enforces verifier
+                     independence and the regression gate; a refusal there
+                     leaves the subject parked and emits its own event).
+    * ``FAIL``    -> :func:`record_verification` with ``passed=False``, which
+                     routes the subject back for repair.
+    * ``BLOCKER`` -> no verdict is written. The subject cannot be blessed and
+                     must not be silently failed either; it stays in the review
+                     lane with a durable event + comment for its governor.
+    * missing/ambiguous -> same as ``BLOCKER``, plus a distinct event naming
+                     the parse failure so the gap is diagnosable.
+
+    Never raises into the completion path: the verifier's own completion is
+    already durable by the time this runs, and a return-path fault must not
+    un-complete it.
+    """
+    try:
+        row = conn.execute(
+            "SELECT executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
+        ).fetchone()
+        if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+            return
+        subjects = parent_ids(conn, verifier_task_id)
+        if not subjects:
+            return
+        verdict = _parse_verifier_verdict(summary, result)
+        verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+        for subject_id in subjects:
+            srow = conn.execute(
+                "SELECT status, verification_state FROM tasks WHERE id = ?",
+                (subject_id,),
+            ).fetchone()
+            if srow is None:
+                continue
+            if srow["verification_state"] != VERIFICATION_PENDING:
+                # Someone already rendered a verdict for this phase. Record
+                # that the return path fired and stop — never overwrite a
+                # verdict that is already on the ledger.
+                with write_txn(conn):
+                    _append_event(
+                        conn, subject_id, "verifier_verdict_skipped",
+                        {
+                            "verifier_task": verifier_task_id,
+                            "verdict": verdict,
+                            "reason": "subject is not awaiting a verdict",
+                            "verification_state": srow["verification_state"],
+                        },
+                    )
+                continue
+            if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL):
+                passed = verdict == VERIFIER_VERDICT_PASS
+                # Only a PASS may carry it: record_verification refuses a
+                # failing verdict that arrives with regression evidence, and
+                # rightly — there is nothing to bless, so nothing to prove.
+                regression = (
+                    _parse_verifier_regression(summary, result)
+                    if passed else None
+                )
+                ok, detail = record_verification(
+                    conn,
+                    subject_id,
+                    passed=passed,
+                    verifier=verifier_identity,
+                    evidence={
+                        "source": "codex_verify_return_path",
+                        "verifier_task": verifier_task_id,
+                    },
+                    regression_evidence=regression,
+                    reason=(
+                        None if passed else
+                        f"independent verifier {verifier_task_id} returned FAIL"
+                    ),
+                )
+                with write_txn(conn):
+                    _append_event(
+                        conn, subject_id, "verifier_verdict_returned",
+                        {
+                            "verifier_task": verifier_task_id,
+                            "verdict": verdict,
+                            "recorded": bool(ok),
+                            "detail": detail,
+                            "regression_declared": bool(regression),
+                        },
+                    )
+                # A successful independent PASS is the final authority needed
+                # by a parked Gauntlet subject. Finalize it immediately through
+                # the ordinary guarded completion path instead of requiring a
+                # model/human to relay the already-durable verdict back into
+                # complete_task(). FAIL deliberately does not finalize: the
+                # record_verification failure path routes the subject to rework.
+                if passed and ok and detail == VERIFICATION_VERIFIED:
+                    completed = complete_task(
+                        conn,
+                        subject_id,
+                        summary=(
+                            f"Independent verifier {verifier_task_id} returned PASS; "
+                            "subject finalized from the durable verified state."
+                        ),
+                    )
+                    if not completed:
+                        with write_txn(conn):
+                            _append_event(
+                                conn, subject_id, "verified_completion_deferred",
+                                {
+                                    "verifier_task": verifier_task_id,
+                                    "reason": "guarded complete_task transition refused",
+                                },
+                            )
+                continue
+            # BLOCKER, or no parseable verdict at all.
+            kind = (
+                "verification_blocker_returned"
+                if verdict == VERIFIER_VERDICT_BLOCKER
+                else "verifier_verdict_unreadable"
+            )
+            note = (
+                f"Independent verifier {verifier_task_id} reported "
+                f"{verdict or 'no machine-readable verdict'}. No verdict was "
+                f"written; this task stays in verification and needs a "
+                f"governance decision."
+            )
+            with write_txn(conn):
+                _append_event(
+                    conn, subject_id, kind,
+                    {
+                        "verifier_task": verifier_task_id,
+                        "verdict": verdict,
+                    },
+                )
+                add_comment(conn, subject_id, "verifier-return-path", note)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning(
+            "verifier verdict return failed for %s: %s", verifier_task_id, exc
+        )
+
+
+# ---------------------------------------------------------------------------
+# Supervisory alarm routing
+# ---------------------------------------------------------------------------
+#
+# ``detect_stale_gauntlet_work`` has appended a ``gauntlet_stale`` event since
+# it was written, and nothing consumed it. An audit event nobody is subscribed
+# to is a diary, not an alarm: the board recorded that it had been abandoned
+# and the recording itself was also abandoned. The same held for a verifier
+# with no subject — it wrote a correct verdict into a card no reader would
+# return to.
+#
+# What follows is the delivery half. It is deliberately small and deliberately
+# fail-open on transport: an alarm's DURABLE record (the event on the ledger)
+# is written whether or not a chat channel is configured or reachable, and a
+# messaging outage can never take a dispatcher tick down. A supervisor who
+# missed the Telegram message can still find every alarm by querying the
+# ledger; a supervisor with no ledger record has nothing.
+
+
+def _supervisory_routing() -> dict:
+    """Resolve where a supervisory alarm is sent. Live config, never cached.
+
+    ``kanban.supervisory_profile``       — the governing identity (Erika).
+    ``kanban.executive_telegram_chat_id``— the executive channel, falling back
+    to the already-configured ``kanban.approval_telegram_chat_id`` so this
+    works on the current board with no config change. Thread/type follow the
+    same fallback.
+
+    An empty chat id is a supported configuration, not an error: the alarm
+    still lands durably on the ledger and records that it had no transport.
+    """
+    supervisor = SUPERVISORY_PROFILE_DEFAULT
+    chat_id = thread_id = ""
+    chat_type = "dm"
+    try:
+        from hermes_cli.config import load_config
+
+        kcfg = (load_config() or {}).get("kanban") or {}
+        supervisor = (
+            str(kcfg.get("supervisory_profile") or "").strip()
+            or SUPERVISORY_PROFILE_DEFAULT
+        )
+        chat_id = str(
+            kcfg.get("executive_telegram_chat_id")
+            or kcfg.get("approval_telegram_chat_id")
+            or ""
+        ).strip()
+        thread_id = str(
+            kcfg.get("executive_telegram_thread_id")
+            or kcfg.get("approval_telegram_thread_id")
+            or ""
+        ).strip()
+        chat_type = str(
+            kcfg.get("executive_telegram_chat_type")
+            or kcfg.get("approval_telegram_chat_type")
+            or "dm"
+        ).strip() or "dm"
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("supervisory routing config unavailable: %s", exc)
+    return {
+        "supervisor": supervisor,
+        "chat_id": chat_id,
+        "thread_id": thread_id or None,
+        "chat_type": chat_type,
+    }
+
+
+def route_supervisory_alarm(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    payload: dict,
+) -> bool:
+    """Emit one supervisory alarm and route it to Erika + the executive channel.
+
+    Returns True when a delivery channel was armed, False when the alarm is
+    durable-only (no executive channel configured, or subscribing failed).
+    Either way the ``kind`` event IS on the ledger when this returns — that is
+    the guarantee, and it is the one a governor can act on.
+
+    Order matters and is not incidental: the subscription is created BEFORE the
+    alarm event is appended. ``add_notify_sub`` snaps a new subscriber's cursor
+    to the task's current ``MAX(task_events.id)``, so subscribing afterwards
+    would mark the alarm itself as already-consumed and deliver nothing — the
+    same ordering ``_ensure_approval_telegram_subscription`` depends on.
+
+    **Writes no comment on the subject card.** ``add_comment`` emits a
+    ``commented`` event, which counts as durable lifecycle progress, so an
+    alarm that commented on the card it was alarming about would reset the very
+    staleness clock that produced it and silence its own successor. The alarm
+    speaks in events only.
+    """
+    route = _supervisory_routing()
+    delivered = False
+    if route["chat_id"]:
+        try:
+            add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id=route["chat_id"],
+                thread_id=route["thread_id"],
+                chat_type=route["chat_type"],
+                notifier_profile=route["supervisor"],
+                delivery_mode="notify+wake",
+            )
+            delivered = True
+        except Exception as exc:
+            # A messaging outage must never cost the durable record, and must
+            # never fail a dispatcher tick. Record that delivery was not armed
+            # so "nobody was told" is visible instead of assumed.
+            _log.warning(
+                "supervisory alarm subscribe failed for %s (%s): %s",
+                task_id, kind, exc,
+            )
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, kind,
+            {
+                **payload,
+                "supervisor": route["supervisor"],
+                "executive_channel": bool(route["chat_id"]),
+            },
+        )
+        _append_event(
+            conn,
+            task_id,
+            (
+                SUPERVISORY_ALARM_ROUTED_EVENT if delivered
+                else SUPERVISORY_ALARM_UNDELIVERABLE_EVENT
+            ),
+            {
+                "alarm": kind,
+                "supervisor": route["supervisor"],
+                "platform": "telegram" if delivered else None,
+                "reason": (
+                    None if delivered
+                    else "no executive channel configured or subscribe failed"
+                ),
+            },
+        )
+    return delivered
+
+
+def _already_alarmed(
+    conn: sqlite3.Connection, task_id: str, kind: str
+) -> bool:
+    """Whether ``kind`` has ever been recorded on ``task_id``.
+
+    Unlike :func:`_emit_once_this_phase` this is not phase-scoped. An orphan
+    verifier has no verification phase of its own, and its defect is permanent
+    — the card will never acquire a subject — so the correct cadence is once,
+    ever, not once per phase.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (task_id, kind),
+    ).fetchone() is not None
+
+
+def _verifier_reported_verdict(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Best-effort ``(verdict, source)`` recovered from a finished verifier.
+
+    Reads the same fields the live return path parses, so a stranded verdict is
+    reported in the SAME vocabulary a delivered one would have been. ``None``
+    means the verifier left no machine-readable verdict — itself a fact the
+    supervisor needs, and not a reason to stay silent about the orphan.
+    """
+    row = conn.execute(
+        "SELECT result FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    task_result = row["result"] if row is not None else None
+    verdict = _parse_verifier_verdict(task_result)
+    if verdict:
+        return verdict, "tasks.result"
+    run = conn.execute(
+        "SELECT summary, error FROM task_runs WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if run is not None:
+        verdict = _parse_verifier_verdict(run["summary"], run["error"])
+        if verdict:
+            return verdict, "task_runs"
+    return None, None
+
+
+def sweep_orphan_verifiers(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[str]:
+    """Emit ``ORPHAN_VERIFIER_RESULT`` for finished verifiers with no subject.
+
+    The watchdog for the failure the creation guard now prevents going forward
+    and cannot undo backwards. A ``codex_verify`` card with no parent has
+    already run, already rendered a verdict, and already completed — and
+    :func:`_return_verifier_verdict_to_subjects` returned early at
+    ``if not subjects: return``, silently. The verdict exists and nothing
+    consumed it.
+
+    Scope is deliberately narrow:
+
+    * Only FINISHED verifiers. An orphan still sitting in ``todo``/``blocked``
+      has produced no result to strand, and alarming on it would report a
+      creation defect as a lost verdict. The creation guard is what covers
+      that case, at the boundary where it can still be refused.
+    * Once per card, ever. The defect is permanent — the card cannot acquire a
+      subject retroactively without rewriting history, which is forbidden — so
+      a per-tick or per-window repeat would be pure noise.
+
+    **Mutates no historical state.** No status change, no disposition, no
+    counter, no relation is written on the verifier or on anything else. The
+    only writes are the append-only alarm events and one comment ON THE
+    VERIFIER ITSELF (a terminal card, so no staleness clock reads it) naming
+    the stranded verdict for a human reader.
+
+    Returns the verifier ids alarmed on THIS sweep.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    alarmed: list[str] = []
+    for task_id in orphaned_verifier_tasks(conn):
+        row = conn.execute(
+            "SELECT status, terminal_disposition, completed_at, title "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        finished = (
+            row["status"] in ("done", "archived")
+            or row["terminal_disposition"] is not None
+        )
+        if not finished:
+            continue
+        if _already_alarmed(conn, task_id, ORPHAN_VERIFIER_RESULT_EVENT):
+            continue
+        verdict, verdict_source = _verifier_reported_verdict(conn, task_id)
+        route_supervisory_alarm(
+            conn, task_id,
+            kind=ORPHAN_VERIFIER_RESULT_EVENT,
+            payload={
+                "verifier_task": task_id,
+                "verdict": verdict,
+                "verdict_source": verdict_source,
+                "status": row["status"],
+                "terminal_disposition": row["terminal_disposition"],
+                "completed_at": row["completed_at"],
+                "detected_at": now_ts,
+                "reason": (
+                    "independent verifier finished with no subject linkage; "
+                    "its verdict was never returned to any task"
+                ),
+            },
+        )
+        with contextlib.suppress(Exception):
+            add_comment(
+                conn, task_id, "orphan-verifier-watchdog",
+                (
+                    f"ORPHAN_VERIFIER_RESULT: this verifier finished with no "
+                    f"subject linkage, so its verdict "
+                    f"({verdict or 'no machine-readable verdict'}) was never "
+                    f"returned to any task. Escalated to the governing "
+                    f"supervisor for a routing decision. The card and its "
+                    f"history are preserved unchanged."
+                ),
+            )
+        alarmed.append(task_id)
+    return alarmed
+
+
+def _stall_timer(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[ObservationTimer]:
+    """The card's live stall recheck timer, if one is armed."""
+    for timer in task_observation_timers(
+        conn, task_id, state=OBSERVATION_STATE_OBSERVING,
+    ):
+        if timer.kind == LIFECYCLE_STALL_TIMER_KIND:
+            return timer
+    return None
+
+
+def clear_resolved_unroutable_rechecks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[str]:
+    """Retire UNROUTABLE rechecks on cards that are inactive or gone.
+
+    The INACTIVE half of criterion (D)'s handling for this alarm. The ACTIVE
+    half lives in :func:`_ensure_independent_verifier_child`, which retires the
+    timer the moment evidence appears or a verifier child opens — that is the
+    call site that learns the condition resolved, so that is where it is
+    recorded.
+
+    This sweep covers the case that call site can never see: a card that goes
+    terminal, or is deleted, while still unroutable. Nothing will call
+    ``_ensure_independent_verifier_child`` for it again, so without this pass
+    the observation would sit ``observing`` forever — a timer outliving its
+    condition, which is the exact failure shape the observation-timer contract
+    was built to prevent.
+
+    Returns the task ids whose UNROUTABLE recheck was retired on this pass.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    cleared: list[str] = []
+    rows = conn.execute(
+        "SELECT task_id FROM observation_timers WHERE state = ? AND kind = ? "
+        "ORDER BY created_at, id",
+        (OBSERVATION_STATE_OBSERVING, UNROUTABLE_VERIFICATION_TIMER_KIND),
+    ).fetchall()
+    for row in rows:
+        task_id = row["task_id"]
+        timer = _unroutable_recheck_timer(conn, task_id)
+        if timer is None:
+            continue
+        trow = conn.execute(
+            "SELECT status, terminal_disposition FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if trow is None:
+            close_observation_timer(
+                conn, timer.id, reason="task_gone", now=now_ts,
+            )
+            cleared.append(task_id)
+            continue
+        if (
+            trow["status"] in ("done", "archived")
+            or trow["terminal_disposition"] is not None
+        ):
+            close_observation_timer(
+                conn, timer.id, reason="subject_inactive", now=now_ts,
+            )
+            cleared.append(task_id)
+    return cleared
+
+
+def clear_resolved_lifecycle_stalls(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[str]:
+    """Retire stall rechecks on cards that are moving again, or are inactive.
+
+    The ACTIVE/INACTIVE half of the alarm. A 10-minute recheck that outlives
+    the condition it was watching is worse than no recheck: it keeps asking a
+    settled question, and a supervisor who learns to ignore it will also ignore
+    the one that matters.
+
+    Two ways a stall resolves, and they are not the same fact:
+
+    * **INACTIVE** — the card reached a terminal state (``done``/``archived``,
+      or an irreversible disposition). There is no longer anything to make
+      progress on. The alarm is closed as satisfied.
+    * **ACTIVE** — durable lifecycle progress happened after the alarm fired:
+      the card's last meaningful event is newer than the one the alarm was
+      keyed on. Somebody or something picked it up. The alarm is closed as
+      resumed.
+
+    Runs BEFORE the alarm pass on each tick, so a card that resumed and then
+    went stale again gets a fresh episode rather than being suppressed by its
+    own retired timer.
+
+    Returns the task ids whose stall alarm was cleared on this pass.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    cleared: list[str] = []
+    rows = conn.execute(
+        "SELECT task_id FROM observation_timers WHERE state = ? AND kind = ? "
+        "ORDER BY created_at, id",
+        (OBSERVATION_STATE_OBSERVING, LIFECYCLE_STALL_TIMER_KIND),
+    ).fetchall()
+    for row in rows:
+        task_id = row["task_id"]
+        trow = conn.execute(
+            "SELECT status, terminal_disposition FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        timer = _stall_timer(conn, task_id)
+        if timer is None:
+            continue
+        if trow is None:
+            close_observation_timer(
+                conn, timer.id, reason="task_gone", now=now_ts,
+            )
+            cleared.append(task_id)
+            continue
+        inactive = (
+            trow["status"] in ("done", "archived")
+            or trow["terminal_disposition"] is not None
+        )
+        resumed = False
+        if not inactive:
+            alarm = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+                (task_id, NO_LIFECYCLE_PROGRESS_EVENT),
+            ).fetchone()
+            if alarm is not None:
+                latest = _last_meaningful_event(conn, task_id)
+                try:
+                    keyed = (json.loads(alarm["payload"]) or {}).get(
+                        "last_event_id"
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    keyed = None
+                # Strictly newer. Equality means the alarm is still keyed on
+                # the same episode and nothing has moved.
+                resumed = (
+                    latest is not None
+                    and keyed is not None
+                    and int(latest["id"]) > int(keyed)
+                )
+        if not (inactive or resumed):
+            continue
+        reason = "task_inactive" if inactive else "progress_resumed"
+        close_observation_timer(conn, timer.id, reason=reason, now=now_ts)
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, LIFECYCLE_STALL_CLEARED_EVENT,
+                {
+                    "timer_id": timer.id,
+                    "resolution": reason,
+                    "lifecycle": "inactive" if inactive else "active",
+                    "status": trow["status"],
+                    "terminal_disposition": trow["terminal_disposition"],
+                    "cleared_at": now_ts,
+                },
+            )
+        cleared.append(task_id)
+    return cleared
+
+
+def resolve_stale_gauntlet_dispositions(
+    conn: sqlite3.Connection,
+    stale: Iterable["GauntletStaleTask"],
+    *,
+    now: Optional[int] = None,
+) -> dict[str, list[str]]:
+    """Act on stale Gauntlet cards where the next transition is deterministic.
+
+    Detection without disposition is not recovery. Historically the stale
+    sweep could emit NO_LIFECYCLE_PROGRESS every observation interval for days
+    while a review-pending subject already had sufficient evidence for an
+    independent verifier.
+
+    This actuator is deliberately narrow and fail-closed. It only performs a
+    transition already authorized by durable state: review + pending asks the
+    canonical independent-verifier helper to return/create the verifier child.
+    The helper still requires dispatchable evidence and preserves independence.
+
+    Everything else is classified unresolved and left untouched.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    routed: list[str] = []
+    reconciled: list[str] = []
+    infrastructure_released: list[str] = []
+    self_review_released: list[str] = []
+    unresolved: list[str] = []
+
+    for entry in stale:
+        task_id = entry.task_id
+        state_row = conn.execute(
+            "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        repair = None
+        if (
+            entry.status == "blocked"
+            and state_row is not None
+            and state_row["block_kind"] == "needs_input"
+        ):
+            repair = conn.execute(
+            """
+            SELECT newer.id
+              FROM task_relations rel
+              JOIN tasks newer ON newer.id = rel.from_task_id
+             WHERE rel.to_task_id = ?
+               AND rel.relation = 'repairs'
+               AND newer.status = 'done'
+               AND newer.verification_state = ?
+               AND newer.terminal_disposition = 'completed'
+             ORDER BY newer.completed_at DESC, newer.created_at DESC
+             LIMIT 1
+            """,
+                (task_id, VERIFICATION_VERIFIED),
+            ).fetchone()
+        if repair is not None:
+            repair_id = repair["id"]
+            ok, _reason = reconcile_overtaken_by_events(
+                conn,
+                task_id,
+                actor="stale-supervision",
+                reason=(
+                    "stale card was superseded by a newer directly-linked "
+                    "repair that reached done + verified + completed"
+                ),
+                evidence=(
+                    f"task_relations relation=repairs from {repair_id}; "
+                    f"{repair_id} is durably done/verified/completed"
+                ),
+                superseded_by=[repair_id],
+            )
+            if ok:
+                reconciled.append(task_id)
+                continue
+
+        # Infrastructure termination is not human input. Older executor
+        # routing parked timed-out/stale/terminated runs as needs_input, which
+        # made the stale observer re-alert forever even though no owner
+        # decision was required. The executions ledger is the structured
+        # authority here; do not infer this class from comments or summaries.
+        if (
+            entry.status == "blocked"
+            and state_row is not None
+            and state_row["block_kind"] == "needs_input"
+        ):
+            execution = conn.execute(
+                "SELECT id, status, ended_at FROM executions "
+                "WHERE task_id = ? AND ended_at IS NOT NULL "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                execution is not None
+                and execution["status"] in ("timed_out", "stale", "terminated")
+            ):
+                if unblock_task(conn, task_id):
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            task_id,
+                            "gauntlet_stale_disposition",
+                            {
+                                "action": "infrastructure_recovery_released",
+                                "execution_id": execution["id"],
+                                "execution_status": execution["status"],
+                                "detected_at": now_ts,
+                                "source": "stale_supervision",
+                            },
+                        )
+                    infrastructure_released.append(task_id)
+
+                    # If the safe resume phase is REVIEW/PENDING, spend the
+                    # same deterministic opportunity to release its independent
+                    # verifier. Evidence gating remains inside the canonical
+                    # helper and therefore still fails closed.
+                    resumed = conn.execute(
+                        "SELECT status, verification_state, assignee FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if (
+                        resumed is not None
+                        and resumed["status"] == "review"
+                        and resumed["verification_state"] == VERIFICATION_PENDING
+                    ):
+                        implementer = _review_requested_implementer(
+                            conn, task_id, fallback_assignee=resumed["assignee"],
+                        )
+                        child_id = _ensure_independent_verifier_child(
+                            conn, task_id, implementer=implementer,
+                        )
+                        if child_id is not None:
+                            recompute_ready(conn)
+                            routed.append(task_id)
+                    continue
+
+        # A same-identity review refusal is a routing requirement, not owner
+        # input. Older review flows correctly rejected self-review but then
+        # parked the subject in BLOCKED, leaving the independent-verifier path
+        # unopened forever. Release only the current pending review phase, and
+        # only when the block is mechanically tied to that self-review event.
+        if (
+            entry.status == "blocked"
+            and entry.verification_state == VERIFICATION_PENDING
+            and _subject_evidence_is_dispatchable(conn, task_id)
+        ):
+            phase = _current_verification_phase(conn, task_id)
+            self_review = conn.execute(
+                "SELECT id, run_id, created_at FROM task_events "
+                "WHERE task_id = ? AND kind IN "
+                "('verification_blocked_self_review', 'review_claim_rejected_self_review') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            latest_block = conn.execute(
+                "SELECT id, run_id, created_at, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'blocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            related_block = latest_block is None
+            if self_review is not None and latest_block is not None:
+                try:
+                    block_payload = json.loads(latest_block["payload"] or "{}")
+                except Exception:
+                    block_payload = {}
+                related_block = bool(
+                    latest_block["created_at"] >= self_review["created_at"]
+                    and latest_block["created_at"] - self_review["created_at"]
+                    <= MANDATORY_OBSERVATION_INTERVAL_SECONDS
+                    and block_payload.get("source_status") == "review"
+                )
+            phase_created_at = None
+            if phase is not None:
+                phase_row = conn.execute(
+                    "SELECT created_at FROM task_verifications WHERE id = ?",
+                    (phase[0],),
+                ).fetchone()
+                if phase_row is not None:
+                    phase_created_at = int(phase_row["created_at"])
+            if (
+                phase is not None
+                and phase_created_at is not None
+                and self_review is not None
+                and int(self_review["created_at"]) >= phase_created_at
+                and related_block
+            ):
+                if unblock_task(conn, task_id):
+                    resumed = conn.execute(
+                        "SELECT status, verification_state, assignee FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if (
+                        resumed is not None
+                        and resumed["status"] == "review"
+                        and resumed["verification_state"] == VERIFICATION_PENDING
+                    ):
+                        implementer = _review_requested_implementer(
+                            conn, task_id, fallback_assignee=resumed["assignee"],
+                        )
+                        child_id = _ensure_independent_verifier_child(
+                            conn, task_id, implementer=implementer,
+                        )
+                        if child_id is not None:
+                            recompute_ready(conn)
+                            with write_txn(conn):
+                                _append_event(
+                                    conn,
+                                    task_id,
+                                    "gauntlet_stale_disposition",
+                                    {
+                                        "action": "self_review_routed_independent",
+                                        "verifier_task": child_id,
+                                        "self_review_event_id": self_review["id"],
+                                        "detected_at": now_ts,
+                                        "source": "stale_supervision",
+                                    },
+                                )
+                            self_review_released.append(task_id)
+                            routed.append(task_id)
+                            continue
+
+        if (
+            entry.status == "review"
+            and entry.verification_state == VERIFICATION_PENDING
+        ):
+            row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            fallback = row["assignee"] if row is not None else None
+            implementer = _review_requested_implementer(
+                conn, task_id, fallback_assignee=fallback,
+            )
+            child_id = _ensure_independent_verifier_child(
+                conn, task_id, implementer=implementer,
+            )
+            if child_id is not None:
+                recompute_ready(conn)
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        task_id,
+                        "gauntlet_stale_disposition",
+                        {
+                            "action": "independent_verifier_routed",
+                            "verifier_task": child_id,
+                            "detected_at": now_ts,
+                            "source": "stale_supervision",
+                        },
+                    )
+                routed.append(task_id)
+                continue
+        unresolved.append(task_id)
+
+    return {
+        "reconciled": reconciled,
+        "infrastructure_released": infrastructure_released,
+        "self_review_released": self_review_released,
+        "verifier_routed": routed,
+        "unresolved": unresolved,
+    }
+
+
+def sweep_lifecycle_stall_alarms(
+    conn: sqlite3.Connection,
+    stale: Iterable["GauntletStaleTask"],
+    *,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Route this tick's stale-Gauntlet findings to Erika and the executive.
+
+    Consumes the result of :func:`detect_stale_gauntlet_work` rather than
+    re-deriving staleness, so there is exactly one definition of "no lifecycle
+    progress" on the board and exactly one anti-spam policy (that scan's
+    per-episode / ``realert_seconds`` de-duplication) governing how often a
+    supervisor hears about the same parked card.
+
+    For each finding this pass:
+
+    1. Emits ``NO_LIFECYCLE_PROGRESS`` and routes it to the governing
+       supervisor and the configured executive channel.
+    2. Arms a 300-second observation timer (:data:`LIFECYCLE_STALL_TIMER_KIND`)
+       so the alarm is re-evidenced every ten minutes for as long as the card
+       stays stuck, instead of being one message that scrolls away.
+       :func:`clear_resolved_lifecycle_stalls` retires it when the card moves
+       or goes terminal.
+
+    Arming is best-effort and never blocks the alarm: an ownerless card cannot
+    carry a timer (``arm_observation_timer`` fails closed on exactly that), and
+    an unowned stalled card is precisely one a supervisor must still hear
+    about. The refusal is recorded on the alarm's own event rather than
+    swallowed.
+
+    **Changes no workflow state.** Nothing is completed, verified, requeued,
+    reassigned or failed here, for the same reason the scan it consumes does
+    not: a watchdog has no evidence, and manufacturing a transition would
+    defeat the chain it is watching.
+
+    Returns the task ids alarmed on THIS sweep.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    alarmed: list[str] = []
+    for entry in stale:
+        task_id = entry.task_id
+        timer_id: Optional[str] = None
+        timer_error: Optional[str] = None
+        if _stall_timer(conn, task_id) is None:
+            try:
+                timer_id = arm_observation_timer(
+                    conn, task_id,
+                    kind=LIFECYCLE_STALL_TIMER_KIND,
+                    now=now_ts,
+                ).id
+            except Exception as exc:
+                timer_error = f"{type(exc).__name__}: {exc}"
+                _log.warning(
+                    "lifecycle stall recheck could not be armed on %s: %s",
+                    task_id, exc,
+                )
+        else:
+            timer_error = None
+        route_supervisory_alarm(
+            conn, task_id,
+            kind=NO_LIFECYCLE_PROGRESS_EVENT,
+            payload={
+                "age_seconds": entry.age_seconds,
+                "status": entry.status,
+                "verification_state": entry.verification_state,
+                "regression_required": entry.regression_required,
+                "reasons": entry.reasons,
+                "last_event_id": entry.last_event_id,
+                "last_event_at": entry.last_event_at,
+                "last_event_kind": entry.last_event_kind,
+                "detected_at": now_ts,
+                "recheck_timer_id": timer_id,
+                "recheck_interval_seconds": (
+                    MANDATORY_OBSERVATION_INTERVAL_SECONDS
+                    if timer_id else None
+                ),
+                "recheck_error": timer_error,
+            },
+        )
+        alarmed.append(task_id)
+    return alarmed
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -7092,26 +11410,90 @@ def complete_task(
                     # Lost the race with a re-claim/reopen, or the pre-check
                     # was bypassed entirely. Refuse without mutating.
                     return False
-                # Verifier independence (doctrine_verification.md): this
-                # implicit approval path derives "reviewer" purely from which
-                # RUN claimed the review lane, not from WHO is acting — the
-                # same profile can stay its own assignee across the whole
-                # phase (a governance profile that never reassigns, e.g.
-                # t_7311348b/t_aba8b8d8) and this path would otherwise record
-                # a "VERIFIED" verdict for its own decision with no identity
-                # check at all, unlike the explicit `record_verification`
-                # CLI path. Apply the same refusal here. ``return False``
-                # (not raise) so the audit event below still commits — this
-                # function returns normally on refusal elsewhere in this
-                # block too, only raising pre-write gate errors it wants the
-                # caller to see as ``VerificationRequiredError``.
+                # Verifier identity (D4). This implicit approval path derives
+                # "reviewer" purely from which RUN claimed the review lane, not
+                # from WHO is acting — the same profile can stay its own
+                # assignee across the whole phase (a governance profile that
+                # never reassigns, e.g. t_7311348b/t_aba8b8d8) and this path
+                # would otherwise record a "VERIFIED" verdict for its own
+                # decision with no identity check at all, unlike the explicit
+                # `record_verification` CLI path. It carries the same three
+                # gates that path does. ``return False`` (not raise) so the
+                # audit event still commits — this function returns normally on
+                # refusal elsewhere in this block too, only raising pre-write
+                # gate errors it wants the caller to see as
+                # ``VerificationRequiredError``.
+                reviewer = _canonical_assignee(reviewer) if reviewer else None
+                # (b) An unnamed reviewer means the review run has no assignee
+                # at all. Nothing about that verdict is attributable; fail
+                # closed rather than blessing it as "not the implementer".
+                if not reviewer:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "verification_blocked_unknown_verifier",
+                        {
+                            "verifier": None,
+                            "detail": "review run has no assignee identity",
+                            "source": "review_run_approval",
+                        },
+                        run_id=review_run_id,
+                    )
+                    return False
+                # (a) The reviewer identity must resolve against the profile
+                # registry or the verifier-lane allow-list.
+                identity_status, identity_detail = _verifier_identity_status(reviewer)
+                if identity_status == VERIFIER_IDENTITY_UNKNOWN:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "verification_blocked_unknown_verifier",
+                        {
+                            "verifier": reviewer,
+                            "detail": identity_detail,
+                            "source": "review_run_approval",
+                        },
+                        run_id=review_run_id,
+                    )
+                    return False
+                if identity_status == VERIFIER_IDENTITY_UNCHECKED:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "verifier_identity_unchecked",
+                        {
+                            "verifier": reviewer,
+                            "detail": identity_detail,
+                            "source": "review_run_approval",
+                        },
+                        run_id=review_run_id,
+                    )
+                # (c) Independence against the implementer AND the task's own
+                # assignee. On this path the reviewer IS ``tasks.assignee`` by
+                # construction, so the assignee arm only bites when nothing
+                # auditable ever put that identity in the reviewer seat — see
+                # ``_phase_reviewer_identities``.
                 implementer = _review_requested_implementer(conn, task_id, reviewer)
-                if reviewer and implementer and _canonical_assignee(reviewer) == implementer:
+                head_assignee = conn.execute(
+                    "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()
+                conflict = _verifier_independence_conflict(
+                    conn, task_id, reviewer,
+                    implementer=implementer,
+                    assignee=head_assignee["assignee"] if head_assignee else None,
+                )
+                if conflict is not None:
+                    conflict_identity, conflict_source = conflict
                     _append_event(
                         conn,
                         task_id,
                         "verification_blocked_self_review",
-                        {"verifier": reviewer, "implementer": implementer},
+                        {
+                            "verifier": reviewer,
+                            "implementer": implementer,
+                            "conflict_identity": conflict_identity,
+                            "conflict_source": conflict_source,
+                        },
                         run_id=review_run_id,
                     )
                     return False
@@ -7317,6 +11699,13 @@ def complete_task(
                     },
                     run_id=run_id,
                 )
+    # An independent verifier's completion is only half the transaction: the
+    # subject it verified has to hear the verdict. Post-commit, in its own
+    # txn(s), so the verifier's own completion is durable first and a fault in
+    # the return path can never roll it back. No-op for every other task.
+    _return_verifier_verdict_to_subjects(
+        conn, task_id, summary=summary, result=result,
+    )
     # Successful completion — wipe the consecutive-failures counter.
     # Failure history stays on the event log for audit; the counter
     # just tracks "is there a current pathology the breaker should
@@ -8371,17 +12760,44 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        # D8: ``reviewer`` is written straight into ``assignee`` below, so it
+        # gets the same gate as every other assignee write. Before this, an
+        # arbitrary string ("reviewer") landed on a live card and parked it in
+        # the review lane with nothing that could ever claim it (t_f853abd8).
+        # Refused as a normal transition failure rather than an exception:
+        # request_review's contract is (ok, reason), and a caller that gets a
+        # reason can retry with a real reviewer, whereas a phantom write
+        # succeeds loudly and fails silently forever.
+        try:
+            _assert_assignee_dispatchable(
+                reviewer, context="cannot hand off for review"
+            )
+        except ValueError as exc:
+            return _ret(False, str(exc))
+        # D5: this is an assignee write on a task that is, by definition, about
+        # to be in 'review' — the one status the ready-queue's lazy shorthand
+        # normalization never sees. ``reviewer='atlas'`` therefore used to park
+        # the card on a token no dispatch loop can spawn, which is exactly how
+        # t_6b7d5845 and t_06e046f1 stalled (35.7h / 16.8h, 12 gauntlet_stale
+        # events between them) while doing the RIGHT thing: routing to an
+        # independent verifier to escape an Erika-reviews-Erika loop.
+        reviewer, reviewer_lane, reviewer_from_token = _normalize_shorthand_lane(
+            reviewer, None
+        )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        lane_sql = ", executor_lane = ?" if reviewer_from_token is not None else ""
+        assignee_sql += lane_sql
+        head: tuple[Any, ...] = ()
+        if reviewer is not None:
+            head = (reviewer,)
+            if reviewer_from_token is not None:
+                head += (reviewer_lane,)
         params: tuple[Any, ...]
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params = head + (task_id,)
             run_guard = ""
         else:
-            params = (
-                (reviewer, task_id, int(expected_run_id))
-                if reviewer is not None
-                else (task_id, int(expected_run_id))
-            )
+            params = head + (task_id, int(expected_run_id))
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
@@ -8401,6 +12817,19 @@ def request_review(
                 False,
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
+            )
+        if reviewer_from_token is not None:
+            # Same event kind the ready-queue dispatcher and assign_task emit,
+            # so the audit trail reads identically whichever path translated.
+            _append_event(
+                conn, task_id, "executor_lane_normalized",
+                {
+                    "from_assignee": reviewer_from_token,
+                    "assignee": reviewer,
+                    "executor_lane": reviewer_lane,
+                    "source": "request_review",
+                    "status": "review",
+                },
             )
         run_id = _end_run(
             conn,
@@ -8446,6 +12875,44 @@ def request_review(
             },
             run_id=run_id,
         )
+    # Autonomous Gauntlet routing. The handoff above is durable; what follows
+    # decides WHO can act on it. When the review assignee this handoff leaves
+    # behind is the implementer itself — the ``reviewer=None`` default, which
+    # is what every autonomous caller passes — a Gauntlet subject has been
+    # parked in a lane whose only candidate the verdict gate is guaranteed to
+    # refuse. That is the live t_cbc133db failure, and the point of repair is
+    # that it is knowable HERE, at the handoff, rather than after a refusal.
+    #
+    # Post-commit on purpose (the same placement ``complete_task`` uses for the
+    # verdict return path): the subject is already correctly parked, and a
+    # fault while opening the independent route must not roll back an
+    # implementation handoff that succeeded.
+    if gauntlet_required(conn, task_id):
+        assignee_now = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        effective = assignee_now["assignee"] if assignee_now is not None else None
+        conflict = _review_claim_conflict(conn, task_id, effective)
+        if conflict is not None:
+            conflict_identity, conflict_source = conflict
+            child_id = _ensure_independent_verifier_child(
+                conn, task_id, implementer=implementer,
+            )
+            with write_txn(conn):
+                _emit_once_this_phase(
+                    conn, task_id, "independent_verification_required",
+                    {
+                        "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                        "conflict_identity": conflict_identity,
+                        "conflict_source": conflict_source,
+                        "verifier_task": child_id,
+                        "source": "request_review",
+                    },
+                )
+            # Promote the child off the subject's evidence packet now, so the
+            # independent route is actionable on this tick instead of the next
+            # dispatcher pass.
+            recompute_ready(conn)
     return _ret(True)
 
 
@@ -8660,37 +13127,139 @@ def record_verification(
                 f"from it)"
             )
 
-        # Verifier independence (doctrine_verification.md: "the verifier
+        # Verifier identity (D4). Three gates, all fail-closed, all committing
+        # a durable audit event on refusal — a refusal that leaves no event is
+        # a refusal the rest of the board cannot act on, which is how the same
+        # identity was re-selected three times on t_00690780. ``return`` (not
+        # raise) so the event commits with the rest of the txn.
+
+        # (b) An anonymous verdict. This used to be a documented concession to
+        # "untracked/legacy callers": the guard read ``if verifier and ...``,
+        # so passing no verifier bypassed the independence comparison outright.
+        # No such caller survives — ``kanban.py`` falls back to the acting
+        # profile and ``_return_verifier_verdict_to_subjects`` always signs —
+        # and an unattributable verdict cannot be shown to be independent of
+        # anyone, which is the whole property being asserted. Fail closed.
+        if not verifier:
+            _append_event(
+                conn, task_id, "verification_blocked_unknown_verifier",
+                {
+                    "verifier": None,
+                    "detail": "no verifier identity supplied",
+                    "source": "record_verification",
+                },
+                run_id=review_run_id,
+            )
+            return False, (
+                "verification requires a named verifier; an anonymous verdict "
+                "cannot be shown to be independent of the implementer — pass "
+                "--verifier <profile> or route through the codex_verify lane"
+            )
+
+        # (a) The identity must resolve to something the system knows: an
+        # existing Hermes profile, or a recognized verifier lane. Nothing
+        # checked this before, so any string that merely DIFFERED from the
+        # implementer rendered a binding verdict — how 'chatgpt-systems'
+        # closed t_023d2af6 and t_616527d7 (a live production deployment).
+        identity_status, identity_detail = _verifier_identity_status(verifier)
+        if identity_status == VERIFIER_IDENTITY_UNKNOWN:
+            _append_event(
+                conn, task_id, "verification_blocked_unknown_verifier",
+                {
+                    "verifier": verifier,
+                    "detail": identity_detail,
+                    "source": "record_verification",
+                },
+                run_id=review_run_id,
+            )
+            return False, (
+                f"verifier {verifier!r} is not a registered identity: "
+                f"{identity_detail}. A verdict signed by an identity the "
+                f"system cannot resolve is not attributable and cannot be "
+                f"shown to be independent — register the profile or route "
+                f"through the codex_verify lane"
+            )
+        if identity_status == VERIFIER_IDENTITY_UNCHECKED:
+            # The registry itself is unreadable. Do not convert that into a
+            # false accusation against a possibly-valid verifier, but do not
+            # let it pass silently either: the gap is on the ledger.
+            _append_event(
+                conn, task_id, "verifier_identity_unchecked",
+                {
+                    "verifier": verifier,
+                    "detail": identity_detail,
+                    "source": "record_verification",
+                },
+                run_id=review_run_id,
+            )
+
+        # (c) Verifier independence (doctrine_verification.md: "the verifier
         # should be independent of the executor where practical"). The
         # `status == "running"` branch above already refuses an executor
         # verifying its OWN in-flight run structurally, but that guard is
         # about which RUN is claimed, not WHO is acting — the same profile
         # can author a decision (as the task's assignee/implementer) and
         # then separately claim the review run, or verify a parked
-        # 'review' task outright, and nothing compared identities. Refuse
-        # unless the caller passes no verifier at all (untracked/legacy
-        # callers) or names someone other than the implementer. No
+        # 'review' task outright, and nothing compared identities. No
         # doctrine exception for this is currently on file; do not invent
         # one here — a real exception is a doctrine amendment, not a code
         # bypass.
         # The implementer identity lives on the ``review_requested`` event
         # that parked this phase — see ``_review_requested_implementer``.
+        # The task's own ``assignee`` is now compared too, except where that
+        # assignee was deliberately installed as this phase's reviewer — see
+        # ``_phase_reviewer_identities`` for why that carve-out is required
+        # rather than optional.
         implementer = _review_requested_implementer(conn, task_id, row["assignee"])
-        if verifier and implementer and verifier == implementer:
-            phase = _current_verification_phase(conn, task_id)
+        conflict = _verifier_independence_conflict(
+            conn, task_id, verifier,
+            implementer=implementer,
+            assignee=row["assignee"],
+        )
+        if conflict is not None:
+            conflict_identity, conflict_source = conflict
+            # Emit the same audit event ``complete_task``'s implicit path
+            # emits. It is not decoration: it is the durable record the
+            # selection guard in ``claim_review_task``, the retry carve-out
+            # in ``_record_task_failure`` and the governed-handoff release in
+            # ``_GOVERNED_IMPLEMENTATION_HANDOFF_SQL`` all read.
+            #
+            # Bind it to a run that release predicate can actually follow. A
+            # refusal raised from a claimed review run keeps that run: the
+            # ``claimed``/``source_status='review'`` chain leads back to the
+            # handoff. A refusal against a task parked in 'review' has no run
+            # in flight, and used to be recorded with no run at all — leaving
+            # the phase unanchored, so the parked arm of that predicate could
+            # never match. Fall back to the implementation run that opened the
+            # current verification phase, which is exactly what the predicate
+            # compares against.
+            blocked_run_id = review_run_id
+            if blocked_run_id is None:
+                blocked_phase = _current_verification_phase(conn, task_id)
+                if blocked_phase is not None:
+                    blocked_run_id = blocked_phase[1]
             _append_event(
-                conn,
-                task_id,
-                "verification_blocked_self_review",
-                {"verifier": verifier, "implementer": implementer},
-                run_id=phase[1] if phase is not None else None,
+                conn, task_id, "verification_blocked_self_review",
+                {
+                    "verifier": verifier,
+                    "implementer": implementer,
+                    "conflict_identity": conflict_identity,
+                    "conflict_source": conflict_source,
+                    "source": "record_verification",
+                },
+                run_id=blocked_run_id,
             )
             return False, (
-                f"verifier {verifier!r} matches the implementer "
-                f"{implementer!r}; doctrine_verification.md requires an "
-                f"independent verifier and no governance-ruling exception "
-                f"is on file — route to a different reviewer or the "
-                f"codex_verify lane"
+                f"verifier {verifier!r} matches the "
+                + (
+                    f"implementer {conflict_identity!r}"
+                    if conflict_source == "implementer"
+                    else f"task's own assignee {conflict_identity!r}, which "
+                         f"was never installed as this phase's reviewer"
+                )
+                + "; doctrine_verification.md requires an independent "
+                  "verifier and no governance-ruling exception is on file — "
+                  "route to a different reviewer or the codex_verify lane"
             )
 
         proof_id: Optional[int] = None
@@ -10488,11 +15057,25 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
+        # Governance relations cascade with the row for the same reason the
+        # dependency links do: a relation whose endpoint no longer exists is
+        # not evidence, it is a dangling pointer that makes the linkage
+        # read-back report a link the board cannot honour.
+        conn.execute(
+            "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # Timers cascade AFTER the card row, not before it, because
+        # ``trg_obs_timer_no_delete_while_task_lives`` refuses to let a timer be
+        # deleted while its subject is still on the board. ``delete_task``
+        # already had this order; this path did not, and the trigger is what
+        # makes the difference load-bearing instead of stylistic.
+        _delete_observation_timers_for_task(conn, task_id)
         return cur.rowcount == 1
 
 
@@ -10511,10 +15094,15 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute(
+            "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_observation_timers_for_task(conn, task_id)
     recompute_ready(conn)
     return True
 
@@ -11000,6 +15588,24 @@ class DispatchResult:
     a ``gauntlet_stale`` event and left the cards exactly as they were. One id
     appears once per stale episode (or per
     ``kanban.gauntlet_stale_realert_seconds``), not once per tick."""
+    lifecycle_alarms: list[str] = field(default_factory=list)
+    """Task ids whose ``gauntlet_stale`` finding was escalated this tick as
+    ``NO_LIFECYCLE_PROGRESS`` to the governing supervisor and the configured
+    executive channel, with a 300-second recheck armed.
+
+    Strictly a superset relationship with :attr:`gauntlet_stale`: the scan
+    decides WHO is stale (and how often to re-say it), this records who was
+    actually told. The two lists differing is itself the signal that routing
+    is broken."""
+    lifecycle_alarms_cleared: list[str] = field(default_factory=list)
+    """Task ids whose stall recheck was retired this tick because the card
+    resumed durable progress (active) or reached a terminal state
+    (inactive)."""
+    orphan_verifiers: list[str] = field(default_factory=list)
+    """Verifier ids escalated this tick as ``ORPHAN_VERIFIER_RESULT`` — a
+    finished ``codex_verify`` card with no subject linkage, whose verdict was
+    never returned to anything. Once per card, ever; historical cards are
+    reported, never altered."""
     executions_reconciled: dict = field(default_factory=dict)
     """Outcome of this tick's execution-supervisor reconciliation pass.
 
@@ -11016,6 +15622,39 @@ class DispatchResult:
 
     Empty dict when the pass found nothing to do or could not run.
     """
+    observation_ticks: list[dict] = field(default_factory=list)
+    """Recheck emissions discharged this tick by :func:`run_observation_cycle`.
+
+    Each entry is :meth:`ObservationTick.as_dict`. This is the mechanical
+    driver for the mandatory 300-second observation timer: the interval, the
+    one-time verdict and the continued observation all live in
+    ``observation_timers`` / ``observation_ticks`` and are enforced by database
+    constraints, but *something* has to look at the clock, and before this
+    pass existed nothing in the running control plane did. A timer whose only
+    driver is a prompt ("remember to re-check in ten minutes") or a held-open
+    session is the convention the 2026-09-03 ruling forbade, not a control.
+
+    Deliberately additive and observational: the pass emits an
+    ``observation_tick`` event on the card and re-arms the timer for its next
+    300 s boundary. It closes nothing, changes no task status, and cannot
+    retire a timer — see :func:`emit_observation_tick`. An empty list is the
+    steady state (no timer owed a recheck this tick), NOT a failure signal."""
+    unowned: list[str] = field(default_factory=list)
+    """Live cards :func:`resolve_task_ownership` can give no accountable owner.
+
+    Observability ONLY — nothing is reclaimed, reassigned or blocked to produce
+    it, for the reason spelled out on :attr:`TaskOwnership.governable`: every
+    pre-provenance card would fail a hard gate, so a gate here would strand the
+    board including its preserved failure evidence. The enforced boundary stays
+    :func:`require_resolvable_ownership` at the points that create new
+    obligations.
+
+    It is computed on the tick rather than left to a diagnostic command because
+    "did this card lose its owner when its session died?" must be answerable
+    from persisted state on a schedule nobody has to remember — an ownerless
+    card that only a human running an audit would ever notice is exactly the
+    silently-ownerless card the 2026-09-03 ruling forbade. Empty is the goal
+    state; non-empty is operator-actionable."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -11050,7 +15689,7 @@ class DispatchResult:
 # so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
 # be consulted. Entries are trimmed by age (and total size cap as a
 # belt-and-braces against unbounded growth on exotic platforms).
-_RECENT_WORKER_EXIT_TTL_SECONDS = 600
+_RECENT_WORKER_EXIT_TTL_SECONDS = 300
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
@@ -11477,11 +16116,19 @@ def enforce_max_runtime(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
                 timed_out.append(tid)
-        # Increment the unified failure counter. Outside the write_txn
-        # above because ``_record_task_failure`` opens its own. If the
-        # breaker trips, this flips the retried task to ``blocked`` and
-        # emits a ``gave_up`` event on top of the ``timed_out`` we
-        # already emitted.
+        # Record the non-success and re-queue. Outside the write_txn above
+        # because ``_record_task_failure`` opens its own.
+        #
+        # ``infrastructure=True``: this is the level-1 runtime timer firing —
+        # the control plane deciding the worker has had its authorized time,
+        # not the work reporting that it failed. Charging it to the ordinary
+        # implementation retry budget spends a retry on the clock, and at the
+        # threshold it would trip the breaker and ``gave_up`` a task whose only
+        # offence was being long. Found by the independent ``codex_verify``
+        # review of t_f9b3b48b, which correctly observed that repairing only
+        # ``exec_supervisor.route_task_from_execution`` left this second
+        # infrastructure-timeout path still charging. The ``timed_out`` event
+        # is emitted above either way, so nothing about the timeout is hidden.
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
@@ -11489,10 +16136,12 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                infrastructure=True,
                 event_payload_extra={
                     "pid": pid,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    "failure_class": "infrastructure",
                 },
             )
     return timed_out
@@ -11520,7 +16169,15 @@ def detect_stale_running(
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
     2. Its ``last_heartbeat_at`` is older than
-       ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
+       ``_STALE_HEARTBEAT_GAP_SECONDS``, or is NULL *and* the worker PID can
+       no longer be confirmed alive.
+
+    The NULL qualifier in (2) is load-bearing. A NULL heartbeat with a live
+    PID is an unobserved worker, not a dead one, and reaping it is how live
+    gateway-launched Claude executors were killed on 2026-09-03 — that lane's
+    executor is a foreign CLI process that cannot write this column at all.
+    Such a task is passed over with a one-per-run ``stale_reap_suppressed``
+    event; ``enforce_max_runtime`` remains its upper bound.
 
     On reclaim the task is restored to its source phase, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -11565,6 +16222,40 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        # NULL heartbeat + demonstrably live worker is NOT a stale worker.
+        # ``last_heartbeat_at IS NULL`` says nothing about the worker; it says
+        # nothing ever reported on it. For a gateway-launched Claude executor
+        # that was the permanent steady state until 2026-09-03 — the executor
+        # is a foreign CLI process with no kanban tools, so it could not touch
+        # this column even while working perfectly. Reaping on an absence of
+        # evidence is what killed live repair runs; the level-1 bound
+        # (``enforce_max_runtime``) still ends a worker that has had its time,
+        # and a worker that ever DID heartbeat and then went quiet still falls
+        # through to the reclaim below.
+        if last_hb is None and pid and _pid_alive(pid):
+            run_id = _current_run_id(conn, tid)
+            # Once per run: this scan repeats every dispatcher tick for the
+            # whole remaining life of a long task, and an unbounded event
+            # stream would bury the one row that matters.
+            already = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                "AND run_id IS ? LIMIT 1",
+                (tid, "stale_reap_suppressed", run_id),
+            ).fetchone()
+            if already is None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, tid, "stale_reap_suppressed",
+                        {
+                            "reason": "no_heartbeat_ever_recorded_and_worker_alive",
+                            "elapsed_seconds": int(elapsed),
+                            "timeout_seconds": stale_timeout_seconds,
+                            "worker_pid": int(pid),
+                        },
+                        run_id=run_id,
+                    )
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
@@ -12396,6 +17087,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    infrastructure: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -12455,7 +17147,50 @@ def _record_task_failure(
             if release_claim
             else ("review" if row["status"] == "review" else "ready")
         )
-        failures = int(row["consecutive_failures"]) + 1
+        # A reviewer run that ended because the board correctly refused a
+        # same-identity verdict is a GOVERNANCE refusal, not an execution
+        # failure, and must not be charged to the subject's ordinary
+        # implementation retry budget. On t_00690780 it was: two reviewer runs
+        # exited non-zero after `verification_blocked_self_review`, the crash
+        # path counted both, and the breaker tripped at 2/2 (`gave_up`, event
+        # 9884) on a task whose implementation had succeeded and whose evidence
+        # packet was intact. The board then had to be told the work "gave up".
+        #
+        # Scope is deliberately narrow: only a run that retries from the REVIEW
+        # lane, and only while a refusal is on record for the CURRENT
+        # verification phase. An implementation-lane crash still counts, and so
+        # does a review-lane crash with no refusal behind it (a genuinely
+        # broken reviewer). The counter is left exactly as it was — preserved,
+        # not reset — so real prior failures keep their weight.
+        governance_refusal = (
+            retry_status == "review"
+            and _independent_verification_required(conn, task_id)
+        )
+        # An INFRASTRUCTURE termination is the second thing that is not an
+        # implementation failure, and it is charged for exactly the same
+        # reason the governance refusal was: the counter sits at the end of
+        # every non-success path and cannot see what caused the non-success.
+        # A runtime cap, a lease/liveness reap, an orphan-policy kill or an
+        # operator terminate ends a process that may have been making perfect
+        # progress — nothing about it is evidence that the work is wrong, so
+        # spending an implementation retry on it charges the work for the
+        # control plane's decision. On t_aef6bbe1 the control plane's own
+        # stale-heartbeat rule killed the executor 1804 s into an authorized
+        # 3600 s, and the only thing distinguishing that from a bad patch was
+        # a classification the counter never received. Callers that know the
+        # cause pass ``infrastructure=True``; see
+        # ``exec_supervisor.is_infrastructure_termination``, which is the one
+        # place that decides.
+        #
+        # Same shape as the refusal carve-out: the counter is PRESERVED, not
+        # reset, so genuine prior failures keep their weight, and the breaker
+        # cannot trip on this pass.
+        not_implementation_failure = governance_refusal or infrastructure
+        if not_implementation_failure:
+            failures = int(row["consecutive_failures"])
+            force_trip = False
+        else:
+            failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -12469,7 +17204,9 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        if not not_implementation_failure and (
+            force_trip or failures >= effective_limit
+        ):
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -12562,6 +17299,50 @@ def _record_task_failure(
                     f"{failures} consecutive failures and needs a human "
                     f"decision: {error[:500]}",
                 )
+                # Notifying a card that cannot run is not notification. A
+                # dependent parked in ``todo`` behind this now-dead dependency
+                # is gated by ``_parents_satisfied``, so ``recompute_ready``
+                # will never promote it, no dispatcher will ever claim it, and
+                # the event + comment above land somewhere nothing can act on.
+                # That is exactly what happened to t_db0af7e0: it took
+                # ``linked_task_gave_up`` (event 9886) while sitting in 'todo'
+                # with block_kind='dependency', and became ungovernable — Erika
+                # owned a recovery decision she had no mechanical route to make.
+                #
+                # Move it into the same governable state this function just
+                # gave the failing task itself: blocked/needs_input, which is a
+                # real human-decision bucket with ``unblock_task`` as its exit.
+                # Only cards that are genuinely parked move — a dependent that
+                # is running, in review, already terminal, claimed, or
+                # irreversibly disposed is left completely alone.
+                rel_row = conn.execute(
+                    "SELECT status, block_kind FROM tasks WHERE id = ?",
+                    (related_id,),
+                ).fetchone()
+                woken = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'needs_input' "
+                    "WHERE id = ? AND status IN ('todo', 'ready', 'blocked') "
+                    "AND claim_lock IS NULL "
+                    "AND " + _not_irreversibly_disposed_sql(),
+                    (related_id,),
+                )
+                if woken.rowcount == 1:
+                    _append_event(
+                        conn, related_id, "dependency_failure_needs_decision",
+                        {
+                            "task_id": task_id,
+                            "relation": relation,
+                            "from_status": (
+                                rel_row["status"] if rel_row else None
+                            ),
+                            "from_block_kind": (
+                                rel_row["block_kind"] if rel_row else None
+                            ),
+                            "status": "blocked",
+                            "block_kind": "needs_input",
+                        },
+                    )
             blocked = True
         else:
             # Below threshold.
@@ -12581,6 +17362,7 @@ def _record_task_failure(
                     "last_failure_error = ? WHERE id = ?",
                     (failures, error[:500], task_id),
                 )
+            run_id = None
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
@@ -12602,6 +17384,52 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+            if infrastructure:
+                # Same reasoning as the refusal marker below: a counter that
+                # silently declines to increment is indistinguishable from a
+                # broken counter. This is the falsifiable record that an
+                # infrastructure termination was classified as such and kept
+                # off the implementation retry budget.
+                _append_event(
+                    conn, task_id, "infrastructure_failure_not_counted",
+                    {
+                        "outcome": outcome,
+                        "retry_status": retry_status,
+                        "consecutive_failures": failures,
+                        "error": error[:500],
+                        **(event_payload_extra or {}),
+                    },
+                    run_id=run_id,
+                )
+            if governance_refusal:
+                # Say out loud what was NOT counted, and why. Silently
+                # declining to increment a counter is indistinguishable from
+                # a bug in six months; this is the falsifiable record that the
+                # carve-out fired, plus the once-per-phase routing marker that
+                # tells a governor the subject is parked awaiting an
+                # independent verifier rather than stuck.
+                _append_event(
+                    conn, task_id, "self_review_refusal_not_counted",
+                    {
+                        "outcome": outcome,
+                        "retry_status": retry_status,
+                        "consecutive_failures": failures,
+                        "refused_identities": sorted(
+                            _self_review_refused_implementers(conn, task_id)
+                        ),
+                        "error": error[:500],
+                    },
+                    run_id=run_id,
+                )
+                _emit_once_this_phase(
+                    conn, task_id, "independent_verification_required",
+                    {
+                        "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                        "refused_identities": sorted(
+                            _self_review_refused_implementers(conn, task_id)
+                        ),
+                    },
+                )
     return blocked
 
 
@@ -13274,6 +18102,9 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Replay-safe Gauntlet actuator: a PASS persisted before a gateway restart
+    # must still reach DONE without another model/human completion relay.
+    finalize_stranded_verified_reviews(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Gauntlet freshness. Runs BEFORE any of the concurrency/memory-pressure
@@ -13284,17 +18115,64 @@ def _dispatch_once_locked(
     # wrapped, because an observability pass must never be able to take a
     # dispatcher tick down with it.
     try:
-        result.gauntlet_stale = [
-            entry.task_id
-            for entry in detect_stale_gauntlet_work(
-                conn,
-                stale_timeout_seconds=gauntlet_stale_timeout_seconds,
-                realert_seconds=gauntlet_stale_realert_seconds,
-            )
+        _stale_entries = detect_stale_gauntlet_work(
+            conn,
+            stale_timeout_seconds=gauntlet_stale_timeout_seconds,
+            realert_seconds=gauntlet_stale_realert_seconds,
+        )
+        result.gauntlet_stale = [entry.task_id for entry in _stale_entries]
+        # Recovery half: deterministic stale dispositions run before alarm
+        # delivery. A card that was successfully routed/reconciled/released in
+        # this same tick must not then receive a stale alarm from the pre-action
+        # snapshot; only unresolved entries flow into the alarm pass.
+        _dispositions = resolve_stale_gauntlet_dispositions(conn, _stale_entries)
+        _resolved_stale_ids = set()
+        for _key in (
+            "reconciled", "infrastructure_released", "self_review_released",
+            "verifier_routed",
+        ):
+            _resolved_stale_ids.update(_dispositions.get(_key, []))
+        _alarm_entries = [
+            entry for entry in _stale_entries
+            if entry.task_id not in _resolved_stale_ids
         ]
+        # Delivery half of the same pass. Clearing runs FIRST so a card that
+        # resumed and re-stalled opens a fresh episode instead of being
+        # suppressed by its own retired timer. Wrapped separately from the scan
+        # above: a routing fault must not cost the detection, which is the part
+        # that is durable with or without a channel.
+        try:
+            result.lifecycle_alarms_cleared = clear_resolved_lifecycle_stalls(
+                conn
+            )
+            # Same clear-before-alarm ordering, for the sibling observation.
+            # Retiring an UNROUTABLE recheck whose subject went terminal costs
+            # nothing when there is none, and is the only pass that can see
+            # that case at all.
+            clear_resolved_unroutable_rechecks(conn)
+            result.lifecycle_alarms = sweep_lifecycle_stall_alarms(
+                conn, _alarm_entries
+            )
+        except Exception:
+            _log.exception(
+                "kanban dispatch: lifecycle stall escalation failed "
+                "(tick continues)"
+            )
     except Exception:
         _log.exception(
             "kanban dispatch: gauntlet freshness scan failed (tick continues)"
+        )
+
+    # Orphan-verifier watchdog. Same pre-early-return position and the same
+    # reasoning: a finished verifier whose verdict reached nobody is exactly
+    # the kind of silent hole that only ever gets found by a pass that runs
+    # unconditionally. Once per card, ever; historical orphans are reported and
+    # never altered.
+    try:
+        result.orphan_verifiers = sweep_orphan_verifiers(conn)
+    except Exception:
+        _log.exception(
+            "kanban dispatch: orphan verifier sweep failed (tick continues)"
         )
 
     # Execution-supervisor reconciliation. Runs in the same pre-early-return
@@ -13316,6 +18194,46 @@ def _dispatch_once_locked(
     except Exception:
         _log.exception(
             "kanban dispatch: execution reconciliation failed (tick continues)"
+        )
+
+    # Mandatory 300-second observation. Same pre-early-return position and the
+    # same reason as the two passes above: a saturated or memory-pressured host
+    # is exactly when an observation is worth having, so the tick that would
+    # discharge it must not be the one that gets skipped.
+    #
+    # This is the whole mechanical enforcement of the 300 s control. The
+    # durability, the exact interval, the emit-the-verdict-once rule and the
+    # keep-observing-afterwards rule are all carried by ``observation_timers``
+    # and its CHECK constraints and triggers; what they cannot do is notice
+    # that a due instant has passed. Before this pass, nothing in a running
+    # process did — ``run_observation_cycle`` existed with no production
+    # caller, which meant the timer fired only when a model or a human
+    # remembered to drive it. That is a convention, and a convention is what
+    # the ruling replaced.
+    #
+    # Arming stays an explicit governed act (:func:`arm_observation_timer`);
+    # only FIRING is automatic. The failure being closed here is an
+    # observation that stopped at its verdict or quietly vanished, not an
+    # observation that was never requested.
+    try:
+        result.observation_ticks = [
+            tick.as_dict() for tick in run_observation_cycle(conn)
+        ]
+    except Exception:
+        _log.exception(
+            "kanban dispatch: observation cycle failed (tick continues)"
+        )
+
+    # Session-independent ownership census. Reads persisted rows only — never
+    # the process table, a session registry or the environment — so the answer
+    # is identical whether the originating session is live or was destroyed an
+    # hour ago. Observational; see DispatchResult.unowned for why it is not a
+    # gate.
+    try:
+        result.unowned = unowned_tasks(conn)
+    except Exception:
+        _log.exception(
+            "kanban dispatch: ownership census failed (tick continues)"
         )
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -13420,9 +18338,21 @@ def _dispatch_once_locked(
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
             return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+        for row in review_rows:
+            assignee = row["assignee"]
+            if not assignee or not _rpe(assignee):
+                continue
+            # A reviewer identity the claim path will reject cannot consume the
+            # reserved review slot — whether it was already refused for this
+            # phase or is a Gauntlet self-review that will be pre-empted at
+            # selection. ``claim_review_task`` rejects both deterministically,
+            # so reserving capacity for either starves genuinely runnable READY
+            # work (observed live on t_30e58898 while default self-review cards
+            # sat in REVIEW). Same predicate as the claim path, by construction.
+            if _review_claim_conflict(conn, row["id"], assignee) is not None:
+                continue
+            return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():

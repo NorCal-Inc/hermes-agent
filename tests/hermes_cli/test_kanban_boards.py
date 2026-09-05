@@ -35,6 +35,15 @@ from hermes_cli import kanban_db as kb
 # Fixture
 # ---------------------------------------------------------------------------
 
+
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities below ("worker", "alice", "reviewer") are synthetic and are not
+# profile directories on disk, so this module declares the registry-patching
+# fixture that already exists for exactly that reason. The gate itself is
+# pinned in test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
+
 @pytest.fixture
 def fresh_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with no prior kanban state.
@@ -323,10 +332,14 @@ class TestCLI:
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
-        # Create one task on each via --board.
-        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev"], env_extra=env)
+        # Create one task on each via --board. The assignee is "default"
+        # rather than a synthetic name because this test drives the real CLI
+        # in a SUBPROCESS: the module's ``all_assignees_spawnable`` fixture
+        # patches this process only, and since D8 the CLI refuses an assignee
+        # that is not a profile in the child's own HERMES_HOME.
+        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "default"], env_extra=env)
         assert r.returncode == 0, r.stderr
-        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env)
+        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "default"], env_extra=env)
         assert r.returncode == 0, r.stderr
 
         # list on each board only shows its own.

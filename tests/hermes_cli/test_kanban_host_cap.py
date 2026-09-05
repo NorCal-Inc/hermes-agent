@@ -216,6 +216,28 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
     return tid
 
 
+def _park_legacy_phantom_review(
+    conn: sqlite3.Connection, title: str, assignee: str
+) -> str:
+    """Park a review card on an assignee that is NOT a spawnable profile.
+
+    Since D8, ``create_task`` refuses such an assignee, so this state can no
+    longer be minted through the API — but it still EXISTS on boards written
+    before the gate (8 live rows across 5 phantom assignees when D8 was
+    filed), and the dispatcher's own spawnability check is what keeps those
+    rows from taxing the ready budget. Writing the column directly reproduces
+    the legacy row without reopening the creation path, so this dispatcher
+    behaviour stays pinned independently of the creation gate.
+    """
+    tid = kb.create_task(conn, title=title, assignee="alice")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, tid)
+        )
+    _set_task_status(conn, tid, "review")
+    return tid
+
+
 def test_review_lane_gets_reserved_slot_under_ready_backlog(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
@@ -281,13 +303,49 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2"):
             kb.create_task(conn, title=title, assignee="alice")
-        _park_in_review(conn, "human-review", "some-human")
+        _park_legacy_phantom_review(conn, "human-review", "some-human")
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
     # Human-lane review is not spawnable → no reservation, ready gets both.
     assert len(res.spawned) == 2
+
+
+def test_self_review_refusal_releases_reserved_slot(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A deterministically refused review must not starve runnable READY work.
+
+    Live regression: with one effective spawn slot, a REVIEW card assigned to
+    ``default`` had already recorded a self-review refusal. The reservation
+    logic still treated it as spawnable, reduced ready_budget to zero, then the
+    review claim correctly refused it. Result: zero workers spawned while the
+    independent codex verifier remained READY.
+    """
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawns: list = []
+    with kb.connect() as conn:
+        ready_id = kb.create_task(conn, title="independent verifier", assignee="alice")
+        review_id = _park_in_review(conn, "refused-self-review", "default")
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, review_id, "verification_blocked_self_review",
+                {"verifier": "default", "implementer": "default"},
+            )
+
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
+        )
+
+    spawned_ids = [s[0] for s in res.spawned]
+    assert spawned_ids == [ready_id]
+    assert review_id not in spawned_ids
 
 
 def test_review_budget_still_bounded_by_shared_cap(

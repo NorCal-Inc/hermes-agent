@@ -103,6 +103,18 @@ class AttemptResult:
         return self.execution_status == ex.STATUS_COMPLETED and self.returncode == 0
 
     @property
+    def infrastructure(self) -> bool:
+        """Whether the control plane ended this attempt, rather than the work.
+
+        A runtime cap, a lease/liveness reap, an orphan-policy kill or an
+        operator terminate says nothing about whether the repair was going
+        well. Keeping the two apart is what lets the lane block the card as
+        "resume me" instead of "this approach failed", and what keeps the
+        ordinary implementation retry budget unspent.
+        """
+        return ex.is_infrastructure_termination(self.execution_status)
+
+    @property
     def evidence(self) -> str:
         suffix = f" [execution {self.execution_id}]" if self.execution_id else ""
         if self.error:
@@ -113,9 +125,15 @@ class AttemptResult:
                 f"confirmed the process group ended{suffix}"
             )
         if self.execution_status and self.execution_status != ex.STATUS_COMPLETED:
+            # Name the CLASS in the evidence line itself. This string is what a
+            # human and the next executor read off the blocked card, and
+            # "execution ended failed (rc=143)" was read as an implementation
+            # failure on t_aef6bbe1 when it was the supervisor's own SIGTERM.
+            klass = "infrastructure" if self.infrastructure else "implementation"
             return (
                 f"[{self.executor}] execution ended "
-                f"{self.execution_status} (rc={self.returncode}){suffix}"
+                f"{self.execution_status} (rc={self.returncode}) "
+                f"[failure_class={klass}]{suffix}"
             )
         parts = [f"[{self.executor}] rc={self.returncode}{suffix}"]
         if self.stdout.strip():
@@ -408,7 +426,7 @@ def _register_attachment_dir_files(conn, task_id: str) -> list[str]:
 
 
 def run_codex_verifier(task_id: str) -> int:
-    """Run one independent read-only verification task through Codex."""
+    """Run one independent verifier with writable scratch, read-only target access."""
     conn = kb.connect()
     try:
         task = kb.get_task(conn, task_id)
@@ -449,11 +467,10 @@ def run_codex_verifier(task_id: str) -> int:
         result = _extract_codex_result(attempt.stdout)
         summary = result[:4000]
         verdict = _atlas_verdict(result)
-        if verdict is not True:
+        if verdict is None:
             reason = (
-                "Atlas verification failed.\n\n" + result
-                if verdict is False
-                else "Atlas verification result is missing the required final ATLAS_VERDICT line.\n\n" + result
+                "Atlas verification result is missing the required final "
+                "ATLAS_VERDICT line.\n\n" + result
             )
             ok = kb.block_task(
                 conn, task_id, reason=reason, kind="needs_input",
@@ -462,10 +479,14 @@ def run_codex_verifier(task_id: str) -> int:
             if ok:
                 kb.add_comment(conn, task_id, author="atlas-codex-lane", body=result)
             return 0 if ok else 1
+        # PASS and FAIL are both successful verifier executions. The verifier
+        # artifact must complete so complete_task's post-commit return hook can
+        # route the machine-readable VERDICT back to the subject. Blocking the
+        # verifier on FAIL strands a valid unfavorable verdict on the child.
         metadata = {
             "executor_lane": "codex_verify",
             "executor": "codex",
-            "sandbox": "read-only",
+            "sandbox": "workspace-write-scratch; target-read-only",
             "duration_seconds": round(time.time() - started_at, 1),
         }
         try:
@@ -523,7 +544,24 @@ def run_claude_executor(task_id: str) -> int:
         # and treating that as success is exactly the split-brain this lane
         # was rewired to end.
         if not attempt.ok:
-            reason = "Direct Claude executor failed or timed out.\n\n" + attempt.evidence
+            # An infrastructure termination is a RESUME instruction, not a
+            # verdict on the work: the workspace, the session transcript and
+            # any attachments the attempt already produced are intact, and the
+            # next attempt must continue from them rather than restart
+            # diagnosis from zero. Say so on the card, because the card is the
+            # only thing the next executor reads.
+            if attempt.infrastructure:
+                reason = (
+                    "Direct Claude executor was terminated by the control "
+                    "plane (infrastructure), not by a failure of the work. "
+                    "Resume from the preserved workspace and evidence; do not "
+                    "restart from zero.\n\n"
+                ) + attempt.evidence
+            else:
+                reason = (
+                    "Direct Claude executor failed or timed out.\n\n"
+                    + attempt.evidence
+                )
             ok = kb.block_task(
                 conn,
                 task_id,
@@ -634,7 +672,7 @@ def _invoke_claude(
 def _invoke_codex_verifier(
     prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
 ) -> AttemptResult:
-    """One bounded independent Codex verification attempt in read-only sandbox."""
+    """One bounded independent Codex attempt in disposable writable scratch."""
     with tempfile.NamedTemporaryFile(prefix="hermes-codex-verify-", suffix=".txt", delete=False) as tmp:
         last_message_path = tmp.name
     try:

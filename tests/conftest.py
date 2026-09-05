@@ -1170,6 +1170,13 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "dispatcher's memory guard to 'no data' — only for tests that "
         "exercise the guard itself with their own patched samples.",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_profile_registry: bypass the autouse fixture that treats a "
+        "module's synthetic identities ('alice', 'reviewer') as registered "
+        "profiles — only for tests that exercise the profile/verifier "
+        "identity gates themselves.",
+    )
     # NOTE: linux_only / macos_only / windows_only are declared in
     # pyproject.toml's ``markers`` list, not here — they are part of the
     # project's public marker vocabulary (``pytest --markers``, and the CI
@@ -1737,3 +1744,34 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture
+def all_assignees_spawnable(monkeypatch):
+    """Pretend every assignee maps to a real Hermes profile.
+
+    Most tests that touch the Kanban board use synthetic assignees
+    ("alice", "bob", "worker") that are not profile directories on disk —
+    and cannot be, since the suite repoints ``HERMES_HOME`` at a per-test
+    tempdir (invariant 2 above), so ``profile_exists`` is False for every
+    name except ``default``.
+
+    Two separate guards make that matter, and this one fixture covers both:
+
+    * the dispatcher's profile-exists guard (PR #20105), which routes such
+      tasks into ``skipped_nonspawnable`` instead of spawning them; and
+    * the assignee-existence gate on every write of ``tasks.assignee``
+      (``kanban_db._assert_assignee_dispatchable``, defect D8), which
+      refuses to create or reassign a card to a name nothing can spawn.
+
+    Declare it (usually as a module-level
+    ``pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")``) in
+    any module whose cards use synthetic identities. Tests that assert the
+    guards THEMSELVES must not use it — they need the real registry; see
+    ``tests/hermes_cli/test_kanban_assignee_validation.py``.
+
+    Lives in the root conftest rather than ``tests/hermes_cli/`` because the
+    board is exercised from the gateway, plugin, tools and tui suites too.
+    """
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)

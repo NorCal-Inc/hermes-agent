@@ -36,6 +36,14 @@ from hermes_cli import exec_supervisor as ex
 from hermes_cli import kanban_db as kb
 
 
+# A verifier identity the registry can actually resolve. Verdicts are refused
+# unless the signer is an existing profile or a recognized verifier lane (D4),
+# and `codex_verify` is a lane that is independent of the "default" implementer
+# these tests use — so it exercises the regression chain rather than tripping
+# the identity or independence gates on the way in.
+VERIFIER = "codex_verify"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -411,6 +419,40 @@ class TestSynchronousCeiling:
             record = ex.get_execution(conn, result.execution_id)
         assert record.ownership == ex.OWNERSHIP_SUPERVISOR
 
+    def test_codex_verifier_is_supervisor_owned_below_sync_ceiling(
+        self, kanban_home, workroot, policy, monkeypatch
+    ):
+        """Verifier survival must not depend on the launching model session.
+
+        Regression for 2026-09-03: x_3caa572cb0b2367c was a durable Codex
+        verifier but was controller-owned because its 1500 s bound sat below
+        the sync ceiling. When the parent Claude run hit its cap, controller
+        loss caused reconciliation to reap the verifier as collateral.
+        ``codex.verify`` is therefore supervisor-owned from creation regardless
+        of duration.
+        """
+        monkeypatch.setitem(
+            ex.LAUNCHERS,
+            "codex.verify",
+            ex.Launcher(
+                "codex.verify", "codex",
+                lambda spec: [sys.executable, "-c", "pass"],
+            ),
+        )
+        result = ex.run_supervised(
+            command_class="codex.verify",
+            spec={"prompt": "verify"},
+            cwd=str(workroot),
+            timeout=1,
+            policy=policy,
+        )
+        assert result.succeeded
+        assert result.ownership == ex.OWNERSHIP_SUPERVISOR
+        with kb.connect_closing() as conn:
+            record = ex.get_execution(conn, result.execution_id)
+        assert record is not None
+        assert record.ownership == ex.OWNERSHIP_SUPERVISOR
+
     def test_background_launch_is_supervisor_owned_and_returns_immediately(
         self, kanban_home, workroot, policy
     ):
@@ -596,6 +638,27 @@ class TestReconciliation:
     def test_stale_heartbeat_is_detected_and_reconciled(
         self, kanban_home, workroot, policy
     ):
+        """The liveness rule still reaps — within its own authority.
+
+        Rewritten twice on 2026-09-03, and the second rewrite is the one that
+        matters. The original pinned ``max_runtime_s=3600`` against a 10 s
+        liveness window and asserted the reap on an execution that had never
+        heartbeated — i.e. it asserted the inversion that killed t_aef6bbe1 at
+        half its authorized runtime. The first rewrite dodged that by shrinking
+        the cap below the window, which made the fixture pass but described a
+        situation the rule can no longer reach.
+
+        What the rule means now: a heartbeat WAS recorded (by
+        ``ex.LivenessPump``, after proving the process against /proc) and then
+        stopped. That is genuine evidence of a lost owner, and reaping on it is
+        the level-3 window doing its actual job rather than shadowing the
+        level-1 cap. So the fixture writes one real heartbeat, ages it past the
+        window, and leaves the authorized cap far away.
+
+        The precedence half — never-heartbeated work surviving to its own cap —
+        is pinned in ``test_exec_timeout_hierarchy.py`` and
+        ``test_exec_heartbeat_liveness.py``.
+        """
         stale_policy = ex.ExecutionPolicy(
             **{**policy.__dict__, "stale_heartbeat_seconds": 10}
         )
@@ -612,18 +675,30 @@ class TestReconciliation:
                     controller_pid=os.getpid(),
                     controller_key=ex.process_identity(os.getpid()),
                     ownership=ex.OWNERSHIP_SUPERVISOR,
+                    # Comfortably above the aged runtime below, so Rule 3
+                    # (the authorized cap) does not preempt and this really
+                    # does exercise Rule 5.
                     max_runtime_s=3600,
                 )
                 ex._attach_process(
                     conn, record.id, pid=proc.pid, pgid=os.getpgid(proc.pid),
                     proc_key=ex.process_identity(proc.pid),
                 )
+                # Staleness is now "a heartbeat existed and then stopped",
+                # not "the row is old": ``ex.stale_reap_permitted`` refuses to
+                # reap a live process that was never heartbeated at all, since
+                # ``heartbeat_at == started_at`` is seeded, not observed. So
+                # age ``started_at`` and leave ``heartbeat_at`` strictly after
+                # it — one real heartbeat, 500 s ago, under a 10 s window.
+                # Same rule, same expectations; only the fixture now describes
+                # a situation that can actually occur.
                 conn.execute(
-                    "UPDATE executions SET heartbeat_at = heartbeat_at - 600 "
-                    "WHERE id = ?",
+                    "UPDATE executions SET started_at = started_at - 600, "
+                    "heartbeat_at = heartbeat_at - 500 WHERE id = ?",
                     (record.id,),
                 )
                 conn.commit()
+                assert ex.has_recorded_heartbeat(ex.get_execution(conn, record.id))
                 result = ex.reconcile(conn, policy=stale_policy)
                 refreshed = ex.get_execution(conn, record.id)
             assert record.id in result.stale
@@ -1123,10 +1198,18 @@ class TestGauntletIntegration:
             cwd=str(workroot), task_id=tid, policy=policy,
         )
         with kb.connect_closing() as conn:
-            kb.record_verification(
-                conn, tid, passed=False, verifier="reviewer",
+            # The verifier must be an identity the system can resolve. This
+            # used to read "reviewer", which the D4 identity gate now refuses
+            # as unregistered -- so the FAIL verdict was never recorded and
+            # the regression gate was never armed. The test then failed two
+            # lines later on regression_required, naming the symptom instead
+            # of the cause. Assert the verdict landed, so a refused verdict
+            # can never again masquerade as a regression-gate defect.
+            recorded, detail = kb.record_verification(
+                conn, tid, passed=False, verifier=VERIFIER,
                 reason="did not actually fix it",
             )
+            assert recorded is True, f"FAIL verdict was refused: {detail}"
             assert kb.get_task(conn, tid).regression_required is True
 
             # Repair leg: re-run the work under supervision, hand it back.
@@ -1144,10 +1227,12 @@ class TestGauntletIntegration:
             # without the supervisor in the picture. The supervisor changes
             # WHO owns the process, never what the chain demands.
             ok, detail = kb.record_verification(
-                conn, tid, passed=True, verifier="reviewer",
+                conn, tid, passed=True, verifier=VERIFIER,
                 evidence={"note": "looks fine now"},
             )
             assert ok is False
+            # Refused for the RIGHT reason: missing regression proof, not a
+            # verifier the registry could not resolve.
             assert "regression evidence is required" in detail
             task = kb.get_task(conn, tid)
             assert task.regression_required is True
@@ -1298,3 +1383,89 @@ class TestMigration:
         kb.init_db()
         with kb.connect_closing() as conn:
             assert ex.get_execution(conn, record.id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Supervised executors must not inherit the controller's stdin
+#
+# Real incident, 2026-09-04: every `codex.verify` attempt burned its full
+# timeout emitting zero bytes on BOTH stdout and stderr. It read as a hung
+# model. It was not — `_start_process` never set `stdin`, so the child
+# inherited the controller's, and `codex exec` (0.149.0) reads trailing stdin
+# ("Reading additional input from stdin...") and blocks until EOF. When the
+# controller's own stdin is a descriptor that never closes, that EOF never
+# comes and the independent verification path silently stops producing
+# verdicts. A control plane whose verifier cannot return is a control plane
+# that cannot certify anything, so this is pinned rather than commented.
+# ---------------------------------------------------------------------------
+
+
+class TestSupervisedExecutorsGetNoStdin:
+    def test_start_process_closes_stdin(self, monkeypatch, workroot):
+        """The launcher explicitly hands the child a closed stdin."""
+        seen: dict = {}
+        real_popen = subprocess.Popen
+
+        def fake_popen(argv, **kwargs):
+            seen.update(kwargs)
+            return real_popen(argv, **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        proc = ex._start_process(
+            [sys.executable, "-c", "pass"],
+            cwd=str(workroot), env=dict(os.environ), capture_output=True,
+        )
+        proc.wait(timeout=30)
+        assert seen.get("stdin") == subprocess.DEVNULL
+
+    @pytest.mark.parametrize("capture_output", [True, False])
+    def test_stdin_reader_cannot_hang_on_an_inherited_never_eof_stdin(
+        self, workroot, capture_output
+    ):
+        """The falsifiable one: a child that reads stdin still terminates.
+
+        The controller's own fd 0 is replaced with the read end of a pipe
+        nobody ever writes to or closes — exactly the shape a resident
+        dispatcher hands its children. A child that inherits it and calls
+        ``stdin.read()`` blocks forever; one given DEVNULL sees EOF at once.
+        """
+        script = workroot / "reads_stdin.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdin.read()\n"
+            "sys.stdout.write('REACHED_EOF\\n')\n",
+            encoding="utf-8",
+        )
+
+        read_fd, write_fd = os.pipe()
+        saved_stdin = os.dup(0)
+        try:
+            os.dup2(read_fd, 0)  # controller stdin: open, never EOF
+            proc = ex._start_process(
+                [sys.executable, str(script)],
+                cwd=str(workroot),
+                env=dict(os.environ),
+                capture_output=capture_output,
+            )
+        finally:
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+            os.close(read_fd)
+
+        try:
+            # Without the fix this raises TimeoutExpired: the child is still
+            # parked in read() on a descriptor that will never close.
+            rc = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+            pytest.fail(
+                "supervised child inherited the controller's stdin and hung "
+                "waiting for an EOF that never comes"
+            )
+        finally:
+            os.close(write_fd)
+
+        assert rc == 0
+        if capture_output:
+            assert "REACHED_EOF" in (proc.stdout.read() if proc.stdout else "")

@@ -32,6 +32,36 @@ from hermes_cli import kanban_db as kb
 REGRESSION_PROOF = {"command": "pytest -q tests/hermes_cli", "exit_code": 0}
 
 
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities below ("worker", "alice", "reviewer") are synthetic and are not
+# profile directories on disk, so this module declares the registry-patching
+# fixture that already exists for exactly that reason. The gate itself is
+# pinned in test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_identities_are_registered(request, monkeypatch):
+    """Treat this module's synthetic identities as registered profiles.
+
+    Every assignee, reviewer and verifier in this file is a stand-in name
+    ("alice", "bob", "reviewer") with no profile directory behind it. The
+    verifier-identity gate refuses an unregistered verifier outright and the
+    assignee gate refuses an unregistered assignee, so without this the module
+    would be testing the identity registry rather than the lifecycle it is
+    about. Registry behaviour has its own coverage in
+    ``test_kanban_verifier_identity.py``.
+
+    Tests that exercise the registry itself opt out with
+    ``@pytest.mark.real_profile_registry``.
+    """
+    if request.node.get_closest_marker("real_profile_registry"):
+        return
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""

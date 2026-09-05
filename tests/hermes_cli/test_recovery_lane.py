@@ -110,7 +110,10 @@ def test_assignee_claude_is_shorthand_for_direct_lane(kanban_home):
 
 def test_assignee_atlas_is_shorthand_for_readonly_codex_verifier(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="verify implementation", assignee="atlas")
+        subject = kb.create_task(conn, title="implementation subject", assignee="default")
+        tid = kb.create_task(
+            conn, title="verify implementation", assignee="atlas", parents=[subject]
+        )
         task = kb.get_task(conn, tid)
     assert task.executor_lane == "codex_verify"
     assert task.assignee == "default"
@@ -119,9 +122,10 @@ def test_assignee_atlas_is_shorthand_for_readonly_codex_verifier(kanban_home):
 
 def test_explicit_codex_verify_lane_normalizes_to_default_carrier(kanban_home):
     with kb.connect() as conn:
+        subject = kb.create_task(conn, title="implementation subject", assignee="default")
         tid = kb.create_task(
             conn, title="verify implementation", assignee="overall_manager",
-            executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+            executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY, parents=[subject],
         )
         task = kb.get_task(conn, tid)
     assert task.executor_lane == "codex_verify"
@@ -293,20 +297,26 @@ def test_kanban_cli_create_defaults_executor_lane_none():
 
 def test_codex_verify_task_does_not_recursively_require_gauntlet_review(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="independent verify", assignee="atlas")
+        subject = kb.create_task(
+            conn, title="gauntlet subject", assignee="default", gauntlet=True
+        )
+        tid = kb.create_task(
+            conn, title="independent verify", assignee="atlas", parents=[subject]
+        )
         task = kb.get_task(conn, tid)
         assert task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+        assert task.gauntlet_enforced is True
         assert kb.gauntlet_required(conn, tid) is False
 
 
-def test_codex_verify_launcher_is_mechanically_read_only(monkeypatch):
+def test_codex_verify_launcher_writes_only_governed_scratch(monkeypatch):
     monkeypatch.setattr(recovery_lane.ex.shutil, "which", lambda name: f"/bin/{name}")
     argv = recovery_lane.ex.LAUNCHERS["codex.verify"].build({
         "prompt": "verify", "last_message_path": "/tmp/last.txt"
     })
     assert argv[0] == "/bin/codex"
     assert argv[1] == "exec"
-    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert "--skip-git-repo-check" in argv
 
 
@@ -383,7 +393,7 @@ def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
     assert not block_calls
     assert len(complete_calls) == 1
     assert complete_calls[0]["result"] == "PASS all checks; GO\nATLAS_VERDICT: PASS"
-    assert complete_calls[0]["metadata"]["sandbox"] == "read-only"
+    assert complete_calls[0]["metadata"]["sandbox"] == "workspace-write-scratch; target-read-only"
 
 
 def test_atlas_verdict_parser_is_fail_closed():
@@ -393,7 +403,7 @@ def test_atlas_verdict_parser_is_fail_closed():
     assert recovery_lane._atlas_verdict("ATLAS_VERDICT: PASS\ntrailing prose") is None
 
 
-def test_codex_verifier_fail_blocks_instead_of_releasing_children(monkeypatch, tmp_path):
+def test_codex_verifier_fail_completes_so_verdict_can_return_to_subject(monkeypatch, tmp_path):
     task = _make_recovery_task(
         executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
         recovery_gate_cmd=None,
@@ -417,9 +427,9 @@ def test_codex_verifier_fail_blocks_instead_of_releasing_children(monkeypatch, t
     monkeypatch.setattr(recovery_lane.kb, "block_task", lambda *a, **k: block_calls.append(k) or True)
     monkeypatch.setattr(recovery_lane.kb, "add_comment", lambda *a, **k: 1)
     assert recovery_lane.run_codex_verifier("t_recover") == 0
-    assert complete_calls == []
-    assert len(block_calls) == 1
-    assert "Atlas verification failed" in block_calls[0]["reason"]
+    assert len(complete_calls) == 1
+    assert complete_calls[0]["result"] == "NO-GO\nATLAS_VERDICT: FAIL"
+    assert block_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -953,7 +963,7 @@ def test_telegram_notify_wake_inherits_to_dependent_continuation(kanban_home):
             delivery_mode="notify+wake",
         )
         child = kb.create_task(
-            conn, title="parked continuation", assignee="paris_worker",
+            conn, title="parked continuation", assignee="default",
             parents=[parent],
         )
         rows = kb.list_notify_subs(conn, child)
