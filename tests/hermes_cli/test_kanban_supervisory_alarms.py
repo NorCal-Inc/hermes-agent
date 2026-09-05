@@ -877,10 +877,17 @@ class TestStaleDispositionActuator:
                 reason="control-plane timeout; no human decision required",
                 kind="needs_input",
             )
+            block = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id=? AND kind='blocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert block is not None
+            block_at = int(block["created_at"])
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE executions SET status='timed_out', ended_at=? WHERE id=?",
-                    (1_700_000_300, execution.id),
+                    (block_at, execution.id),
                 )
 
             entry = kb.GauntletStaleTask(
@@ -1049,3 +1056,117 @@ class TestStaleDispositionActuator:
             ).fetchone()[0] == 300
             events = _events(conn, tid, "gauntlet_stale_disposition")
             assert any(p["action"] == "self_review_routed_independent" for _, p in events)
+
+
+    def test_old_verified_repair_cannot_archive_newer_stale_episode(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(
+                conn, title="subject later reopened", assignee="default",
+                gauntlet=True, max_runtime_seconds=300,
+            )
+            assert kb.claim_task(conn, subject)
+            assert kb.block_task(conn, subject, reason="first episode", kind="needs_input")
+
+            repair = kb.create_task(
+                conn, title="repair for first episode", assignee="default",
+                gauntlet=True, max_runtime_seconds=300,
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', verification_state=?, "
+                    "terminal_disposition='completed', completed_at=? WHERE id=?",
+                    (kb.VERIFICATION_VERIFIED, 1_700_000_100, repair),
+                )
+            kb.add_task_relation(conn, repair, subject, "repairs", created_by="test")
+            rel = conn.execute(
+                "SELECT created_at FROM task_relations WHERE from_task_id=? "
+                "AND to_task_id=? AND relation='repairs'",
+                (repair, subject),
+            ).fetchone()
+            assert rel is not None
+
+            # Model a later subject episode: the stale detector's latest
+            # meaningful event post-dates the relation that authorized the old
+            # repair. The old repair must not retire this newer objective.
+            entry = kb.GauntletStaleTask(
+                task_id=subject,
+                status="blocked",
+                verification_state=None,
+                regression_required=False,
+                age_seconds=600,
+                reasons=["parked_blocked"],
+                last_event_id=999999,
+                last_event_at=int(rel["created_at"]) + 10,
+                last_event_kind="blocked",
+            )
+            result = kb.resolve_stale_gauntlet_dispositions(
+                conn, [entry], now=int(rel["created_at"]) + 610,
+            )
+            assert result["reconciled"] == []
+            assert result["unresolved"] == [subject]
+            row = conn.execute(
+                "SELECT status, terminal_disposition FROM tasks WHERE id=?",
+                (subject,),
+            ).fetchone()
+            assert row["status"] == "blocked"
+            assert row["terminal_disposition"] is None
+
+    def test_historical_infrastructure_timeout_cannot_clear_new_human_block(self, kanban_home):
+        from hermes_cli import exec_supervisor as ex
+
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="current credential decision", assignee="default",
+                gauntlet=True, max_runtime_seconds=300,
+            )
+            assert kb.claim_task(conn, tid)
+            assert kb.block_task(
+                conn, tid,
+                reason="owner must choose current credential source",
+                kind="needs_input",
+            )
+            block = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id=? AND kind='blocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert block is not None
+            block_at = int(block["created_at"])
+
+            # Only execution history is an older infrastructure timeout. The
+            # former stale actuator selected this row and incorrectly cleared
+            # the current owner-decision block.
+            execution = ex.create_execution(
+                conn,
+                executor_type="claude",
+                command_class="claude.headless",
+                cwd=str(kanban_home),
+                task_id=tid,
+                max_runtime_s=300,
+                now=block_at - 1200,
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE executions SET status='timed_out', ended_at=? WHERE id=?",
+                    (block_at - 900, execution.id),
+                )
+
+            entry = kb.GauntletStaleTask(
+                task_id=tid,
+                status="blocked",
+                verification_state=None,
+                regression_required=False,
+                age_seconds=600,
+                reasons=["parked_blocked"],
+                last_event_id=None,
+                last_event_at=block_at,
+                last_event_kind="blocked",
+            )
+            result = kb.resolve_stale_gauntlet_dispositions(
+                conn, [entry], now=block_at + 600,
+            )
+            assert result["infrastructure_released"] == []
+            assert result["unresolved"] == [tid]
+            assert conn.execute(
+                "SELECT status FROM tasks WHERE id=?", (tid,)
+            ).fetchone()["status"] == "blocked"
