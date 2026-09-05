@@ -1521,3 +1521,153 @@ class TestEvidenceReadyVerifierDependency:
             assert ok is True, detail
             assert kb.complete_task(conn, pid, summary="verified") is True
             assert kb.get_task(conn, pid).status == "done"
+
+
+class TestSelfReviewBlockedImplementationHandoff:
+    @staticmethod
+    def _blocked_parent(conn):
+        parent = kb.create_task(
+            conn, title="governed decision", assignee="default", gauntlet=True,
+        )
+        run = kb.claim_task(conn, parent)
+        kb.add_attachment(
+            conn, parent, filename="DECISION-EVIDENCE.md",
+            stored_path=f"/tmp/{parent}/DECISION-EVIDENCE.md", size=128,
+        )
+        assert kb.request_review(
+            conn, parent, summary="decision ready for independent review",
+            reviewer="default", expected_run_id=run.current_run_id,
+        )
+        ok, detail = kb.record_verification(
+            conn, parent, passed=True, verifier="default",
+        )
+        assert ok is False
+        assert "matches the implementer" in detail
+        return parent
+
+    @staticmethod
+    def _governed_chain(conn, parent):
+        implementation = kb.create_task(
+            conn, title="implement governed decision", assignee="default",
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+            parents=[parent], gauntlet=True,
+        )
+        verifier = kb.create_task(
+            conn, title="independent implementation verification",
+            assignee="default", executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+            parents=[implementation], gauntlet=True,
+        )
+        return implementation, verifier
+
+    def test_same_identity_review_stays_blocked_and_parent_nonterminal(
+        self, kanban_home,
+    ):
+        with kb.connect_closing() as conn:
+            parent = self._blocked_parent(conn)
+            task = kb.get_task(conn, parent)
+            assert task.status == "review"
+            assert task.verification_state == kb.VERIFICATION_PENDING
+            assert task.completed_at is None
+            assert len(_events(
+                conn, parent, kind="verification_blocked_self_review",
+            )) == 1
+            with pytest.raises(kb.VerificationRequiredError):
+                kb.complete_task(conn, parent, summary="not independently reviewed")
+            assert kb.get_task(conn, parent).status != "done"
+
+    def test_governed_implementation_releases_on_recompute_and_direct_claim(
+        self, kanban_home,
+    ):
+        with kb.connect_closing() as conn:
+            parent = self._blocked_parent(conn)
+            implementation, _ = self._governed_chain(conn, parent)
+            assert kb.get_task(conn, implementation).status == "todo"
+            assert kb.recompute_ready(conn) >= 1
+            assert kb.get_task(conn, implementation).status == "ready"
+            assert kb.claim_task(conn, implementation) is not None
+            assert kb.get_task(conn, implementation).status == "running"
+            assert kb.get_task(conn, parent).status == "review"
+            assert kb.get_task(conn, parent).completed_at is None
+
+    def test_review_run_self_review_block_releases_only_governed_implementation(
+        self, kanban_home,
+    ):
+        """Reproduce the production sequence with distinct implementation/review runs."""
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(
+                conn, title="governed decision", assignee="default", gauntlet=True,
+            )
+            implementation_run = kb.claim_task(conn, parent).current_run_id
+            kb.add_attachment(
+                conn, parent, filename="DECISION-EVIDENCE.md",
+                stored_path=f"/tmp/{parent}/DECISION-EVIDENCE.md", size=128,
+            )
+            assert kb.request_review(
+                conn, parent, summary="decision ready for independent review",
+                reviewer="default", expected_run_id=implementation_run,
+            )
+
+            review_task = kb.claim_review_task(conn, parent, claimer="same-identity")
+            assert review_task is not None
+            review_run = review_task.current_run_id
+            assert review_run != implementation_run
+            assert kb.complete_task(
+                conn, parent, summary="attempted self-review",
+                expected_run_id=review_run,
+            ) is False
+            blocker = conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'verification_blocked_self_review' "
+                "ORDER BY id DESC LIMIT 1",
+                (parent,),
+            ).fetchone()
+            assert blocker["run_id"] == review_run
+
+            implementation, verifier = self._governed_chain(conn, parent)
+            assert kb.recompute_ready(conn) == 1
+            assert kb.get_task(conn, implementation).status == "ready"
+            assert kb.get_task(conn, verifier).status == "todo"
+            assert kb.get_task(conn, parent).status == "running"
+
+    def test_arbitrary_child_without_governed_topology_remains_blocked(
+        self, kanban_home,
+    ):
+        with kb.connect_closing() as conn:
+            parent = self._blocked_parent(conn)
+            ordinary = kb.create_task(
+                conn, title="ordinary dependent", assignee="default",
+                parents=[parent], gauntlet=True,
+            )
+            unverified_implementation = kb.create_task(
+                conn, title="claude child without verifier leg",
+                assignee="default", executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+                parents=[parent], gauntlet=True,
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, ordinary).status == "todo"
+            assert kb.get_task(conn, unverified_implementation).status == "todo"
+
+    def test_codex_verifier_waits_for_implementation_evidence_handoff(
+        self, kanban_home,
+    ):
+        with kb.connect_closing() as conn:
+            parent = self._blocked_parent(conn)
+            implementation, verifier = self._governed_chain(conn, parent)
+            kb.recompute_ready(conn)
+            run = kb.claim_task(conn, implementation)
+            assert run is not None
+            assert kb.get_task(conn, verifier).status == "todo"
+
+            kb.add_attachment(
+                conn, implementation, filename="IMPLEMENTATION-EVIDENCE.md",
+                stored_path=f"/tmp/{implementation}/IMPLEMENTATION-EVIDENCE.md",
+                size=256,
+            )
+            assert kb.request_review(
+                conn, implementation, summary="implementation ready for Codex",
+                expected_run_id=run.current_run_id,
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "ready"
+            assert kb.get_task(conn, implementation).status == "review"
+            assert kb.get_task(conn, implementation).completed_at is None

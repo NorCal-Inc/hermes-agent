@@ -5420,7 +5420,8 @@ def recompute_ready(
     """Promote ``todo`` tasks to ``ready`` when every parent is satisfied.
 
     "Satisfied" is :func:`_parents_satisfied` — normally ``done``/``archived``,
-    plus the evidence-ready carve-out for an independent verifier child.
+    plus the evidence-ready verifier and governed implementation-handoff
+    carve-outs described at that predicate.
 
     Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
     MUST be called OUTSIDE any open write transaction (plain ``write_txn``
@@ -5565,6 +5566,85 @@ _EVIDENCE_READY_PARENT_SQL = """
     )
 """
 
+# A review handoff can also be the governing parent of the implementation it
+# authorises. Requiring that parent to complete first is circular when the
+# handoff was refused solely by the independent-reviewer guard. This exception
+# is topology- and evidence-bound rather than inferred from title/body prose.
+_GOVERNED_IMPLEMENTATION_HANDOFF_SQL = """
+    (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :implement_lane
+    AND (SELECT c.gauntlet_enforced FROM tasks c WHERE c.id = :child) = 1
+    AND p.verification_state = :pending
+    AND EXISTS (
+        SELECT 1 FROM task_verifications pv
+         WHERE pv.task_id = p.id
+           AND pv.kind = :verdict_kind
+           AND pv.state = :pending
+           AND EXISTS (
+               SELECT 1 FROM task_events blocked
+                WHERE blocked.task_id = p.id
+                  AND blocked.kind = 'verification_blocked_self_review'
+                  AND (
+                      -- Parked ``record_verification`` refusals are anchored
+                      -- directly to the implementation run that opened pv.
+                      blocked.run_id = pv.run_id
+                      OR EXISTS (
+                          -- Inline ``complete_task`` refusals happen in a
+                          -- later run claimed from review. Bind that review
+                          -- run back to this exact implementation handoff by
+                          -- the ordered, durable event chain rather than by
+                          -- identity or current task state.
+                          SELECT 1
+                            FROM task_events requested
+                            JOIN task_events claimed
+                              ON claimed.task_id = requested.task_id
+                             AND claimed.run_id = blocked.run_id
+                           WHERE requested.task_id = p.id
+                             AND requested.kind = 'review_requested'
+                             AND requested.run_id = pv.run_id
+                             AND claimed.kind = 'claimed'
+                             AND json_valid(claimed.payload)
+                             AND json_extract(
+                                 claimed.payload, '$.source_status'
+                             ) = 'review'
+                             AND requested.id < claimed.id
+                             AND claimed.id < blocked.id
+                      )
+                  )
+           )
+    )
+    AND EXISTS (SELECT 1 FROM task_attachments pa WHERE pa.task_id = p.id)
+    AND EXISTS (
+        SELECT 1 FROM task_events created
+         WHERE created.task_id = :child
+           AND created.kind = 'created'
+           AND json_valid(created.payload)
+           AND json_extract(created.payload, '$.executor_lane') = :implement_lane
+           AND EXISTS (
+               SELECT 1 FROM json_each(created.payload, '$.parents') ep
+                WHERE ep.value = p.id
+           )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM task_links vl
+          JOIN tasks verifier ON verifier.id = vl.child_id
+         WHERE vl.parent_id = :child
+           AND verifier.executor_lane = :verify_lane
+           AND verifier.gauntlet_enforced = 1
+           AND EXISTS (
+               SELECT 1 FROM task_events vc
+                WHERE vc.task_id = verifier.id
+                  AND vc.kind = 'created'
+                  AND json_valid(vc.payload)
+                  AND json_extract(vc.payload, '$.executor_lane') = :verify_lane
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(vc.payload, '$.parents') vp
+                       WHERE vp.value = :child
+                  )
+           )
+    )
+"""
+
 # A parent carrying an IRREVERSIBLE disposition is satisfied regardless of the
 # status column. In practice the two agree — reconciliation parks the card in
 # ``archived``, which was already terminal here — but stating it explicitly is
@@ -5584,12 +5664,16 @@ _UNSATISFIED_PARENTS_SQL = f"""
      WHERE l.child_id = :child
        AND p.status NOT IN ('done', 'archived')
        AND {_not_irreversibly_disposed_sql("p")}
-       AND NOT COALESCE(({_EVIDENCE_READY_PARENT_SQL}), 0)
+       AND NOT COALESCE((
+           ({_EVIDENCE_READY_PARENT_SQL})
+           OR ({_GOVERNED_IMPLEMENTATION_HANDOFF_SQL})
+       ), 0)
      LIMIT 1
 """
 
 _PARENT_GATE_PARAMS = {
     "verify_lane": EXECUTOR_LANE_CODEX_VERIFY,
+    "implement_lane": EXECUTOR_LANE_CLAUDE,
     "pending": VERIFICATION_PENDING,
     "verdict_kind": LEDGER_KIND_VERDICT,
 }
@@ -5598,9 +5682,10 @@ _PARENT_GATE_PARAMS = {
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is satisfied for dependency gating.
 
-    Satisfied means terminal ('done'/'archived') — or, for an independent
-    verifier child only, evidence-ready. See ``_EVIDENCE_READY_PARENT_SQL``
-    above for why the second case exists and how narrow it is.
+    Satisfied means terminal ('done'/'archived'), evidence-ready for an
+    independent verifier child, or a self-review-blocked evidence handoff for
+    a pre-wired governed implementation -> independent-verifier graph. See the
+    two SQL predicates above for their fail-closed evidence requirements.
 
     This is the dependency-eligibility predicate: :func:`recompute_ready`,
     :func:`claim_task`, :func:`claim_review_task`, :func:`complete_task` and
@@ -8566,6 +8651,14 @@ def record_verification(
         # that parked this phase — see ``_review_requested_implementer``.
         implementer = _review_requested_implementer(conn, task_id, row["assignee"])
         if verifier and implementer and verifier == implementer:
+            phase = _current_verification_phase(conn, task_id)
+            _append_event(
+                conn,
+                task_id,
+                "verification_blocked_self_review",
+                {"verifier": verifier, "implementer": implementer},
+                run_id=phase[1] if phase is not None else None,
+            )
             return False, (
                 f"verifier {verifier!r} matches the implementer "
                 f"{implementer!r}; doctrine_verification.md requires an "
