@@ -100,7 +100,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "cancelled", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # ---------------------------------------------------------------------------
@@ -1521,6 +1521,9 @@ class Task:
     # an overtaken card was never completed, and conflating the two would put
     # fabricated completions into every time-to-complete metric.
     disposition_at: Optional[int] = None
+    cancelled_at: Optional[int] = None
+    cancellation_reason: Optional[str] = None
+    cancelled_by: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1651,6 +1654,12 @@ class Task:
                 if "disposition_at" in keys and row["disposition_at"] is not None
                 else None
             ),
+            cancelled_at=(
+                int(row["cancelled_at"])
+                if "cancelled_at" in keys and row["cancelled_at"] is not None else None
+            ),
+            cancellation_reason=(row["cancellation_reason"] if "cancellation_reason" in keys else None),
+            cancelled_by=(row["cancelled_by"] if "cancelled_by" in keys else None),
         )
 
 
@@ -1873,6 +1882,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- with no regression evidence cannot reach 'done' even when every Python
     -- pre-check is bypassed.
     regression_required  INTEGER NOT NULL DEFAULT 0,
+    -- Cancellation is a durable fence separate from the presentation status.
+    cancelled_at         INTEGER,
+    cancellation_reason  TEXT,
+    cancelled_by         TEXT,
     -- Terminal disposition: NULL for every ordinary/live card,
     -- 'completed' when THIS executor did the work (stamped by
     -- complete_task's own guarded UPDATE), 'overtaken_by_events' when the
@@ -3360,6 +3373,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "gauntlet_enforced",
             "gauntlet_enforced INTEGER NOT NULL DEFAULT 0",
         )
+
+    if "cancelled_at" not in cols:
+        _add_column_if_missing(conn, "tasks", "cancelled_at", "cancelled_at INTEGER")
+    if "cancellation_reason" not in cols:
+        _add_column_if_missing(conn, "tasks", "cancellation_reason", "cancellation_reason TEXT")
+    if "cancelled_by" not in cols:
+        _add_column_if_missing(conn, "tasks", "cancelled_by", "cancelled_by TEXT")
 
     if "verification_state" not in cols:
         # NULL on legacy rows = "no verification phase entered". A task
@@ -5460,7 +5480,7 @@ def recompute_ready(
             # An irreversibly disposed card is terminal; auto-promotion must
             # never pull it back into the ready column, whatever its status
             # says.
-            f"AND {_not_irreversibly_disposed_sql()}"
+            f"AND {_not_irreversibly_disposed_sql()} AND cancelled_at IS NULL"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -5792,6 +5812,7 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND cancelled_at IS NULL
                -- Redispatch guard. A card whose objective was satisfied
                -- elsewhere has nothing left to do, ever. Testing it HERE
                -- (not only in the dispatcher's SELECT) is what makes the
@@ -5903,6 +5924,7 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND cancelled_at IS NULL
                -- Redispatch guard; see the same predicate in claim_task.
                AND """ + _not_irreversibly_disposed_sql() + """
             """,
@@ -6300,6 +6322,84 @@ def reclaim_task(
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
     return True
+
+
+def cancel_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+    actor: str = "user", signal_fn=None,
+) -> bool:
+    """Durably cancel without fabricating completion or deleting history."""
+    reason, actor = str(reason or "").strip(), str(actor or "").strip()
+    if not reason:
+        raise ValueError("cancellation reason is required")
+    if not actor:
+        raise ValueError("cancellation actor is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] in {"done", "archived"}:
+            return False
+        if row["status"] == "cancelled":
+            return True
+        now, run_id = int(time.time()), row["current_run_id"]
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'cancelled', cancelled_at = ?, "
+            "cancellation_reason = ?, cancelled_by = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status NOT IN ('done', 'archived', 'cancelled')",
+            (now, reason, actor, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET status = 'cancelled', outcome = 'cancelled', "
+                "summary = COALESCE(summary, ?), ended_at = COALESCE(ended_at, ?), "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (reason, now, int(run_id), task_id),
+            )
+        _append_event(conn, task_id, "cancelled", {
+            "actor": actor, "reason": reason, "prior_status": row["status"],
+        }, run_id=int(run_id) if run_id is not None else None)
+        worker_pid, claim_lock = row["worker_pid"], row["claim_lock"]
+    # Commit the deny state first. A worker that survives SIGTERM is fenced by
+    # check_worker_authority during the termination window.
+    termination = _terminate_reclaimed_worker(worker_pid, claim_lock, signal_fn=signal_fn)
+    if worker_pid is not None:
+        with write_txn(conn):
+            _append_event(conn, task_id, "cancel_termination", termination,
+                          run_id=int(run_id) if run_id is not None else None)
+    return True
+
+
+def task_authority_fingerprint(task: Task) -> str:
+    """Stable identity of the authority-bearing fields seen at dispatch."""
+    payload = {"id": task.id, "title": task.title, "body": task.body,
+               "assignee": task.assignee, "executor_lane": task.executor_lane,
+               "run_id": task.current_run_id, "claim_lock": task.claim_lock}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def check_worker_authority(conn: sqlite3.Connection, task_id: str, *,
+                           expected_run_id: int,
+                           expected_fingerprint: str) -> tuple[bool, str]:
+    """Re-read canonical authority before a dispatched worker uses a tool."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, "task no longer exists"
+    if task.cancelled_at is not None or task.status == "cancelled":
+        return False, "task was cancelled"
+    if task.status != "running":
+        return False, f"task is no longer running (status={task.status})"
+    if task.current_run_id != int(expected_run_id):
+        return False, "worker run was superseded"
+    if not expected_fingerprint or task_authority_fingerprint(task) != expected_fingerprint:
+        return False, "objective, lane, assignee, or claim changed after dispatch"
+    return True, ""
 
 
 def reassign_task(
@@ -12725,7 +12825,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error, terminal_disposition FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, terminal_disposition, cancelled_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -12742,6 +12842,8 @@ def check_respawn_guard(
     #    reopened card needs.
     if row["terminal_disposition"] in IRREVERSIBLE_DISPOSITIONS:
         return "terminal_disposition"
+    if row["cancelled_at"] is not None:
+        return "cancelled"
 
     now = int(time.time())
 
@@ -12850,7 +12952,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Mirrors the dispatcher's own ready query. Without this a disposed
         # card would make the health check report "real spawnable work is
         # waiting" for work the dispatcher will correctly never spawn.
-        f"    AND {_not_irreversibly_disposed_sql()}"
+        f"    AND {_not_irreversibly_disposed_sql()} AND cancelled_at IS NULL"
     ).fetchall()
     if not rows:
         return False
@@ -13387,7 +13489,7 @@ def _dispatch_once_locked(
         # enforces this too; filtering here as well keeps a disposed card out
         # of the spawn budget accounting instead of burning a slot on a claim
         # that is guaranteed to fail.
-        f"AND {_not_irreversibly_disposed_sql()} "
+        f"AND {_not_irreversibly_disposed_sql()} AND cancelled_at IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -13397,7 +13499,7 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
-            f"AND {_not_irreversibly_disposed_sql()} "
+            f"AND {_not_irreversibly_disposed_sql()} AND cancelled_at IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
@@ -14311,6 +14413,7 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    env["HERMES_KANBAN_AUTHORITY"] = task_authority_fingerprint(task)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.

@@ -559,6 +559,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    p_cancel = sub.add_parser(
+        "cancel", help="Cancel a task and stop/deny any active worker",
+    )
+    p_cancel.add_argument("task_id")
+    p_cancel.add_argument("reason", nargs="+", help="Owner/admin cancellation reason")
+    p_cancel.add_argument("--actor", default="user", help="Owner/admin identity")
+
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
         "diagnostics",
@@ -1425,6 +1432,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
+            "cancel": _cmd_cancel,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
@@ -2223,6 +2231,22 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.cancel_task(
+                conn, args.task_id, reason=" ".join(args.reason), actor=args.actor,
+            )
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"cannot cancel {args.task_id} (unknown or already terminal)", file=sys.stderr)
+        return 1
+    print(f"Cancelled {args.task_id}")
     return 0
 
 

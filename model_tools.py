@@ -1236,6 +1236,30 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # The dispatched prompt is a snapshot, never continuing authority. Guard
+    # every tool because terminal/browser/MCP/plugin tools can all mutate and
+    # a static mutator-name list would fail open as tools evolve.
+    _kanban_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if _kanban_tid:
+        _raw_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        _authority = (os.environ.get("HERMES_KANBAN_AUTHORITY") or "").strip()
+        try:
+            if not _raw_run:
+                raise RuntimeError("missing spawn-time run identity")
+            from hermes_cli import kanban_db as _kanban_db
+            with _kanban_db.connect_closing() as _authority_conn:
+                _allowed, _reason = _kanban_db.check_worker_authority(
+                    _authority_conn, _kanban_tid,
+                    expected_run_id=int(_raw_run),
+                    expected_fingerprint=_authority,
+                )
+        except Exception as _authority_exc:
+            _allowed, _reason = False, f"live authority check failed: {_authority_exc}"
+        if not _allowed:
+            return tool_error(
+                f"Kanban authority denied tool execution for {_kanban_tid}: {_reason}"
+            )
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every

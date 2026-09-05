@@ -150,7 +150,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "cancelled",
 ]
 
 
@@ -1377,6 +1377,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     raise HTTPException(status_code=409, detail=str(e))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+            elif s == "cancelled":
+                ok = kanban_db.cancel_task(
+                    conn, task_id,
+                    reason=payload.block_reason or "cancelled from dashboard",
+                    actor="dashboard-owner",
+                )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "review":
@@ -1828,6 +1834,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
+                    elif s == "cancelled":
+                        ok = kanban_db.cancel_task(
+                            conn, tid,
+                            reason=payload.block_reason or "cancelled from dashboard",
+                            actor="dashboard-owner",
+                        )
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(
