@@ -12879,24 +12879,105 @@ def redact_review_value(value: Any) -> Any:
 _GENERATED_REVIEW_EVIDENCE_BY = "hermes:review-handoff"
 
 
-def _qualifying_review_evidence(metadata: Any) -> bool:
+def _nonempty_string_list(value: Any) -> bool:
+    return bool(
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, str) and item.strip() for item in value)
+    )
+
+
+def _qualifying_review_evidence(
+    conn: sqlite3.Connection, task_id: str, metadata: Any
+) -> bool:
     """Return whether run metadata is concrete enough to verify independently.
 
-    A handoff must identify both the changed artifacts and the checks that can
-    falsify the implementation claim.  Requiring non-empty string lists keeps
-    arbitrary JSON, scalar-only metadata, and prose summaries fail-closed.
+    Two evidence shapes are accepted, both fail-closed:
+
+    * implementation evidence: non-empty ``changed_files`` and ``verification``
+      lists;
+    * governed orchestration-release evidence: metadata names the upstream
+      verified task/verifier and a pre-wired implementation -> verifier graph,
+      and every claimed edge/state is re-derived from the durable DB here.
+
+    The second form exists for orchestration parents whose work is authorising
+    a governed implementation phase rather than changing source files. Metadata
+    alone never authorises release.
     """
     if not isinstance(metadata, dict):
         return False
-    for key in ("changed_files", "verification"):
-        values = metadata.get(key)
-        if (
-            not isinstance(values, list)
-            or not values
-            or any(not isinstance(value, str) or not value.strip() for value in values)
-        ):
-            return False
-    return True
+    if (
+        _nonempty_string_list(metadata.get("changed_files"))
+        and _nonempty_string_list(metadata.get("verification"))
+    ):
+        return True
+    if metadata.get("phase") != "orchestration_release":
+        return False
+    upstream = metadata.get("upstream_verified")
+    implementation_child = metadata.get("implementation_child")
+    verifier_child = metadata.get("independent_verifier_child")
+    if not (
+        isinstance(upstream, dict)
+        and isinstance(upstream.get("task_id"), str)
+        and upstream.get("task_id")
+        and isinstance(upstream.get("verifier"), str)
+        and upstream.get("verifier")
+        and upstream.get("verdict") == "PASS"
+        and isinstance(implementation_child, str)
+        and implementation_child
+        and isinstance(verifier_child, str)
+        and verifier_child
+        and _nonempty_string_list(metadata.get("performed"))
+    ):
+        return False
+
+    upstream_row = conn.execute(
+        "SELECT status, verification_state, terminal_disposition FROM tasks WHERE id = ?",
+        (upstream["task_id"],),
+    ).fetchone()
+    upstream_verifier = conn.execute(
+        "SELECT status, executor_lane FROM tasks WHERE id = ?",
+        (upstream["verifier"],),
+    ).fetchone()
+    impl_row = conn.execute(
+        "SELECT executor_lane, gauntlet_enforced FROM tasks WHERE id = ?",
+        (implementation_child,),
+    ).fetchone()
+    verify_row = conn.execute(
+        "SELECT executor_lane, gauntlet_enforced FROM tasks WHERE id = ?",
+        (verifier_child,),
+    ).fetchone()
+    if not (
+        upstream_row is not None
+        and upstream_row["status"] in ("done", "archived")
+        and upstream_row["verification_state"] == VERIFICATION_VERIFIED
+        and upstream_row["terminal_disposition"] == DISPOSITION_COMPLETED
+        and upstream_verifier is not None
+        and upstream_verifier["status"] in ("done", "archived")
+        and upstream_verifier["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY
+        and impl_row is not None
+        and impl_row["executor_lane"] == EXECUTOR_LANE_CLAUDE
+        and bool(impl_row["gauntlet_enforced"])
+        and verify_row is not None
+        and verify_row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY
+        and bool(verify_row["gauntlet_enforced"])
+    ):
+        return False
+    edges = (
+        conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (upstream["task_id"], upstream["verifier"]),
+        ).fetchone()
+        and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, implementation_child),
+        ).fetchone()
+        and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (implementation_child, verifier_child),
+        ).fetchone()
+    )
+    return bool(edges)
 
 
 def _materialize_review_evidence(
@@ -12907,7 +12988,7 @@ def _materialize_review_evidence(
     metadata: Any,
 ) -> Optional[int]:
     """Persist qualifying run evidence through the native attachment API."""
-    if run_id is None or not _qualifying_review_evidence(metadata):
+    if run_id is None or not _qualifying_review_evidence(conn, task_id, metadata):
         return None
     payload = {
         "schema": "hermes.review-handoff-evidence.v1",

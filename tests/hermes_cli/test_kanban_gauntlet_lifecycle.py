@@ -1372,6 +1372,81 @@ class TestEvidenceReadyVerifierDependency:
             assert kb.get_task(conn, cid).status == "ready"
             assert kb.get_task(conn, pid).status == "review"
 
+    def test_governed_orchestration_handoff_materializes_from_verified_graph(self, kanban_home):
+        with kb.connect_closing() as conn:
+            upstream = kb.create_task(conn, title="verified upstream", assignee="default", gauntlet=True)
+            upstream_verifier = kb.create_task(
+                conn, title="verify upstream", assignee="atlas", parents=[upstream], gauntlet=True,
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', verification_state=?, terminal_disposition=?, completed_at=1700000000 WHERE id=?",
+                    (kb.VERIFICATION_VERIFIED, kb.DISPOSITION_COMPLETED, upstream),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='done', terminal_disposition=?, completed_at=1700000000 WHERE id=?",
+                    (kb.DISPOSITION_COMPLETED, upstream_verifier),
+                )
+
+            parent = kb.create_task(conn, title="orchestration parent", assignee="default", gauntlet=True)
+            implementation = kb.create_task(
+                conn, title="implementation child", assignee="claude", parents=[parent], gauntlet=True,
+            )
+            verifier = kb.create_task(
+                conn, title="implementation verifier", assignee="atlas", parents=[implementation], gauntlet=True,
+            )
+            claimed = kb.claim_task(conn, parent)
+            assert claimed is not None
+            metadata = {
+                "phase": "orchestration_release",
+                "upstream_verified": {
+                    "task_id": upstream,
+                    "verifier": upstream_verifier,
+                    "verdict": "PASS",
+                },
+                "implementation_child": implementation,
+                "independent_verifier_child": verifier,
+                "performed": ["graph inspection", "upstream verification-state inspection"],
+                "not_performed": ["runtime mutation"],
+            }
+            attachment_id = kb._materialize_review_evidence(
+                conn, parent, claimed.current_run_id, "governed release", metadata,
+            )
+            assert attachment_id is not None
+            attachments = kb.list_attachments(conn, parent)
+            assert len(attachments) == 1
+            packet = json.loads(Path(attachments[0].stored_path).read_text())
+            assert packet["metadata"] == metadata
+
+    def test_governed_orchestration_handoff_rejects_unverified_or_wrong_graph(self, kanban_home):
+        with kb.connect_closing() as conn:
+            upstream = kb.create_task(conn, title="not verified upstream", assignee="default", gauntlet=True)
+            bogus_verifier = kb.create_task(conn, title="ordinary task", assignee="default", gauntlet=True)
+            parent = kb.create_task(conn, title="orchestration parent", assignee="default", gauntlet=True)
+            implementation = kb.create_task(
+                conn, title="implementation child", assignee="claude", parents=[parent], gauntlet=True,
+            )
+            verifier = kb.create_task(
+                conn, title="implementation verifier", assignee="atlas", parents=[implementation], gauntlet=True,
+            )
+            claimed = kb.claim_task(conn, parent)
+            assert claimed is not None
+            metadata = {
+                "phase": "orchestration_release",
+                "upstream_verified": {
+                    "task_id": upstream,
+                    "verifier": bogus_verifier,
+                    "verdict": "PASS",
+                },
+                "implementation_child": implementation,
+                "independent_verifier_child": verifier,
+                "performed": ["graph inspection"],
+            }
+            assert kb._materialize_review_evidence(
+                conn, parent, claimed.current_run_id, "false release", metadata,
+            ) is None
+            assert kb.list_attachments(conn, parent) == []
+
     @pytest.mark.parametrize(
         "metadata",
         [
