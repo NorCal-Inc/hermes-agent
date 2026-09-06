@@ -1130,12 +1130,23 @@ class TestStaleDispositionActuator:
             assert phase is not None
             now = 1_700_000_000
             with kb.write_txn(conn):
+                cur = conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                    "VALUES (?, 'default', 'running', ?)",
+                    (tid, now),
+                )
+                review_run = int(cur.lastrowid)
+                kb._append_event(
+                    conn, tid, "claimed",
+                    {"source_status": "review", "run_id": review_run},
+                    run_id=review_run,
+                )
                 kb._append_event(
                     conn,
                     tid,
                     "verification_blocked_self_review",
                     {"verifier": "default", "implementer": "default"},
-                    run_id=phase[1],
+                    run_id=review_run,
                 )
                 conn.execute(
                     "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
@@ -1150,7 +1161,7 @@ class TestStaleDispositionActuator:
                         "kind": "needs_input",
                         "source_status": "review",
                     },
-                    run_id=phase[1],
+                    run_id=review_run,
                 )
 
             entry = kb.GauntletStaleTask(
@@ -1181,6 +1192,75 @@ class TestStaleDispositionActuator:
             ).fetchone()[0] == 300
             events = _events(conn, tid, "gauntlet_stale_disposition")
             assert any(p["action"] == "self_review_routed_independent" for _, p in events)
+
+    def test_old_self_review_episode_cannot_release_newer_pending_phase(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = self._review_pending_subject(conn)
+            kb.store_attachment_bytes(
+                conn, tid, "self-review-old-phase.txt", b"evidence\n",
+                content_type="text/plain", uploaded_by="test",
+            )
+            old_phase = kb._current_verification_phase(conn, tid)
+            assert old_phase is not None
+            with kb.write_txn(conn):
+                cur = conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                    "VALUES (?, 'default', 'blocked', 1700000000)", (tid,),
+                )
+                old_review_run = int(cur.lastrowid)
+                kb._append_event(
+                    conn, tid, "claimed",
+                    {"source_status": "review", "run_id": old_review_run},
+                    run_id=old_review_run,
+                )
+                kb._append_event(
+                    conn, tid, "verification_blocked_self_review",
+                    {"verifier": "default", "implementer": "default"},
+                    run_id=old_review_run,
+                )
+                kb._append_event(
+                    conn, tid, "blocked",
+                    {"reason": "old self review", "kind": "needs_input", "source_status": "review"},
+                    run_id=old_review_run,
+                )
+                # Open a NEW pending phase after the historical refusal. The
+                # stale actuator must not spend the old episode on this phase.
+                cur2 = conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, 'default', 'done', 1700000100, 1700000101, 'review')",
+                    (tid,),
+                )
+                new_impl_run = int(cur2.lastrowid)
+                conn.execute(
+                    "INSERT INTO task_verifications "
+                    "(task_id, run_id, state, verifier, evidence, created_at, kind) "
+                    "VALUES (?, ?, ?, 'atlas', '{}', 1700000101, 'verdict')",
+                    (tid, new_impl_run, kb.VERIFICATION_PENDING),
+                )
+                kb._append_event(
+                    conn, tid, "review_requested",
+                    {"implementer": "default", "verification_state": "pending"},
+                    run_id=new_impl_run,
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', block_kind='needs_input', verification_state=? WHERE id=?",
+                    (kb.VERIFICATION_PENDING, tid),
+                )
+
+            entry = kb.GauntletStaleTask(
+                task_id=tid, status="blocked",
+                verification_state=kb.VERIFICATION_PENDING,
+                regression_required=False, age_seconds=600,
+                reasons=["parked_blocked"], last_event_id=None,
+                last_event_at=None, last_event_kind=None,
+            )
+            result = kb.resolve_stale_gauntlet_dispositions(conn, [entry], now=1700000700)
+            assert result["self_review_released"] == []
+            assert result["verifier_routed"] == []
+            assert result["unresolved"] == [tid]
+            row = conn.execute("SELECT status, verification_state FROM tasks WHERE id=?", (tid,)).fetchone()
+            assert row["status"] == "blocked"
+            assert row["verification_state"] == kb.VERIFICATION_PENDING
 
 
     def test_old_verified_repair_cannot_archive_newer_same_second_episode(self, kanban_home):

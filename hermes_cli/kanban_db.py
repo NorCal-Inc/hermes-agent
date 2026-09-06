@@ -11218,45 +11218,71 @@ def resolve_stale_gauntlet_dispositions(
         ):
             phase = _current_verification_phase(conn, task_id)
             self_review = conn.execute(
-                "SELECT id, run_id, created_at FROM task_events "
+                "SELECT id, run_id, payload FROM task_events "
                 "WHERE task_id = ? AND kind IN "
                 "('verification_blocked_self_review', 'review_claim_rejected_self_review') "
                 "ORDER BY id DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
             latest_block = conn.execute(
-                "SELECT id, run_id, created_at, payload FROM task_events "
+                "SELECT id, run_id, payload FROM task_events "
                 "WHERE task_id = ? AND kind = 'blocked' "
                 "ORDER BY id DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
-            related_block = latest_block is None
-            if self_review is not None and latest_block is not None:
-                try:
-                    block_payload = json.loads(latest_block["payload"] or "{}")
-                except Exception:
-                    block_payload = {}
-                related_block = bool(
-                    latest_block["created_at"] >= self_review["created_at"]
-                    and latest_block["created_at"] - self_review["created_at"]
-                    <= MANDATORY_OBSERVATION_INTERVAL_SECONDS
-                    and block_payload.get("source_status") == "review"
-                )
-            phase_created_at = None
-            if phase is not None:
-                phase_row = conn.execute(
-                    "SELECT created_at FROM task_verifications WHERE id = ?",
-                    (phase[0],),
+
+            # Bind self-review recovery to the exact CURRENT review episode.
+            # Timestamps are not authority: a historical self-review refusal
+            # can share the same second (or five-minute window) as a later
+            # phase. The durable chain is event/run identity:
+            # current phase's review_requested -> reviewer claimed from review
+            # -> self-review refusal -> block on that SAME reviewer run.
+            review_requested = None
+            if phase is not None and phase[1] is not None:
+                review_requested = conn.execute(
+                    "SELECT id, run_id FROM task_events "
+                    "WHERE task_id = ? AND kind = 'review_requested' AND run_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, int(phase[1])),
                 ).fetchone()
-                if phase_row is not None:
-                    phase_created_at = int(phase_row["created_at"])
-            if (
+            review_claim = None
+            if self_review is not None and self_review["run_id"] is not None:
+                review_claim = conn.execute(
+                    "SELECT id, run_id, payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, int(self_review["run_id"])),
+                ).fetchone()
+            try:
+                block_payload = json.loads(
+                    latest_block["payload"] or "{}"
+                ) if latest_block is not None else {}
+            except Exception:
+                block_payload = {}
+            try:
+                claim_payload = json.loads(
+                    review_claim["payload"] or "{}"
+                ) if review_claim is not None else {}
+            except Exception:
+                claim_payload = {}
+
+            exact_self_review_episode = bool(
                 phase is not None
-                and phase_created_at is not None
+                and review_requested is not None
                 and self_review is not None
-                and int(self_review["created_at"]) >= phase_created_at
-                and related_block
-            ):
+                and self_review["run_id"] is not None
+                and review_claim is not None
+                and latest_block is not None
+                and latest_block["run_id"] is not None
+                and int(review_claim["run_id"]) == int(self_review["run_id"])
+                and int(latest_block["run_id"]) == int(self_review["run_id"])
+                and int(review_claim["id"]) > int(review_requested["id"])
+                and int(self_review["id"]) > int(review_claim["id"])
+                and int(latest_block["id"]) > int(self_review["id"])
+                and claim_payload.get("source_status") == "review"
+                and block_payload.get("source_status") == "review"
+            )
+            if exact_self_review_episode:
                 if unblock_task(conn, task_id):
                     resumed = conn.execute(
                         "SELECT status, verification_state, assignee FROM tasks WHERE id = ?",
