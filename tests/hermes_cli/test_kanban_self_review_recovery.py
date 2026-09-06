@@ -32,7 +32,13 @@ Six separate defects are visible in those 12 lines, and each has a test here:
   4. the independent ``codex_verify`` lane had no return path — a verdict could
      be produced and the subject would never receive it;
   5. end to end, a subject whose implementation succeeded could not reach a
-     verdict at all.
+     verdict at all;
+  6. GATE — one link earlier in the same return path, the verifier child's
+     START gate keyed on terminal parent completion, so a subject that had
+     produced a complete evidence packet and entered verification-pending
+     still could not hand it to anyone. Verifier dependencies must key on
+     evidence readiness / verification-pending, never on terminal parent
+     completion; see the last section of this module.
 
 Defect 0's repair changes how the later defects are REACHED, not whether their
 guards still hold. The dispatcher can no longer put the implementer into a
@@ -1300,3 +1306,144 @@ class TestVerifierRegressionParsing:
         """No declaration must never become a passing proof."""
         assert kb._parse_verifier_regression("REGRESSION:") is None
         assert kb._parse_verifier_regression("REGRESSION:   ") is None
+
+
+# ---------------------------------------------------------------------------
+# Defect 6 — the verifier's START gate keyed on terminal parent completion
+#
+# The return path above only matters if the verifier can begin. Ordinary
+# dependency gating demanded a terminal ('done'/'archived') parent, which is
+# circular for a gauntlet-enforced subject: completion requires an independent
+# VERIFIED verdict, the verdict requires an independent verifier, and the
+# verifier could not start until the parent had completed. Every gate behaved
+# correctly and the chain still could not terminate. Observed live on
+# t_cda2da6b -- 18-artefact evidence packet, verification_state='pending',
+# parked after a correctly refused same-identity review -- whose codex_verify
+# child t_0c9e2a80 sat with nothing in the system able to promote it.
+#
+# The durable rule this section pins, stated once so a later refactor cannot
+# lose it: **a verifier child's start gate keys on the parent's evidence
+# readiness (verification-pending + an open ledger phase + an evidence
+# packet), never on terminal parent completion.** The mechanism lives in
+# ``_EVIDENCE_READY_PARENT_SQL``; ``TestEvidenceReadyVerifierDependency`` in
+# test_kanban_gauntlet_lifecycle.py pins the predicate's own edges. What is
+# pinned HERE is the property this return path depends on: the deadlock class
+# cannot reappear one link upstream of the verdict route, and the carve-out
+# stays lane-scoped so nothing else is released early.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifierGateKeysOnEvidenceNotCompletion:
+    def test_verifier_starts_while_the_subject_is_still_pending(
+        self, kanban_home
+    ):
+        """The t_cda2da6b / t_0c9e2a80 shape on this module's fixtures.
+
+        The verifier becomes dispatchable and the subject is NOT dragged
+        terminal to make that happen -- it is still awaiting the verdict the
+        verifier exists to produce.
+        """
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            cid = _verifier_child(conn, tid)
+
+            assert kb._parents_satisfied(conn, cid) is True
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, cid).status == "ready"
+
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "review"
+            assert subject.verification_state == kb.VERIFICATION_PENDING
+            assert subject.completed_at is None
+            assert subject.terminal_disposition is None
+
+            # ...and it actually runs: promotion the claim invariant would
+            # demote straight back is not a route.
+            claimed = kb.claim_task(conn, cid)
+            assert claimed is not None and claimed.status == "running"
+            assert _events(conn, cid, "claim_rejected") == []
+
+    def test_an_ordinary_child_of_the_same_subject_still_waits(
+        self, kanban_home
+    ):
+        """The carve-out is lane-scoped, not a general loosening.
+
+        Same evidence-ready subject, two children. Only the ``codex_verify``
+        one moves; the ordinary one waits for genuine terminal completion and
+        is released only by the verdict.
+        """
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            verifier = _verifier_child(conn, tid)
+            ordinary = kb.create_task(
+                conn, title="follow-on implementation", assignee="default",
+                parents=[tid],
+            )
+
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "ready"
+            assert kb._parents_satisfied(conn, ordinary) is False
+            assert kb.get_task(conn, ordinary).status == "todo"
+
+            # The verdict -- not the carve-out -- is what frees it.
+            _run_verifier(
+                conn, tid,
+                summary="VERDICT: PASS\nVerified against the evidence packet.",
+            )
+            assert kb.get_task(conn, tid).verification_state == (
+                kb.VERIFICATION_VERIFIED
+            )
+            assert kb.get_task(conn, tid).status == "done"
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, ordinary).status == "ready"
+
+    def test_evidence_is_what_opens_the_gate_not_the_pending_state(
+        self, kanban_home
+    ):
+        """Fail-closed control. Verification-pending alone is not enough.
+
+        An evidence-less subject in the identical review/pending state leaves
+        a verifier child gated, so the gate is keyed on something falsifiable
+        rather than merely on the parent having left the running lane.
+        """
+        with kb.connect_closing() as conn:
+            tid = _evidenceless_parked_subject(conn, title="nothing attached")
+            cid = kb.create_task(
+                conn, title="independent codex verification",
+                assignee="default",
+                executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+                parents=[tid], gauntlet=True,
+            )
+
+            assert kb._parents_satisfied(conn, cid) is False
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, cid).status == "todo"
+            assert kb.claim_task(conn, cid) is None
+
+    def test_completion_and_independence_gates_are_untouched(
+        self, kanban_home
+    ):
+        """Nothing about an eligible verifier weakens the two hard gates.
+
+        The subject still cannot go EXECUTING -> COMPLETED on its own, and a
+        same-identity verdict is still refused, while its verifier is running.
+        """
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            cid = _verifier_child(conn, tid)
+            kb.recompute_ready(conn)
+            assert kb.claim_task(conn, cid) is not None
+
+            # The completion gate refuses loudly rather than returning a
+            # falsy value a caller could ignore, so pin the raise itself.
+            with pytest.raises(kb.VerificationRequiredError):
+                kb.complete_task(conn, tid, summary="done anyway")
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier="default",
+            )
+            assert ok is False
+            assert "self" in detail.lower() or "independent" in detail.lower()
+
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "review"
+            assert subject.verification_state == kb.VERIFICATION_PENDING
