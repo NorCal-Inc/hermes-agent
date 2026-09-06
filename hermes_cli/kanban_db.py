@@ -10647,6 +10647,150 @@ def _verifier_reported_verdict(
     return None, None
 
 
+
+_HISTORICAL_VERIFIER_TASK_REF_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+
+
+def _historical_orphan_subject_candidate(
+    conn: sqlite3.Connection, verifier_task_id: str
+) -> Optional[str]:
+    """Return one mechanically safe legacy subject candidate, else ``None``.
+
+    This is a migration/reconciliation path for verifier cards created before
+    the creation boundary required ``parents=[subject]``. It is intentionally
+    stricter than ordinary routing:
+
+    * the verifier must still have no dependency parents;
+    * its immutable title must contain exactly one task id other than itself;
+    * that task must still exist in ``review`` with a pending verification
+      phase and no terminal disposition;
+    * the pending phase must pre-date the verifier card. A verifier created
+      before the current phase cannot be spent on a later phase.
+
+    The title reference supplies identity. Timestamps are used only as a
+    one-way freshness rejection after identity is already exact; equality
+    fails closed. No body/result prose is parsed for subject identity.
+    """
+    if parent_ids(conn, verifier_task_id):
+        return None
+    row = conn.execute(
+        "SELECT title, created_at FROM tasks WHERE id = ? AND executor_lane = ?",
+        (verifier_task_id, EXECUTOR_LANE_CODEX_VERIFY),
+    ).fetchone()
+    if row is None:
+        return None
+    refs = [
+        ref for ref in dict.fromkeys(
+            _HISTORICAL_VERIFIER_TASK_REF_RE.findall(row["title"] or "")
+        )
+        if ref != verifier_task_id
+    ]
+    if len(refs) != 1:
+        return None
+    subject_id = refs[0]
+    subject = conn.execute(
+        "SELECT status, verification_state, terminal_disposition "
+        "FROM tasks WHERE id = ?",
+        (subject_id,),
+    ).fetchone()
+    if (
+        subject is None
+        or subject["status"] != "review"
+        or subject["verification_state"] != VERIFICATION_PENDING
+        or subject["terminal_disposition"] is not None
+    ):
+        return None
+    phase = conn.execute(
+        "SELECT id, created_at FROM task_verifications "
+        "WHERE task_id = ? AND kind = ? AND state = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (subject_id, LEDGER_KIND_VERDICT, VERIFICATION_PENDING),
+    ).fetchone()
+    if phase is None:
+        return None
+    # Strictly older: same-second ambiguity is deliberately unrecoverable.
+    if int(phase["created_at"]) >= int(row["created_at"]):
+        return None
+    return subject_id
+
+
+def _consume_historical_orphan_verdict(
+    conn: sqlite3.Connection, verifier_task_id: str
+) -> Optional[str]:
+    """Spend a legacy orphan PASS/FAIL on its one safe pending subject.
+
+    Returns the subject id when the verdict was durably consumed. The orphan
+    verifier row itself is never rewritten and no dependency edge is invented
+    retroactively; append-only events record the reconciliation.
+    """
+    subject_id = _historical_orphan_subject_candidate(conn, verifier_task_id)
+    if subject_id is None:
+        return None
+    verdict, verdict_source = _verifier_reported_verdict(conn, verifier_task_id)
+    if verdict not in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL):
+        return None
+    passed = verdict == VERIFIER_VERDICT_PASS
+    verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+    ok, detail = record_verification(
+        conn,
+        subject_id,
+        passed=passed,
+        verifier=verifier_identity,
+        evidence={
+            "source": "historical_orphan_verifier_reconciliation",
+            "verifier_task": verifier_task_id,
+            "verdict_source": verdict_source,
+        },
+        reason=(
+            None if passed else
+            f"historical orphan verifier {verifier_task_id} returned FAIL"
+        ),
+    )
+    with write_txn(conn):
+        _append_event(
+            conn, subject_id, "orphan_verifier_verdict_consumed",
+            {
+                "verifier_task": verifier_task_id,
+                "verdict": verdict,
+                "verdict_source": verdict_source,
+                "recorded": bool(ok),
+                "detail": detail,
+            },
+        )
+        _append_event(
+            conn, verifier_task_id, "orphan_verifier_reconciled",
+            {
+                "subject": subject_id,
+                "verdict": verdict,
+                "verdict_source": verdict_source,
+                "recorded": bool(ok),
+            },
+        )
+    if not ok:
+        return None
+    if passed and detail == VERIFICATION_VERIFIED:
+        completed = complete_task(
+            conn,
+            subject_id,
+            summary=(
+                f"Historical orphan verifier {verifier_task_id} returned PASS; "
+                "subject finalized from the durable verified state."
+            ),
+        )
+        if not completed:
+            with write_txn(conn):
+                _append_event(
+                    conn, subject_id, "verified_completion_deferred",
+                    {
+                        "verifier_task": verifier_task_id,
+                        "source": "historical_orphan_verifier_reconciliation",
+                        "reason": "guarded complete_task transition refused",
+                    },
+                )
+            return subject_id
+    return subject_id
+
+
 def sweep_orphan_verifiers(
     conn: sqlite3.Connection, *, now: Optional[int] = None
 ) -> list[str]:
@@ -10692,6 +10836,14 @@ def sweep_orphan_verifiers(
             or row["terminal_disposition"] is not None
         )
         if not finished:
+            continue
+        if _already_alarmed(conn, task_id, "orphan_verifier_reconciled"):
+            continue
+        # Legacy cards created before verifier-parent linkage was mandatory can
+        # still be reconciled when one exact, current review/pending subject is
+        # recoverable from the verifier's immutable title. Consume that verdict
+        # before escalating it as lost. Unsafe/ambiguous history remains alarm-only.
+        if _consume_historical_orphan_verdict(conn, task_id) is not None:
             continue
         if _already_alarmed(conn, task_id, ORPHAN_VERIFIER_RESULT_EVENT):
             continue
@@ -10925,35 +11077,37 @@ def resolve_stale_gauntlet_dispositions(
             entry.status == "blocked"
             and state_row is not None
             and state_row["block_kind"] == "needs_input"
+            and entry.last_event_id is not None
         ):
-            # A verified repair may retire only the stale EPISODE it was
-            # linked to. If the subject moved after that relation was created
-            # (reopened, re-scoped, or blocked again), an older repair must not
-            # archive the newer objective. ``entry.last_event_at`` is the stale
-            # detector's latest lifecycle-progress event, excluding watchdog
-            # bookkeeping; binding the relation timestamp to it makes the
-            # decision episode-local and fail-closed.
-            repair = conn.execute(
-            """
-            SELECT newer.id, newer.completed_at, rel.created_at AS relation_created_at
-              FROM task_relations rel
-              JOIN tasks newer ON newer.id = rel.from_task_id
-             WHERE rel.to_task_id = ?
-               AND rel.relation = 'repairs'
-               AND newer.status = 'done'
-               AND newer.verification_state = ?
-               AND newer.terminal_disposition = 'completed'
-               AND newer.completed_at IS NOT NULL
-               AND rel.created_at >= ?
-             ORDER BY newer.completed_at DESC, newer.created_at DESC
-             LIMIT 1
-            """,
-                (
-                    task_id,
-                    VERIFICATION_VERIFIED,
-                    int(entry.last_event_at or 0),
-                ),
+            # Exact episode binding: add_task_relation() writes a structured
+            # relation_received event on the subject. The repair is authorized
+            # to retire only the episode for which THAT event is still the
+            # stale detector's latest meaningful event. Event IDs, not clocks,
+            # make same-second reopen/reblock races fail closed.
+            relation_event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'relation_received' AND id = ?",
+                (task_id, int(entry.last_event_id)),
             ).fetchone()
+            if relation_event is not None:
+                try:
+                    relation_payload = json.loads(relation_event["payload"] or "{}")
+                except Exception:
+                    relation_payload = {}
+                repair_id = relation_payload.get("from")
+                if (
+                    relation_payload.get("to") == task_id
+                    and relation_payload.get("relation") == "repairs"
+                    and isinstance(repair_id, str)
+                    and repair_id
+                ):
+                    repair = conn.execute(
+                        "SELECT id FROM tasks WHERE id = ? AND status = 'done' "
+                        "AND verification_state = ? "
+                        "AND terminal_disposition = 'completed' "
+                        "AND completed_at IS NOT NULL",
+                        (repair_id, VERIFICATION_VERIFIED),
+                    ).fetchone()
         if repair is not None:
             repair_id = repair["id"]
             ok, _reason = reconcile_overtaken_by_events(
@@ -10984,35 +11138,33 @@ def resolve_stale_gauntlet_dispositions(
             and state_row is not None
             and state_row["block_kind"] == "needs_input"
         ):
-            execution = conn.execute(
-                "SELECT id, status, ended_at FROM executions "
-                "WHERE task_id = ? AND ended_at IS NOT NULL "
-                "ORDER BY created_at DESC, id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
             current_block = conn.execute(
-                "SELECT id, created_at FROM task_events "
+                "SELECT id, run_id, payload FROM task_events "
                 "WHERE task_id = ? AND kind = 'blocked' "
                 "ORDER BY id DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
-            # Old infrastructure history is not authority to clear a NEW human
-            # blocker. Tie the terminal execution to the current blocked event
-            # by time: routing may write the block a few seconds before/after
-            # the supervisor settles, but a later owner-decision block will be
-            # far outside this bounded settlement window.
-            infrastructure_block_matches = bool(
-                execution is not None
-                and current_block is not None
-                and execution["ended_at"] is not None
-                and abs(
-                    int(execution["ended_at"]) - int(current_block["created_at"])
-                ) <= 30
-            )
+            block_payload = {}
+            if current_block is not None:
+                try:
+                    block_payload = json.loads(current_block["payload"] or "{}")
+                except Exception:
+                    block_payload = {}
+            linked_execution_id = block_payload.get("execution_id")
+            execution = None
+            if (
+                isinstance(linked_execution_id, str)
+                and linked_execution_id
+                and block_payload.get("failure_class") == "infrastructure"
+            ):
+                execution = conn.execute(
+                    "SELECT id, status, ended_at FROM executions "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NOT NULL LIMIT 1",
+                    (linked_execution_id, task_id),
+                ).fetchone()
             if (
                 execution is not None
                 and execution["status"] in ("timed_out", "stale", "terminated")
-                and infrastructure_block_matches
             ):
                 if unblock_task(conn, task_id):
                     with write_txn(conn):
@@ -12450,6 +12602,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -12656,15 +12809,16 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
+            blocked_payload = {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "source_status": source_status,
+            }
+            if event_payload_extra:
+                blocked_payload.update(event_payload_extra)
             _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
+                conn, task_id, "blocked", blocked_payload, run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(

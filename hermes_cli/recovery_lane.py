@@ -460,7 +460,17 @@ def run_codex_verifier(task_id: str) -> int:
         )
         if not attempt.ok:
             reason = "Codex verifier failed or timed out.\n\n" + attempt.evidence
-            ok = kb.block_task(conn, task_id, reason=reason, kind="needs_input", expected_run_id=expected_run_id)
+            ok = kb.block_task(
+                conn, task_id, reason=reason, kind="needs_input",
+                expected_run_id=expected_run_id,
+                event_payload_extra={
+                    "execution_id": attempt.execution_id,
+                    "execution_status": attempt.execution_status,
+                    "failure_class": (
+                        "infrastructure" if attempt.infrastructure else "implementation"
+                    ),
+                },
+            )
             if ok:
                 kb.add_comment(conn, task_id, author="atlas-codex-lane", body=attempt.evidence)
             return 0 if ok else 1
@@ -568,6 +578,13 @@ def run_claude_executor(task_id: str) -> int:
                 reason=reason,
                 kind="needs_input",
                 expected_run_id=expected_run_id,
+                event_payload_extra={
+                    "execution_id": attempt.execution_id,
+                    "execution_status": attempt.execution_status,
+                    "failure_class": (
+                        "infrastructure" if attempt.infrastructure else "implementation"
+                    ),
+                },
             )
             if ok:
                 kb.add_comment(

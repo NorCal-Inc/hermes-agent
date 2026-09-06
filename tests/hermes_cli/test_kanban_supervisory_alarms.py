@@ -210,6 +210,120 @@ class TestVerifierCreationLinkage:
 # ---------------------------------------------------------------------------
 
 class TestOrphanVerifierWatchdog:
+    def _pending_subject(self, conn, *, title="historical subject"):
+        tid = kb.create_task(
+            conn, title=title, assignee="default", gauntlet=True,
+            max_runtime_seconds=300,
+        )
+        assert kb.claim_task(conn, tid)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["current_run_id"]
+        ok = kb.request_review(
+            conn, tid, summary="implementation complete; awaiting Atlas",
+            expected_run_id=run_id,
+        )
+        assert ok is True or (isinstance(ok, tuple) and ok[0] is True)
+        return tid
+
+    def test_legacy_orphan_pass_is_consumed_and_closes_exact_pending_subject(
+        self, kanban_home, routed,
+    ):
+        with kb.connect_closing() as conn:
+            subject = self._pending_subject(conn)
+            phase = conn.execute(
+                "SELECT id, created_at FROM task_verifications "
+                "WHERE task_id=? AND state=? ORDER BY id DESC LIMIT 1",
+                (subject, kb.VERIFICATION_PENDING),
+            ).fetchone()
+            verifier = _make_orphan_verifier(
+                conn, title=f"Independent verification: {subject}"
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', result='VERDICT: PASS', "
+                    "created_at=?, completed_at=? WHERE id=?",
+                    (int(phase["created_at"]) + 1, int(phase["created_at"]) + 2, verifier),
+                )
+
+            # The consumer spends the PASS before the orphan alarm path.
+            assert kb.sweep_orphan_verifiers(conn) == []
+            row = kb.get_task(conn, subject)
+            assert row.status == "done"
+            assert row.verification_state == kb.VERIFICATION_VERIFIED
+            assert row.terminal_disposition == kb.DISPOSITION_COMPLETED
+            consumed = _events(conn, subject, "orphan_verifier_verdict_consumed")
+            assert len(consumed) == 1
+            assert consumed[0][1]["verifier_task"] == verifier
+            assert consumed[0][1]["verdict"] == "PASS"
+            assert consumed[0][1]["recorded"] is True
+            assert "orphan_verifier_reconciled" in _kinds(conn, verifier)
+            assert kb.ORPHAN_VERIFIER_RESULT_EVENT not in _kinds(conn, verifier)
+            # Idempotent: a second sweep neither reapplies nor alarms it.
+            assert kb.sweep_orphan_verifiers(conn) == []
+            assert len(_events(conn, subject, "orphan_verifier_verdict_consumed")) == 1
+
+    def test_legacy_orphan_fail_is_consumed_and_routes_subject_to_rework(
+        self, kanban_home, routed,
+    ):
+        with kb.connect_closing() as conn:
+            subject = self._pending_subject(conn, title="historical failing subject")
+            phase = conn.execute(
+                "SELECT created_at FROM task_verifications "
+                "WHERE task_id=? AND state=? ORDER BY id DESC LIMIT 1",
+                (subject, kb.VERIFICATION_PENDING),
+            ).fetchone()
+            verifier = _make_orphan_verifier(
+                conn, title=f"Independent verification: {subject}"
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', result='VERDICT: FAIL', "
+                    "created_at=?, completed_at=? WHERE id=?",
+                    (int(phase["created_at"]) + 1, int(phase["created_at"]) + 2, verifier),
+                )
+            assert kb.sweep_orphan_verifiers(conn) == []
+            row = kb.get_task(conn, subject)
+            assert row.status in ("ready", "todo")
+            assert row.verification_state is None
+            assert kb.verification_history(conn, subject)[-1]["state"] == kb.VERIFICATION_FAILED
+            assert "orphan_verifier_reconciled" in _kinds(conn, verifier)
+
+    def test_legacy_orphan_recovery_refuses_ambiguous_deleted_or_wrong_phase(
+        self, kanban_home, routed,
+    ):
+        with kb.connect_closing() as conn:
+            subject = self._pending_subject(conn, title="current subject")
+            other = kb.create_task(conn, title="other context task", assignee="default")
+            phase = conn.execute(
+                "SELECT created_at FROM task_verifications "
+                "WHERE task_id=? AND state=? ORDER BY id DESC LIMIT 1",
+                (subject, kb.VERIFICATION_PENDING),
+            ).fetchone()
+            ambiguous = _make_orphan_verifier(
+                conn, title=f"Independent verification: {subject} context {other}"
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', result='VERDICT: PASS', "
+                    "created_at=?, completed_at=? WHERE id=?",
+                    (int(phase["created_at"]) + 1, int(phase["created_at"]) + 2, ambiguous),
+                )
+            assert kb.sweep_orphan_verifiers(conn) == [ambiguous]
+            assert kb.get_task(conn, subject).status == "review"
+
+            # Deleted/non-existent subjects are never reconstructed from prose.
+            deleted = _make_orphan_verifier(
+                conn, title="Independent verification: t_b0ba7338"
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', result='VERDICT: PASS' WHERE id=?",
+                    (deleted,),
+                )
+            assert kb.sweep_orphan_verifiers(conn) == [deleted]
+            assert "orphan_verifier_reconciled" not in _kinds(conn, deleted)
+
     def test_finished_orphan_is_escalated_with_its_stranded_verdict(
         self, kanban_home, routed,
     ):
@@ -821,6 +935,12 @@ class TestStaleDispositionActuator:
             kb.add_task_relation(
                 conn, repair, subject, "repairs", created_by="test"
             )
+            relation_event = conn.execute(
+                "SELECT id, created_at FROM task_events WHERE task_id=? "
+                "AND kind='relation_received' ORDER BY id DESC LIMIT 1",
+                (subject,),
+            ).fetchone()
+            assert relation_event is not None
 
             entry = kb.GauntletStaleTask(
                 task_id=subject,
@@ -829,9 +949,9 @@ class TestStaleDispositionActuator:
                 regression_required=False,
                 age_seconds=600,
                 reasons=["parked_blocked"],
-                last_event_id=None,
-                last_event_at=None,
-                last_event_kind=None,
+                last_event_id=int(relation_event["id"]),
+                last_event_at=int(relation_event["created_at"]),
+                last_event_kind="relation_received",
             )
             result = kb.resolve_stale_gauntlet_dispositions(
                 conn, [entry], now=1_700_000_200,
@@ -876,6 +996,11 @@ class TestStaleDispositionActuator:
                 tid,
                 reason="control-plane timeout; no human decision required",
                 kind="needs_input",
+                event_payload_extra={
+                    "execution_id": execution.id,
+                    "execution_status": "timed_out",
+                    "failure_class": "infrastructure",
+                },
             )
             block = conn.execute(
                 "SELECT created_at FROM task_events WHERE task_id=? AND kind='blocked' "
@@ -1058,7 +1183,7 @@ class TestStaleDispositionActuator:
             assert any(p["action"] == "self_review_routed_independent" for _, p in events)
 
 
-    def test_old_verified_repair_cannot_archive_newer_stale_episode(self, kanban_home):
+    def test_old_verified_repair_cannot_archive_newer_same_second_episode(self, kanban_home):
         with kb.connect_closing() as conn:
             subject = kb.create_task(
                 conn, title="subject later reopened", assignee="default",
@@ -1078,16 +1203,22 @@ class TestStaleDispositionActuator:
                     (kb.VERIFICATION_VERIFIED, 1_700_000_100, repair),
                 )
             kb.add_task_relation(conn, repair, subject, "repairs", created_by="test")
-            rel = conn.execute(
-                "SELECT created_at FROM task_relations WHERE from_task_id=? "
-                "AND to_task_id=? AND relation='repairs'",
-                (repair, subject),
+            rel_event = conn.execute(
+                "SELECT id, created_at FROM task_events WHERE task_id=? "
+                "AND kind='relation_received' ORDER BY id DESC LIMIT 1",
+                (subject,),
             ).fetchone()
-            assert rel is not None
+            assert rel_event is not None
 
-            # Model a later subject episode: the stale detector's latest
-            # meaningful event post-dates the relation that authorized the old
-            # repair. The old repair must not retire this newer objective.
+            # A later meaningful event in the SAME second creates a new episode.
+            # Timestamp comparison cannot distinguish it; event identity can.
+            with kb.write_txn(conn):
+                kb._append_event(conn, subject, "commented", {"author":"test","len":1})
+                later = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                conn.execute(
+                    "UPDATE task_events SET created_at=? WHERE id=?",
+                    (int(rel_event["created_at"]), int(later)),
+                )
             entry = kb.GauntletStaleTask(
                 task_id=subject,
                 status="blocked",
@@ -1095,12 +1226,12 @@ class TestStaleDispositionActuator:
                 regression_required=False,
                 age_seconds=600,
                 reasons=["parked_blocked"],
-                last_event_id=999999,
-                last_event_at=int(rel["created_at"]) + 10,
-                last_event_kind="blocked",
+                last_event_id=int(later),
+                last_event_at=int(rel_event["created_at"]),
+                last_event_kind="commented",
             )
             result = kb.resolve_stale_gauntlet_dispositions(
-                conn, [entry], now=int(rel["created_at"]) + 610,
+                conn, [entry], now=int(rel_event["created_at"]) + 600,
             )
             assert result["reconciled"] == []
             assert result["unresolved"] == [subject]
@@ -1133,9 +1264,9 @@ class TestStaleDispositionActuator:
             assert block is not None
             block_at = int(block["created_at"])
 
-            # Only execution history is an older infrastructure timeout. The
-            # former stale actuator selected this row and incorrectly cleared
-            # the current owner-decision block.
+            # Execution history terminates in the exact same second as the
+            # human block. Timestamp correlation would clear it; the missing
+            # structured execution_id/failure_class linkage must keep it blocked.
             execution = ex.create_execution(
                 conn,
                 executor_type="claude",
@@ -1148,7 +1279,7 @@ class TestStaleDispositionActuator:
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE executions SET status='timed_out', ended_at=? WHERE id=?",
-                    (block_at - 900, execution.id),
+                    (block_at, execution.id),
                 )
 
             entry = kb.GauntletStaleTask(
