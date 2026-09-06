@@ -1452,6 +1452,16 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     executor_lane = args.get("executor_lane")
     recovery_gate_cmd = args.get("recovery_gate_cmd")
+    # Structured repair linkage: any one of these arms create_task's
+    # declares_repair guard, which requires all three and establishes the
+    # relations atomically in the same transaction as the insert — a card
+    # cannot land here linked to only a subject or only an owner. Omitted
+    # entirely, this call behaves exactly as it did before (an ordinary
+    # card, or a repair declared only in prose — which is the orphan defect
+    # this repair closes, not one it can retroactively detect).
+    recovery_owner = args.get("recovery_owner")
+    repairs_task_id = args.get("repairs_task_id")
+    umbrella_task_id = args.get("umbrella_task_id")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1506,6 +1516,9 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
                 executor_lane=executor_lane,
                 recovery_gate_cmd=recovery_gate_cmd,
+                recovery_owner=recovery_owner,
+                repairs_task_id=repairs_task_id,
+                umbrella_task_id=umbrella_task_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(
@@ -2594,6 +2607,36 @@ KANBAN_CREATE_SCHEMA = {
                     "never by trusting Claude's or Codex's own report — to "
                     "decide whether the gate is green (exit 0 = green). "
                     "Required when 'executor_lane' is 'claude_recovery'."
+                ),
+            },
+            "recovery_owner": {
+                "type": "string",
+                "description": (
+                    "Identity accountable for this card's recovery "
+                    "decision. Set this (with repairs_task_id and "
+                    "umbrella_task_id) when the new task IS a governed "
+                    "repair for another task — never describe a repair "
+                    "only in the body; prose is not a machine-readable "
+                    "link. All three are required together: creation "
+                    "fails closed and no card is created if only some "
+                    "are given."
+                ),
+            },
+            "repairs_task_id": {
+                "type": "string",
+                "description": (
+                    "Task id this card repairs (the subject). Required "
+                    "together with recovery_owner and umbrella_task_id "
+                    "to create a governed repair card; the linkage is "
+                    "established atomically with the card itself."
+                ),
+            },
+            "umbrella_task_id": {
+                "type": "string",
+                "description": (
+                    "Task id of the umbrella/tracking card this repair "
+                    "falls under. Required together with recovery_owner "
+                    "and repairs_task_id to create a governed repair card."
                 ),
             },
         },

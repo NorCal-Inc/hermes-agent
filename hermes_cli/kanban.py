@@ -434,6 +434,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "a verifier must record a passing verdict via "
                                "`hermes kanban verify`. Defaults to the "
                                "kanban.gauntlet_enforcement config value.")
+    p_create.add_argument("--recovery-owner", default=None,
+                          dest="recovery_owner", metavar="IDENTITY",
+                          help="Identity accountable for this card's "
+                               "recovery decision. Set together with "
+                               "--repairs-task-id and --umbrella-task-id "
+                               "to declare a governed repair task — never "
+                               "describe a repair only in the body. All "
+                               "three are required together; creation "
+                               "fails closed and no card is created if "
+                               "only some are given.")
+    p_create.add_argument("--repairs-task-id", default=None,
+                          dest="repairs_task_id", metavar="TASK_ID",
+                          help="Task id this card repairs (the subject). "
+                               "Required together with --recovery-owner "
+                               "and --umbrella-task-id.")
+    p_create.add_argument("--umbrella-task-id", default=None,
+                          dest="umbrella_task_id", metavar="TASK_ID",
+                          help="Task id of the umbrella/tracking card this "
+                               "repair falls under. Required together "
+                               "with --recovery-owner and "
+                               "--repairs-task-id.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1908,6 +1929,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             executor_lane=getattr(args, "executor_lane", None),
             recovery_gate_cmd=getattr(args, "recovery_gate_cmd", None),
             gauntlet=getattr(args, "gauntlet", None),
+            recovery_owner=getattr(args, "recovery_owner", None),
+            repairs_task_id=getattr(args, "repairs_task_id", None),
+            umbrella_task_id=getattr(args, "umbrella_task_id", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

@@ -27,12 +27,14 @@ one test asserts explicitly that an unrecorded provenance stays unrecorded.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
 
 
@@ -669,6 +671,125 @@ class TestRelationApiGuards:
             assert conn.execute(
                 "SELECT COUNT(*) AS n FROM task_relations"
             ).fetchone()["n"] == 0
+
+
+def _cli_create_ns(**overrides):
+    """Namespace shaped like argparse output for ``kb_cli._cmd_create``.
+
+    Mirrors ``_make_create_ns`` in ``test_kanban_core_functionality.py``:
+    every attribute ``_cmd_create`` reads via plain ``args.X`` (not
+    ``getattr(..., default)``) must be present here.
+    """
+    ns = argparse.Namespace(
+        title="repair via CLI", body=None, assignee="worker",
+        created_by="user", workspace="scratch", tenant=None,
+        priority=0, parent=None, triage=False,
+        idempotency_key=None, max_runtime=None, skills=None,
+        json=True,
+    )
+    for k, v in overrides.items():
+        setattr(ns, k, v)
+    return ns
+
+
+@pytest.mark.usefixtures("all_assignees_spawnable")
+class TestCliAndToolBoundaryWiring:
+    """The two real entry points a caller uses, not just the DB function.
+
+    ``create_task`` refuses an orphaned repair (``TestCreateTaskBoundaryIsTheGuard``
+    above), but a guard only proves the defect is closed if the paths
+    Christopher and governed automation actually call reach it. The CLI
+    (``hermes kanban create``) and the MCP tool (``kanban_create``) are those
+    two paths, and each wires its own argument set into ``create_task``
+    independently — a passthrough bug in either would silently reopen the
+    orphan hole this repair closes, with the DB-level tests still green.
+
+    ``assignee="worker"`` is a synthetic name with no profile directory on
+    disk (the suite repoints ``HERMES_HOME`` at a per-test tempdir), so it
+    needs the same ``all_assignees_spawnable`` fixture every other
+    dispatch-touching test in this codebase uses — see
+    ``test_kanban_core_functionality.py``'s module-level ``pytestmark``.
+    """
+
+    def test_cli_create_wires_full_repair_linkage_through(
+        self, kanban_home, capsys
+    ):
+        with kb.connect_closing() as conn:
+            subject, umbrella = _subject_and_umbrella(conn)
+        ns = _cli_create_ns(
+            recovery_owner="erika",
+            repairs_task_id=subject,
+            umbrella_task_id=umbrella,
+        )
+        rc = kb_cli._cmd_create(ns)
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        with kb.connect_closing() as conn:
+            assert kb.missing_repair_relations(conn, out["id"]) == []
+            assert kb.relation_targets(conn, out["id"], kb.RELATION_REPAIRS) == [
+                subject
+            ]
+            assert kb.relation_targets(conn, out["id"], kb.RELATION_UMBRELLA) == [
+                umbrella
+            ]
+            assert kb.get_task(conn, out["id"]).recovery_owner == "erika"
+
+    def test_cli_create_partial_repair_declaration_fails_closed(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            before = _task_count(conn)
+        ns = _cli_create_ns(recovery_owner="erika")
+        with pytest.raises(kb.RecoveryLinkageError):
+            kb_cli._cmd_create(ns)
+        with kb.connect_closing() as conn:
+            assert _task_count(conn) == before
+            assert kb.orphaned_repair_tasks(conn) == []
+
+    def test_tool_create_wires_full_repair_linkage_through(self, kanban_home):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            subject, umbrella = _subject_and_umbrella(conn)
+        out = json.loads(kt._handle_create({
+            "title": "repair via kanban_create tool",
+            "assignee": "worker",
+            "recovery_owner": "erika",
+            "repairs_task_id": subject,
+            "umbrella_task_id": umbrella,
+        }))
+        assert out["ok"] is True
+        with kb.connect_closing() as conn:
+            tid = out["task_id"]
+            assert kb.missing_repair_relations(conn, tid) == []
+            assert kb.relation_targets(conn, tid, kb.RELATION_REPAIRS) == [subject]
+            assert kb.relation_targets(conn, tid, kb.RELATION_UMBRELLA) == [umbrella]
+            assert kb.get_task(conn, tid).recovery_owner == "erika"
+
+    def test_tool_create_partial_repair_declaration_fails_closed(
+        self, kanban_home
+    ):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            before = _task_count(conn)
+        out = json.loads(kt._handle_create({
+            "title": "orphan via kanban_create tool",
+            "assignee": "worker",
+            "repairs_task_id": "t_doesnotexist",
+        }))
+        # The tool layer catches the exception and reports failure through
+        # its normal error contract rather than crashing — but the card
+        # must be just as absent as the direct DB-level test proves. This
+        # codebase's tool error contract is ``{"error": ...}`` (see
+        # ``tools/registry.py:tool_error``); it never sets an ``ok`` key on
+        # failure, so asserting ``out["ok"] is False`` would KeyError even
+        # when the guard worked correctly.
+        assert "ok" not in out
+        assert "error" in out
+        with kb.connect_closing() as conn:
+            assert _task_count(conn) == before
+            assert kb.orphaned_repair_tasks(conn) == []
 
 
 class TestLegacyBoardMigration:
