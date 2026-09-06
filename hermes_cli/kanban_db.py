@@ -7473,7 +7473,9 @@ def add_attachment(
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
+    # ``request_review`` composes this canonical attachment write into the
+    # same transaction when it materialises a structured run handoff.
+    with write_txn(conn, allow_nested=True):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
@@ -12874,6 +12876,57 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+_GENERATED_REVIEW_EVIDENCE_BY = "hermes:review-handoff"
+
+
+def _qualifying_review_evidence(metadata: Any) -> bool:
+    """Return whether run metadata is concrete enough to verify independently.
+
+    A handoff must identify both the changed artifacts and the checks that can
+    falsify the implementation claim.  Requiring non-empty string lists keeps
+    arbitrary JSON, scalar-only metadata, and prose summaries fail-closed.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    for key in ("changed_files", "verification"):
+        values = metadata.get(key)
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ):
+            return False
+    return True
+
+
+def _materialize_review_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    summary: Optional[str],
+    metadata: Any,
+) -> Optional[int]:
+    """Persist qualifying run evidence through the native attachment API."""
+    if run_id is None or not _qualifying_review_evidence(metadata):
+        return None
+    payload = {
+        "schema": "hermes.review-handoff-evidence.v1",
+        "generated": True,
+        "source": {"task_id": task_id, "run_id": int(run_id)},
+        "summary": summary,
+        "metadata": metadata,
+    }
+    return store_attachment_bytes(
+        conn,
+        task_id,
+        f"review-handoff-run-{int(run_id)}.json",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(),
+        content_type="application/vnd.hermes.review-handoff+json",
+        uploaded_by=_GENERATED_REVIEW_EVIDENCE_BY,
+        board=get_current_board(),
+    )
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13074,6 +13127,7 @@ def request_review(
             evidence={"implementer": implementer, "reviewer": reviewer},
             reason="implementation handed off for verification",
         )
+        _materialize_review_evidence(conn, task_id, run_id, summary, metadata)
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
         _append_event(
@@ -13122,10 +13176,11 @@ def request_review(
                         "source": "request_review",
                     },
                 )
-            # Promote the child off the subject's evidence packet now, so the
-            # independent route is actionable on this tick instead of the next
-            # dispatcher pass.
-            recompute_ready(conn)
+    # A pre-wired verifier OR governed implementation child must not require an
+    # operator relay after the evidence-producing transition commits. The
+    # normal dependency predicate remains authoritative and keeps any
+    # evidence-less handoff gated.
+    recompute_ready(conn)
     return _ret(True)
 
 

@@ -1322,6 +1322,113 @@ class TestEvidenceReadyVerifierDependency:
 
     # -- the deadlock is broken --------------------------------------------
 
+    def test_structured_run_handoff_materializes_and_releases_prewired_verifier(
+        self, kanban_home
+    ):
+        """Regression for t_2a976bfe: run evidence needs no operator relay."""
+        with kb.connect_closing() as conn:
+            pid = kb.create_task(
+                conn, title="implementation", assignee="claude", gauntlet=True,
+            )
+            cid = self._verifier_child(conn, pid)
+            claimed = kb.claim_task(conn, pid)
+            assert claimed is not None
+            assert kb.list_attachments(conn, pid) == []
+
+            metadata = {
+                "changed_files": ["hermes_cli/kanban_db.py"],
+                "verification": [
+                    "pytest -q tests/hermes_cli/test_kanban_gauntlet_lifecycle.py"
+                ],
+                "residual_risk": [],
+            }
+            assert kb.request_review(
+                conn,
+                pid,
+                summary="Implemented the scoped repair; targeted tests exit 0.",
+                metadata=metadata,
+                expected_run_id=claimed.current_run_id,
+            ) is True
+
+            attachments = kb.list_attachments(conn, pid)
+            assert len(attachments) == 1
+            generated = attachments[0]
+            assert generated.uploaded_by == kb._GENERATED_REVIEW_EVIDENCE_BY
+            assert generated.content_type == "application/vnd.hermes.review-handoff+json"
+            packet = json.loads(Path(generated.stored_path).read_text())
+            assert packet["schema"] == "hermes.review-handoff-evidence.v1"
+            assert packet["generated"] is True
+            assert packet["source"] == {
+                "task_id": pid,
+                "run_id": claimed.current_run_id,
+            }
+            assert packet["metadata"] == metadata
+            run = conn.execute(
+                "SELECT summary, metadata FROM task_runs WHERE id = ?",
+                (claimed.current_run_id,),
+            ).fetchone()
+            assert run["summary"] == packet["summary"]
+            assert json.loads(run["metadata"]) == packet["metadata"]
+            assert kb.get_task(conn, cid).status == "ready"
+            assert kb.get_task(conn, pid).status == "review"
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            {},
+            {"changed_files": "file.py", "verification": "pytest"},
+            {"changed_files": ["file.py"], "verification": []},
+            {"changed_files": ["file.py"], "verification": [""]},
+            {"gate": "pass"},
+        ],
+    )
+    def test_unstructured_handoff_does_not_release_verifier(
+        self, kanban_home, metadata
+    ):
+        with kb.connect_closing() as conn:
+            pid = kb.create_task(
+                conn, title="implementation", assignee="claude", gauntlet=True,
+            )
+            cid = self._verifier_child(conn, pid)
+            claimed = kb.claim_task(conn, pid)
+            assert claimed is not None
+            assert kb.request_review(
+                conn,
+                pid,
+                summary="Confident prose claim only.",
+                metadata=metadata,
+                expected_run_id=claimed.current_run_id,
+            ) is True
+            assert kb.list_attachments(conn, pid) == []
+            assert kb.get_task(conn, cid).status == "todo"
+
+    def test_generated_handoff_preserves_native_attachment(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = kb.create_task(
+                conn, title="implementation", assignee="claude", gauntlet=True,
+            )
+            native_id = kb.add_attachment(
+                conn, pid, filename="user.txt", stored_path="/tmp/user.txt",
+                size=4, uploaded_by="user",
+            )
+            claimed = kb.claim_task(conn, pid)
+            assert claimed is not None
+            assert kb.request_review(
+                conn, pid, summary="scoped implementation",
+                metadata={
+                    "changed_files": ["file.py"],
+                    "verification": ["pytest tests/test_file.py -q"],
+                },
+                expected_run_id=claimed.current_run_id,
+            ) is True
+            attachments = kb.list_attachments(conn, pid)
+            assert len(attachments) == 2
+            native = next(item for item in attachments if item.id == native_id)
+            assert native.filename == "user.txt"
+            assert native.stored_path == "/tmp/user.txt"
+            assert native.uploaded_by == "user"
+
     def test_verifier_child_promotes_from_evidence_ready_parent(
         self, kanban_home
     ):
