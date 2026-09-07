@@ -21875,6 +21875,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.handle_message(event)
 
+    def _voice_reply_chat_allowed(self, event) -> bool:
+        """Whether outgoing voice is permitted in this conversation.
+
+        ``voice.reply_chats`` is an optional allowlist of chat ids. Unset or
+        empty means "any conversation", which -- combined with the
+        self-injected gate in :meth:`_should_send_voice_reply` -- already
+        delivers the decided rule on a surface only Christopher talks to.
+        Setting it pins voice to exactly his own conversation with Erika, which
+        is what the decision asks for on a surface shared with anyone else.
+
+        Read live rather than cached, for the same reason ``_voice_hard_off``
+        is: an operator narrowing the allowlist must take effect without a
+        reconnect. ``load_config()`` is memoised on the config file's
+        (mtime, size), so this is cheap.
+
+        Fails closed: any error resolving config means no outgoing voice.
+        """
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            allowed = (
+                (_load_full_config().get("voice") or {}).get("reply_chats") or []
+            )
+            if not allowed:
+                return True
+            chat_id = str(getattr(event.source, "chat_id", "") or "")
+            return chat_id in {str(x) for x in allowed}
+        except Exception:
+            return False
+
     def _should_send_voice_reply(
         self,
         event: MessageEvent,
@@ -21901,6 +21930,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._voice_hard_off():
             logger.debug(
                 "Auto voice reply suppressed: global text-only mode chat=%s platform=%s",
+                event.source.chat_id, event.source.platform.value,
+            )
+            return False
+
+        # Erika speaks only when replying to a message Christopher sent her.
+        #
+        # A self-injected turn carries ``internal=True`` (set by
+        # ``gateway.wake.deliver_wake``): kanban notifier wakes, cron, digests,
+        # scheduled sends, any automated report. Those produce a normal agent
+        # response, and on a voice-enabled chat that response was spoken
+        # exactly like a real reply -- which is the "reporting" voice
+        # Christopher never wanted, and the reason the blanket hard-off was
+        # reached for as a mitigation.
+        #
+        # Decided 2026-09-07, verbatim: "i ONLY wanted the erika voice on
+        # messages i send to erika, not for reporting or anything else."
+        # Canonical: vault Identity/Erika-Voice-And-Avatar.md, "Voice scope".
+        #
+        # This beats every per-chat mode, exactly as the hard off does: an
+        # explicit /voice on must not make report turns speak.
+        if getattr(event, "internal", False):
+            logger.debug(
+                "Auto voice reply suppressed: self-injected turn "
+                "(automated/report) chat=%s platform=%s",
+                event.source.chat_id, event.source.platform.value,
+            )
+            return False
+
+        if not self._voice_reply_chat_allowed(event):
+            logger.debug(
+                "Auto voice reply suppressed: chat not in voice.reply_chats "
+                "chat=%s platform=%s",
                 event.source.chat_id, event.source.platform.value,
             )
             return False
