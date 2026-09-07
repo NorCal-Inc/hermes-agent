@@ -98,6 +98,10 @@ def _make_runner() -> GatewayRunner:
         runner = GatewayRunner.__new__(GatewayRunner)
         runner._voice_mode = {}
         runner.adapters = {}
+        # These cases assert voice replies DO fire, which is only reachable
+        # when the global text-only hard off is inactive. Declare it rather
+        # than inheriting the host's config.yaml.
+        runner._voice_text_only = False
     return runner
 
 

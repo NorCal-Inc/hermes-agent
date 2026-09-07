@@ -3092,14 +3092,14 @@ class BasePlatformAdapter(ABC):
         # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
         # Per-chat overrides live in two sets populated from ``_voice_mode``:
         #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
-        #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
-        #     the global default is False.
+        #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Records intent
+        #     only — it cannot fire while the global default is False.
         #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
         #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
         #     global default is True.
-        # The gate in _process_message() is:
-        #   fire if chat in _auto_tts_enabled_chats
-        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
+        # The gate (_should_auto_tts_for_chat) is:
+        #   fire if _auto_tts_default and chat not in _auto_tts_disabled_chats
+        # ``_auto_tts_default`` False is a hard off — see _should_auto_tts_for_chat.
         self._auto_tts_default: bool = False
         self._auto_tts_enabled_chats: set = set()
         self._auto_tts_disabled_chats: set = set()
@@ -3411,17 +3411,30 @@ class BasePlatformAdapter(ABC):
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """Whether auto-TTS on voice input should fire for ``chat_id``.
 
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
+        Decision layers:
+          1. Global text-only mode (``voice.auto_tts: false``, pushed onto
+             ``_auto_tts_default`` by GatewayRunner on adapter connect) →
+             never fire. This is a hard off, not a default: nothing re-enables
+             it per-chat, including ``/voice on`` and ``/voice tts``.
           2. Explicit ``/voice off`` → never fire.
-          3. Fall back to the global ``voice.auto_tts`` config default.
+          3. Otherwise (global default True, no per-chat opt-out) → fire.
+
+        Supersedes the Issue #16007 layering, where an explicit per-chat opt-in
+        beat a False global default. That made ``voice.auto_tts: false`` a
+        *default* rather than an *off switch*, so any chat could re-enable
+        outgoing voice for itself and persist it — the override bypass found by
+        verifier t_e4c3b271 (CONFIG_FALSE_EXPLICIT_OPT_IN_BASE_GATE). The
+        per-chat opt-in set is still tracked so it applies if the global is
+        turned back on; it can no longer force a send while the global is off.
+
+        Fails closed: ``_auto_tts_default`` initialises to False, so an adapter
+        that never received the config push stays silent.
         """
-        if chat_id in self._auto_tts_enabled_chats:
-            return True
+        if not bool(self._auto_tts_default):
+            return False
         if chat_id in self._auto_tts_disabled_chats:
             return False
-        return bool(self._auto_tts_default)
+        return True
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
