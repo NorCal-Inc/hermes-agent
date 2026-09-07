@@ -9,6 +9,14 @@ from pathlib import Path
 
 import pytest
 
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities used below ("parent-worker") are synthetic and are not profile
+# directories on disk, so this module declares the registry-patching fixture
+# that already exists for exactly that reason. The gate itself is pinned in
+# tests/hermes_cli/test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
+
 # The subprocess-boundary tests below spawn ``sys.executable -c`` with a tmp
 # cwd. Without an explicit PYTHONPATH the child resolves ``hermes_cli`` /
 # ``agent`` through whatever install is on sys.path (in a worktree that is the

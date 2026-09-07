@@ -20,6 +20,14 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 from hermes_cli.plugins import get_plugin_manager
 
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities used below ("worker") are synthetic and are not profile
+# directories on disk, so this module declares the registry-patching fixture
+# that already exists for exactly that reason. The gate itself is pinned in
+# tests/hermes_cli/test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
+
 
 def _load_plugin_router():
     repo_root = Path(__file__).resolve().parents[2]
