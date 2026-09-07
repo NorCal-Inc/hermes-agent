@@ -22,6 +22,7 @@ or does not.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -948,3 +949,222 @@ class TestMigration:
             stored = kb.list_lessons(conn)
             assert len(stored) == 1
             assert stored[0]["retired_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# #4 -- extraction is mandatory; PROMOTION is gated
+# ---------------------------------------------------------------------------
+
+class TestLessonPromotionEligibility:
+    """Deterministic and structural. No model judgement decides what binds."""
+
+    def test_global_scope_needs_an_operator(self):
+        ok, why = kb.lesson_promotion_eligibility(
+            kb.LESSON_SCOPE_GLOBAL, "assignee:coder", "Retry 429 as transient."
+        )
+        assert (ok, why) == (False, "global_scope_needs_operator")
+
+    def test_unbounded_applicability_needs_an_operator(self):
+        ok, why = kb.lesson_promotion_eligibility(
+            kb.LESSON_SCOPE_TENANT, "all", "Retry 429 as transient."
+        )
+        assert (ok, why) == (False, "unbounded_applicability_needs_operator")
+
+    @pytest.mark.parametrize("lesson", [
+        "Change the entity-routing table so cards reach the right lead.",
+        "The architecture should separate the dispatcher from the verifier.",
+        "Governance: escalate cross-company work to Erika.",
+        "Always request review before completing.",
+    ])
+    def test_governance_impacting_language_needs_an_operator(self, lesson):
+        ok, why = kb.lesson_promotion_eligibility(
+            kb.LESSON_SCOPE_TENANT, "assignee:coder", lesson
+        )
+        assert ok is False
+        assert why == "governance_impacting_needs_operator"
+
+    @pytest.mark.parametrize("lesson", [
+        # Christopher's own examples of safely auto-promotable lessons.
+        "Do not count provider 429 as implementation failure.",
+        "A worktree commit must be reachable from canonical integration "
+        "before closure.",
+        "Terminal tasks must not retain observing lifecycle timers.",
+    ])
+    def test_narrow_observational_lessons_are_eligible(self, lesson):
+        ok, why = kb.lesson_promotion_eligibility(
+            kb.LESSON_SCOPE_TENANT, "assignee:coder", lesson
+        )
+        assert (ok, why) == (True, "narrow_and_scoped")
+
+
+class TestExtractLesson:
+    SAFE = "Do not count provider 429 as implementation failure."
+    BROAD = "Governance: escalate cross-company work to Erika."
+
+    def test_eligible_lesson_is_promoted_and_binds(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, tid, lesson=self.SAFE,
+                applicability="assignee:coder", actor="operator",
+            )
+            assert out["auto_promoted"] is True
+            assert out["state"] == kb.LESSON_STATE_ACTIVE
+            row = conn.execute(
+                "SELECT state, active, review_by FROM task_lessons WHERE id=?",
+                (out["id"],),
+            ).fetchone()
+            assert row["state"] == kb.LESSON_STATE_ACTIVE
+            assert row["active"] == 1
+            assert row["review_by"] is not None   # expiry is always set
+
+    def test_ineligible_lesson_becomes_a_candidate_and_binds_nothing(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, tid, lesson=self.BROAD,
+                applicability="assignee:coder", actor="operator",
+            )
+            assert out["auto_promoted"] is False
+            assert out["eligibility_reason"] == "governance_impacting_needs_operator"
+            row = conn.execute(
+                "SELECT state, active FROM task_lessons WHERE id=?", (out["id"],),
+            ).fetchone()
+            assert row["state"] == kb.LESSON_STATE_CANDIDATE
+            # active = 0 is the binding gate lessons_for_task reads.
+            assert row["active"] == 0
+
+    def test_a_candidate_never_reaches_a_worker(self, kanban_home):
+        """The whole safety property: an unapproved interpretation binds nothing."""
+        with kb.connect_closing() as conn:
+            src_tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, src_tid, lesson=self.BROAD,
+                applicability="assignee:coder", actor="operator",
+            )
+            assert out["state"] == kb.LESSON_STATE_CANDIDATE
+            target = kb.create_task(conn, title="later work", assignee="coder", tenant="acme")
+            assert kb.lessons_for_task(conn, target) == []
+
+    def test_extraction_still_refuses_an_unverified_source(self, kanban_home):
+        """Every existing promote_lesson gate still runs first."""
+        with kb.connect_closing() as conn:
+            tid, _ = _executing(conn, tenant="acme")
+            with pytest.raises(kb.LessonPromotionError):
+                kb.extract_lesson(
+                    conn, tid, lesson=self.SAFE,
+                    applicability="assignee:coder", actor="operator",
+                )
+
+
+class TestCandidateApproval:
+    BROAD = "Governance: escalate cross-company work to Erika."
+
+    def _candidate(self, conn):
+        tid = _verified(conn, tenant="acme")
+        return kb.extract_lesson(
+            conn, tid, lesson=self.BROAD,
+            applicability="assignee:coder", actor="operator",
+        )
+
+    def test_approval_activates_it_and_it_then_binds(self, kanban_home):
+        with kb.connect_closing() as conn:
+            out = self._candidate(conn)
+            assert kb.approve_lesson(conn, out["id"], approver="christopher") is True
+            row = conn.execute(
+                "SELECT state, active FROM task_lessons WHERE id=?", (out["id"],),
+            ).fetchone()
+            assert (row["state"], row["active"]) == (kb.LESSON_STATE_ACTIVE, 1)
+            target = kb.create_task(conn, title="later work", assignee="coder", tenant="acme")
+            assert len(kb.lessons_for_task(conn, target)) == 1
+
+    def test_approval_requires_a_named_approver(self, kanban_home):
+        with kb.connect_closing() as conn:
+            out = self._candidate(conn)
+            with pytest.raises(kb.LessonPromotionError):
+                kb.approve_lesson(conn, out["id"], approver="  ")
+
+    def test_approving_a_non_candidate_is_a_no_op(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+            )
+            assert out["state"] == kb.LESSON_STATE_ACTIVE
+            assert kb.approve_lesson(conn, out["id"], approver="christopher") is False
+
+    def test_candidates_are_listable_for_review(self, kanban_home):
+        with kb.connect_closing() as conn:
+            out = self._candidate(conn)
+            pending = kb.lesson_candidates(conn)
+            assert [p["id"] for p in pending] == [out["id"]]
+
+
+class TestLessonExpiry:
+    """retire_lesson has always existed and nothing ever called it.
+
+    A lesson binds by exact match, so one that stopped being true steers work
+    silently -- worse than no lesson at all.
+    """
+
+    def test_review_horizon_is_recorded_with_a_named_retire_condition(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+                review_after_days=30,
+                retire_condition="the provider stops using 429 for rate limits",
+            )
+            row = conn.execute(
+                "SELECT review_by, retire_condition FROM task_lessons WHERE id=?",
+                (out["id"],),
+            ).fetchone()
+            assert row["review_by"] is not None
+            assert "429" in row["retire_condition"]
+
+    def test_expired_lessons_are_surfaced(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+                review_after_days=1,
+            )
+            future = int(time.time()) + 2 * 86400
+            due = kb.lessons_due_for_review(conn, now=future)
+            assert [d["id"] for d in due] == [out["id"]]
+
+    def test_nothing_is_due_before_its_horizon(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+                review_after_days=90,
+            )
+            assert kb.lessons_due_for_review(conn, now=int(time.time())) == []
+
+
+class TestUntenantedSourceCannotAutoPromote:
+    """An untenanted source can only produce a GLOBAL lesson, and a global
+    lesson always needs an operator. So the widest-reaching lesson the system
+    can express is precisely the one automation may never grant itself."""
+
+    def test_global_extraction_is_always_a_candidate(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn)          # deliberately no tenant
+            out = kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+                allow_global=True,
+            )
+            assert out["auto_promoted"] is False
+            assert out["eligibility_reason"] == "global_scope_needs_operator"
+            assert out["state"] == kb.LESSON_STATE_CANDIDATE
