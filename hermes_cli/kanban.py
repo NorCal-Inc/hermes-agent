@@ -951,6 +951,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Who retired it. Defaults to the acting profile.",
     )
 
+    p_lesson_approve = sub.add_parser(
+        "lesson-approve",
+        help=(
+            "Approve a candidate lesson so it starts binding future "
+            "applicable tasks"
+        ),
+    )
+    p_lesson_approve.add_argument("lesson_id", type=int)
+    p_lesson_approve.add_argument(
+        "--approver", required=True,
+        help=(
+            "Who decided it binds. Required and deliberately never defaulted "
+            "to the acting profile: a rule that constrains every future "
+            "matching task carries the name of the person who approved it."
+        ),
+    )
+
+    p_lesson_candidates = sub.add_parser(
+        "lesson-candidates",
+        help=(
+            "List candidate lessons awaiting an operator decision "
+            "(a candidate binds nothing)"
+        ),
+    )
+    p_lesson_candidates.add_argument(
+        "--tenant", default=None,
+        help="Only candidates in this tenant's lane.",
+    )
+    p_lesson_candidates.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit JSON instead of the text table.",
+    )
+
     p_lessons = sub.add_parser(
         "lessons",
         help="List promoted lessons, or show the ones binding a given task",
@@ -1470,6 +1503,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "exec":     _dispatch_exec,
             "lesson-promote": _cmd_lesson_promote,
             "lesson-retire":  _cmd_lesson_retire,
+            "lesson-approve": _cmd_lesson_approve,
+            "lesson-candidates": _cmd_lesson_candidates,
             "lessons":  _cmd_lessons,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -3182,6 +3217,77 @@ def _cmd_lesson_retire(args: argparse.Namespace) -> int:
     print(
         f"Retired lesson {args.lesson_id} — it stops being injected; the row "
         f"and its history are kept"
+    )
+    return 0
+
+
+def _cmd_lesson_approve(args: argparse.Namespace) -> int:
+    lesson_id = int(args.lesson_id)
+    with kb.connect_closing() as conn:
+        # Read the candidate first, so the confirmation can state exactly what
+        # was made binding and so an unknown id is distinguishable from one
+        # that was already decided.
+        pending = {c["id"]: c for c in kb.lesson_candidates(conn)}
+        lesson = pending.get(lesson_id)
+        try:
+            ok = kb.approve_lesson(conn, lesson_id, approver=args.approver)
+        except kb.LessonPromotionError as exc:
+            print(f"cannot approve lesson {lesson_id}: {exc}", file=sys.stderr)
+            return 2
+    if not ok:
+        print(
+            f"cannot approve lesson {lesson_id}: it is not a candidate "
+            f"awaiting a decision (already active, retired, or no such lesson)",
+            file=sys.stderr,
+        )
+        return 1
+    if lesson is None:
+        print(f"Approved lesson {lesson_id} — approver {args.approver}")
+        return 0
+    scope = (
+        "global (every tenant)"
+        if lesson["scope"] == kb.LESSON_SCOPE_GLOBAL
+        else f"tenant {lesson['tenant']}"
+    )
+    print(
+        f"Approved lesson {lesson_id} — approver {args.approver}. Now "
+        f"binding on tasks matching '{lesson['applicability']}' — {scope}"
+    )
+    return 0
+
+
+def _cmd_lesson_candidates(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        pending = kb.lesson_candidates(
+            conn, tenant=getattr(args, "tenant", None)
+        )
+    if getattr(args, "as_json", False):
+        print(json.dumps(pending, indent=2, ensure_ascii=False))
+        return 0
+    if not pending:
+        print("No candidate lessons awaiting a decision")
+        return 0
+    print(
+        f"{len(pending)} candidate lesson(s) awaiting a decision — a "
+        f"candidate binds nothing until it is approved:"
+    )
+    for lesson in pending:
+        scope = (
+            "global" if lesson["scope"] == kb.LESSON_SCOPE_GLOBAL
+            else f"tenant:{lesson['tenant']}"
+        )
+        print(
+            f"#{lesson['id']:<4} [candidate] {scope}  "
+            f"applies-to={lesson['applicability']}  "
+            f"from={lesson['source_task_id']}"
+        )
+        for line in lesson["lesson"].splitlines():
+            print(f"      {line}")
+        if lesson.get("retire_condition"):
+            print(f"      (retire when: {lesson['retire_condition']})")
+    print(
+        "\nApprove one with:  hermes kanban lesson-approve <id> "
+        "--approver <name>"
     )
     return 0
 

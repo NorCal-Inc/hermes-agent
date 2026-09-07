@@ -244,9 +244,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"task_lessons now: {total} rows, {binding} binding")
         print(
             "\nNothing binds until approved. Review with:\n"
-            "  hermes kanban lesson list --state candidate\n"
+            "  hermes kanban lesson-candidates\n"
             "and approve individually with:\n"
-            "  hermes kanban lesson approve <id> --approver christopher"
+            "  hermes kanban lesson-approve <id> --approver christopher"
         )
         return 0
     finally:
