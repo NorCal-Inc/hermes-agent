@@ -1011,6 +1011,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json", dest="as_json", action="store_true",
         help="Emit JSON instead of the text table.",
     )
+    p_lessons.add_argument(
+        "--error", default=None,
+        help=(
+            "Look up lessons matching an ERROR you just hit, scored by "
+            "signature overlap. This is the intended way to reach the corpus: "
+            "lessons are not loaded into a task up front, they are retrieved "
+            "when something fails. Searches every lesson, bound or not."
+        ),
+    )
 
     p_promote = sub.add_parser(
         "promote",
@@ -3296,6 +3305,33 @@ def _cmd_lesson_candidates(args: argparse.Namespace) -> int:
 
 
 def _cmd_lessons(args: argparse.Namespace) -> int:
+    error_text = getattr(args, "error", None)
+    if error_text:
+        with kb.connect_closing() as conn:
+            matches = kb.lessons_for_error(
+                conn, error_text, tenant=getattr(args, "tenant", None),
+            )
+        if getattr(args, "as_json", False):
+            print(json.dumps(matches, indent=2, ensure_ascii=False))
+            return 0
+        if not matches:
+            print(
+                "No recorded lesson matches that error.\n"
+                "That makes it a NEW failure: fix it, then record it so the "
+                "next agent finds it instead of rediscovering it."
+            )
+            return 0
+        print(f"{len(matches)} lesson(s) match that error, best first:")
+        for lesson in matches:
+            print(
+                f"#{lesson['id']:<4} score={lesson['match_score']} "
+                f"matched on: {', '.join(lesson['match_terms'][:6])}"
+            )
+            for line in lesson["lesson"].splitlines():
+                print(f"      {line}")
+            print(f"      _source_: `{lesson['source_task_id']}`")
+        return 0
+
     task_id = getattr(args, "task_id", None)
     with kb.connect_closing() as conn:
         if task_id:

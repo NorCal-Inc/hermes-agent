@@ -15608,6 +15608,93 @@ def approve_lesson(
     return True
 
 
+#: Terms too common in error text to discriminate between lessons.
+_ERROR_STOPWORDS = frozenset({
+    "error", "errors", "failed", "failure", "exception", "traceback", "call",
+    "last", "recent", "line", "file", "self", "none", "true", "false", "with",
+    "from", "this", "that", "then", "than", "have", "been", "when", "which",
+    "while", "into", "your", "must", "does", "will", "would", "could", "such",
+    "return", "returns", "returned", "raise", "raised", "python", "module",
+})
+
+
+def _error_signature_terms(text: str) -> set:
+    """Significant terms from an error, with the variable parts stripped.
+
+    Two occurrences of the SAME error differ in their ids, paths, line numbers
+    and timestamps. Matching on raw text therefore makes every recurrence look
+    novel -- which is exactly how a bounded "only a new error opens a loop"
+    rule degrades back into an unbounded one. Strip those first.
+    """
+    import re as _re
+
+    lowered = (text or "").lower()
+    lowered = _re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{8,}\b", " ", lowered)
+    lowered = _re.sub(r"[a-z]?[:/][^\s'\"]+", " ", lowered)
+    lowered = _re.sub(r"\b\d[\d.:_-]*\b", " ", lowered)
+    terms = {t for t in _re.split(r"[^a-z_]+", lowered) if len(t) > 3}
+    return terms - _ERROR_STOPWORDS
+
+
+def count_lessons(conn: sqlite3.Connection) -> int:
+    """Size of the whole retrievable corpus, bound or not.
+
+    Tolerates the table being absent. ``build_worker_context`` runs on legacy
+    boards that predate ``task_lessons`` and on boards mid-migration; a
+    context builder must never be the thing that breaks them. Returns 0, which
+    correctly renders no retrieval pointer.
+    """
+    try:
+        return int(
+            conn.execute("SELECT COUNT(*) FROM task_lessons").fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def lessons_for_error(
+    conn: sqlite3.Connection,
+    error_text: str,
+    *,
+    limit: int = 5,
+    tenant: Optional[str] = None,
+) -> list:
+    """Lessons whose recorded rule matches this error's signature.
+
+    Searches the WHOLE corpus, not just ``active`` rows. That distinction is
+    the point of this design: ``active`` now means "binds unconditionally"
+    (and should be near-empty), while every row -- candidate, active or
+    retired -- stays retrievable when something actually goes wrong. A lesson
+    nobody chose to make binding is still the best available evidence about an
+    error somebody already hit.
+
+    Scored by overlap of normalised signature terms, best first. Returns [] on
+    empty input rather than the whole table, so a caller that fails to capture
+    the error text gets nothing instead of everything.
+    """
+    terms = _error_signature_terms(error_text)
+    if not terms:
+        return []
+    sql = "SELECT * FROM task_lessons"
+    params: list = []
+    if tenant:
+        sql += " WHERE tenant = ? OR scope = ?"
+        params += [tenant, LESSON_SCOPE_GLOBAL]
+    scored = []
+    for row in conn.execute(sql, tuple(params)):
+        lesson = _lesson_row_to_dict(row)
+        overlap = terms & _error_signature_terms(lesson["lesson"])
+        if overlap:
+            scored.append((len(overlap), -int(lesson["id"]), lesson, overlap))
+    scored.sort(reverse=True)
+    out = []
+    for score, _, lesson, overlap in scored[:max(1, int(limit))]:
+        lesson["match_score"] = score
+        lesson["match_terms"] = sorted(overlap)
+        out.append(lesson)
+    return out
+
+
 def lesson_candidates(
     conn: sqlite3.Connection, tenant: Optional[str] = None
 ) -> list[dict[str, Any]]:
@@ -21290,55 +21377,40 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
-    # Binding verified lessons. This is where the verified-learning loop
-    # closes: the kernel selects them (:func:`lessons_for_task` — exact
-    # selector match, tenant-scoped) and states them as constraints, so the
-    # worker is bound by what a verifier established on earlier work whether
-    # or not any model remembers it. Provenance travels with each one so the
-    # worker can go read the source card rather than take the rule on faith.
-    lessons = lessons_for_task(conn, task_id)
-    if lessons:
-        omitted_l = max(0, len(lessons) - _CTX_MAX_LESSONS)
-        shown_l = lessons[-_CTX_MAX_LESSONS:] if omitted_l else lessons
-        lines.append("## Binding verified lessons")
+    # Lessons are deliberately NOT loaded here.
+    #
+    # Christopher's ruling, 2026-09-07: "no agent should load all the lessons
+    # at any point. that is part of the identifying process when an error is
+    # encountered."
+    #
+    # Measured before this change: 196 approved lessons put ~22,600 tokens into
+    # every dispatched task, ahead of the actual work, with 196 rules competing
+    # for attention. It is also the wrong shape. A lesson is diagnostic
+    # material for a failure that HAS happened; what binds unconditionally is
+    # doctrine, and doctrine loads at boot.
+    #
+    # This is a removal, not a cap. There is no code path in this function that
+    # can inject the corpus, so approving lessons can never reintroduce bulk
+    # loading -- which is the property the previous ``_CTX_MAX_LESSONS`` cap
+    # did not have.
+    corpus_size = count_lessons(conn)
+    if corpus_size:
+        lines.append("## If you hit an error")
         lines.append(
-            "These are BINDING constraints on this task, not suggestions. "
-            "Each was promoted from a task that passed Gauntlet verification "
-            "(and, where it had failed first, proved its repair by re-running "
-            "the checks). Follow them. If one is wrong or cannot be followed "
-            "here, say so explicitly in your handoff and explain why — do not "
-            "silently ignore it."
+            f"{corpus_size} lesson(s) recorded from earlier failures are "
+            "available. **Do not read them now.** When -- and only when -- you "
+            "hit an error, look up the ones matching it:"
         )
-        if omitted_l:
-            lines.append(
-                f"_({omitted_l} earlier lesson{'s' if omitted_l != 1 else ''} "
-                f"omitted; showing the {len(shown_l)} most recent — see "
-                f"`hermes kanban lessons` for the full set)_"
-            )
-        for lesson in shown_l:
-            when = time.strftime(
-                "%Y-%m-%d", time.localtime(int(lesson["created_at"]))
-            )
-            scope_note = (
-                f"tenant {lesson['tenant']}"
-                if lesson["scope"] == LESSON_SCOPE_TENANT
-                else "global"
-            )
-            lines.append(
-                f"### Lesson {lesson['id']} — applies to "
-                f"`{lesson['applicability']}` ({scope_note})"
-            )
-            lines.append(_cap(lesson["lesson"], _CTX_MAX_LESSON_BYTES))
-            # Same treatment as a comment author: the promoter name is
-            # attribution, so it must not be able to close its own code span
-            # and read as framing text around the lesson.
-            promoter = (lesson["created_by"] or "(unattributed)").replace("`", "")
-            lines.append(
-                f"_source_: verified task `{lesson['source_task_id']}`, "
-                f"verification ledger #{lesson['verification_id']}, promoted "
-                f"by `{promoter}` on {when}"
-            )
-            lines.append("")
+        lines.append("")
+        lines.append('    hermes kanban lessons --error "<the error text>"')
+        lines.append("")
+        lines.append(
+            "If a match resolves it, follow it and name the lesson id in your "
+            "handoff. If nothing matches, you have hit a NEW failure: fix it, "
+            "then record it so the next agent finds it instead of "
+            "rediscovering it."
+        )
+        lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has
