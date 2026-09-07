@@ -417,6 +417,7 @@ BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED = "attempt_budget_exhausted"
 VALID_BLOCK_KINDS = {
     "dependency", "needs_input", "approval_required", "capability", "transient",
     BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED,
+    "runtime_cap_exhausted",
 }
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
@@ -659,6 +660,40 @@ REQUIRED_REPAIR_RELATIONS = (RELATION_REPAIRS, RELATION_UMBRELLA)
 #: timers are five minutes. It remains a constant so callers cannot silently
 #: drift to a longer observation interval.
 MANDATORY_OBSERVATION_INTERVAL_SECONDS = 300
+
+#: Per-card runtime cap escalation ladder. Christopher's 2026-09-07 ruling:
+#: *"the raised cap is only for cards hitting 300. not a new default. if cards
+#: hit 300 twice then adjust THAT card to 600. if it hits 600 twice then 900.
+#: after 900 stop that card until i see it."*
+#:
+#: The point is that time is granted only to a card that has *demonstrated*,
+#: twice, that it cannot finish at its current rung — never to the board as a
+#: whole. Raising ``execution.max_runtime_seconds`` would remove the brake for
+#: everything, which is the opposite of the 2026-09-06 remediation; leaving a
+#: too-short cap in place turns a card that misses by one second into an
+#: unbounded respawn (t_9a90c33a, and 153 executors across t_0ce21cbe /
+#: t_db21ca59). The ladder sits between those two failures.
+#:
+#: The top of the ladder is a terminus, not a rung: after it the card stops and
+#: waits for a person, exactly as ``_block_objective_attempt_ceiling`` does.
+RUNTIME_CAP_LADDER = (300, 600, 900)
+
+#: Timeouts *at the same rung* required before the next rung is granted. One
+#: timeout is an incident; two is the card telling you the cap is wrong.
+RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG = 2
+
+#: Gauntlet verifier children stop one rung early (Christopher, 2026-09-07).
+#: They get the single rung that historically mattered — the 301-302s misses
+#: against a 300s cap — and then a human looks, rather than letting Gauntlet's
+#: own machinery run to 900s per attempt.
+RUNTIME_CAP_LADDER_VERIFIER_CEILING = 600
+
+#: A card that has exhausted the ladder. Distinct from
+#: ``attempt_budget_exhausted``: that one means "too many attempts", this one
+#: means "each attempt needs more wall-clock than we will grant unsupervised".
+#: Different remedies, so an operator must be able to tell them apart without
+#: reading the reason text.
+BLOCK_KIND_RUNTIME_CAP_EXHAUSTED = "runtime_cap_exhausted"
 
 #: A timer that is still observing. Ticks are only ever emitted in this state.
 OBSERVATION_STATE_OBSERVING = "observing"
@@ -8596,6 +8631,123 @@ def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> 
         })
 
 
+def _runtime_cap_ladder_ceiling(conn: sqlite3.Connection, task_id: str) -> int:
+    """Highest rung this card may reach before a human must look at it.
+
+    Gauntlet verifier children stop one rung early — see
+    ``RUNTIME_CAP_LADDER_VERIFIER_CEILING``.
+    """
+    row = conn.execute(
+        "SELECT executor_lane FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    lane = (row["executor_lane"] if row is not None else None) or ""
+    if lane == EXECUTOR_LANE_CODEX_VERIFY:
+        return RUNTIME_CAP_LADDER_VERIFIER_CEILING
+    return RUNTIME_CAP_LADDER[-1]
+
+
+def runtime_cap_timeouts_at(
+    conn: sqlite3.Connection, task_id: str, cap: int
+) -> int:
+    """How many times this card has timed out *at this exact cap*.
+
+    Counted from the ``timed_out`` events' own ``limit_seconds``, so a card
+    that has already been promoted starts the next rung at zero rather than
+    inheriting the previous rung's tally. That is what makes each rung an
+    independent two-strikes test instead of a lifetime budget.
+    """
+    total = 0
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'timed_out'",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if int(payload.get("limit_seconds") or 0) == int(cap):
+            total += 1
+    return total
+
+
+def _runtime_cap_ladder_step(
+    conn: sqlite3.Connection, task_id: str, *, cap: int, run_id=None
+) -> None:
+    """Advance one rung, or stop the card, after a ``timed_out``.
+
+    Called after the timeout has been recorded and the card re-queued, so the
+    status written here is the one that survives the tick.
+
+    Deliberately a no-op for any card whose cap is not itself a rung: a
+    bespoke cap (7200 for a long migration, say) was set by someone who knew
+    what they were doing, and inferring a ladder position for it would silently
+    overwrite that judgement.
+    """
+    cap = int(cap or 0)
+    if cap not in RUNTIME_CAP_LADDER:
+        return
+    if runtime_cap_timeouts_at(conn, task_id, cap) < RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG:
+        return
+
+    ceiling = _runtime_cap_ladder_ceiling(conn, task_id)
+    if cap >= ceiling:
+        reason = (
+            f"RUNTIME_CAP_EXHAUSTED: timed out {RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG}x "
+            f"at {cap}s, the highest cap granted without review. This is NOT a "
+            f"failure verdict -- each attempt needs more wall-clock than "
+            f"automation will grant unsupervised, and continuing requires an "
+            f"operator decision."
+        )
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] in (
+                "done", "archived", "failed", "cancelled"
+            ):
+                return
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind=?, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "last_failure_error=? WHERE id=?",
+                (BLOCK_KIND_RUNTIME_CAP_EXHAUSTED, reason, task_id),
+            )
+            _append_event(conn, task_id, "runtime_cap_ladder_exhausted", {
+                "cap_seconds": cap,
+                "ceiling_seconds": ceiling,
+                "timeouts_at_cap": RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG,
+            }, run_id=run_id)
+            _append_event(conn, task_id, "blocked", {
+                "reason": reason,
+                "kind": BLOCK_KIND_RUNTIME_CAP_EXHAUSTED,
+                "source": "runtime_cap_ladder",
+            }, run_id=run_id)
+        return
+
+    nxt = min(
+        (r for r in RUNTIME_CAP_LADDER if r > cap),
+        default=None,
+    )
+    if nxt is None:
+        return
+    nxt = min(nxt, ceiling)
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = ? "
+            "WHERE id = ? AND max_runtime_seconds = ?",
+            (nxt, task_id, cap),
+        )
+        if cur.rowcount:
+            _append_event(conn, task_id, "runtime_cap_raised", {
+                "max_runtime_seconds": nxt,
+                "previous": cap,
+                "ceiling_seconds": ceiling,
+                "timeouts_at_previous": RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG,
+                "source": "runtime_cap_ladder",
+            }, run_id=run_id)
+
+
 def gauntlet_canonical_ref() -> str:
     try:
         from hermes_cli.config import load_config_readonly
@@ -10543,10 +10695,19 @@ def _ensure_independent_verifier_child(
         # and make creation below explicit so the defect cannot recur.
         if gauntlet_required(conn, subject_id):
             with write_txn(conn):
+                # ``<`` rather than ``!=`` (2026-09-07). The defect this guard
+                # was written for was verifier children inheriting
+                # ``gauntlet_enforced`` but NOT a runtime cap, producing
+                # *uncapped* Atlas runs -- so the property that matters is
+                # "never above the floor unbounded", not "exactly 300".
+                # Forcing equality also silently reverted any deliberate raise,
+                # which would have made the cap ladder a no-op for verifier
+                # cards -- 77 of the 90 cards historically sitting at 300s.
+                # Lowering is still refused; only a raise survives.
                 cur = conn.execute(
                     "UPDATE tasks SET max_runtime_seconds = ? "
                     "WHERE id = ? AND (max_runtime_seconds IS NULL "
-                    "OR max_runtime_seconds != ?)",
+                    "OR max_runtime_seconds < ?)",
                     (
                         MANDATORY_OBSERVATION_INTERVAL_SECONDS,
                         existing,
@@ -17210,6 +17371,17 @@ def enforce_max_runtime(
                     "retry_status": retry_status,
                     "failure_class": "infrastructure",
                 },
+            )
+            # Per-card cap ladder (Christopher, 2026-09-07). Runs AFTER
+            # ``_record_task_failure`` has re-queued the card, so that when the
+            # ladder is exhausted the ``blocked`` status it writes is the one
+            # that survives the tick rather than being overwritten by the
+            # requeue. A second timeout at the same rung buys the next rung;
+            # the top rung parks the card for a person.
+            _runtime_cap_ladder_step(
+                conn, tid,
+                cap=int(row["max_runtime_seconds"]),
+                run_id=run_id,
             )
     return timed_out
 
