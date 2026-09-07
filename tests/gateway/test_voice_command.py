@@ -82,6 +82,11 @@ def _make_runner(tmp_path):
     runner._session_db = None
     runner.session_store = MagicMock()
     runner._is_user_authorized = lambda source: True
+    # These cases exercise per-chat voice modes, which only have any effect
+    # when the global text-only hard off is NOT active. Declare that here so
+    # they don't silently depend on the host's config.yaml.
+    # The hard-off side lives in tests/gateway/test_voice_hard_off.py.
+    runner._voice_text_only = False
     return runner
 
 
@@ -1751,6 +1756,10 @@ class TestVoiceTTSPlayback:
         runner = object.__new__(GatewayRunner)
         runner._voice_mode = {}
         runner.adapters = {}
+        # Per-chat dedup behaviour is only reachable when the global
+        # text-only hard off is inactive — declare it, don't inherit it
+        # from the host's config.yaml.
+        runner._voice_text_only = False
         return runner
 
     def _call_should_reply(self, runner, voice_mode, msg_type, response="Hello",
@@ -1874,7 +1883,12 @@ class TestUDPKeepalive:
 # =====================================================================
 
 class TestShouldAutoTtsForChat:
-    """Three-layer gate: per-chat enable > per-chat disable > config default."""
+    """Gate order: global hard off > per-chat disable > global default.
+
+    ``voice.auto_tts: false`` is an off switch, not a default — an explicit
+    per-chat ``/voice on`` / ``/voice tts`` no longer beats it. That inverts
+    the original Issue #16007 layering; see test_voice_hard_off.py.
+    """
 
     def _make_adapter(self, *, default: bool, enabled=(), disabled=()):
         """Build a bare adapter with only the attrs the gate reads."""
@@ -1894,9 +1908,29 @@ class TestShouldAutoTtsForChat:
         assert fn(adapter, "chat1") is False
 
 
-    def test_explicit_enable_overrides_false_default(self):
-        """``/voice on`` with config auto_tts=False still fires."""
+    def test_explicit_enable_cannot_override_false_default(self):
+        """``/voice on`` with config auto_tts=False must NOT fire.
+
+        Inverts the original #16007 expectation. The old behaviour was the
+        override bypass reported by verifier t_e4c3b271 as
+        CONFIG_FALSE_EXPLICIT_OPT_IN_BASE_GATE=True.
+        """
         fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
+        assert fn(adapter, "chat1") is False
+
+    def test_default_true_fires(self):
+        """auto_tts=True with no per-chat state → fires."""
+        fn, adapter = self._make_adapter(default=True)
+        assert fn(adapter, "chat1") is True
+
+    def test_default_true_explicit_disable_suppresses(self):
+        """``/voice off`` still wins over a True global default."""
+        fn, adapter = self._make_adapter(default=True, disabled={"chat1"})
+        assert fn(adapter, "chat1") is False
+
+    def test_default_true_explicit_enable_fires(self):
+        """``/voice on`` under a True global default still fires."""
+        fn, adapter = self._make_adapter(default=True, enabled={"chat1"})
         assert fn(adapter, "chat1") is True
 
 

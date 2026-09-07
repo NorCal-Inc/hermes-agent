@@ -7106,6 +7106,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
+        # Explicit override for the global text-only hard off, read by
+        # _voice_hard_off(). None (the production value) means "resolve from
+        # live config on every call" — deliberately NOT a connect-time cache,
+        # so turning voice off in config.yaml takes effect without a restart.
+        # Tests set it to a bool to pin the gate.
+        self._voice_text_only: Optional[bool] = None
         # Recent voice transcripts per (guild,user) for duplicate suppression.
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
@@ -7371,6 +7377,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             enabled_chats.discard(chat_id)
 
+    def _voice_hard_off(self) -> bool:
+        """True when the runtime is in global text-only mode.
+
+        Text-only is ``voice.auto_tts: false`` in config.yaml. It is a hard
+        off, not a per-chat default: an explicit ``/voice on`` or ``/voice tts``
+        must not re-enable outgoing TTS while it is active. Verifier
+        t_e4c3b271 found both dispatch gates failing open here
+        (CONFIG_FALSE_EXPLICIT_OPT_IN_BASE_GATE /
+        CONFIG_FALSE_EXPLICIT_OPT_IN_RUNNER_GATE); this is the runner half.
+
+        Resolution order: the explicit ``_voice_text_only`` override when a
+        bool (tests only), else a **live** read of config.yaml on every call.
+
+        Deliberately uncached. ``adapter._auto_tts_default`` is written only at
+        adapter connect, so a config edit afterwards has no effect on it until
+        reconnect; mirroring that staleness here would mean an operator setting
+        ``auto_tts: false`` mid-session kept getting voice replies — the unsafe
+        direction. ``load_config()`` is itself memoised on the config file's
+        (mtime, size), so a live read is cheap and picks up edits immediately.
+
+        Fails closed: any error resolving config means no outgoing voice.
+        """
+        override = getattr(self, "_voice_text_only", None)
+        if isinstance(override, bool):
+            return override
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            return not bool(
+                (_load_full_config().get("voice") or {}).get("auto_tts", False)
+            )
+        except Exception:
+            return True
+
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live platform adapter.
 
@@ -7378,6 +7417,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           - ``_auto_tts_default``: global default from ``voice.auto_tts``
           - ``_auto_tts_enabled_chats``: chats with mode ``voice_only``/``all``
           - ``_auto_tts_disabled_chats``: chats with mode ``off``
+
+        The runner-side gate does not read anything set here — see
+        ``_voice_hard_off()``, which reads config live on every call so an
+        operator turning voice off does not have to wait for a reconnect.
         """
         platform = getattr(adapter, "platform", None)
         if not isinstance(platform, Platform):
@@ -21849,7 +21892,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           UNLESS streaming already consumed the response (already_sent=True),
           in which case the base adapter won't have text for auto-TTS so the
           runner must handle it.
+        - global text-only mode is active (``voice.auto_tts: false``), which
+          overrides every per-chat mode including an explicit /voice on|tts.
         """
+        # Global text-only hard off beats every per-chat mode. /voice on and
+        # /voice tts still record a preference for when voice is re-enabled;
+        # they cannot make the runner speak while text-only is active.
+        if self._voice_hard_off():
+            logger.debug(
+                "Auto voice reply suppressed: global text-only mode chat=%s platform=%s",
+                event.source.chat_id, event.source.platform.value,
+            )
+            return False
+
         if not response or response.startswith("Error:"):
             return False
 
