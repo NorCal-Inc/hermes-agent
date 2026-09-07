@@ -413,6 +413,25 @@ DEFAULT_GAUNTLET_STALE_REALERT_SECONDS = 14400
 #: text. It is NOT a failure: the work may be perfectly healthy and merely
 #: expensive.
 BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED = "attempt_budget_exhausted"
+#: The same error, over and over, against one objective.
+#:
+#: Distinct from the attempt budget. Six attempts against six different
+#: errors is progress; six against the SAME error is a wrong fix being
+#: retried, and it should stop long before the objective budget is spent.
+BLOCK_KIND_ERROR_RECURRED = "error_recurred"
+#: Default recurrences of one error before the loop stops on it.
+REPEATED_ERROR_LIMIT_DEFAULT = 3
+
+#: Run outcomes where the WORK failed on its own terms.
+#:
+#: Only these are charged to the repeated-error bound. A rate limit, a
+#: lease reap, a runtime cap, an orphan kill or a spawn failure is the
+#: control plane's decision, not the work's verdict — it 'ends a process
+#: that may have been making perfect progress', as the retry-counter
+#: carve-out puts it. Charging those would block a card for a reason that
+#: has nothing to do with the card, which is the opposite of the bound's
+#: purpose: catching a wrong fix being retried.
+IMPLEMENTATION_FAILURE_OUTCOMES = frozenset({"crashed", "gave_up"})
 
 VALID_BLOCK_KINDS = {
     "dependency", "needs_input", "approval_required", "capability", "transient",
@@ -4310,6 +4329,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("state", f"state TEXT NOT NULL DEFAULT '{LESSON_STATE_ACTIVE}'"),
             ("review_by", "review_by INTEGER"),
             ("retire_condition", "retire_condition TEXT"),
+            # The normalised signature of the error this lesson fixes,
+            # recorded when the fix is logged. NULL on every legacy row
+            # (imported prose has no error attached), which is exactly why
+            # retrieval keeps a term-overlap fallback.
+            ("error_signature", "error_signature TEXT"),
             ("evidence", "evidence TEXT"),
             ("verification_id", "verification_id INTEGER"),
             ("regression_proof_id", "regression_proof_id INTEGER"),
@@ -8641,6 +8665,120 @@ def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
     return total
 
 
+def repeated_error_limit() -> int:
+    """How many times one error may recur against a single objective.
+
+    Config: ``kanban.repeated_error_limit``. Deliberately far below the
+    objective attempt budget — the point is to catch a wrong fix while the
+    objective still has room to try a different one.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return max(2, int(
+            (load_config() or {}).get("kanban", {}).get(
+                "repeated_error_limit", REPEATED_ERROR_LIMIT_DEFAULT
+            )
+        ))
+    except Exception:
+        return REPEATED_ERROR_LIMIT_DEFAULT
+
+
+def objective_error_recurrences(
+    conn: sqlite3.Connection, task_id: str, signature: str
+) -> int:
+    """How many runs in this objective's lineage failed with this signature.
+
+    Counts ``task_runs.error`` rows, which are append-only. The existing
+    counters (``consecutive_failures``, ``review_reopened``) are cleared on
+    reopen, which is precisely why the three-retry ceiling was unreachable in
+    practice; a bound built on them would inherit that defect.
+    """
+    if not signature:
+        return 0
+    root = _objective_lineage_root(conn, task_id)
+    members = sorted(_objective_lineage_members(conn, root))
+    hits = 0
+    for i in range(0, len(members), _LINEAGE_SQL_CHUNK):
+        batch = members[i:i + _LINEAGE_SQL_CHUNK]
+        marks = ",".join("?" * len(batch))
+        outcome_marks = ",".join("?" * len(IMPLEMENTATION_FAILURE_OUTCOMES))
+        for row in conn.execute(
+            f"SELECT error FROM task_runs WHERE task_id IN ({marks}) "
+            "AND error IS NOT NULL AND error != '' "
+            f"AND outcome IN ({outcome_marks})",
+            tuple(batch) + tuple(sorted(IMPLEMENTATION_FAILURE_OUTCOMES)),
+        ):
+            if error_signature(row["error"]) == signature:
+                hits += 1
+    return hits
+
+
+def repeated_error_ceiling_reached(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple:
+    """(reached, signature, count, limit, root) for this task's latest error.
+
+    Universal, like the attempt ceiling: retry protection is a safety control,
+    not a governance policy, so it is not gated on Gauntlet enforcement.
+    """
+    root = _objective_lineage_root(conn, task_id)
+    outcome_marks = ",".join("?" * len(IMPLEMENTATION_FAILURE_OUTCOMES))
+    row = conn.execute(
+        "SELECT error FROM task_runs WHERE task_id = ? AND error IS NOT NULL "
+        f"AND error != '' AND outcome IN ({outcome_marks}) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,) + tuple(sorted(IMPLEMENTATION_FAILURE_OUTCOMES)),
+    ).fetchone()
+    if row is None:
+        return (False, "", 0, repeated_error_limit(), root)
+    sig = error_signature(row["error"])
+    if not sig:
+        return (False, "", 0, repeated_error_limit(), root)
+    limit = repeated_error_limit()
+    count = objective_error_recurrences(conn, task_id, sig)
+    return (count >= limit, sig, count, limit, root)
+
+
+def _block_repeated_error(conn: sqlite3.Connection, task_id: str) -> None:
+    reached, sig, count, limit, root = repeated_error_ceiling_reached(
+        conn, task_id
+    )
+    if not reached:
+        return
+    reason = (
+        f"ERROR_RECURRED: the same failure has now occurred {count} times "
+        f"against objective lineage {root} (limit {limit}). Signature: "
+        f"{sig[:200]!r}. Retrying has not changed the outcome, so the fix is "
+        f"wrong or the cause is elsewhere. This is NOT a failure verdict -- "
+        f"it needs a different approach or an operator decision. Look up what "
+        f"is known about this error first: "
+        f'hermes kanban lessons --error "<the error text>"'
+    )
+    for tid in dict.fromkeys((root, task_id)):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+        if row is None or row["status"] in (
+            "done", "archived", "failed", "cancelled"
+        ):
+            continue
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            (BLOCK_KIND_ERROR_RECURRED, reason, tid),
+        )
+        _append_event(conn, tid, "repeated_error_ceiling_reached", {
+            "objective": root, "signature": sig[:200],
+            "count": count, "limit": limit,
+        })
+        _append_event(conn, tid, "blocked", {
+            "reason": reason,
+            "kind": BLOCK_KIND_ERROR_RECURRED,
+            "source": "repeated_error_ceiling",
+        })
+
+
 def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -> tuple[bool, int, int, str]:
     """Universal. Applies to EVERY task, Gauntlet-governed or not.
 
@@ -8872,6 +9010,12 @@ def claim_task(
         if reached:
             _block_objective_attempt_ceiling(conn, task_id)
             return None
+        # Same error over and over is a wrong fix, not progress. Checked
+        # alongside the attempt budget so both brakes share every call site
+        # and neither can quietly become an uncalled stage.
+        if repeated_error_ceiling_reached(conn, task_id)[0]:
+            _block_repeated_error(conn, task_id)
+            return None
         # Structural invariant: never transition ready -> running while a
         # parent dependency is unsatisfied. This is the single enforcement
         # point regardless of which writer (create_task, link_tasks,
@@ -9013,6 +9157,12 @@ def claim_review_task(
         reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
         if reached:
             _block_objective_attempt_ceiling(conn, task_id)
+            return None
+        # Same error over and over is a wrong fix, not progress. Checked
+        # alongside the attempt budget so both brakes share every call site
+        # and neither can quietly become an uncalled stage.
+        if repeated_error_ceiling_reached(conn, task_id)[0]:
+            _block_repeated_error(conn, task_id)
             return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -15608,6 +15758,212 @@ def approve_lesson(
     return True
 
 
+#: Minimum inverse-document-frequency score for a lesson to be offered.
+#:
+#: Below this, return nothing. "No match" is a useful and honest answer --
+#: it tells the agent this is a NEW failure, which is the branch that grows
+#: the corpus. A weak match is worse than none: it sends the agent down a
+#: wrong path with false confidence.
+LESSON_MATCH_MIN_SCORE = 0.30
+
+#: Distinct shared terms required before a lesson is offered at all.
+#:
+#: Rarity alone is not enough — a term appearing in exactly one lesson
+#: scores the maximum, so a single incidental word would outrank a real
+#: two-term match. Corroboration first, then rank by rarity.
+LESSON_MATCH_MIN_TERMS = 2
+
+#: Terms too common in error text to discriminate between lessons.
+_ERROR_STOPWORDS = frozenset({
+    "error", "errors", "failed", "failure", "exception", "traceback", "call",
+    "last", "recent", "line", "file", "self", "none", "true", "false", "with",
+    "from", "this", "that", "then", "than", "have", "been", "when", "which",
+    "while", "into", "your", "must", "does", "will", "would", "could", "such",
+    "return", "returns", "returned", "raise", "raised", "python", "module",
+})
+
+
+def _error_signature_terms(text: str) -> set:
+    """Significant terms from an error, with the variable parts stripped.
+
+    Two occurrences of the SAME error differ in their ids, paths, line numbers
+    and timestamps. Matching on raw text therefore makes every recurrence look
+    novel -- which is exactly how a bounded "only a new error opens a loop"
+    rule degrades back into an unbounded one. Strip those first.
+    """
+    import re as _re
+
+    lowered = (text or "").lower()
+    lowered = _re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{8,}\b", " ", lowered)
+    lowered = _re.sub(r"[a-z]?[:/][^\s'\"]+", " ", lowered)
+    lowered = _re.sub(r"\b\d[\d.:_-]*\b", " ", lowered)
+    terms = {t for t in _re.split(r"[^a-z_]+", lowered) if len(t) > 3}
+    return terms - _ERROR_STOPWORDS
+
+
+def error_signature(text: str) -> str:
+    """A stable key for an error, safe to compare across occurrences.
+
+    The sorted, normalised significant terms joined by spaces. Two occurrences
+    of the same failure differ in ids, paths, line numbers and timestamps;
+    those are stripped by :func:`_error_signature_terms`, so both produce the
+    same key. Empty when the text carries no signal.
+    """
+    return " ".join(sorted(_error_signature_terms(text)))
+
+
+def record_error_lesson(
+    conn: sqlite3.Connection,
+    *,
+    error_text: str,
+    lesson: str,
+    source_task_id: str,
+    created_by: str = "loop",
+    tenant: Optional[str] = None,
+) -> dict:
+    """Log the fix for an error, keyed by that error's signature.
+
+    This is the write half of retrieval-on-error, and the step that makes the
+    loop compound: an error is hit, diagnosed and fixed once, and every later
+    occurrence finds the fix by exact signature match rather than by hoping
+    two prose descriptions share vocabulary.
+
+    Recorded as a CANDIDATE (``active = 0``). It is retrievable immediately —
+    retrieval searches the whole corpus — but binds nothing until somebody
+    approves it. Logging a fix must never silently create a rule that
+    constrains every future task.
+    """
+    sig = error_signature(error_text)
+    if not sig:
+        raise ValueError("error_text carries no significant terms to key on")
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO task_lessons (source_task_id, tenant, scope, "
+            "applicability, lesson, error_signature, created_by, created_at, "
+            "active, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (
+                source_task_id,
+                tenant,
+                LESSON_SCOPE_TENANT if tenant else LESSON_SCOPE_GLOBAL,
+                "all",
+                lesson,
+                sig,
+                created_by,
+                now,
+                LESSON_STATE_CANDIDATE,
+            ),
+        )
+        lid = int(cur.lastrowid or 0)
+        _append_event(
+            conn, source_task_id, "error_lesson_recorded",
+            {"lesson_id": lid, "signature_terms": len(sig.split())},
+        )
+    return {"id": lid, "error_signature": sig, "lesson": lesson}
+
+
+def count_lessons(conn: sqlite3.Connection) -> int:
+    """Size of the whole retrievable corpus, bound or not.
+
+    Tolerates the table being absent. ``build_worker_context`` runs on legacy
+    boards that predate ``task_lessons`` and on boards mid-migration; a
+    context builder must never be the thing that breaks them. Returns 0, which
+    correctly renders no retrieval pointer.
+    """
+    try:
+        return int(
+            conn.execute("SELECT COUNT(*) FROM task_lessons").fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def lessons_for_error(
+    conn: sqlite3.Connection,
+    error_text: str,
+    *,
+    limit: int = 5,
+    tenant: Optional[str] = None,
+) -> list:
+    """Lessons whose recorded rule matches this error's signature.
+
+    Searches the WHOLE corpus, not just ``active`` rows. That distinction is
+    the point of this design: ``active`` now means "binds unconditionally"
+    (and should be near-empty), while every row -- candidate, active or
+    retired -- stays retrievable when something actually goes wrong. A lesson
+    nobody chose to make binding is still the best available evidence about an
+    error somebody already hit.
+
+    Scored by overlap of normalised signature terms, best first. Returns [] on
+    empty input rather than the whole table, so a caller that fails to capture
+    the error text gets nothing instead of everything.
+    """
+    terms = _error_signature_terms(error_text)
+    if not terms:
+        return []
+    sql = "SELECT * FROM task_lessons"
+    params: list = []
+    if tenant:
+        sql += " WHERE tenant = ? OR scope = ?"
+        params += [tenant, LESSON_SCOPE_GLOBAL]
+
+    # Signature match first: exact, no heuristics, and the reason recording
+    # the error at fix time is worth doing. Only rows that HAVE a signature can
+    # match this way, so legacy prose falls through to the overlap fallback
+    # below.
+    query_sig = " ".join(sorted(terms))
+    exact = []
+    for row in conn.execute(
+        sql + (" AND " if tenant else " WHERE ") + "error_signature = ?",
+        tuple(params) + (query_sig,),
+    ):
+        lesson = _lesson_row_to_dict(row)
+        lesson["match_score"] = "exact"
+        lesson["match_terms"] = sorted(terms)
+        exact.append(lesson)
+    if exact:
+        return exact[:max(1, int(limit))]
+
+    corpus = []
+    doc_freq: dict = {}
+    for row in conn.execute(sql, tuple(params)):
+        lesson = _lesson_row_to_dict(row)
+        lesson_terms = _error_signature_terms(lesson["lesson"])
+        corpus.append((lesson, lesson_terms))
+        for t in lesson_terms:
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+    # Weight each shared term by how RARE it is in the corpus. Raw overlap
+    # counting let common words dominate: a here-document failure matched a
+    # lesson about wrapper syntax on the word "syntax" alone, and missed the
+    # heredoc lesson entirely. A term in two lessons is evidence; a term in
+    # ninety is noise.
+    scored = []
+    for lesson, lesson_terms in corpus:
+        overlap = terms & lesson_terms
+        # Corroboration before rarity. A single shared word between an error
+        # and a paragraph of prose is a coincidence: pure IDF ranked a
+        # here-document failure against a lesson about unlabelled icons on the
+        # word "near" alone, because "near" happened to appear in exactly one
+        # lesson and therefore scored the maximum.
+        if len(overlap) < LESSON_MATCH_MIN_TERMS:
+            continue
+        score = sum(1.0 / doc_freq.get(t, 1) for t in overlap)
+        if score < LESSON_MATCH_MIN_SCORE:
+            continue
+        scored.append((score, -int(lesson["id"]), lesson, overlap))
+
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    out = []
+    for score, _, lesson, overlap in scored[:max(1, int(limit))]:
+        lesson["match_score"] = round(score, 3)
+        lesson["match_terms"] = sorted(
+            overlap, key=lambda t: doc_freq.get(t, 1)
+        )
+        out.append(lesson)
+    return out
+
+
 def lesson_candidates(
     conn: sqlite3.Connection, tenant: Optional[str] = None
 ) -> list[dict[str, Any]]:
@@ -21290,55 +21646,40 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
-    # Binding verified lessons. This is where the verified-learning loop
-    # closes: the kernel selects them (:func:`lessons_for_task` — exact
-    # selector match, tenant-scoped) and states them as constraints, so the
-    # worker is bound by what a verifier established on earlier work whether
-    # or not any model remembers it. Provenance travels with each one so the
-    # worker can go read the source card rather than take the rule on faith.
-    lessons = lessons_for_task(conn, task_id)
-    if lessons:
-        omitted_l = max(0, len(lessons) - _CTX_MAX_LESSONS)
-        shown_l = lessons[-_CTX_MAX_LESSONS:] if omitted_l else lessons
-        lines.append("## Binding verified lessons")
+    # Lessons are deliberately NOT loaded here.
+    #
+    # Christopher's ruling, 2026-09-07: "no agent should load all the lessons
+    # at any point. that is part of the identifying process when an error is
+    # encountered."
+    #
+    # Measured before this change: 196 approved lessons put ~22,600 tokens into
+    # every dispatched task, ahead of the actual work, with 196 rules competing
+    # for attention. It is also the wrong shape. A lesson is diagnostic
+    # material for a failure that HAS happened; what binds unconditionally is
+    # doctrine, and doctrine loads at boot.
+    #
+    # This is a removal, not a cap. There is no code path in this function that
+    # can inject the corpus, so approving lessons can never reintroduce bulk
+    # loading -- which is the property the previous ``_CTX_MAX_LESSONS`` cap
+    # did not have.
+    corpus_size = count_lessons(conn)
+    if corpus_size:
+        lines.append("## If you hit an error")
         lines.append(
-            "These are BINDING constraints on this task, not suggestions. "
-            "Each was promoted from a task that passed Gauntlet verification "
-            "(and, where it had failed first, proved its repair by re-running "
-            "the checks). Follow them. If one is wrong or cannot be followed "
-            "here, say so explicitly in your handoff and explain why — do not "
-            "silently ignore it."
+            f"{corpus_size} lesson(s) recorded from earlier failures are "
+            "available. **Do not read them now.** When -- and only when -- you "
+            "hit an error, look up the ones matching it:"
         )
-        if omitted_l:
-            lines.append(
-                f"_({omitted_l} earlier lesson{'s' if omitted_l != 1 else ''} "
-                f"omitted; showing the {len(shown_l)} most recent — see "
-                f"`hermes kanban lessons` for the full set)_"
-            )
-        for lesson in shown_l:
-            when = time.strftime(
-                "%Y-%m-%d", time.localtime(int(lesson["created_at"]))
-            )
-            scope_note = (
-                f"tenant {lesson['tenant']}"
-                if lesson["scope"] == LESSON_SCOPE_TENANT
-                else "global"
-            )
-            lines.append(
-                f"### Lesson {lesson['id']} — applies to "
-                f"`{lesson['applicability']}` ({scope_note})"
-            )
-            lines.append(_cap(lesson["lesson"], _CTX_MAX_LESSON_BYTES))
-            # Same treatment as a comment author: the promoter name is
-            # attribution, so it must not be able to close its own code span
-            # and read as framing text around the lesson.
-            promoter = (lesson["created_by"] or "(unattributed)").replace("`", "")
-            lines.append(
-                f"_source_: verified task `{lesson['source_task_id']}`, "
-                f"verification ledger #{lesson['verification_id']}, promoted "
-                f"by `{promoter}` on {when}"
-            )
-            lines.append("")
+        lines.append("")
+        lines.append('    hermes kanban lessons --error "<the error text>"')
+        lines.append("")
+        lines.append(
+            "If a match resolves it, follow it and name the lesson id in your "
+            "handoff. If nothing matches, you have hit a NEW failure: fix it, "
+            "then record it so the next agent finds it instead of "
+            "rediscovering it."
+        )
+        lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has

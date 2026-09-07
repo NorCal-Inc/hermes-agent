@@ -570,7 +570,15 @@ class TestApplicabilityMatching:
 # ---------------------------------------------------------------------------
 
 class TestWorkerContextInjection:
-    def test_applicable_task_gets_the_lesson_marked_binding(self, kanban_home):
+    def test_selection_still_works_but_nothing_is_injected(self, kanban_home):
+        """Selection and delivery are now separate concerns.
+
+        ``lessons_for_task`` still resolves exactly which lessons bind a card
+        — that logic is untouched and still worth protecting. What changed is
+        that the result is no longer poured into the prompt. Christopher's
+        ruling, 2026-09-07: no agent loads the corpus; it is consulted when an
+        error is hit.
+        """
         with kb.connect_closing() as conn:
             source = _verified(conn, assignee="coder", title="the source card")
             lesson = _promote(
@@ -579,18 +587,20 @@ class TestWorkerContextInjection:
                 applicability="assignee:coder", allow_global=True,
             )
             tid, _ = _executing(conn, assignee="coder", title="new work")
-            ctx = kb.build_worker_context(conn, tid)
 
-            assert "## Binding verified lessons" in ctx
-            assert "BINDING constraints" in ctx
+            # Selection is unchanged.
+            assert [
+                le["id"] for le in kb.lessons_for_task(conn, tid)
+            ] == [lesson["id"]]
+
+            # Delivery is gone.
+            ctx = kb.build_worker_context(conn, tid)
+            assert "Binding verified lessons" not in ctx
             assert (
-                "Always re-run tests/hermes_cli after touching claims." in ctx
+                "Always re-run tests/hermes_cli after touching claims."
+                not in ctx
             )
-            # Provenance travels with it: which card, which verdict, who.
-            assert source in ctx
-            assert f"Lesson {lesson['id']}" in ctx
-            assert f"verification ledger #{lesson['verification_id']}" in ctx
-            assert "assignee:coder" in ctx
+            assert "If you hit an error" in ctx
 
     def test_non_applicable_task_gets_nothing(self, kanban_home):
         with kb.connect_closing() as conn:
@@ -611,8 +621,12 @@ class TestWorkerContextInjection:
                 conn, tid
             )
 
-    def test_injection_is_bounded(self, kanban_home):
-        """A rulebook-sized board must not swallow the worker's prompt."""
+    def test_a_rulebook_sized_board_injects_nothing_at_all(self, kanban_home):
+        """This used to assert a CAP. A cap limited the damage and left the
+        mechanism: approving more lessons put more of them in every prompt. The
+        property now asserted is stronger and is the one Christopher asked for
+        — no amount of lessons can reach the context.
+        """
         with kb.connect_closing() as conn:
             source = _verified(conn, title="source")
             for i in range(kb._CTX_MAX_LESSONS + 3):
@@ -622,8 +636,9 @@ class TestWorkerContextInjection:
                 )
             tid, _ = _executing(conn, title="new work")
             ctx = kb.build_worker_context(conn, tid)
-            assert ctx.count("### Lesson ") == kb._CTX_MAX_LESSONS
-            assert "3 earlier lessons omitted" in ctx
+            assert "### Lesson " not in ctx
+            assert "rule number 0" not in ctx
+            assert "If you hit an error" in ctx
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +653,8 @@ class TestRetirement:
                 conn, source, lesson="Deploy on Fridays.", allow_global=True,
             )
             tid, _ = _executing(conn, title="later work")
-            assert "Deploy on Fridays." in kb.build_worker_context(conn, tid)
+            # Binding, though no longer injected — see TestWorkerContextInjection.
+            assert len(kb.lessons_for_task(conn, tid)) == 1
 
             ok, detail = kb.retire_lesson(
                 conn, lesson["id"], actor="operator",
@@ -647,7 +663,6 @@ class TestRetirement:
             assert (ok, detail) == (True, None)
 
             assert kb.lessons_for_task(conn, tid) == []
-            assert "Deploy on Fridays." not in kb.build_worker_context(conn, tid)
             assert kb.list_lessons(conn) == []
 
             # History survives: the row, its reason, and the audit event.
@@ -907,14 +922,19 @@ class TestMigration:
                 "retired_by", "retired_reason",
             } <= cols
             assert kb.list_lessons(conn) == []
-            # And the upgraded board can promote and inject immediately.
+            # And the upgraded board can promote and RETRIEVE immediately.
             lesson = _promote(
                 conn, tid, lesson="Migrated boards work.", allow_global=True,
             )
             later, _ = _executing(conn, title="after the migration")
-            assert "Migrated boards work." in kb.build_worker_context(
+            assert "Migrated boards work." not in kb.build_worker_context(
                 conn, later
             )
+            assert [
+                m["id"] for m in kb.lessons_for_error(
+                    conn, "migrated boards broke"
+                )
+            ] == [lesson["id"]]
             assert lesson["id"] > 0
 
     def test_migration_is_idempotent_and_preserves_rows(self, kanban_home):
