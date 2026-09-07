@@ -413,6 +413,14 @@ DEFAULT_GAUNTLET_STALE_REALERT_SECONDS = 14400
 #: text. It is NOT a failure: the work may be perfectly healthy and merely
 #: expensive.
 BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED = "attempt_budget_exhausted"
+#: The same error, over and over, against one objective.
+#:
+#: Distinct from the attempt budget. Six attempts against six different
+#: errors is progress; six against the SAME error is a wrong fix being
+#: retried, and it should stop long before the objective budget is spent.
+BLOCK_KIND_ERROR_RECURRED = "error_recurred"
+#: Default recurrences of one error before the loop stops on it.
+REPEATED_ERROR_LIMIT_DEFAULT = 3
 
 VALID_BLOCK_KINDS = {
     "dependency", "needs_input", "approval_required", "capability", "transient",
@@ -8646,6 +8654,115 @@ def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
     return total
 
 
+def repeated_error_limit() -> int:
+    """How many times one error may recur against a single objective.
+
+    Config: ``kanban.repeated_error_limit``. Deliberately far below the
+    objective attempt budget — the point is to catch a wrong fix while the
+    objective still has room to try a different one.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return max(2, int(
+            (load_config() or {}).get("kanban", {}).get(
+                "repeated_error_limit", REPEATED_ERROR_LIMIT_DEFAULT
+            )
+        ))
+    except Exception:
+        return REPEATED_ERROR_LIMIT_DEFAULT
+
+
+def objective_error_recurrences(
+    conn: sqlite3.Connection, task_id: str, signature: str
+) -> int:
+    """How many runs in this objective's lineage failed with this signature.
+
+    Counts ``task_runs.error`` rows, which are append-only. The existing
+    counters (``consecutive_failures``, ``review_reopened``) are cleared on
+    reopen, which is precisely why the three-retry ceiling was unreachable in
+    practice; a bound built on them would inherit that defect.
+    """
+    if not signature:
+        return 0
+    root = _objective_lineage_root(conn, task_id)
+    members = sorted(_objective_lineage_members(conn, root))
+    hits = 0
+    for i in range(0, len(members), _LINEAGE_SQL_CHUNK):
+        batch = members[i:i + _LINEAGE_SQL_CHUNK]
+        marks = ",".join("?" * len(batch))
+        for row in conn.execute(
+            f"SELECT error FROM task_runs WHERE task_id IN ({marks}) "
+            "AND error IS NOT NULL AND error != ''",
+            tuple(batch),
+        ):
+            if error_signature(row["error"]) == signature:
+                hits += 1
+    return hits
+
+
+def repeated_error_ceiling_reached(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple:
+    """(reached, signature, count, limit, root) for this task's latest error.
+
+    Universal, like the attempt ceiling: retry protection is a safety control,
+    not a governance policy, so it is not gated on Gauntlet enforcement.
+    """
+    root = _objective_lineage_root(conn, task_id)
+    row = conn.execute(
+        "SELECT error FROM task_runs WHERE task_id = ? AND error IS NOT NULL "
+        "AND error != '' ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return (False, "", 0, repeated_error_limit(), root)
+    sig = error_signature(row["error"])
+    if not sig:
+        return (False, "", 0, repeated_error_limit(), root)
+    limit = repeated_error_limit()
+    count = objective_error_recurrences(conn, task_id, sig)
+    return (count >= limit, sig, count, limit, root)
+
+
+def _block_repeated_error(conn: sqlite3.Connection, task_id: str) -> None:
+    reached, sig, count, limit, root = repeated_error_ceiling_reached(
+        conn, task_id
+    )
+    if not reached:
+        return
+    reason = (
+        f"ERROR_RECURRED: the same failure has now occurred {count} times "
+        f"against objective lineage {root} (limit {limit}). Signature: "
+        f"{sig[:200]!r}. Retrying has not changed the outcome, so the fix is "
+        f"wrong or the cause is elsewhere. This is NOT a failure verdict -- "
+        f"it needs a different approach or an operator decision. Look up what "
+        f"is known about this error first: "
+        f'hermes kanban lessons --error "<the error text>"'
+    )
+    for tid in dict.fromkeys((root, task_id)):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+        if row is None or row["status"] in (
+            "done", "archived", "failed", "cancelled"
+        ):
+            continue
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            (BLOCK_KIND_ERROR_RECURRED, reason, tid),
+        )
+        _append_event(conn, tid, "repeated_error_ceiling_reached", {
+            "objective": root, "signature": sig[:200],
+            "count": count, "limit": limit,
+        })
+        _append_event(conn, tid, "blocked", {
+            "reason": reason,
+            "kind": BLOCK_KIND_ERROR_RECURRED,
+            "source": "repeated_error_ceiling",
+        })
+
+
 def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -> tuple[bool, int, int, str]:
     """Universal. Applies to EVERY task, Gauntlet-governed or not.
 
@@ -8877,6 +8994,12 @@ def claim_task(
         if reached:
             _block_objective_attempt_ceiling(conn, task_id)
             return None
+        # Same error over and over is a wrong fix, not progress. Checked
+        # alongside the attempt budget so both brakes share every call site
+        # and neither can quietly become an uncalled stage.
+        if repeated_error_ceiling_reached(conn, task_id)[0]:
+            _block_repeated_error(conn, task_id)
+            return None
         # Structural invariant: never transition ready -> running while a
         # parent dependency is unsatisfied. This is the single enforcement
         # point regardless of which writer (create_task, link_tasks,
@@ -9018,6 +9141,12 @@ def claim_review_task(
         reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
         if reached:
             _block_objective_attempt_ceiling(conn, task_id)
+            return None
+        # Same error over and over is a wrong fix, not progress. Checked
+        # alongside the attempt budget so both brakes share every call site
+        # and neither can quietly become an uncalled stage.
+        if repeated_error_ceiling_reached(conn, task_id)[0]:
+            _block_repeated_error(conn, task_id)
             return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
