@@ -68,7 +68,13 @@ try:
     parity_ok = _vp.returncode == 0 and bool(
         re.search(r'(?m)^BOOT PARITY: PASS\s*$', _vout)
     )
-    if not parity_ok:
+    if parity_ok:
+        # Record the pass explicitly. Leaving the default here would write
+        # "not run" into the state file for a gate that DID run and passed —
+        # a state file that misreports its own gate is the failure this whole
+        # change exists to remove.
+        parity_detail = 'PASS'
+    else:
         _errs = [ln for ln in _vout.splitlines() if ln.startswith('ERROR:')]
         parity_detail = '; '.join(_errs) if _errs else f'rc={_vp.returncode}'
 except Exception as exc:
