@@ -2433,7 +2433,15 @@ CREATE TABLE IF NOT EXISTS task_lessons (
     active              INTEGER NOT NULL DEFAULT 1,
     retired_at          INTEGER,
     retired_by          TEXT,
-    retired_reason      TEXT
+    retired_reason      TEXT,
+    -- 'candidate' | 'active' | 'retired'. Only 'active' binds work; the
+    -- binding gate itself remains ``active = 1``, which this mirrors.
+    state               TEXT NOT NULL DEFAULT 'active',
+    -- When this lesson must be re-justified. A lesson binds by exact match,
+    -- so one that has stopped being true steers work silently.
+    review_by           INTEGER,
+    -- The named condition under which this lesson should be retired.
+    retire_condition    TEXT
 );
 
 -- NOTE: the two indexes this table needs are NOT created here. One of them
@@ -4281,6 +4289,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         for col, ddl in (
             ("tenant", "tenant TEXT"),
             ("scope", f"scope TEXT NOT NULL DEFAULT '{LESSON_SCOPE_TENANT}'"),
+            # Existing rows are 'active': they were promoted under the old
+            # unconditional path, and re-labelling them candidates would
+            # silently un-bind lessons already in force. (There are none
+            # today, but the migration must be correct regardless.)
+            ("state", f"state TEXT NOT NULL DEFAULT '{LESSON_STATE_ACTIVE}'"),
+            ("review_by", "review_by INTEGER"),
+            ("retire_condition", "retire_condition TEXT"),
             ("evidence", "evidence TEXT"),
             ("verification_id", "verification_id INTEGER"),
             ("regression_proof_id", "regression_proof_id INTEGER"),
@@ -14647,6 +14662,63 @@ class LessonPromotionError(ValueError):
         super().__init__(message)
 
 
+#: Lifecycle of a lesson. ``active`` is the only state that BINDS work --
+#: ``lessons_for_task`` filters on ``active = 1`` -- so a candidate is fully
+#: auditable while constraining nothing.
+LESSON_STATE_CANDIDATE = "candidate"
+LESSON_STATE_ACTIVE = "active"
+LESSON_STATE_RETIRED = "retired"
+VALID_LESSON_STATES = {
+    LESSON_STATE_CANDIDATE, LESSON_STATE_ACTIVE, LESSON_STATE_RETIRED,
+}
+
+#: Default review horizon. A lesson binds future work by exact match, so one
+#: that has stopped being true is worse than no lesson: it steers silently.
+LESSON_DEFAULT_REVIEW_DAYS = 90
+
+#: Interpretations that must not become binding doctrine without a human.
+#: Christopher's list: architecture choices, governance changes, entity-routing
+#: changes, broad behavioural rules, anything spanning companies.
+_LESSON_REVIEW_REQUIRED_RE = re.compile(
+    r"\b("
+    r"architect(ure|ural)?"
+    r"|governance|doctrine|hierarchy|authority|escalat(e|ion)"
+    r"|entity[ _-]?(registry|routing)|rout(e|ing)[ _-]?(rule|change|table)"
+    r"|cross[ _-]?(company|entity|tenant)|company[ _-]?lane|tenant[ _-]?boundary"
+    r"|polic(y|ies)|always|never|every[ _-]?(task|worker|agent|profile)"
+    r")\b",
+    re.I,
+)
+
+
+def lesson_promotion_eligibility(
+    scope: str, applicability: str, lesson: str
+) -> tuple[bool, str]:
+    """May this candidate promote itself, or must an operator rule on it?
+
+    Deterministic and structural -- no model judgement. Three refusals, each
+    keyed on something already in the data model:
+
+    * ``scope='global'`` -- reaches every company. Cross-company reach is
+      exactly the class that needs a human.
+    * ``applicability='all'`` -- unbounded. A broad behavioural rule binds work
+      nobody reviewed it against.
+    * governance/architecture/routing language -- an interpretation, not an
+      observation.
+
+    Anything narrow, single-tenant and free of those is safe to promote:
+    "do not count provider 429 as implementation failure" constrains one
+    selector and asserts nothing about how the company is run.
+    """
+    if scope == LESSON_SCOPE_GLOBAL:
+        return False, "global_scope_needs_operator"
+    if (applicability or "").strip().lower() == LESSON_SELECTOR_ALL:
+        return False, "unbounded_applicability_needs_operator"
+    if _LESSON_REVIEW_REQUIRED_RE.search(lesson or ""):
+        return False, "governance_impacting_needs_operator"
+    return True, "narrow_and_scoped"
+
+
 def normalize_lesson_applicability(value: Optional[str]) -> str:
     """Normalise and validate an applicability selector. Raises on garbage.
 
@@ -14878,6 +14950,13 @@ def _lesson_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "active": bool(row["active"]),
         "retired_at": row["retired_at"] if "retired_at" in keys else None,
         "retired_by": row["retired_by"] if "retired_by" in keys else None,
+        "state": (
+            row["state"] if "state" in keys else LESSON_STATE_ACTIVE
+        ),
+        "review_by": row["review_by"] if "review_by" in keys else None,
+        "retire_condition": (
+            row["retire_condition"] if "retire_condition" in keys else None
+        ),
         "retired_reason": (
             row["retired_reason"] if "retired_reason" in keys else None
         ),
@@ -14893,8 +14972,16 @@ def promote_lesson(
     actor: Optional[str] = None,
     evidence: Optional[dict] = None,
     allow_global: bool = False,
+    gate_promotion: bool = False,
 ) -> dict[str, Any]:
     """Promote a verified task's finding into a durable, binding lesson.
+
+    ``gate_promotion`` applies :func:`lesson_promotion_eligibility` to the
+    DERIVED scope at insert time, so an ineligible lesson is written as a
+    non-binding ``candidate`` in the same transaction that creates it. It is a
+    parameter here rather than a follow-up UPDATE in the caller because a
+    second transaction would leave a window in which an unapproved
+    interpretation is live and binding.
 
     The one way a row enters ``task_lessons``. Refuses — raising
     :class:`LessonPromotionError` and writing nothing — unless all of:
@@ -14991,13 +15078,24 @@ def promote_lesson(
                 provenance["promoter_evidence"] = redact_review_value(evidence)
 
             now = int(time.time())
+            # The gate runs HERE, against the scope this function derived, so
+            # the row is never briefly binding before being downgraded.
+            if gate_promotion:
+                eligible, gate_reason = lesson_promotion_eligibility(
+                    scope, selector, text
+                )
+            else:
+                eligible, gate_reason = True, "ungated"
+            lesson_state = (
+                LESSON_STATE_ACTIVE if eligible else LESSON_STATE_CANDIDATE
+            )
             cur = conn.execute(
                 """
                 INSERT INTO task_lessons
                     (source_task_id, tenant, scope, applicability, lesson,
                      evidence, verification_id, regression_proof_id,
-                     created_by, created_at, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                     created_by, created_at, active, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -15010,13 +15108,18 @@ def promote_lesson(
                     state["regression_proof_id"],
                     actor,
                     now,
+                    1 if eligible else 0,
+                    lesson_state,
                 ),
             )
             lesson_id = int(cur.lastrowid)
             _append_event(
-                conn, task_id, "lesson_promoted",
+                conn, task_id,
+                "lesson_promoted" if eligible else "lesson_candidate_recorded",
                 {
                     "lesson_id": lesson_id,
+                    "state": lesson_state,
+                    "eligibility_reason": gate_reason,
                     "scope": scope,
                     "tenant": tenant,
                     "applicability": selector,
@@ -15127,6 +15230,143 @@ def list_lessons(
         params.append(int(limit))
     return [
         _lesson_row_to_dict(row) for row in conn.execute(query, params)
+    ]
+
+
+def extract_lesson(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lesson: str,
+    applicability: str,
+    actor: Optional[str] = None,
+    evidence: Optional[dict] = None,
+    allow_global: bool = False,
+    review_after_days: int = LESSON_DEFAULT_REVIEW_DAYS,
+    retire_condition: Optional[str] = None,
+) -> dict[str, Any]:
+    """The required post-VERIFIED step. Promotes only when narrow and safe.
+
+    Runs every existing :func:`promote_lesson` gate first -- verified head, no
+    outstanding regression debt, a named regression proof when the source ever
+    failed -- so an unverified task still produces nothing. Then applies
+    :func:`lesson_promotion_eligibility`:
+
+    * eligible -> stays ``active`` and binds future matching work.
+    * not eligible -> downgraded to ``candidate``: recorded, auditable,
+      attributable, and binding nothing until an operator approves it.
+
+    The distinction matters because a verifier proves an IMPLEMENTATION met its
+    acceptance criteria. It does not prove the INTERPRETATION drawn from the
+    incident should become doctrine.
+    """
+    # gate_promotion=True makes the eligibility decision part of the INSERT, so
+    # an ineligible lesson is NEVER briefly active.
+    row = promote_lesson(
+        conn,
+        task_id,
+        lesson=lesson,
+        applicability=applicability,
+        actor=actor,
+        evidence=evidence,
+        allow_global=allow_global,
+        gate_promotion=True,
+    )
+    lesson_id = int(row["id"])
+    eligible = bool(row.get("active"))
+    reason = lesson_promotion_eligibility(
+        str(row.get("scope") or LESSON_SCOPE_TENANT),
+        str(row.get("applicability") or applicability),
+        lesson,
+    )[1]
+    now = int(time.time())
+    review_by = now + int(review_after_days) * 86400 if review_after_days else None
+    # Only the review horizon is set here. It gates nothing, so a second
+    # statement is harmless -- unlike the binding state, which is not.
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_lessons SET review_by = ?, retire_condition = ? "
+            "WHERE id = ?",
+            (review_by, retire_condition, lesson_id),
+        )
+    out = dict(row)
+    out.update(
+        state=LESSON_STATE_ACTIVE if eligible else LESSON_STATE_CANDIDATE,
+        auto_promoted=eligible,
+        eligibility_reason=reason,
+        review_by=review_by,
+        retire_condition=retire_condition,
+    )
+    return out
+
+
+def approve_lesson(
+    conn: sqlite3.Connection,
+    lesson_id: int,
+    *,
+    approver: str,
+) -> bool:
+    """Operator approval of a candidate. Returns False if it is not one.
+
+    Deliberately requires a named approver: a lesson that binds every future
+    matching task should carry who decided it binds.
+    """
+    if not (approver or "").strip():
+        raise LessonPromotionError(
+            "unnamed_approver",
+            "approving a candidate lesson requires a named approver",
+        )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_lessons SET state = ?, active = 1 "
+            "WHERE id = ? AND state = ?",
+            (LESSON_STATE_ACTIVE, int(lesson_id), LESSON_STATE_CANDIDATE),
+        )
+        if cur.rowcount != 1:
+            return False
+        row = conn.execute(
+            "SELECT source_task_id FROM task_lessons WHERE id = ?", (int(lesson_id),)
+        ).fetchone()
+        if row is not None:
+            _append_event(
+                conn, str(row["source_task_id"]), "lesson_candidate_approved",
+                {"lesson_id": int(lesson_id), "approver": approver},
+            )
+    return True
+
+
+def lesson_candidates(
+    conn: sqlite3.Connection, tenant: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Candidates awaiting an operator decision. These bind nothing."""
+    sql = "SELECT * FROM task_lessons WHERE state = ?"
+    params: list[Any] = [LESSON_STATE_CANDIDATE]
+    if tenant:
+        sql += " AND tenant = ?"
+        params.append(tenant)
+    return [
+        _lesson_row_to_dict(r)
+        for r in conn.execute(sql + " ORDER BY id", tuple(params))
+    ]
+
+
+def lessons_due_for_review(
+    conn: sqlite3.Connection, now: Optional[int] = None
+) -> list[dict[str, Any]]:
+    """Active lessons past their review horizon.
+
+    ``retire_lesson`` has always existed and nothing ever called it, so a
+    lesson that stopped being true kept constraining work. This is the query
+    that makes expiry actionable rather than theoretical.
+    """
+    stamp = int(now if now is not None else time.time())
+    return [
+        _lesson_row_to_dict(r)
+        for r in conn.execute(
+            "SELECT * FROM task_lessons WHERE state = ? AND review_by IS NOT NULL "
+            "AND review_by <= ? ORDER BY review_by",
+            (LESSON_STATE_ACTIVE, stamp),
+        )
     ]
 
 
