@@ -2,6 +2,7 @@
 from pathlib import Path
 import hashlib, os, subprocess, sys
 HERE=Path(__file__).resolve().parent; HOME=Path.home()
+REPO=HERE.parents[1]
 C=(HERE/'boot-constraints.md').read_text(encoding='utf-8').strip()
 errs=[]
 for p in [HOME/'.local/bin/hermes-shared-boot-context', HOME/'.local/bin/boot-context', HOME/'.local/bin/claude-session-start-gate.py', HOME/'.local/bin/codex']:
@@ -12,7 +13,24 @@ if not ag.exists() or not ag.read_text(encoding='utf-8').startswith(C+'\n'):
 cfg=(HOME/'.codex/config.toml').read_text(encoding='utf-8')
 if 'model_instructions_file = "/home/chris/.codex/norcal-boot-current.md"' not in cfg: errs.append('Codex model_instructions_file not configured')
 runtime=(HOME/'.hermes/config.yaml').read_text(encoding='utf-8')
-if 'gauntlet_enforcement: true' not in runtime: errs.append('North Caledonia live config does not enable kanban.gauntlet_enforcement')
+# Selective enforcement (2026-09-07). Board-wide `gauntlet_enforcement: true`
+# is no longer the contract: investigations and diagnostics are deliberately
+# ungoverned, because governing them turned every non-converging question into
+# a verifier chain (t_0ce21cbe produced 59 verifier cards). What must hold
+# instead is stricter than the flag ever was -- the flag guaranteed
+# verification, never brakes.
+_kdb_path = REPO/'hermes_cli/kanban_db.py'
+_kdb = _kdb_path.read_text(encoding='utf-8') if _kdb_path.exists() else ''
+if '_objective_lineage_members' not in _kdb:
+    errs.append('universal objective attempt ceiling is missing: ungoverned work would retry without bound')
+if 'if _gauntlet_objective_scoped(' in _kdb:
+    errs.append('attempt ceiling is still coupled to Gauntlet enforcement; exempting work from verification would exempt it from having brakes')
+if 'ControlPlaneAdmissionError' not in _kdb:
+    errs.append('control-plane admission control is missing: automation could reopen Gauntlet construction unsupervised')
+if 'gauntlet_default_for_subject' not in _kdb:
+    errs.append('selective enforcement classifier is missing: deliverables would inherit the board default instead of being governed on their own merits')
+if 'gauntlet_objective_attempt_limit' not in runtime:
+    errs.append('North Caledonia live config sets no kanban.gauntlet_objective_attempt_limit')
 session_src=(HERE/'claude-session-start-gate.py').read_text(encoding='utf-8')
 claude_src=(HERE/'claude-boot-context').read_text(encoding='utf-8')
 codex_src=(HERE/'codex-boot').read_text(encoding='utf-8')
@@ -26,7 +44,6 @@ if '^BOOT STATUS: COMPLETE\\s*$' not in helper_src:
 # prompt through the shared chokepoint, which reuses the same exact-line parser above. They
 # previously judged boot success by exit code alone, and the generator exits 0 on a degraded
 # boot unless --gate-exit-code is passed, so Erika alone failed open.
-REPO=HERE.parents[1]
 norcal_boot_src=(REPO/'hermes_cli/norcal_boot.py').read_text(encoding='utf-8') if (REPO/'hermes_cli/norcal_boot.py').exists() else ''
 if 'shared_boot_complete' not in norcal_boot_src:
     errs.append('Hermes session boot chokepoint does not use the canonical exact shared boot-state parser')
