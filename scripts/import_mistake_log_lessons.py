@@ -73,6 +73,10 @@ PROVENANCE_PREFIX = "mistakelog:"
 
 ROW_RE = re.compile(r"^\| (\d{4}-\d{2}-\d{2}) \|")
 
+#: A well-formed row splits to exactly this many fragments:
+#: '' | date | what | rule | resolution | account | ''
+EXPECTED_CELLS = 7
+
 
 def split_cells(line: str) -> list[str]:
     """Split a markdown row on unescaped pipes.
@@ -101,25 +105,41 @@ def truncate(text: str, limit: int = MAX_RULE_CHARS) -> str:
     return cut.rstrip() + " […]"
 
 
-def parse_rows(path: Path) -> list[dict]:
-    """Extract (date, rule, resolution, account) for every indexed mistake."""
+def parse_rows(path: Path, skipped: list | None = None) -> list[dict]:
+    """Extract (date, rule, resolution, account) for every indexed mistake.
+
+    ``skipped`` collects ``(line_number, cell_count)`` for each row refused
+    for having an unexpected width, so the caller can report them loudly
+    instead of letting a malformed row vanish silently.
+    """
     out: list[dict] = []
+    if skipped is None:
+        skipped = []
     for lineno, line in enumerate(path.read_text().split("\n"), 1):
         m = ROW_RE.match(line)
         if not m:
             continue
         cells = split_cells(line.rstrip())
-        # | date | what | rule | resolution | account |  -> 7 fragments, but a
-        # row containing unescaped pipes yields more. The last content cell is
-        # always the account and the third is always the rule, so index from
-        # both ends rather than assuming a width.
-        if len(cells) < 6:
+        # STRICT: exactly ``| date | what | rule | resolution | account |``,
+        # which splits to EXPECTED_CELLS fragments (leading/trailing empties
+        # included).
+        #
+        # Indexing from either end is a guess, and both guesses have already
+        # been wrong on this file. From the START, an unescaped pipe in the
+        # "what" cell shifts the rule. From the END, a row still in the OLD
+        # 4-column format (no resolution column) puts the rule index on "what"
+        # -- which happened: another session appended one and its narrative
+        # imported as a rule. A pipe inside the rule cell breaks the end-index
+        # too.
+        #
+        # No indexing scheme survives an unknown width, so a row of unexpected
+        # width is REFUSED and reported rather than guessed at. These rows
+        # become candidate rules an operator may approve into binding force;
+        # importing the wrong cell is worse in every case than importing
+        # nothing and saying so out loud.
+        if len(cells) != EXPECTED_CELLS:
+            skipped.append((lineno, len(cells)))
             continue
-        # Index from the END, never the start. Extra unescaped pipes inside the
-        # "what went wrong" cell inflate the middle of the row -- three rows in
-        # the live file do this -- and a fixed index of 3 then reads a fragment
-        # of the wrong cell as the rule. Caught by the test before it wrote
-        # "grep -i hermes`.**" into the board as a binding-candidate rule.
         rule = strip_markdown(cells[-4])
         if not rule:
             continue
@@ -165,7 +185,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"board not found: {args.db}", file=sys.stderr)
         return 2
 
-    rows = parse_rows(args.log)
+    skipped: list = []
+    rows = parse_rows(args.log, skipped)
     if not rows:
         print("no indexed mistake rows found — refusing to proceed", file=sys.stderr)
         return 1
@@ -186,6 +207,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rows parsed : {len(rows)}")
         print(f"already imported: {len(seen)}")
         print(f"to import   : {len(by_id)}")
+        if skipped:
+            print(
+                f"\nSKIPPED {len(skipped)} malformed row(s) — fix the table, "
+                f"do not guess at them:"
+            )
+            for ln, n in skipped:
+                print(f"  line {ln}: {n} cells, expected {EXPECTED_CELLS}")
 
         if not args.apply:
             print("\n--- DRY RUN (pass --apply to write) ---")

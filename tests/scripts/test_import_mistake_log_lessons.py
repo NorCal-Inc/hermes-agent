@@ -78,19 +78,48 @@ class TestParsing:
         assert rows[0]["resolution"] == "Fixed by Z."
         assert rows[0]["date"] == "2026-09-07"
 
-    def test_unescaped_pipes_in_content_do_not_shift_columns(self, tmp_path):
-        """Four rows in the live file contain `env | grep`.
-
-        A naive ``.split('|')`` reads the wrong cell as the rule and would
-        import garbage as a binding-candidate rule.
-        """
+    def test_escaped_pipes_in_content_keep_the_row_well_formed(self, tmp_path):
+        """The correct way to write `env | grep` in a cell is to escape it."""
         row = (
-            "| 2026-09-07 | **Ran `env | grep -i hermes`.** "
+            "| 2026-09-07 | **Ran `env \\| grep -i hermes`.** "
             "| **Never dump the environment.** | Used cut -d= -f1. | `note.md` |"
         )
         rows = imp.parse_rows(_log(tmp_path, row))
         assert len(rows) == 1
         assert rows[0]["rule"] == "Never dump the environment."
+
+    def test_unescaped_pipe_row_is_refused_not_guessed_at(self, tmp_path):
+        """An unescaped pipe makes the width ambiguous, so the row is skipped.
+
+        Indexing from either end is a guess and both guesses have been wrong on
+        the live file. These rows become candidate rules an operator may approve
+        into binding force, so importing the wrong cell is worse than importing
+        nothing — provided the skip is reported, which is what ``skipped`` is.
+        """
+        row = (
+            "| 2026-09-07 | **Ran `env | grep -i hermes`.** "
+            "| **Never dump the environment.** | Used cut -d= -f1. | `note.md` |"
+        )
+        skipped = []
+        rows = imp.parse_rows(_log(tmp_path, row), skipped)
+        assert rows == []
+        assert len(skipped) == 1
+        assert skipped[0][1] != imp.EXPECTED_CELLS
+
+    def test_old_four_column_row_is_refused(self, tmp_path):
+        """The failure that actually happened.
+
+        A row appended in the pre-resolution 4-column format made the
+        end-relative rule index land on the "what went wrong" narrative, and
+        that narrative was imported as a rule.
+        """
+        row = "| 2026-09-07 | **Something broke.** | **Check X before Y.** | `note.md` |"
+        skipped = []
+        rows = imp.parse_rows(_log(tmp_path, row), skipped)
+        assert rows == []
+        # line 5: the header block above is four lines. The reported line
+        # number is what an operator uses to find and fix the row.
+        assert skipped == [(5, 6)]
 
     def test_rows_without_a_rule_are_skipped(self, tmp_path):
         rows = imp.parse_rows(_log(tmp_path, "| 2026-09-07 | broke | | | `n.md` |"))
