@@ -40,7 +40,41 @@ ctx = str(payload.get('hookSpecificOutput', {}).get('additionalContext') or '')
 claude_complete = bool(re.search(r'(?m)^CLAUDE BOOT STATUS: COMPLETE\s*$', ctx))
 shared_loaded = '<shared-boot-state>' in ctx
 shared_complete = bool(shared_loaded and shared_boot_complete(ctx))
-complete = bool(sid and claude_complete and shared_complete and (proc is None or proc.returncode == 0))
+
+# Boot parity. ``verify.py`` asserts the boot plumbing itself: that the four
+# entry points in ~/.local/bin still resolve into the canonical boot dir, that
+# every boot-state parser is exact-line anchored, that Erika's two session
+# paths judge boot through the shared chokepoint rather than an exit code, and
+# that the live attempt ceiling / admission control / selective-enforcement
+# classifier are present and decoupled.
+#
+# It had ZERO callers, so none of that was checked at session start while
+# PR #4 kept adding assertions to it. Run it here, as a gate term.
+#
+# Fails CLOSED for ordinary work (``complete``) but is deliberately NOT a term
+# in ``recovery_only`` below: a parity failure is exactly what a recovery
+# session is authorized to repair, and gating recovery on it would reproduce
+# the circular deadlock doctrine 2.27 was written to remove.
+parity_ok = False
+parity_detail = 'not run'
+try:
+    _verify = Path(__file__).resolve().parent / 'verify.py'
+    _vp = subprocess.run(
+        [sys.executable, str(_verify)], capture_output=True, text=True, timeout=120
+    )
+    _vout = ((_vp.stdout or '') + '\n' + (_vp.stderr or '')).strip()
+    # Exact-line anchored, per doctrine 2.27: a prose mention of the pass
+    # string anywhere in the output is not evidence that parity passed.
+    parity_ok = _vp.returncode == 0 and bool(
+        re.search(r'(?m)^BOOT PARITY: PASS\s*$', _vout)
+    )
+    if not parity_ok:
+        _errs = [ln for ln in _vout.splitlines() if ln.startswith('ERROR:')]
+        parity_detail = '; '.join(_errs) if _errs else f'rc={_vp.returncode}'
+except Exception as exc:
+    parity_detail = f'boot parity check did not run: {exc}'
+
+complete = bool(sid and claude_complete and shared_complete and parity_ok and (proc is None or proc.returncode == 0))
 recovery_id = recovery_task_id()
 recovery_authorized, recovery_reason = validate_recovery_task(recovery_id) if recovery_id else (False, 'not requested')
 # Claude role rules must be synchronized even for recovery. The shared gate itself may
@@ -61,6 +95,8 @@ state = {
     'recovery_authority_reason': recovery_reason,
     'claude_boot_complete': claude_complete,
     'shared_boot_complete': shared_complete,
+    'boot_parity_ok': parity_ok,
+    'boot_parity_detail': parity_detail,
     'boot_returncode': None if proc is None else proc.returncode,
 }
 if sid:
@@ -85,6 +121,7 @@ elif not complete:
     payload['systemMessage'] = (msg + ' | HARD GATE ACTIVE: all tools denied until a fresh session reaches COMPLETE').strip(' |')
     hso = payload.setdefault('hookSpecificOutput', {})
     existing = str(hso.get('additionalContext') or '')
-    hso['additionalContext'] = existing + '\n\n<HARD-GATE>INCOMPLETE BOOT. DO NOT EXECUTE TOOLS. START A FRESH SESSION AFTER THE NAMED BOOT FAILURE IS FIXED.</HARD-GATE>'
+    named = '' if parity_ok else f'\nFAILED GATE: boot parity — {parity_detail}'
+    hso['additionalContext'] = existing + '\n\n<HARD-GATE>INCOMPLETE BOOT. DO NOT EXECUTE TOOLS. START A FRESH SESSION AFTER THE NAMED BOOT FAILURE IS FIXED.' + named + '</HARD-GATE>'
 
 print(json.dumps(payload))
