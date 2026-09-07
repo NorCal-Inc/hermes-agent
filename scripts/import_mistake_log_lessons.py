@@ -104,7 +104,8 @@ def truncate(text: str, limit: int = MAX_RULE_CHARS) -> str:
 def parse_rows(path: Path) -> list[dict]:
     """Extract (date, rule, resolution, account) for every indexed mistake."""
     out: list[dict] = []
-    for lineno, line in enumerate(path.read_text().split("\n"), 1):
+    text = path.read_text(encoding="utf-8")
+    for lineno, line in enumerate(text.split("\n"), 1):
         m = ROW_RE.match(line)
         if not m:
             continue
