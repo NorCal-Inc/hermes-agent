@@ -16465,10 +16465,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            self._last_chat_result = result
             return response
             
         except Exception as e:
             print(f"Error: {e}")
+            self._last_chat_result = {"failed": True, "error": str(e)}
             return None
         finally:
             # Stop the ambient thinking sound the moment the turn ends —
@@ -20862,6 +20864,20 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _chat_result = getattr(cli, "_last_chat_result", None)
+                if (
+                    os.environ.get("HERMES_KANBAN_TASK")
+                    and isinstance(_chat_result, dict)
+                    and _chat_result.get("failed")
+                    and _chat_result.get("failure_reason") in ("rate_limit", "billing")
+                ):
+                    try:
+                        from hermes_cli.kanban_db import (
+                            KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                        )
+                    except Exception:
+                        _RL_CODE = 1
+                    raise SystemExit(_RL_CODE)
         finally:
             _finalize_single_query(cli)
         return

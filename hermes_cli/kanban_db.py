@@ -517,10 +517,27 @@ CREATION_CAUSE_RECOVERY = "recovery"
 #: An independent-verification card spawned for a subject's evidence packet.
 CREATION_CAUSE_VERIFICATION = "verification"
 CREATION_CAUSE_UNKNOWN = "unknown"
+#: The transient cause a repair card wears between its INSERT and the moment
+#: its linkage is sealed — both inside one transaction, so no committed row
+#: should ever carry it.
+#:
+#: It exists because SQLite has no deferred constraints. "A recovery card has
+#: a subject and an umbrella" is a COMMIT-time statement, and a BEFORE INSERT
+#: trigger cannot check relations that the same transaction has not written
+#: yet. Splitting creation into insert-then-seal moves the check to an UPDATE,
+#: which CAN see the relations, and lets the storage layer refuse a pre-sealed
+#: INSERT outright. See the GOVERNANCE INTEGRITY TRIGGERS block.
+#:
+#: A committed row carrying this cause therefore means a seal was interrupted
+#: in a way that should be impossible; :func:`orphaned_repair_tasks` reports
+#: those rows rather than filtering them out, so the impossible case is
+#: countable instead of invisible.
+CREATION_CAUSE_RECOVERY_PENDING = "recovery_pending"
 VALID_CREATION_CAUSES = {
     CREATION_CAUSE_MANUAL_RELAY,
     CREATION_CAUSE_AUTOMATED,
     CREATION_CAUSE_RECOVERY,
+    CREATION_CAUSE_RECOVERY_PENDING,
     CREATION_CAUSE_VERIFICATION,
     CREATION_CAUSE_UNKNOWN,
 }
@@ -8180,6 +8197,142 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+
+GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT = 6
+
+
+def gauntlet_objective_attempt_limit() -> int:
+    """Total implementation+review+verifier run ceiling for one Gauntlet objective."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "gauntlet_objective_attempt_limit", GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
+        )
+        value = int(raw)
+        return value if value >= 1 else GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
+    except Exception:
+        return GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
+
+
+def _gauntlet_objective_root(conn: sqlite3.Connection, task_id: str) -> str:
+    """Map a verifier child back to the subject whose objective it serves."""
+    row = conn.execute(
+        "SELECT executor_lane FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
+        parent = conn.execute(
+            "SELECT l.parent_id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? ORDER BY p.created_at ASC LIMIT 1", (task_id,)
+        ).fetchone()
+        if parent is not None:
+            return str(parent["parent_id"])
+    return task_id
+
+
+def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count every run against one subject, including direct verifier children.
+
+    Timeouts, controller loss, review runs, verifier FAILs and successful runs all
+    count.  This deliberately ignores mechanism-specific failure classification:
+    the budget answers only "how many times did we spend capacity on this same
+    objective?".
+    """
+    root = _gauntlet_objective_root(conn, task_id)
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM task_runs r WHERE r.task_id=? OR r.task_id IN ("
+        " SELECT c.id FROM task_links l JOIN tasks c ON c.id=l.child_id "
+        " WHERE l.parent_id=? AND c.executor_lane=?"
+        ")",
+        (root, root, EXECUTOR_LANE_CODEX_VERIFY),
+    ).fetchone()[0])
+
+
+def _gauntlet_objective_scoped(conn: sqlite3.Connection, task_id: str) -> bool:
+    root = _gauntlet_objective_root(conn, task_id)
+    return gauntlet_required(conn, root)
+
+
+def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -> tuple[bool, int, int, str]:
+    root = _gauntlet_objective_root(conn, task_id)
+    limit = gauntlet_objective_attempt_limit()
+    attempts = gauntlet_objective_attempts(conn, root)
+    return attempts >= limit, attempts, limit, root
+
+
+def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> None:
+    reached, attempts, limit, root = _objective_attempt_ceiling_reached(conn, task_id)
+    if not reached:
+        return
+    reason = (
+        f"Gauntlet objective attempt ceiling reached: {attempts} total runs "
+        f"against objective {root} (limit {limit}); operator decision required."
+    )
+    for tid in dict.fromkeys((root, task_id)):
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None or row["status"] in ("done", "archived", "failed", "cancelled"):
+            continue
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, last_failure_error=? "
+            "WHERE id=?", (reason, tid),
+        )
+        _append_event(conn, tid, "objective_attempt_ceiling_reached", {
+            "objective": root, "attempts": attempts, "limit": limit,
+        })
+        _append_event(conn, tid, "blocked", {
+            "reason": reason, "kind": "needs_input", "source": "objective_attempt_ceiling"
+        })
+
+
+def gauntlet_canonical_ref() -> str:
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "gauntlet_canonical_ref", "origin/main"
+        )
+        return str(raw).strip() or "origin/main"
+    except Exception:
+        return "origin/main"
+
+
+def _gauntlet_worktree_integrated(conn: sqlite3.Connection, task_id: str) -> tuple[bool, str]:
+    """Prove a Gauntlet worktree's commits are integrated in the canonical ref.
+
+    Direct ancestry passes.  Cherry-picks also pass when ``git cherry`` marks
+    every worktree-only commit as patch-equivalent (``-``). Any ``+`` is an
+    unintegrated commit and fails closed.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None or row["workspace_kind"] != "worktree":
+        return True, "not a worktree task"
+    path = row["workspace_path"]
+    if not path:
+        return False, "worktree task has no workspace_path"
+    ref = gauntlet_canonical_ref()
+    try:
+        anc = subprocess.run(
+            ["git", "-C", str(path), "merge-base", "--is-ancestor", "HEAD", ref],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if anc.returncode == 0:
+            return True, f"HEAD is ancestor of {ref}"
+        cherry = subprocess.run(
+            ["git", "-C", str(path), "cherry", ref, "HEAD"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        if cherry.returncode != 0:
+            return False, (cherry.stderr or cherry.stdout or "git cherry failed").strip()[:500]
+        lines = [ln.strip() for ln in cherry.stdout.splitlines() if ln.strip()]
+        if all(ln.startswith("-") for ln in lines):
+            return True, f"all worktree-only commits are patch-equivalent on {ref}"
+        missing = [ln for ln in lines if ln.startswith("+")]
+        return False, f"unintegrated commits relative to {ref}: " + ", ".join(missing[:5])
+    except Exception as exc:
+        return False, f"canonical integration probe failed: {type(exc).__name__}: {exc}"
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8196,6 +8349,11 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _gauntlet_objective_scoped(conn, task_id):
+            reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
+            if reached:
+                _block_objective_attempt_ceiling(conn, task_id)
+                return None
         # Structural invariant: never transition ready -> running while a
         # parent dependency is unsatisfied. This is the single enforcement
         # point regardless of which writer (create_task, link_tasks,
@@ -8333,6 +8491,11 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _gauntlet_objective_scoped(conn, task_id):
+            reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
+            if reached:
+                _block_objective_attempt_ceiling(conn, task_id)
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -8474,6 +8637,52 @@ def claim_review_task(
         # not the next one.
         recompute_ready(conn)
     return None
+
+
+def defer_rate_limited_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int] = None,
+    execution_id: Optional[str] = None,
+) -> bool:
+    """Neutral-return a live task whose provider capacity is exhausted.
+
+    This is the in-process counterpart of the worker EX_TEMPFAIL reap path:
+    preserve failure counters, close the active run as ``rate_limited``,
+    release the claim back to its source phase, and stamp the quota reason so
+    the respawn guard can cool the task down instead of burning retries.
+    """
+    text = (reason or "provider capacity exhausted").strip()[:500]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] is None:
+            return False
+        run_id = int(row["current_run_id"])
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        retry_status = _retry_status_for_run(conn, task_id, run_id)
+        meta = {"retry_status": retry_status, "provider_capacity": True}
+        if execution_id:
+            meta["execution_id"] = execution_id
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, last_failure_error = ? WHERE id = ? AND status = 'running'",
+            (retry_status, text, task_id),
+        )
+        _end_run(
+            conn, task_id, outcome="rate_limited", status="rate_limited",
+            error=text, metadata=meta,
+        )
+        _append_event(
+            conn, task_id, "rate_limited",
+            {"reason": text, **meta}, run_id=run_id,
+        )
+        return True
 
 
 def _retry_status_for_run(
@@ -9990,6 +10199,12 @@ def _ensure_independent_verifier_child(
     durable evidence changes what "falsifiable" means for delegation cards,
     and that is a governance decision, not a code bypass.
     """
+    if gauntlet_required(conn, subject_id):
+        reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, subject_id)
+        if reached:
+            with write_txn(conn):
+                _block_objective_attempt_ceiling(conn, subject_id)
+            return None
     existing = _open_verifier_child(conn, subject_id)
     if existing is not None:
         # Every Gauntlet verifier is itself Gauntlet work and therefore owns
@@ -10793,6 +11008,141 @@ def _consume_historical_orphan_verdict(
     return subject_id
 
 
+
+def reconcile_stranded_direct_codex_verdicts(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """Recover completed caller-owned Codex verifier results stranded off-ledger.
+
+    Recovery-lane verifier executions intentionally use ``route_task=False``
+    because their caller owns the richer post-execution handoff. If that caller
+    dies or times out after Codex finishes, the execution and its task-scoped
+    verdict artifact remain durable while the subject can be left in
+    triage/blocked with an unchanged pending verification phase.
+
+    Consume only an exact, fail-closed match: Gauntlet subject with a pending
+    phase and no live run; completed exit-0 ``codex.verify`` execution with
+    ``route_task=0``; and a verdict artifact under the subject workspace that
+    contains that exact execution id and ends with ATLAS_VERDICT PASS/FAIL.
+    """
+    reconciled: list[str] = []
+    rows = conn.execute(
+        "SELECT id, status, verification_state, current_run_id, workspace_path, "
+        "       terminal_disposition "
+        "FROM tasks WHERE gauntlet_enforced = 1 AND verification_state = ? "
+        "AND status IN ('review','triage','blocked') AND current_run_id IS NULL "
+        "AND terminal_disposition IS NULL",
+        (VERIFICATION_PENDING,),
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        workspace = row["workspace_path"]
+        if not workspace:
+            continue
+        root = Path(workspace)
+        try:
+            root_resolved = root.resolve(strict=True)
+        except OSError:
+            continue
+        executions = conn.execute(
+            "SELECT id, ended_at FROM executions WHERE task_id = ? "
+            "AND command_class = 'codex.verify' AND status = 'completed' "
+            "AND exit_code = 0 AND route_task = 0 "
+            "ORDER BY ended_at DESC, created_at DESC",
+            (task_id,),
+        ).fetchall()
+        consumed = False
+        for execution in executions:
+            execution_id = str(execution["id"])
+            candidates = sorted(
+                root_resolved.glob("CODEX-VERIFY-VERDICT*.md"),
+                key=lambda x: x.stat().st_mtime if x.exists() else 0,
+                reverse=True,
+            )
+            for artifact in candidates:
+                try:
+                    resolved = artifact.resolve(strict=True)
+                    resolved.relative_to(root_resolved)
+                    text = resolved.read_text(encoding="utf-8", errors="replace")
+                except (OSError, ValueError):
+                    continue
+                if execution_id not in text:
+                    continue
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                verdict_line = next(
+                    (ln for ln in reversed(lines)
+                     if ln in ("ATLAS_VERDICT: PASS", "ATLAS_VERDICT: FAIL")),
+                    None,
+                )
+                if verdict_line is None:
+                    continue
+                passed = verdict_line.endswith("PASS")
+
+                # Restore only the verification lane. Do not clear the pending
+                # phase, failure history, block history, or evidence.
+                if row["status"] != "review":
+                    with write_txn(conn):
+                        cur = conn.execute(
+                            "UPDATE tasks SET status = 'review', block_kind = NULL "
+                            "WHERE id = ? AND status IN ('triage','blocked') "
+                            "AND verification_state = ? AND current_run_id IS NULL "
+                            "AND terminal_disposition IS NULL",
+                            (task_id, VERIFICATION_PENDING),
+                        )
+                        if cur.rowcount != 1:
+                            continue
+                        _append_event(
+                            conn, task_id, "verification_lane_restored",
+                            {"execution_id": execution_id,
+                             "source": "stranded_direct_codex_verdict"},
+                        )
+
+                evidence = {
+                    "source": "stranded_direct_codex_verdict_reconciliation",
+                    "execution_id": execution_id,
+                    "command_class": "codex.verify",
+                    "exit_code": 0,
+                    "artifact": str(resolved),
+                }
+                ok, detail = record_verification(
+                    conn,
+                    task_id,
+                    passed=passed,
+                    verifier=f"codex_verify:{execution_id}",
+                    evidence=evidence,
+                    reason=(None if passed else
+                            f"direct Codex verifier {execution_id} returned FAIL"),
+                )
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "direct_codex_verdict_consumed",
+                        {"execution_id": execution_id,
+                         "verdict": "PASS" if passed else "FAIL",
+                         "artifact": str(resolved),
+                         "recorded": bool(ok),
+                         "detail": detail},
+                    )
+                if not ok:
+                    consumed = True
+                    break
+                if passed and detail == VERIFICATION_VERIFIED:
+                    complete_task(
+                        conn,
+                        task_id,
+                        summary=(
+                            f"Recovered independent Codex PASS from execution "
+                            f"{execution_id}; pending subject finalized through "
+                            "the verification ledger."
+                        ),
+                    )
+                reconciled.append(task_id)
+                consumed = True
+                break
+            if consumed:
+                break
+    return reconciled
+
+
 def sweep_orphan_verifiers(
     conn: sqlite3.Connection, *, now: Optional[int] = None
 ) -> list[str]:
@@ -11513,6 +11863,17 @@ def complete_task(
     # makes it mechanical.
     require_verified = gauntlet_required(conn, task_id)
     if require_verified:
+        integrated, integration_detail = _gauntlet_worktree_integrated(conn, task_id)
+        if not integrated:
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_blocked_not_integrated", {
+                    "canonical_ref": gauntlet_canonical_ref(),
+                    "detail": integration_detail,
+                })
+            raise VerificationRequiredError(
+                task_id, "integration_pending", None,
+                regression_detail=integration_detail,
+            )
         vrow = conn.execute(
             "SELECT status, verification_state FROM tasks WHERE id = ?",
             (task_id,),
@@ -11613,6 +11974,9 @@ def complete_task(
         # been flipped, or the task re-flagged, since the pre-check above.
         require_verified = gauntlet_required(conn, task_id)
         if require_verified:
+            integrated, _integration_detail = _gauntlet_worktree_integrated(conn, task_id)
+            if not integrated:
+                return False
             head = conn.execute(
                 "SELECT verification_state FROM tasks WHERE id = ?",
                 (task_id,),
@@ -16042,6 +16406,12 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 300
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Gateway-scoped workers are not direct children of the dispatcher. The
+# dispatcher owns the systemd-run launcher process while Kanban stores the
+# scoped worker PID. Keep the launcher handle mapped to the stored PID so the
+# launcher exit status can be attributed to the task worker during reap.
+_scoped_worker_launchers: "dict[int, tuple[int, subprocess.Popen]]" = {}
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -16110,12 +16480,31 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
 
 def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children of this process without blocking.
+    """Reap worker exits and preserve scoped-worker exit attribution.
 
-    Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    Direct workers are reaped with ``waitpid``. Gateway-scoped workers are
+    launched through ``systemd-run --scope``: Kanban stores the scoped worker
+    PID, but the dispatcher can only wait on the ``systemd-run`` launcher.
+    Poll retained launcher handles first and record their return code against
+    the stored worker PID so rate-limit and crash classification remains exact.
     """
     reaped: "list[int]" = []
+
+    for launcher_pid, (worker_pid, proc) in list(_scoped_worker_launchers.items()):
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is None:
+            continue
+        if rc >= 0:
+            raw_status = int(rc) << 8
+        else:
+            raw_status = int(-rc) & 0x7F
+        _record_worker_exit(worker_pid, raw_status)
+        _scoped_worker_launchers.pop(launcher_pid, None)
+        reaped.append(worker_pid)
+
     if os.name != "nt":
         try:
             while True:
@@ -18524,6 +18913,14 @@ def _dispatch_once_locked(
             "kanban dispatch: orphan verifier sweep failed (tick continues)"
         )
 
+    try:
+        reconcile_stranded_direct_codex_verdicts(conn)
+    except Exception:
+        _log.exception(
+            "kanban dispatch: direct Codex verdict reconciliation failed "
+            "(tick continues)"
+        )
+
     # Execution-supervisor reconciliation. Runs in the same pre-early-return
     # position and for a sharper version of the same reason: a saturated host
     # is exactly when a controller dies mid-execution, and the orphan it
@@ -19489,6 +19886,7 @@ def _spawn_gateway_scoped_worker(
                         "systemd scope worker wrote an invalid PID"
                     ) from exc
                 if pid > 1:
+                    _scoped_worker_launchers[int(launcher.pid)] = (pid, launcher)
                     return pid
                 raise RuntimeError("systemd scope worker wrote an invalid PID")
             rc = launcher.poll()

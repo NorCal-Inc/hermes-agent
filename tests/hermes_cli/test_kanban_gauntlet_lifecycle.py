@@ -2027,3 +2027,95 @@ class TestSelfReviewBlockedImplementationHandoff:
             assert kb.get_task(conn, verifier).status == "ready"
             assert kb.get_task(conn, implementation).status == "review"
             assert kb.get_task(conn, implementation).completed_at is None
+
+# ---------------------------------------------------------------------------
+# Objective-level spend ceiling + canonical integration gate
+# ---------------------------------------------------------------------------
+
+class TestObjectiveAttemptCeiling:
+    def test_claim_blocks_after_total_objective_attempt_budget(self, kanban_home, monkeypatch):
+        monkeypatch.setattr(kb, "gauntlet_objective_attempt_limit", lambda: 2)
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="bounded objective", assignee="default", gauntlet=True)
+            now = 1_780_000_000
+            with kb.write_txn(conn):
+                for outcome in ("timed_out", "completed"):
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                        "VALUES (?, 'default', ?, ?, ?, ?)",
+                        (tid, outcome, now, now + 1, outcome),
+                    )
+            assert kb.gauntlet_objective_attempts(conn, tid) == 2
+            assert kb.claim_task(conn, tid) is None
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked"
+            assert task.block_kind == "needs_input"
+            events = _events(conn, tid, kind="objective_attempt_ceiling_reached")
+            assert len(events) == 1
+            assert events[0][1]["attempts"] == 2
+            assert events[0][1]["limit"] == 2
+
+    def test_verifier_runs_count_against_subject_budget(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(conn, title="subject", assignee="default", gauntlet=True)
+            verifier = kb.create_task(
+                conn, title="verify", assignee="atlas", parents=[subject], gauntlet=True
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET executor_lane=? WHERE id=?",
+                    (kb.EXECUTOR_LANE_CODEX_VERIFY, verifier),
+                )
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, 'default', 'done', 1, 2, 'completed')",
+                    (subject,),
+                )
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, 'default', 'done', 3, 4, 'completed')",
+                    (verifier,),
+                )
+            assert kb.gauntlet_objective_attempts(conn, subject) == 2
+            assert kb.gauntlet_objective_attempts(conn, verifier) == 2
+
+
+class TestCanonicalIntegrationGate:
+    def test_worktree_is_rejected_until_head_reaches_canonical_ref(
+        self, kanban_home, tmp_path, monkeypatch
+    ):
+        import subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", base], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-b", "task"], cwd=repo, check=True, capture_output=True)
+        (repo / "change.txt").write_text("change\n")
+        subprocess.run(["git", "add", "change.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "task change"], cwd=repo, check=True, capture_output=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+        monkeypatch.setattr(kb, "gauntlet_canonical_ref", lambda: "origin/main")
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="code task", assignee="default", gauntlet=True,
+                workspace_kind="worktree", workspace_path=str(repo), branch_name="task",
+            )
+            ok, detail = kb._gauntlet_worktree_integrated(conn, tid)
+            assert ok is False
+            assert "unintegrated commits" in detail
+
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/main", head],
+                cwd=repo, check=True,
+            )
+            ok, detail = kb._gauntlet_worktree_integrated(conn, tid)
+            assert ok is True
+            assert "ancestor" in detail

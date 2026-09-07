@@ -459,6 +459,29 @@ def run_codex_verifier(task_id: str) -> int:
             _build_codex_verifier_prompt(task), cwd, timeout, task_id=task_id,
         )
         if not attempt.ok:
+            _capacity_text = "\n".join(
+                part for part in (attempt.stdout, attempt.stderr, attempt.error or "") if part
+            ).lower()
+            _capacity_exhausted = any(marker in _capacity_text for marker in (
+                "you've hit your usage limit",
+                "you have hit your usage limit",
+                "usage limit has been reached",
+                "usage_limit_reached",
+                "rate limit",
+                "rate_limit",
+            ))
+            if _capacity_exhausted:
+                reason = "Codex provider capacity exhausted; deferred without failure credit"
+                ok = kb.defer_rate_limited_task(
+                    conn, task_id, reason=reason, expected_run_id=expected_run_id,
+                    execution_id=attempt.execution_id,
+                )
+                if ok:
+                    kb.add_comment(
+                        conn, task_id, author="atlas-codex-lane",
+                        body=reason + (f" [execution {attempt.execution_id}]" if attempt.execution_id else ""),
+                    )
+                return 0 if ok else 1
             reason = "Codex verifier failed or timed out.\n\n" + attempt.evidence
             ok = kb.block_task(
                 conn, task_id, reason=reason, kind="needs_input",
