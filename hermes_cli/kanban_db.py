@@ -404,7 +404,20 @@ DEFAULT_GAUNTLET_STALE_REALERT_SECONDS = 14400
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "approval_required", "capability", "transient"}
+#: Set when the universal objective attempt budget is exhausted. Deliberately
+#: distinct from ``needs_input``: that means "a human must supply something the
+#: work needs"; this means "automation has spent its budget on this objective
+#: and continuing requires an operator decision". They are different events with
+#: different remedies, and an operator triaging a board must be able to tell a
+#: blocked-on-input card from a spent-budget card without reading the reason
+#: text. It is NOT a failure: the work may be perfectly healthy and merely
+#: expensive.
+BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED = "attempt_budget_exhausted"
+
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "approval_required", "capability", "transient",
+    BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED,
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -8214,19 +8227,101 @@ def gauntlet_objective_attempt_limit() -> int:
         return GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
 
 
-def _gauntlet_objective_root(conn: sqlite3.Connection, task_id: str) -> str:
-    """Map a verifier child back to the subject whose objective it serves."""
-    row = conn.execute(
-        "SELECT executor_lane FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is not None and row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
-        parent = conn.execute(
-            "SELECT l.parent_id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
-            "WHERE l.child_id=? ORDER BY p.created_at ASC LIMIT 1", (task_id,)
+#: Bound on lineage walks. A cycle is already impossible-by-construction here
+#: (``seen`` short-circuits), so this only caps pathological depth.
+_OBJECTIVE_LINEAGE_MAX_DEPTH = 16
+
+#: Max ids bound into one ``IN (...)`` below. SQLITE_LIMIT_VARIABLE_NUMBER is
+#: 32766 on this build but only 999 on older ones, and the frontier query binds
+#: each id TWICE, so 400 keeps us safe on both (400*2 = 800 < 999). The largest
+#: lineage observed on the live board is 60, so this only ever matters for a
+#: pathological graph -- but an unchunked bind would raise rather than degrade,
+#: and a safety control must not be the thing that throws.
+_LINEAGE_SQL_CHUNK = 400
+
+
+def _objective_lineage_root(conn: sqlite3.Connection, task_id: str) -> str:
+    """Walk to the root of the objective ``task_id`` is a continuation of.
+
+    Exactly two edge kinds continue the SAME objective:
+
+    * a ``codex_verify`` child -> its subject: a verifier exists only to serve
+      the subject's objective, so its runs are spent on that objective.
+    * a card that ``repairs`` X -> X: a repair is another attempt at X.
+
+    Deliberately NOT followed, because each would make one budget swallow work
+    that is not a retry:
+
+    * ``RELATION_UMBRELLA`` -- an umbrella is an ORGANISING parent. Its children
+      are separate objectives that merely share a heading. Following it would
+      give a whole project one budget of six and starve honest multi-stage work.
+    * ``RELATION_EVIDENCE`` -- documented as non-governing.
+    * plain ``task_links`` parents -- that edge is a dependency, i.e. legitimate
+      follow-on work, not another attempt at the same thing.
+
+    This distinction is the whole design: the budget must bound *replacements
+    and retries of one objective*, never *legitimate follow-on work*.
+    """
+    seen: set = set()
+    current = task_id
+    for _ in range(_OBJECTIVE_LINEAGE_MAX_DEPTH):
+        if current in seen:
+            break
+        seen.add(current)
+        row = conn.execute(
+            "SELECT executor_lane FROM tasks WHERE id = ?", (current,)
         ).fetchone()
-        if parent is not None:
-            return str(parent["parent_id"])
-    return task_id
+        if row is not None and row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
+            parent = conn.execute(
+                "SELECT l.parent_id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                "WHERE l.child_id=? ORDER BY p.created_at ASC LIMIT 1", (current,)
+            ).fetchone()
+            if parent is not None and str(parent["parent_id"]) not in seen:
+                current = str(parent["parent_id"])
+                continue
+        repaired = conn.execute(
+            "SELECT to_task_id FROM task_relations "
+            "WHERE from_task_id = ? AND relation = ? "
+            "ORDER BY created_at ASC LIMIT 1",
+            (current, RELATION_REPAIRS),
+        ).fetchone()
+        if repaired is not None and str(repaired["to_task_id"]) not in seen:
+            current = str(repaired["to_task_id"])
+            continue
+        break
+    return current
+
+
+def _objective_lineage_members(conn: sqlite3.Connection, root: str) -> set:
+    """Every card that spends the objective budget of ``root`` (root included).
+
+    The inverse of :func:`_objective_lineage_root`, walked downward, so a card
+    that spawned a replacement cannot escape the budget by being a new row.
+    """
+    members = {root}
+    frontier = [root]
+    for _ in range(_OBJECTIVE_LINEAGE_MAX_DEPTH):
+        if not frontier:
+            break
+        found: list = []
+        for i in range(0, len(frontier), _LINEAGE_SQL_CHUNK):
+            batch = frontier[i:i + _LINEAGE_SQL_CHUNK]
+            marks = ",".join("?" * len(batch))
+            rows = conn.execute(
+                f"SELECT l.child_id AS id FROM task_links l "
+                f"JOIN tasks c ON c.id = l.child_id "
+                f"WHERE l.parent_id IN ({marks}) AND c.executor_lane = ? "
+                f"UNION "
+                f"SELECT r.from_task_id AS id FROM task_relations r "
+                f"WHERE r.to_task_id IN ({marks}) AND r.relation = ?",
+                (*batch, EXECUTOR_LANE_CODEX_VERIFY, *batch, RELATION_REPAIRS),
+            ).fetchall()
+            found.extend(str(r["id"]) for r in rows)
+        nxt = [i for i in dict.fromkeys(found) if i not in members]
+        members.update(nxt)
+        frontier = nxt
+    return members
+
 
 
 def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
@@ -8237,23 +8332,28 @@ def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
     the budget answers only "how many times did we spend capacity on this same
     objective?".
     """
-    root = _gauntlet_objective_root(conn, task_id)
-    return int(conn.execute(
-        "SELECT COUNT(*) FROM task_runs r WHERE r.task_id=? OR r.task_id IN ("
-        " SELECT c.id FROM task_links l JOIN tasks c ON c.id=l.child_id "
-        " WHERE l.parent_id=? AND c.executor_lane=?"
-        ")",
-        (root, root, EXECUTOR_LANE_CODEX_VERIFY),
-    ).fetchone()[0])
-
-
-def _gauntlet_objective_scoped(conn: sqlite3.Connection, task_id: str) -> bool:
-    root = _gauntlet_objective_root(conn, task_id)
-    return gauntlet_required(conn, root)
+    root = _objective_lineage_root(conn, task_id)
+    members = sorted(_objective_lineage_members(conn, root))
+    total = 0
+    for i in range(0, len(members), _LINEAGE_SQL_CHUNK):
+        batch = members[i:i + _LINEAGE_SQL_CHUNK]
+        marks = ",".join("?" * len(batch))
+        total += int(conn.execute(
+            f"SELECT COUNT(*) FROM task_runs r WHERE r.task_id IN ({marks})",
+            tuple(batch),
+        ).fetchone()[0])
+    return total
 
 
 def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -> tuple[bool, int, int, str]:
-    root = _gauntlet_objective_root(conn, task_id)
+    """Universal. Applies to EVERY task, Gauntlet-governed or not.
+
+    Retry protection is a safety control; Gauntlet verification is a governance
+    policy. Coupling them meant exempting work from verification also exempted
+    it from having any brakes, which is how an ungoverned task could retry
+    without bound. The two are now independent.
+    """
+    root = _objective_lineage_root(conn, task_id)
     limit = gauntlet_objective_attempt_limit()
     attempts = gauntlet_objective_attempts(conn, root)
     return attempts >= limit, attempts, limit, root
@@ -8264,23 +8364,27 @@ def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> 
     if not reached:
         return
     reason = (
-        f"Gauntlet objective attempt ceiling reached: {attempts} total runs "
-        f"against objective {root} (limit {limit}); operator decision required."
+        f"ATTEMPT_BUDGET_EXHAUSTED: {attempts} total runs against objective "
+        f"lineage {root} (limit {limit}). This is NOT a failure verdict -- "
+        f"automation has spent its budget on this objective and continuing "
+        f"requires an operator decision."
     )
     for tid in dict.fromkeys((root, task_id)):
         row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
         if row is None or row["status"] in ("done", "archived", "failed", "cancelled"):
             continue
         conn.execute(
-            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "UPDATE tasks SET status='blocked', block_kind=?, "
             "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, last_failure_error=? "
-            "WHERE id=?", (reason, tid),
+            "WHERE id=?", (BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED, reason, tid),
         )
         _append_event(conn, tid, "objective_attempt_ceiling_reached", {
             "objective": root, "attempts": attempts, "limit": limit,
         })
         _append_event(conn, tid, "blocked", {
-            "reason": reason, "kind": "needs_input", "source": "objective_attempt_ceiling"
+            "reason": reason,
+            "kind": BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED,
+            "source": "objective_attempt_ceiling",
         })
 
 
@@ -8349,11 +8453,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        if _gauntlet_objective_scoped(conn, task_id):
-            reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
-            if reached:
-                _block_objective_attempt_ceiling(conn, task_id)
-                return None
+        # Universal safety control -- deliberately NOT gated on
+        # ``_gauntlet_objective_scoped``. Every task gets brakes.
+        reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
+        if reached:
+            _block_objective_attempt_ceiling(conn, task_id)
+            return None
         # Structural invariant: never transition ready -> running while a
         # parent dependency is unsatisfied. This is the single enforcement
         # point regardless of which writer (create_task, link_tasks,
@@ -8491,11 +8596,11 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        if _gauntlet_objective_scoped(conn, task_id):
-            reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
-            if reached:
-                _block_objective_attempt_ceiling(conn, task_id)
-                return None
+        # Universal safety control -- see claim_task.
+        reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
+        if reached:
+            _block_objective_attempt_ceiling(conn, task_id)
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -10199,12 +10304,14 @@ def _ensure_independent_verifier_child(
     durable evidence changes what "falsifiable" means for delegation cards,
     and that is a governance decision, not a code bypass.
     """
-    if gauntlet_required(conn, subject_id):
-        reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, subject_id)
-        if reached:
-            with write_txn(conn):
-                _block_objective_attempt_ceiling(conn, subject_id)
-            return None
+    # Universal safety control -- see claim_task. Spawning another verifier is
+    # itself an attempt against the subject's objective, so the budget is
+    # checked before the spawn regardless of enforcement policy.
+    reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, subject_id)
+    if reached:
+        with write_txn(conn):
+            _block_objective_attempt_ceiling(conn, subject_id)
+        return None
     existing = _open_verifier_child(conn, subject_id)
     if existing is not None:
         # Every Gauntlet verifier is itself Gauntlet work and therefore owns

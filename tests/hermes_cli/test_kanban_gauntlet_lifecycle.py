@@ -2049,7 +2049,9 @@ class TestObjectiveAttemptCeiling:
             assert kb.claim_task(conn, tid) is None
             task = kb.get_task(conn, tid)
             assert task.status == "blocked"
-            assert task.block_kind == "needs_input"
+            # #5: an exhausted budget is NOT an ordinary needs-input block.
+            assert task.block_kind == kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED
+            assert task.block_kind != "needs_input"
             events = _events(conn, tid, kind="objective_attempt_ceiling_reached")
             assert len(events) == 1
             assert events[0][1]["attempts"] == 2
@@ -2078,6 +2080,139 @@ class TestObjectiveAttemptCeiling:
                 )
             assert kb.gauntlet_objective_attempts(conn, subject) == 2
             assert kb.gauntlet_objective_attempts(conn, verifier) == 2
+
+
+    # -- #1: the ceiling is a SAFETY control, not a governance policy --------
+
+    def test_ceiling_applies_to_ungoverned_task(self, kanban_home, monkeypatch):
+        """A task with gauntlet=False still gets brakes.
+
+        Regression for the coupling that let an ungoverned task retry without
+        bound: the ceiling used to sit behind ``_gauntlet_objective_scoped``,
+        so exempting work from verification also exempted it from any limit.
+        """
+        monkeypatch.setattr(kb, "gauntlet_objective_attempt_limit", lambda: 2)
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="ungoverned", assignee="default", gauntlet=False
+            )
+            assert kb.gauntlet_required(conn, tid) is False
+            with kb.write_txn(conn):
+                for i in range(2):
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                        "VALUES (?, 'default', 'timed_out', ?, ?, 'timed_out')",
+                        (tid, 100 + i, 101 + i),
+                    )
+            assert kb.claim_task(conn, tid) is None
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked"
+            assert task.block_kind == kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED
+
+    def test_repair_runs_count_against_the_repaired_objective(self, kanban_home, monkeypatch):
+        """A replacement card cannot mint itself a fresh budget.
+
+        Regression for the leak that let an objective escape its ceiling by
+        spawning a new root: runs on a card that ``repairs`` X are attempts at
+        X's objective and must be counted there.
+        """
+        monkeypatch.setattr(kb, "gauntlet_objective_attempt_limit", lambda: 3)
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(conn, title="subject", assignee="default")
+            repair = kb.create_task(conn, title="repair of subject", assignee="default")
+            kb.add_task_relation(conn, repair, subject, kb.RELATION_REPAIRS)
+            with kb.write_txn(conn):
+                for tid, t in ((subject, 10), (subject, 12), (repair, 14)):
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                        "VALUES (?, 'default', 'done', ?, ?, 'completed')",
+                        (tid, t, t + 1),
+                    )
+            # Both ends of the lineage see the same total.
+            assert kb.gauntlet_objective_attempts(conn, subject) == 3
+            assert kb.gauntlet_objective_attempts(conn, repair) == 3
+            # And the replacement is refused, not handed a clean slate.
+            assert kb.claim_task(conn, repair) is None
+            assert kb.get_task(conn, repair).block_kind == (
+                kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED
+            )
+
+    def test_umbrella_children_do_not_share_one_budget(self, kanban_home, monkeypatch):
+        """An umbrella organises separate objectives; it is not a retry chain.
+
+        Guards the starvation failure mode: if lineage followed umbrella edges,
+        one budget would cover a whole project and honest multi-stage work
+        would block on its first stage.
+        """
+        monkeypatch.setattr(kb, "gauntlet_objective_attempt_limit", lambda: 2)
+        with kb.connect_closing() as conn:
+            umbrella = kb.create_task(conn, title="umbrella", assignee="default")
+            first = kb.create_task(conn, title="stage one", assignee="default")
+            second = kb.create_task(conn, title="stage two", assignee="default")
+            kb.add_task_relation(conn, first, umbrella, kb.RELATION_UMBRELLA)
+            kb.add_task_relation(conn, second, umbrella, kb.RELATION_UMBRELLA)
+            with kb.write_txn(conn):
+                for i in range(2):
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                        "VALUES (?, 'default', 'done', ?, ?, 'completed')",
+                        (first, 20 + i, 21 + i),
+                    )
+            # The sibling is untouched by its neighbour's spend.
+            assert kb.gauntlet_objective_attempts(conn, first) == 2
+            assert kb.gauntlet_objective_attempts(conn, second) == 0
+            assert kb.claim_task(conn, second) is not None
+
+    def test_evidence_relation_does_not_join_lineage(self, kanban_home):
+        """``evidence`` is documented as non-governing and must not spend budget."""
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(conn, title="subject", assignee="default")
+            note = kb.create_task(conn, title="evidence note", assignee="default")
+            kb.add_task_relation(conn, note, subject, kb.RELATION_EVIDENCE)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, 'default', 'done', 30, 31, 'completed')",
+                    (note,),
+                )
+            assert kb.gauntlet_objective_attempts(conn, subject) == 0
+
+    def test_budget_exhausted_is_a_valid_distinct_block_kind(self, kanban_home):
+        """#5: the disposition is first-class, not overloaded onto needs_input."""
+        assert kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED in kb.VALID_BLOCK_KINDS
+        assert kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED != "needs_input"
+
+
+    def test_lineage_counting_is_correct_across_sql_chunk_boundaries(
+        self, kanban_home, monkeypatch
+    ):
+        """A lineage larger than one SQL bind batch still counts exactly once.
+
+        Guards the chunked ``IN (...)`` binds: an unchunked query would raise on
+        a pathological lineage, and a safety control must never be the thing
+        that throws. Chunk size is shrunk rather than building 400+ cards.
+        """
+        monkeypatch.setattr(kb, "_LINEAGE_SQL_CHUNK", 2)
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(conn, title="chunk subject", assignee="default")
+            repairs = []
+            for i in range(7):
+                r = kb.create_task(conn, title=f"repair {i}", assignee="default")
+                kb.add_task_relation(conn, r, subject, kb.RELATION_REPAIRS)
+                repairs.append(r)
+            with kb.write_txn(conn):
+                for n, tid in enumerate([subject] + repairs):
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                        "VALUES (?, 'default', 'done', ?, ?, 'completed')",
+                        (tid, 500 + n, 501 + n),
+                    )
+            members = kb._objective_lineage_members(conn, subject)
+            assert len(members) == 8, members
+            # 8 cards x 1 run, counted once each despite spanning 4 batches.
+            assert kb.gauntlet_objective_attempts(conn, subject) == 8
+            for r in repairs:
+                assert kb.gauntlet_objective_attempts(conn, r) == 8
 
 
 class TestCanonicalIntegrationGate:
