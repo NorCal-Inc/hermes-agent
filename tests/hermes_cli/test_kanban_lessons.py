@@ -1102,6 +1102,105 @@ class TestCandidateApproval:
             assert [p["id"] for p in pending] == [out["id"]]
 
 
+class TestCandidateApprovalCliSurface:
+    """The operator's actual route in.
+
+    ``approve_lesson`` and ``lesson_candidates`` existed from the moment the
+    candidate state did, and neither had a non-test call site — so a
+    candidate could be listed by this file and by nothing else. That is the
+    same defect as ``extract_lesson`` never being called, one layer up: the
+    decision half of the loop was written and left unreachable.
+    """
+
+    BROAD = "Governance: escalate cross-company work to Erika."
+
+    def _candidate(self, conn, tenant="acme"):
+        tid = _verified(conn, tenant=tenant)
+        return kb.extract_lesson(
+            conn, tid, lesson=self.BROAD,
+            applicability="assignee:coder", actor="operator",
+        )
+
+    def test_list_then_approve_makes_it_bind(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        with kb.connect_closing() as conn:
+            out = self._candidate(conn)
+        lesson_id = out["id"]
+
+        listed = json.loads(kc.run_slash("lesson-candidates --json"))
+        assert [c["id"] for c in listed] == [lesson_id]
+        assert listed[0]["state"] == kb.LESSON_STATE_CANDIDATE
+
+        # Invisible to the binding listing until somebody decides.
+        assert json.loads(kc.run_slash("lessons --json")) == []
+
+        approved = kc.run_slash(
+            f"lesson-approve {lesson_id} --approver christopher"
+        )
+        assert "Approved lesson" in approved
+        assert "christopher" in approved
+
+        now_binding = json.loads(kc.run_slash("lessons --json"))
+        assert [le["id"] for le in now_binding] == [lesson_id]
+        assert json.loads(kc.run_slash("lesson-candidates --json")) == []
+
+        with kb.connect_closing() as conn:
+            target = kb.create_task(
+                conn, title="later work", assignee="coder", tenant="acme",
+            )
+            assert len(kb.lessons_for_task(conn, target)) == 1
+
+    def test_approving_a_non_candidate_is_refused_not_silent(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            out = kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+            )
+            assert out["state"] == kb.LESSON_STATE_ACTIVE
+        assert "cannot approve lesson" in kc.run_slash(
+            f"lesson-approve {out['id']} --approver christopher"
+        )
+
+    def test_approver_is_required_and_never_defaulted(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        with kb.connect_closing() as conn:
+            out = self._candidate(conn)
+        refused = kc.run_slash(f"lesson-approve {out['id']}")
+        assert "usage error" in refused
+        # Name the missing flag, so this cannot pass merely because the
+        # subcommand itself is absent — which is how it passed when the
+        # wiring was reverted to check that these tests bite.
+        assert "--approver" in refused
+        with kb.connect_closing() as conn:
+            assert [c["id"] for c in kb.lesson_candidates(conn)] == [out["id"]]
+
+    def test_an_empty_queue_says_so(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        assert "No candidate lessons" in kc.run_slash("lesson-candidates")
+
+    def test_tenant_filter_keeps_each_lane_sealed(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        with kb.connect_closing() as conn:
+            mine = self._candidate(conn, tenant="acme")
+            theirs = self._candidate(conn, tenant="beta")
+        acme = json.loads(
+            kc.run_slash("lesson-candidates --tenant acme --json")
+        )
+        beta = json.loads(
+            kc.run_slash("lesson-candidates --tenant beta --json")
+        )
+        assert [c["id"] for c in acme] == [mine["id"]]
+        assert [c["id"] for c in beta] == [theirs["id"]]
+
+
 class TestLessonExpiry:
     """retire_lesson has always existed and nothing ever called it.
 

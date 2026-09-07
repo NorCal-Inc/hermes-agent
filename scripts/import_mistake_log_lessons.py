@@ -115,7 +115,8 @@ def parse_rows(path: Path, skipped: list | None = None) -> list[dict]:
     out: list[dict] = []
     if skipped is None:
         skipped = []
-    for lineno, line in enumerate(path.read_text().split("\n"), 1):
+    text = path.read_text(encoding="utf-8")
+    for lineno, line in enumerate(text.split("\n"), 1):
         m = ROW_RE.match(line)
         if not m:
             continue
@@ -272,9 +273,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"task_lessons now: {total} rows, {binding} binding")
         print(
             "\nNothing binds until approved. Review with:\n"
-            "  hermes kanban lesson list --state candidate\n"
+            "  hermes kanban lesson-candidates\n"
             "and approve individually with:\n"
-            "  hermes kanban lesson approve <id> --approver christopher"
+            "  hermes kanban lesson-approve <id> --approver christopher"
         )
         return 0
     finally:

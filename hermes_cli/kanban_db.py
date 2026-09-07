@@ -742,9 +742,23 @@ OBSERVATION_STATE_CLOSED = "closed"
 # card dispatched, because the disposition survives the status change.
 DISPOSITION_COMPLETED = "completed"
 DISPOSITION_OVERTAKEN_BY_EVENTS = "overtaken_by_events"
+#: Closed without completing: abandoned, superseded, or given up on.
+#:
+#: Added 2026-09-07. 316 closed cards carried no disposition at all, so
+#: two-thirds of the board could not distinguish finished from abandoned --
+#: and there was no honest way to fill it in. ``completed`` was false for them
+#: and ``overtaken_by_events`` asserts the objective is SATISFIED, which was
+#: both untrue and irreversible.
+#:
+#: Deliberately absent from :data:`IRREVERSIBLE_DISPOSITIONS`. An abandoned
+#: objective is not a finished one: the card may legitimately be picked up
+#: again, and it must never satisfy a dependency on its own. That is the whole
+#: distinction this value exists to preserve.
+DISPOSITION_ABANDONED = "abandoned"
 VALID_TERMINAL_DISPOSITIONS = {
     DISPOSITION_COMPLETED,
     DISPOSITION_OVERTAKEN_BY_EVENTS,
+    DISPOSITION_ABANDONED,
 }
 
 # ...but NOT every ending is final, and conflating the two breaks the board.
@@ -8291,6 +8305,30 @@ def _subject_has_evidence_sql(alias: str = "") -> str:
 """
 
 
+def subject_has_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Does this subject carry evidence an independent verifier could check?
+
+    Reuses :func:`_subject_has_evidence_sql` verbatim rather than restating
+    it. That helper's own docstring explains why this matters more than
+    tidiness: the dispatch gate and the verifier pre-flight must not drift
+    apart, and a third hand-copied predicate here would reintroduce exactly
+    the defect they exist to prevent.
+    """
+    # The alias is load-bearing. Unaliased, the predicate emits
+    # ``a.task_id = id``; SQLite binds that bare ``id`` to the INNER
+    # table, and ``task_attachments`` has an ``id`` of its own -- so the
+    # correlation silently becomes ``a.task_id = a.id`` and the whole
+    # gate reads false for every subject. Same failure mode the COALESCE
+    # note above guards: a predicate that inverts quietly rather than
+    # erroring.
+    row = conn.execute(
+        "SELECT (" + _subject_has_evidence_sql("t") + ") AS ok "
+        "FROM tasks t WHERE t.id = :subject",
+        {"subject": task_id, "verified": VERIFICATION_VERIFIED},
+    ).fetchone()
+    return bool(row and row[0])
+
+
 _EVIDENCE_READY_PARENT_SQL = f"""
     (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
     AND p.verification_state = :pending
@@ -13983,7 +14021,8 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, "
+            "gauntlet_enforced "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -14001,6 +14040,58 @@ def request_review(
                 "task is running under a live claim; pass expected_run_id "
                 "(worker ownership) or force=True (explicit operator "
                 "override) instead of clearing the live run's claim",
+            )
+        # A gauntlet handoff carrying no evidence is the defect that cost
+        # t_376c07c8 eight hours. The independent-verifier pre-flight applies
+        # ``_subject_has_evidence_sql`` and correctly declines to create a
+        # child it could never dispatch; failing closed then parks the subject
+        # in review/pending with, in that function's own words, "no route by
+        # which anything can bless it" -- and nothing surfaced that as
+        # actionable, so the stall detector armed an observation timer, and
+        # later a second timer to observe the first one not progressing.
+        #
+        # Refuse here instead. At handoff the implementer still holds the
+        # context, the fix is one attach, and the failure is a sentence rather
+        # than a card that dies quietly and is observed forever.
+        # A gauntlet subject entering review with no evidence is a dead card,
+        # and used to be a SILENT one. The pre-flight applies
+        # ``_subject_has_evidence_sql`` and correctly declines to open a
+        # verification route it could never dispatch -- leaving the subject,
+        # in its own words, with "no route by which anything can bless it".
+        #
+        # Deliberately not blocked and deliberately not repaired here. This
+        # function already materialises evidence for a STRUCTURED handoff and
+        # deliberately not for a prose summary: prose is not falsifiable, and
+        # that gate is correct. Fabricating a packet from the summary would
+        # defeat it; refusing the handoff would convert a silent death into a
+        # blocked queue.
+        #
+        # What was missing was only the record. On 2026-09-07 t_376c07c8 sat
+        # in this exact state for eight and a half hours while the stall
+        # detector armed an ``independent_verification_recheck`` timer (102
+        # ticks) and then a ``lifecycle_stall_recheck`` timer to observe the
+        # first one not progressing (53 ticks). Both closed within one tick of
+        # evidence arriving, with reasons ``evidence_present`` and
+        # ``progress_resumed`` -- the system knew the blocker the whole time
+        # and had nowhere to say it. This is where it says it.
+        if (
+            (trow["gauntlet_enforced"] or gauntlet_enforcement_default())
+            and not subject_has_evidence(conn, task_id)
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "verification_route_unopened",
+                {
+                    "reason": "gauntlet subject entered review carrying no "
+                              "evidence packet and inheriting none from a "
+                              "verified parent; the independent-verifier "
+                              "pre-flight will decline to open a route, so "
+                              "nothing can return a verdict on this card",
+                    "remedy": "attach falsifiable evidence "
+                              "(hermes kanban attach <task_id> <file>), or "
+                              "hand off with structured run metadata",
+                },
             )
         implementer = trow["assignee"]
         if reviewer is None:
