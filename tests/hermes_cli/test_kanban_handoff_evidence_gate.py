@@ -1,24 +1,29 @@
-"""The handoff edge: a gauntlet card may not enter review with nothing to check.
+"""A gauntlet card that enters review with no evidence must SAY SO.
 
 This is the edge whose absence killed ``t_376c07c8`` on 2026-09-07. The
-implementer finished and called ``request_review``; the summary it had just
-written -- 3,325 characters, with file:line references and acceptance-criteria
-mapping -- stayed on the run row and was never attached to the card. The
-independent-verifier pre-flight then applied ``_subject_has_evidence_sql``,
+implementer handed off with a prose summary and no evidence packet. The
+independent-verifier pre-flight applied ``_subject_has_evidence_sql``,
 correctly declined to create a verifier child it could never dispatch, and
-failed closed, leaving the subject in ``review``/``pending`` with, per that
-function's own docstring, "no route by which anything can bless it".
+failed closed -- leaving the subject, per that function's own docstring, with
+"no route by which anything can bless it".
 
-Nothing surfaced that. The stall detector armed an
-``independent_verification_recheck`` timer (102 ticks), then a
-``lifecycle_stall_recheck`` timer to observe the first one not progressing
-(53 ticks). Eight and a half hours, zero verifiers, zero state change.
-Attaching the evidence by hand closed both timers within one dispatcher tick,
-with reasons ``evidence_present`` and ``progress_resumed`` -- the system had
-known the blocker the whole time and had no way to say so.
+Every part of that is the design working. The defect is that it was SILENT.
+The stall detector armed an ``independent_verification_recheck`` timer (102
+ticks), then a ``lifecycle_stall_recheck`` timer to observe the first one not
+progressing (53 ticks). Eight and a half hours, zero verifiers, zero state
+change. The instant evidence was attached by hand, both timers closed inside
+one dispatcher tick with reasons ``evidence_present`` and ``progress_resumed``
+-- the system had known the blocker the whole time and had nowhere to say it.
 
-The fix is plumbing, not a gate: the evidence already existed, so move it.
-Refusal is reserved for the case where there is genuinely nothing to move.
+So this fix records the fact and changes nothing else. Two things it must NOT
+do, both of which I implemented first and had to back out:
+
+  * It must not refuse the handoff. That converts a silent death into a
+    blocked queue, and broke ~59 existing tests.
+  * It must not manufacture an evidence packet from the summary.
+    ``request_review`` already materialises evidence for a STRUCTURED handoff
+    and deliberately not for prose -- prose is not falsifiable. Nine tests in
+    ``test_kanban_gauntlet_lifecycle`` pin that gate; defeating it broke them.
 """
 
 from __future__ import annotations
@@ -79,72 +84,76 @@ def _kinds(conn, tid):
     ]
 
 
-class TestHandoffAlwaysOpensAVerificationRoute:
-    def test_the_summary_becomes_the_evidence_packet(self, conn, kanban_home):
+def _payload(conn, tid, kind):
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1", (tid, kind),
+    ).fetchone()
+    return json.loads(row["payload"]) if row and row["payload"] else {}
+
+
+class TestTheDeadStateIsRecorded:
+    def test_an_evidenceless_gauntlet_handoff_records_the_unopened_route(
+        self, conn
+    ):
         tid, claimed = _gauntlet_task_ready_to_hand_off(conn)
         assert kb.subject_has_evidence(conn, tid) is False
 
         assert kb.request_review(
-            conn, tid, summary="implemented X; ran the suite; 12 passed",
+            conn, tid, summary="implemented X",
             expected_run_id=claimed.current_run_id,
         ) is True
 
-        # The route the pre-flight needs is now open.
-        assert kb.subject_has_evidence(conn, tid) is True
+        assert "verification_route_unopened" in _kinds(conn, tid)
+        payload = _payload(conn, tid, "verification_route_unopened")
+        # The record must be actionable, not merely present.
+        assert "hermes kanban attach" in payload["remedy"]
+        assert "no evidence packet" in payload["reason"]
+
+    def test_the_handoff_still_succeeds(self, conn):
+        """Recording must not become blocking. A blocked queue is not better
+        than a silent one; it is the same failure with a louder failure mode.
+        """
+        tid, claimed = _gauntlet_task_ready_to_hand_off(conn)
+        assert kb.request_review(
+            conn, tid, summary="implemented X",
+            expected_run_id=claimed.current_run_id,
+        ) is True
         assert kb.get_task(conn, tid).status == "review"
-        assert "evidence_auto_materialised" in _kinds(conn, tid)
 
-    def test_the_materialised_packet_holds_the_real_summary(
-        self, conn, kanban_home
-    ):
+    def test_no_evidence_is_manufactured(self, conn):
+        """The prose summary must NOT become an evidence packet.
+
+        ``request_review`` materialises evidence for a structured handoff and
+        deliberately not for prose. Fabricating one here would release a
+        verifier against an unfalsifiable claim.
+        """
         tid, claimed = _gauntlet_task_ready_to_hand_off(conn)
         kb.request_review(
-            conn, tid, summary="the actual claim under test",
+            conn, tid, summary="just prose",
             expected_run_id=claimed.current_run_id,
         )
-        [att] = kb.list_attachments(conn, tid)
-        assert att.filename == kb.HANDOFF_EVIDENCE_FILENAME
-        body = Path(att.stored_path).read_text(encoding="utf-8")
-        assert "the actual claim under test" in body
-        # It must not read as a verdict.
-        assert "not a verdict" in body
-        assert "not been independently verified" in body
+        assert kb.list_attachments(conn, tid) == []
+        assert kb.subject_has_evidence(conn, tid) is False
 
-    def test_existing_evidence_is_never_overwritten(self, conn, kanban_home):
+    def test_a_subject_with_evidence_records_nothing(self, conn):
         tid, claimed = _gauntlet_task_ready_to_hand_off(conn)
-        _attach(conn, tid, filename="real-artefacts.tar.gz")
+        _attach(conn, tid)
         kb.request_review(
-            conn, tid, summary="prose",
+            conn, tid, summary="implemented X",
             expected_run_id=claimed.current_run_id,
         )
-        names = [a.filename for a in kb.list_attachments(conn, tid)]
-        assert names == ["real-artefacts.tar.gz"]
-        assert "evidence_auto_materialised" not in _kinds(conn, tid)
+        assert "verification_route_unopened" not in _kinds(conn, tid)
 
-    def test_nothing_to_materialise_is_refused_with_an_actionable_message(
-        self, conn, kanban_home
-    ):
-        """The one case that must still fail closed, and say why."""
-        tid, claimed = _gauntlet_task_ready_to_hand_off(conn)
-        ok, reason = kb.request_review(
-            conn, tid, summary=None,
-            expected_run_id=claimed.current_run_id, with_reason=True,
-        )
-        assert ok is False
-        assert "no path to any verdict" in reason
-        assert "hermes kanban attach" in reason
-        assert kb.get_task(conn, tid).status == "running"
-
-    def test_a_non_gauntlet_handoff_is_untouched(self, conn, kanban_home):
-        """The change must not widen into ordinary review work."""
+    def test_a_non_gauntlet_handoff_records_nothing(self, conn):
+        """The record must not widen into ordinary review work."""
         tid = kb.create_task(conn, title="ordinary", assignee="worker")
         claimed = kb.claim_task(conn, tid)
-        assert kb.request_review(
+        kb.request_review(
             conn, tid, summary="done",
             expected_run_id=claimed.current_run_id,
-        ) is True
-        assert kb.list_attachments(conn, tid) == []
-        assert "evidence_auto_materialised" not in _kinds(conn, tid)
+        )
+        assert "verification_route_unopened" not in _kinds(conn, tid)
 
 
 class TestPredicateIsNotACopy:
@@ -152,13 +161,14 @@ class TestPredicateIsNotACopy:
 
     ``_subject_has_evidence_sql`` accepts INHERITED evidence from a
     done/archived + verified source parent. A hand-written "has an attachment"
-    check here would disagree with the pre-flight, which is the drift that
-    helper's docstring explicitly warns about.
+    check would disagree with the pre-flight -- the drift that helper's own
+    docstring warns about.
 
-    ``test_own_attachment_counts`` also pins the alias: unaliased, the
-    predicate emits ``a.task_id = id``, SQLite binds the bare ``id`` to the
-    INNER table -- ``task_attachments`` has one -- and the whole gate silently
-    reads false for every subject. It did, until these tests caught it.
+    ``test_own_attachment_counts`` also pins the alias. Unaliased, the
+    predicate emits ``a.task_id = id``; SQLite binds that bare ``id`` to the
+    INNER table, and ``task_attachments`` has an ``id`` of its own, so the
+    correlation silently became ``a.task_id = a.id`` and the whole predicate
+    read false for every subject. It did, until this test caught it.
     """
 
     def test_own_attachment_counts(self, conn):
@@ -204,8 +214,8 @@ class TestDispatchReportsTheLock:
     ``skipped_locked=True`` when another dispatcher holds the board lock. The
     CLI omitted the field entirely, so a tick that did nothing because the
     gateway held the lock printed exactly what a genuinely idle board prints --
-    while a ``--dry-run`` a second earlier had promised a spawn, because dry
-    runs do not take the lock at all.
+    while a ``--dry-run`` a second earlier promised a spawn, because dry runs
+    never take the lock at all.
     """
 
     def test_json_output_carries_the_field(self, kanban_home):
