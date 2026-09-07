@@ -10889,6 +10889,19 @@ _VERIFIER_VERDICT_RE = re.compile(
 # verifier already dispatched: an unbounded loop in which the recovery leg can
 # never close no matter how cooperative the verifier is. That is precisely the
 # copy/paste relay this repair exists to remove, wearing a different hat.
+_VERIFIER_LESSON_RE = re.compile(
+    r"^[\s>*_-]*(?:\*\*|__)?LESSON(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"
+    r"(?P<detail>.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_VERIFIER_LESSON_APPLICABILITY_RE = re.compile(
+    r"^[\s>*_-]*(?:\*\*|__)?LESSON[ _-]?APPLICABILITY(?:\*\*|__)?"
+    r"\s*[:=]\s*(?:\*\*|__)?"
+    r"(?P<detail>.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 _VERIFIER_REGRESSION_RE = re.compile(
     r"^[\s>*_-]*(?:\*\*|__)?REGRESSION(?:[ _-]?EVIDENCE)?(?:\*\*|__)?"
     r"\s*[:=]\s*(?:\*\*|__)?"
@@ -10936,6 +10949,52 @@ def _names_a_concrete_check(value: Any, _depth: int = 0) -> bool:
             _names_a_concrete_check(v, _depth + 1) for v in value.values()
         )
     return False
+
+
+def _parse_verifier_lesson(*texts: Optional[str]) -> Optional[dict]:
+    """Extract the lesson an independent verifier declared, if any.
+
+    Declaration shape mirrors ``REGRESSION:`` because verifiers already write
+    in it::
+
+        LESSON: do not treat a provider 429 as an implementation failure
+        LESSON_APPLICABILITY: assignee:coder
+
+    **Fails closed.** Returns ``None`` unless BOTH lines are present and
+    non-empty. A lesson without a selector cannot be matched against future
+    work, and inferring one would be the model guessing at scope -- the exact
+    thing ``normalize_lesson_applicability``'s closed grammar exists to
+    prevent. A verifier that declares nothing produces nothing, as before.
+
+    Note the ordering hazard this avoids: ``_VERIFIER_LESSON_RE`` would also
+    match a ``LESSON_APPLICABILITY:`` line (``LESSON`` then ``_APPLICABILITY``
+    swallowed by ``detail``), so applicability is matched first and its lines
+    are excluded from the lesson search rather than relying on regex
+    precedence.
+    """
+    lesson = ""
+    applicability = ""
+    for text in texts:
+        if not text:
+            continue
+        body = str(text)
+        if not applicability:
+            m = _VERIFIER_LESSON_APPLICABILITY_RE.search(body)
+            if m:
+                applicability = m.group("detail").strip().strip("*_`")
+        if not lesson:
+            # Strip applicability declarations before looking for the lesson,
+            # so the broader LESSON: pattern cannot capture one.
+            stripped = _VERIFIER_LESSON_APPLICABILITY_RE.sub("", body)
+            m = _VERIFIER_LESSON_RE.search(stripped)
+            if m:
+                lesson = m.group("detail").strip().strip("*_`")
+    if not lesson or not applicability:
+        return None
+    return {
+        LESSON_EVIDENCE_KEY: lesson,
+        LESSON_APPLICABILITY_EVIDENCE_KEY: applicability,
+    }
 
 
 def _parse_verifier_regression(*texts: Optional[str]) -> Optional[dict]:
@@ -11101,6 +11160,12 @@ def _return_verifier_verdict_to_subjects(
                     _parse_verifier_regression(summary, result)
                     if passed else None
                 )
+                # Same rule as regression evidence: only a PASS may carry a
+                # lesson. A finding drawn from work that failed verification is
+                # an observation, and promote_lesson would refuse it anyway.
+                lesson_evidence = (
+                    _parse_verifier_lesson(summary, result) if passed else None
+                )
                 ok, detail = record_verification(
                     conn,
                     subject_id,
@@ -11109,6 +11174,7 @@ def _return_verifier_verdict_to_subjects(
                     evidence={
                         "source": "codex_verify_return_path",
                         "verifier_task": verifier_task_id,
+                        **(lesson_evidence or {}),
                     },
                     regression_evidence=regression,
                     reason=(
@@ -14261,6 +14327,113 @@ def request_changes(
     return True, implementer
 
 
+#: Keys a verifier uses to state the lesson its PASS earned. They ride on the
+#: ``evidence`` payload because that is the one channel every path reaching a
+#: verdict already fills in, so wiring extraction needs no new plumbing and no
+#: second call an actor can forget to make.
+LESSON_EVIDENCE_KEY = "lesson"
+LESSON_APPLICABILITY_EVIDENCE_KEY = "lesson_applicability"
+
+
+def _extract_lesson_on_verify(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verifier: Optional[str],
+    evidence: Optional[dict],
+    run_id: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Run the required post-VERIFIED extraction step after a passing verdict.
+
+    :func:`extract_lesson` describes itself as "the required post-VERIFIED
+    step" and had no caller, so the write half of the verified-learning loop
+    never ran: the board carried 403 verifications and 0 lessons while
+    :func:`build_worker_context` faithfully injected the empty set into every
+    worker. This is the call site that closes it.
+
+    Deliberately NOT inside :func:`record_verification`'s transaction. The
+    verdict must be durable before extraction is attempted, because
+    :func:`promote_lesson` refuses a source whose head is not already verified
+    -- running it in the same transaction would make every extraction fail its
+    own gate on state this transaction has not yet committed.
+
+    **Never raises.** A lesson is a by-product of a verdict, never a condition
+    of it; an extraction failure that could unwind a PASS would make the
+    learning loop a new way for verification to break. Every outcome --
+    extracted, declined, refused, errored -- is recorded as an event instead,
+    so "no lesson" stops being silence and becomes a counted, auditable fact.
+
+    Returns the lesson row when one was written, else ``None``.
+    """
+    payload = evidence if isinstance(evidence, dict) else {}
+    text = str(payload.get(LESSON_EVIDENCE_KEY) or "").strip()
+    selector = str(payload.get(LESSON_APPLICABILITY_EVIDENCE_KEY) or "").strip()
+
+    def _event(kind: str, detail: dict[str, Any]) -> None:
+        # Its own transaction: this runs after the verdict has committed, and
+        # a bookkeeping failure here must not be able to touch that verdict.
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    kind,
+                    {"verifier": verifier, "source": "record_verification", **detail},
+                    run_id=run_id,
+                )
+        except Exception:
+            pass
+
+    if not text:
+        # The common case today, and the one worth counting. A verifier that
+        # offered no lesson is not an error -- most verdicts genuinely teach
+        # nothing reusable -- but it must be visible, or a loop that never runs
+        # is indistinguishable from a loop with nothing to say.
+        _event("lesson_extraction_skipped", {"reason": "no_lesson_offered"})
+        return None
+    if not selector:
+        _event(
+            "lesson_extraction_skipped",
+            {"reason": "no_applicability", "lesson_chars": len(text)},
+        )
+        return None
+
+    try:
+        row = extract_lesson(
+            conn,
+            task_id,
+            lesson=text,
+            applicability=selector,
+            actor=verifier,
+            evidence=payload,
+        )
+    except LessonPromotionError as exc:
+        # A refusal is the gate working. Record the code so a verifier can see
+        # which gate blocked it rather than concluding extraction is broken.
+        _event(
+            "lesson_extraction_blocked",
+            {"code": exc.code, "detail": str(exc)[:400]},
+        )
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        _event(
+            "lesson_extraction_error",
+            {"error": type(exc).__name__, "detail": str(exc)[:400]},
+        )
+        return None
+
+    _event(
+        "lesson_extracted",
+        {
+            "lesson_id": row.get("id"),
+            "state": row.get("state"),
+            "auto_promoted": bool(row.get("auto_promoted")),
+            "eligibility_reason": row.get("eligibility_reason"),
+        },
+    )
+    return row
+
+
 def record_verification(
     conn: sqlite3.Connection,
     task_id: str,
@@ -14559,6 +14732,15 @@ def record_verification(
         )
 
     if passed:
+        # The verdict is committed above; only now is the source durably
+        # VERIFIED, which is the state extract_lesson's gates require.
+        _extract_lesson_on_verify(
+            conn,
+            task_id,
+            verifier=verifier,
+            evidence=evidence,
+            run_id=phase_run_id,
+        )
         return True, VERIFICATION_VERIFIED
     if not route_on_failure:
         # Verdict is durable; the task stays in review and stays non-complete.
