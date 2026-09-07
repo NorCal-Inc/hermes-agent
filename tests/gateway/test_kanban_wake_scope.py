@@ -8,6 +8,7 @@ without tenant scoping keep their exact key shape.
 """
 
 import asyncio
+import pytest
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +18,14 @@ from gateway.run import GatewayRunner
 from gateway.session import build_session_key
 from hermes_cli import kanban_db as kb
 from plugins.platforms.slack.adapter import SlackAdapter
+
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities used below ("worker", "publisher") are synthetic and are not profile
+# directories on disk, so this module declares the registry-patching fixture
+# that already exists for exactly that reason. The gate itself is pinned in
+# tests/hermes_cli/test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
 
 TEAM = "T0B8U2M6NRE"
 CHANNEL = "C0BCDG3H66P"
