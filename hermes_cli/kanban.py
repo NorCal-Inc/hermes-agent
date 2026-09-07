@@ -1117,7 +1117,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="One dispatcher pass: reclaim stale, promote ready, spawn workers",
     )
     p_disp.add_argument("--dry-run", action="store_true",
-                        help="Don't actually spawn processes; just print what would happen")
+                        help="Don't actually spawn processes; just print what would "
+                             "happen. NOTE: a dry run does not take the board lock, so "
+                             "it can predict spawns a real tick will not perform when "
+                             "another dispatcher holds the lock.")
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
     p_disp.add_argument("--failure-limit", type=int,
@@ -3593,6 +3596,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         print(json.dumps({
+            "skipped_locked": res.skipped_locked,
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -3613,6 +3617,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "observation_ticks": res.observation_ticks,
             "unowned": res.unowned,
         }, indent=2))
+        return 0
+    if res.skipped_locked:
+        print(
+            "Skipped: another dispatcher holds the board lock. This tick did "
+            "nothing and wrote nothing -- that is NOT an empty queue. The "
+            "gateway's embedded dispatcher (kanban.dispatch_in_gateway) "
+            "normally holds it; stop the gateway or wait for its tick."
+        )
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")

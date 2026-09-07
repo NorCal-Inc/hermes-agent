@@ -8291,6 +8291,77 @@ def _subject_has_evidence_sql(alias: str = "") -> str:
 """
 
 
+HANDOFF_EVIDENCE_FILENAME = "handoff-summary.md"
+
+
+def _materialise_handoff_evidence(
+    conn: sqlite3.Connection, task_id: str, summary: str, *, by: Optional[str]
+) -> None:
+    """Write the implementer's own handoff summary in as the evidence packet.
+
+    The information was never missing. ``t_376c07c8`` carried a 3,325-character
+    summary on its run for the entire eight hours it sat stalled; what was
+    missing was the step that moves it somewhere
+    :func:`_subject_has_evidence_sql` can see, so the verifier pre-flight kept
+    correctly declining to open a route and the card died quietly.
+
+    This is plumbing, not judgement. It relocates an artefact that already
+    exists, invents nothing, and records ``evidence_auto_materialised`` so a
+    verifier can see the packet is the implementer's prose claim rather than
+    collected artefacts, and weigh it accordingly.
+    """
+    directory = task_attachments_dir(task_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / HANDOFF_EVIDENCE_FILENAME
+    body = (
+        f"# Handoff summary -- {task_id}\n\n"
+        "> Auto-materialised at `request_review` from the implementer's own\n"
+        "> run summary. This is the implementer's CLAIM. It is not a verdict\n"
+        "> and it has not been independently verified.\n\n---\n\n"
+        f"{summary}\n"
+    )
+    path.write_text(body, encoding="utf-8")
+    add_attachment(
+        conn,
+        task_id,
+        filename=HANDOFF_EVIDENCE_FILENAME,
+        stored_path=str(path),
+        content_type="text/markdown",
+        size=len(body.encode("utf-8")),
+        uploaded_by=by or "handoff",
+    )
+    _append_event(
+        conn,
+        task_id,
+        "evidence_auto_materialised",
+        {"filename": HANDOFF_EVIDENCE_FILENAME, "source": "run_handoff_summary"},
+    )
+
+
+def subject_has_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Does this subject carry evidence an independent verifier could check?
+
+    Reuses :func:`_subject_has_evidence_sql` verbatim rather than restating
+    it. That helper's own docstring explains why this matters more than
+    tidiness: the dispatch gate and the verifier pre-flight must not drift
+    apart, and a third hand-copied predicate here would reintroduce exactly
+    the defect they exist to prevent.
+    """
+    # The alias is load-bearing. Unaliased, the predicate emits
+    # ``a.task_id = id``; SQLite binds that bare ``id`` to the INNER
+    # table, and ``task_attachments`` has an ``id`` of its own -- so the
+    # correlation silently becomes ``a.task_id = a.id`` and the whole
+    # gate reads false for every subject. Same failure mode the COALESCE
+    # note above guards: a predicate that inverts quietly rather than
+    # erroring.
+    row = conn.execute(
+        "SELECT (" + _subject_has_evidence_sql("t") + ") AS ok "
+        "FROM tasks t WHERE t.id = :subject",
+        {"subject": task_id, "verified": VERIFICATION_VERIFIED},
+    ).fetchone()
+    return bool(row and row[0])
+
+
 _EVIDENCE_READY_PARENT_SQL = f"""
     (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
     AND p.verification_state = :pending
@@ -13983,7 +14054,8 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, "
+            "gauntlet_enforced "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -14001,6 +14073,37 @@ def request_review(
                 "task is running under a live claim; pass expected_run_id "
                 "(worker ownership) or force=True (explicit operator "
                 "override) instead of clearing the live run's claim",
+            )
+        # A gauntlet handoff carrying no evidence is the defect that cost
+        # t_376c07c8 eight hours. The independent-verifier pre-flight applies
+        # ``_subject_has_evidence_sql`` and correctly declines to create a
+        # child it could never dispatch; failing closed then parks the subject
+        # in review/pending with, in that function's own words, "no route by
+        # which anything can bless it" -- and nothing surfaced that as
+        # actionable, so the stall detector armed an observation timer, and
+        # later a second timer to observe the first one not progressing.
+        #
+        # Refuse here instead. At handoff the implementer still holds the
+        # context, the fix is one attach, and the failure is a sentence rather
+        # than a card that dies quietly and is observed forever.
+        if (
+            (trow["gauntlet_enforced"] or gauntlet_enforcement_default())
+            and not subject_has_evidence(conn, task_id)
+        ):
+            if not str(summary or "").strip():
+                return _ret(
+                    False,
+                    "gauntlet handoff refused: this task carries no evidence "
+                    "packet, inherits none from a verified parent, and "
+                    "supplied no summary to materialise one from. The "
+                    "independent-verifier pre-flight applies the same "
+                    "predicate, so it would decline to open a verification "
+                    "route and this card would park in review with no path "
+                    "to any verdict. Attach the falsifiable evidence first: "
+                    "hermes kanban attach <task_id> <file>",
+                )
+            _materialise_handoff_evidence(
+                conn, task_id, str(summary), by=trow["assignee"],
             )
         implementer = trow["assignee"]
         if reviewer is None:
