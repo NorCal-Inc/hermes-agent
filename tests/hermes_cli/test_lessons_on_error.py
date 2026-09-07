@@ -153,16 +153,39 @@ class TestRetrievalMatchesTheErrorSignature:
             conn, "TelegramConnectionTimeout while polling updates"
         ) == []
 
-    def test_results_are_capped_and_ordered_best_first(self, conn):
-        _add_lesson(conn, "sqlite alias predicate column binding inner table")
-        _add_lesson(conn, "sqlite something vaguely related")
-        for i in range(10):
-            _add_lesson(conn, f"sqlite filler rule {i} alias")
-        hits = kb.lessons_for_error(
-            conn, "sqlite alias predicate column binding inner table", limit=3
+    def test_results_are_ordered_best_first_and_capped(self, conn):
+        strong = _add_lesson(
+            conn, "sqlite alias predicate column binding inner table"
         )
-        assert len(hits) == 3
+        _add_lesson(conn, "sqlite alias only")
+        hits = kb.lessons_for_error(
+            conn, "sqlite alias predicate column binding inner table", limit=5
+        )
+        assert hits[0]["id"] == strong
         assert hits[0]["match_score"] >= hits[-1]["match_score"]
+        assert len(
+            kb.lessons_for_error(
+                conn, "sqlite alias predicate column", limit=1
+            )
+        ) == 1
+
+    def test_a_single_shared_word_is_not_a_match(self, conn):
+        """Corroboration, not coincidence.
+
+        Live against the real corpus, pure rarity ranked a here-document
+        failure against a lesson about clicking unlabelled icons, on the word
+        "near" alone — because "near" appeared in exactly one lesson and so
+        scored the maximum. One word in common with a paragraph of prose is
+        noise, and a confident wrong answer is worse than "no match".
+        """
+        _add_lesson(
+            conn,
+            "Hover over an icon and confirm its accessible name before "
+            "clicking anything near the toolbar",
+        )
+        assert kb.lessons_for_error(
+            conn, "bash: syntax error near unexpected token"
+        ) == []
 
 
 class TestCliSurface:
@@ -196,3 +219,66 @@ class TestCliSurface:
             kc.run_slash('lessons --error "sqlite predicate alias" --json')
         )
         assert payload and "match_score" in payload[0]
+
+
+class TestSignatureKeyedLessons:
+    """The write half: log the error with the fix, match it exactly next time.
+
+    Term overlap between an error and a paragraph of prose has a hard ceiling
+    — a here-document failure cannot match a lesson that says "heredoc",
+    because the words differ, and no weighting repairs a vocabulary mismatch.
+    Recording the error's signature when the fix is logged removes the guessing
+    entirely, and it is the step Christopher's loop already performs.
+    """
+
+    ERR = "sqlite3.OperationalError: no such column: id at /srv/x.py:1841"
+    FIX = "Alias the outer table before correlating a subquery on a bare column."
+
+    def test_a_recorded_fix_is_found_exactly_next_time(self, conn):
+        tid = kb.create_task(conn, title="src", assignee="worker")
+        rec = kb.record_error_lesson(
+            conn, error_text=self.ERR, lesson=self.FIX, source_task_id=tid,
+        )
+        # Same failure, different path, line, and timestamp.
+        hits = kb.lessons_for_error(
+            conn,
+            "sqlite3.OperationalError: no such column: id at /opt/other.py:12",
+        )
+        assert [h["id"] for h in hits] == [rec["id"]]
+        assert hits[0]["match_score"] == "exact"
+
+    def test_signature_is_stable_across_occurrences(self, conn):
+        a = kb.error_signature("boom at /a/b.py:1 id=0xdead code=42")
+        b = kb.error_signature("boom at /z/q.py:999 id=0xbeef code=7")
+        assert a == b == "boom code"
+
+    def test_a_recorded_fix_binds_nothing_until_approved(self, conn):
+        """Logging a fix must never silently constrain every future task."""
+        tid = kb.create_task(conn, title="src", assignee="worker")
+        rec = kb.record_error_lesson(
+            conn, error_text=self.ERR, lesson=self.FIX, source_task_id=tid,
+        )
+        row = conn.execute(
+            "SELECT active, state FROM task_lessons WHERE id = ?", (rec["id"],)
+        ).fetchone()
+        assert (row["active"], row["state"]) == (0, kb.LESSON_STATE_CANDIDATE)
+        # ...but it is retrievable immediately, which is the point.
+        assert kb.lessons_for_error(conn, self.ERR)
+
+    def test_an_error_with_no_signal_is_refused(self, conn):
+        tid = kb.create_task(conn, title="src", assignee="worker")
+        with pytest.raises(ValueError):
+            kb.record_error_lesson(
+                conn, error_text="12345 /a/b 0xff", lesson=self.FIX,
+                source_task_id=tid,
+            )
+
+    def test_legacy_prose_still_reachable_by_overlap(self, conn):
+        """Signature-first must not strand the 197 imported rows."""
+        legacy = _add_lesson(
+            conn, "Alias the outer table in a sqlite correlated predicate"
+        )
+        hits = kb.lessons_for_error(
+            conn, "sqlite correlated predicate alias failure"
+        )
+        assert legacy in [h["id"] for h in hits]

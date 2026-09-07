@@ -4310,6 +4310,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("state", f"state TEXT NOT NULL DEFAULT '{LESSON_STATE_ACTIVE}'"),
             ("review_by", "review_by INTEGER"),
             ("retire_condition", "retire_condition TEXT"),
+            # The normalised signature of the error this lesson fixes,
+            # recorded when the fix is logged. NULL on every legacy row
+            # (imported prose has no error attached), which is exactly why
+            # retrieval keeps a term-overlap fallback.
+            ("error_signature", "error_signature TEXT"),
             ("evidence", "evidence TEXT"),
             ("verification_id", "verification_id INTEGER"),
             ("regression_proof_id", "regression_proof_id INTEGER"),
@@ -15608,6 +15613,21 @@ def approve_lesson(
     return True
 
 
+#: Minimum inverse-document-frequency score for a lesson to be offered.
+#:
+#: Below this, return nothing. "No match" is a useful and honest answer --
+#: it tells the agent this is a NEW failure, which is the branch that grows
+#: the corpus. A weak match is worse than none: it sends the agent down a
+#: wrong path with false confidence.
+LESSON_MATCH_MIN_SCORE = 0.30
+
+#: Distinct shared terms required before a lesson is offered at all.
+#:
+#: Rarity alone is not enough — a term appearing in exactly one lesson
+#: scores the maximum, so a single incidental word would outrank a real
+#: two-term match. Corroboration first, then rank by rarity.
+LESSON_MATCH_MIN_TERMS = 2
+
 #: Terms too common in error text to discriminate between lessons.
 _ERROR_STOPWORDS = frozenset({
     "error", "errors", "failed", "failure", "exception", "traceback", "call",
@@ -15634,6 +15654,67 @@ def _error_signature_terms(text: str) -> set:
     lowered = _re.sub(r"\b\d[\d.:_-]*\b", " ", lowered)
     terms = {t for t in _re.split(r"[^a-z_]+", lowered) if len(t) > 3}
     return terms - _ERROR_STOPWORDS
+
+
+def error_signature(text: str) -> str:
+    """A stable key for an error, safe to compare across occurrences.
+
+    The sorted, normalised significant terms joined by spaces. Two occurrences
+    of the same failure differ in ids, paths, line numbers and timestamps;
+    those are stripped by :func:`_error_signature_terms`, so both produce the
+    same key. Empty when the text carries no signal.
+    """
+    return " ".join(sorted(_error_signature_terms(text)))
+
+
+def record_error_lesson(
+    conn: sqlite3.Connection,
+    *,
+    error_text: str,
+    lesson: str,
+    source_task_id: str,
+    created_by: str = "loop",
+    tenant: Optional[str] = None,
+) -> dict:
+    """Log the fix for an error, keyed by that error's signature.
+
+    This is the write half of retrieval-on-error, and the step that makes the
+    loop compound: an error is hit, diagnosed and fixed once, and every later
+    occurrence finds the fix by exact signature match rather than by hoping
+    two prose descriptions share vocabulary.
+
+    Recorded as a CANDIDATE (``active = 0``). It is retrievable immediately —
+    retrieval searches the whole corpus — but binds nothing until somebody
+    approves it. Logging a fix must never silently create a rule that
+    constrains every future task.
+    """
+    sig = error_signature(error_text)
+    if not sig:
+        raise ValueError("error_text carries no significant terms to key on")
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO task_lessons (source_task_id, tenant, scope, "
+            "applicability, lesson, error_signature, created_by, created_at, "
+            "active, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (
+                source_task_id,
+                tenant,
+                LESSON_SCOPE_TENANT if tenant else LESSON_SCOPE_GLOBAL,
+                "all",
+                lesson,
+                sig,
+                created_by,
+                now,
+                LESSON_STATE_CANDIDATE,
+            ),
+        )
+        lid = int(cur.lastrowid or 0)
+        _append_event(
+            conn, source_task_id, "error_lesson_recorded",
+            {"lesson_id": lid, "signature_terms": len(sig.split())},
+        )
+    return {"id": lid, "error_signature": sig, "lesson": lesson}
 
 
 def count_lessons(conn: sqlite3.Connection) -> int:
@@ -15680,17 +15761,60 @@ def lessons_for_error(
     if tenant:
         sql += " WHERE tenant = ? OR scope = ?"
         params += [tenant, LESSON_SCOPE_GLOBAL]
-    scored = []
+
+    # Signature match first: exact, no heuristics, and the reason recording
+    # the error at fix time is worth doing. Only rows that HAVE a signature can
+    # match this way, so legacy prose falls through to the overlap fallback
+    # below.
+    query_sig = " ".join(sorted(terms))
+    exact = []
+    for row in conn.execute(
+        sql + (" AND " if tenant else " WHERE ") + "error_signature = ?",
+        tuple(params) + (query_sig,),
+    ):
+        lesson = _lesson_row_to_dict(row)
+        lesson["match_score"] = "exact"
+        lesson["match_terms"] = sorted(terms)
+        exact.append(lesson)
+    if exact:
+        return exact[:max(1, int(limit))]
+
+    corpus = []
+    doc_freq: dict = {}
     for row in conn.execute(sql, tuple(params)):
         lesson = _lesson_row_to_dict(row)
-        overlap = terms & _error_signature_terms(lesson["lesson"])
-        if overlap:
-            scored.append((len(overlap), -int(lesson["id"]), lesson, overlap))
-    scored.sort(reverse=True)
+        lesson_terms = _error_signature_terms(lesson["lesson"])
+        corpus.append((lesson, lesson_terms))
+        for t in lesson_terms:
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+    # Weight each shared term by how RARE it is in the corpus. Raw overlap
+    # counting let common words dominate: a here-document failure matched a
+    # lesson about wrapper syntax on the word "syntax" alone, and missed the
+    # heredoc lesson entirely. A term in two lessons is evidence; a term in
+    # ninety is noise.
+    scored = []
+    for lesson, lesson_terms in corpus:
+        overlap = terms & lesson_terms
+        # Corroboration before rarity. A single shared word between an error
+        # and a paragraph of prose is a coincidence: pure IDF ranked a
+        # here-document failure against a lesson about unlabelled icons on the
+        # word "near" alone, because "near" happened to appear in exactly one
+        # lesson and therefore scored the maximum.
+        if len(overlap) < LESSON_MATCH_MIN_TERMS:
+            continue
+        score = sum(1.0 / doc_freq.get(t, 1) for t in overlap)
+        if score < LESSON_MATCH_MIN_SCORE:
+            continue
+        scored.append((score, -int(lesson["id"]), lesson, overlap))
+
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
     out = []
     for score, _, lesson, overlap in scored[:max(1, int(limit))]:
-        lesson["match_score"] = score
-        lesson["match_terms"] = sorted(overlap)
+        lesson["match_score"] = round(score, 3)
+        lesson["match_terms"] = sorted(
+            overlap, key=lambda t: doc_freq.get(t, 1)
+        )
         out.append(lesson)
     return out
 
