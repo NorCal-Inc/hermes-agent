@@ -23,10 +23,29 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    selected = {
+        name: module for name, module in list(sys.modules.items())
+        if name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    }
+    for name in selected:
+        sys.modules.pop(name, None)
+    try:
+        yield test_home
+    finally:
+        # This test intentionally imports an isolated copy of the Hermes
+        # module graph. Restore the exact pre-test modules afterwards so
+        # later tests do not retain a split-brain set of kanban/plugin
+        # singletons (worker-exit caches, hooks, write guards, config state).
+        for name in list(sys.modules):
+            if (
+                name.startswith("hermes_cli")
+                or name.startswith("hermes_state")
+                or name == "hermes_constants"
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(selected)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

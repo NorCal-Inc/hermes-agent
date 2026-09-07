@@ -19,15 +19,30 @@ def isolated_kanban_home(monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db, test_home
-    # Cleanup is best-effort; tempfile dir survives but pytest isolation
-    # gives each test its own monkeypatched HERMES_HOME so no cross-test
-    # contamination.
+    # Force-reimport so the fresh HERMES_HOME is picked up, but preserve the
+    # original module graph and restore it after the test. Deleting these
+    # modules without restoration leaves split-brain Kanban/plugin singletons
+    # in later tests that imported them before this fixture ran.
+    selected = {
+        name: module for name, module in list(sys.modules.items())
+        if name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    }
+    for name in selected:
+        sys.modules.pop(name, None)
+    try:
+        from hermes_cli import kanban_db
+        yield kanban_db, test_home
+    finally:
+        for name in list(sys.modules):
+            if (
+                name.startswith("hermes_cli")
+                or name.startswith("hermes_state")
+                or name == "hermes_constants"
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(selected)
 
 
 def _fake_spawn(*args, **kwargs):

@@ -96,7 +96,7 @@ def test_dispatch_spawn_fires_worker_spawned(
     assert "board" in kw
     assert pid_at_fire_time == [4242]
 
-def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypatch):
+def test_crash_reclaim_fires_worker_exited(kanban_home, all_assignees_spawnable, captured_hooks, monkeypatch):
     """A dead-PID reclaim fires the exit observer with the exit facts."""
     conn = kb.connect()
     try:
@@ -122,7 +122,7 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     assert "profile_name" in kw
     assert "board" in kw
 
-def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
+def test_stale_claim_reclaim_fires_hook(kanban_home, all_assignees_spawnable, captured_hooks):
     """A TTL-expired reclaim fires the stale-claim observer post-commit."""
     conn = kb.connect()
     try:
