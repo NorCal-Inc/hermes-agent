@@ -14789,6 +14789,13 @@ def _lesson_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "active": bool(row["active"]),
         "retired_at": row["retired_at"] if "retired_at" in keys else None,
         "retired_by": row["retired_by"] if "retired_by" in keys else None,
+        "state": (
+            row["state"] if "state" in keys else LESSON_STATE_ACTIVE
+        ),
+        "review_by": row["review_by"] if "review_by" in keys else None,
+        "retire_condition": (
+            row["retire_condition"] if "retire_condition" in keys else None
+        ),
         "retired_reason": (
             row["retired_reason"] if "retired_reason" in keys else None
         ),
@@ -14804,8 +14811,16 @@ def promote_lesson(
     actor: Optional[str] = None,
     evidence: Optional[dict] = None,
     allow_global: bool = False,
+    gate_promotion: bool = False,
 ) -> dict[str, Any]:
     """Promote a verified task's finding into a durable, binding lesson.
+
+    ``gate_promotion`` applies :func:`lesson_promotion_eligibility` to the
+    DERIVED scope at insert time, so an ineligible lesson is written as a
+    non-binding ``candidate`` in the same transaction that creates it. It is a
+    parameter here rather than a follow-up UPDATE in the caller because a
+    second transaction would leave a window in which an unapproved
+    interpretation is live and binding.
 
     The one way a row enters ``task_lessons``. Refuses — raising
     :class:`LessonPromotionError` and writing nothing — unless all of:
@@ -14902,13 +14917,24 @@ def promote_lesson(
                 provenance["promoter_evidence"] = redact_review_value(evidence)
 
             now = int(time.time())
+            # The gate runs HERE, against the scope this function derived, so
+            # the row is never briefly binding before being downgraded.
+            if gate_promotion:
+                eligible, gate_reason = lesson_promotion_eligibility(
+                    scope, selector, text
+                )
+            else:
+                eligible, gate_reason = True, "ungated"
+            lesson_state = (
+                LESSON_STATE_ACTIVE if eligible else LESSON_STATE_CANDIDATE
+            )
             cur = conn.execute(
                 """
                 INSERT INTO task_lessons
                     (source_task_id, tenant, scope, applicability, lesson,
                      evidence, verification_id, regression_proof_id,
-                     created_by, created_at, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                     created_by, created_at, active, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -14921,13 +14947,18 @@ def promote_lesson(
                     state["regression_proof_id"],
                     actor,
                     now,
+                    1 if eligible else 0,
+                    lesson_state,
                 ),
             )
             lesson_id = int(cur.lastrowid)
             _append_event(
-                conn, task_id, "lesson_promoted",
+                conn, task_id,
+                "lesson_promoted" if eligible else "lesson_candidate_recorded",
                 {
                     "lesson_id": lesson_id,
+                    "state": lesson_state,
+                    "eligibility_reason": gate_reason,
                     "scope": scope,
                     "tenant": tenant,
                     "applicability": selector,
@@ -15068,6 +15099,8 @@ def extract_lesson(
     acceptance criteria. It does not prove the INTERPRETATION drawn from the
     incident should become doctrine.
     """
+    # gate_promotion=True makes the eligibility decision part of the INSERT, so
+    # an ineligible lesson is NEVER briefly active.
     row = promote_lesson(
         conn,
         task_id,
@@ -15076,48 +15109,30 @@ def extract_lesson(
         actor=actor,
         evidence=evidence,
         allow_global=allow_global,
+        gate_promotion=True,
     )
     lesson_id = int(row["id"])
-    # The PERSISTED scope, not the requested one: promote_lesson derives it
-    # from the source task, and the eligibility gate must judge what was
-    # actually written.
-    eligible, reason = lesson_promotion_eligibility(
+    eligible = bool(row.get("active"))
+    reason = lesson_promotion_eligibility(
         str(row.get("scope") or LESSON_SCOPE_TENANT),
         str(row.get("applicability") or applicability),
         lesson,
-    )
+    )[1]
     now = int(time.time())
     review_by = now + int(review_after_days) * 86400 if review_after_days else None
+    # Only the review horizon is set here. It gates nothing, so a second
+    # statement is harmless -- unlike the binding state, which is not.
     with write_txn(conn):
         conn.execute(
-            "UPDATE task_lessons SET state = ?, active = ?, review_by = ?, "
-            "       retire_condition = ? WHERE id = ?",
-            (
-                LESSON_STATE_ACTIVE if eligible else LESSON_STATE_CANDIDATE,
-                1 if eligible else 0,
-                review_by,
-                retire_condition,
-                lesson_id,
-            ),
-        )
-        _append_event(
-            conn, task_id,
-            "lesson_promoted" if eligible else "lesson_candidate_recorded",
-            {
-                "lesson_id": lesson_id,
-                "eligible": eligible,
-                "reason": reason,
-                "applicability": row.get("applicability"),
-                "scope": row.get("scope"),
-                "review_by": review_by,
-            },
+            "UPDATE task_lessons SET review_by = ?, retire_condition = ? "
+            "WHERE id = ?",
+            (review_by, retire_condition, lesson_id),
         )
     out = dict(row)
     out.update(
         state=LESSON_STATE_ACTIVE if eligible else LESSON_STATE_CANDIDATE,
         auto_promoted=eligible,
         eligibility_reason=reason,
-        active=1 if eligible else 0,
         review_by=review_by,
         retire_condition=retire_condition,
     )

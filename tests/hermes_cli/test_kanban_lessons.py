@@ -1168,3 +1168,115 @@ class TestUntenantedSourceCannotAutoPromote:
             assert out["auto_promoted"] is False
             assert out["eligibility_reason"] == "global_scope_needs_operator"
             assert out["state"] == kb.LESSON_STATE_CANDIDATE
+
+
+class TestGateIsAppliedAtInsert:
+    """Regression: an ineligible lesson must NEVER be briefly binding.
+
+    The first draft let promote_lesson commit with active=1 and then flipped
+    the row to candidate in a SECOND transaction. Between those two commits an
+    unapproved governance interpretation was live and binding to every matching
+    worker -- the exact property this feature exists to guarantee. The gate now
+    runs inside promote_lesson's own transaction, against the scope it derived.
+    """
+
+    BROAD = "Governance: escalate cross-company work to Erika."
+    SAFE = "Do not count provider 429 as implementation failure."
+
+    def test_promote_lesson_itself_returns_an_inactive_row_when_gated(
+        self, kanban_home
+    ):
+        """The decision is visible in promote_lesson's OWN return value.
+
+        If the gate were still a follow-up UPDATE in extract_lesson, this row
+        would come back active=True -- which is precisely the window.
+        """
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            row = kb.promote_lesson(
+                conn, tid, lesson=self.BROAD,
+                applicability="assignee:coder", actor="operator",
+                gate_promotion=True,
+            )
+            assert row["active"] is False
+            assert row["state"] == kb.LESSON_STATE_CANDIDATE
+            # And the committed row agrees.
+            db = conn.execute(
+                "SELECT active, state FROM task_lessons WHERE id=?", (row["id"],),
+            ).fetchone()
+            assert (db["active"], db["state"]) == (0, kb.LESSON_STATE_CANDIDATE)
+
+    def test_gated_promotion_still_activates_an_eligible_lesson(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            row = kb.promote_lesson(
+                conn, tid, lesson=self.SAFE,
+                applicability="assignee:coder", actor="operator",
+                gate_promotion=True,
+            )
+            assert row["active"] is True
+            assert row["state"] == kb.LESSON_STATE_ACTIVE
+
+    def test_ungated_promotion_is_unchanged_for_existing_callers(self, kanban_home):
+        """Default gate_promotion=False preserves the old contract exactly."""
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            row = kb.promote_lesson(
+                conn, tid, lesson=self.BROAD,
+                applicability="assignee:coder", actor="operator",
+            )
+            assert row["active"] is True
+            assert row["state"] == kb.LESSON_STATE_ACTIVE
+
+    def test_a_gated_candidate_is_recorded_as_such_in_the_event_log(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            kb.promote_lesson(
+                conn, tid, lesson=self.BROAD,
+                applicability="assignee:coder", actor="operator",
+                gate_promotion=True,
+            )
+            kinds = [k for k, _ in _events(conn, tid)]
+            assert "lesson_candidate_recorded" in kinds
+            assert "lesson_promoted" not in kinds
+
+
+class TestLessonAccessorExposesLifecycle:
+    """Regression: the public accessor omitted the columns that make a
+    candidate list meaningful. The original tests missed it by reading SQL
+    directly instead of going through the accessor.
+    """
+
+    def test_candidate_listing_exposes_state_and_expiry(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            kb.extract_lesson(
+                conn, tid,
+                lesson="Governance: escalate cross-company work to Erika.",
+                applicability="assignee:coder", actor="operator",
+                review_after_days=30,
+                retire_condition="routing policy is rewritten",
+            )
+            pending = kb.lesson_candidates(conn)
+            assert len(pending) == 1
+            row = pending[0]
+            assert row["state"] == kb.LESSON_STATE_CANDIDATE
+            assert row["review_by"] is not None
+            assert row["retire_condition"] == "routing policy is rewritten"
+
+    def test_due_for_review_listing_exposes_the_same(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _verified(conn, tenant="acme")
+            kb.extract_lesson(
+                conn, tid,
+                lesson="Do not count provider 429 as implementation failure.",
+                applicability="assignee:coder", actor="operator",
+                review_after_days=1,
+                retire_condition="the provider stops using 429",
+            )
+            due = kb.lessons_due_for_review(conn, now=int(time.time()) + 2 * 86400)
+            assert len(due) == 1
+            assert due[0]["state"] == kb.LESSON_STATE_ACTIVE
+            assert due[0]["retire_condition"] == "the provider stops using 429"
