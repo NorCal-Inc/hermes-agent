@@ -1,3 +1,4 @@
+import pytest
 """Tests for the TUI-side kanban notification poller (issue #59890).
 
 ``kanban_create`` auto-subscribes TUI/desktop sessions with
@@ -19,6 +20,14 @@ from tui_gateway.server import (
     _collect_kanban_notifications,
     _format_kanban_event_text,
 )
+
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities used below ("worker") are synthetic and are not profile
+# directories on disk, so this module declares the registry-patching fixture
+# that already exists for exactly that reason. The gate itself is pinned in
+# tests/hermes_cli/test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
 
 SESSION_KEY = "tui-session-key-1"
 
