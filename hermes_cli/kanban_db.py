@@ -4081,6 +4081,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "verification_state", "verification_state TEXT"
         )
 
+    if "control_plane" not in cols:
+        # 0 on every legacy row. Nothing is retro-classified: the boundary is
+        # about what may be CREATED from now on, and back-labelling historical
+        # cards would rewrite audit history to look like a rule that did not
+        # exist was being enforced.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "control_plane",
+            "control_plane INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "control_plane_authority" not in cols:
+        # The named justification admitted this card (operator:/regression:/
+        # requirement:/defect:). NULL on legacy rows and on ordinary work.
+        _add_column_if_missing(
+            conn, "tasks", "control_plane_authority", "control_plane_authority TEXT"
+        )
+
     if "regression_required" not in cols:
         # 0 on every legacy row. Nothing is retro-armed: the requirement is
         # evidence-driven, and a board migrated mid-flight has no recorded
@@ -5025,6 +5044,7 @@ def create_task(
     recovery_owner: Optional[str] = None,
     repairs_task_id: Optional[str] = None,
     umbrella_task_id: Optional[str] = None,
+    control_plane_authority: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5134,6 +5154,62 @@ def create_task(
                     f"create an unlinked recovery card "
                     f"(cause={provenance.cause!r})"
                 )
+    # ── Control-plane admission control ────────────────────────────────────
+    # The 2026-08-31 closure declared the Gauntlet closed as construction work.
+    # That rule lived in a vault note nothing read, so 251 control-plane cards
+    # were created after it. It is enforced here, at the creation boundary, for
+    # the same reason declares_repair is: every caller reaches create_task, so
+    # a guard anywhere else is optional.
+    control_plane_authority = (control_plane_authority or "").strip() or None
+    is_control_plane = control_plane_subject(title, body)
+    parent_ids_for_admission = [str(p) for p in (parents or ()) if p]
+    if not is_control_plane and parent_ids_for_admission:
+        # Inheritance: a generically-titled child of control-plane work is
+        # control-plane work. Without this a chain launders itself clean by
+        # the second card simply by not naming its subject.
+        marks = ",".join("?" * len(parent_ids_for_admission))
+        try:
+            inherited = conn.execute(
+                f"SELECT 1 FROM tasks WHERE id IN ({marks}) AND control_plane = 1 LIMIT 1",
+                tuple(parent_ids_for_admission),
+            ).fetchone()
+        except sqlite3.Error:
+            inherited = None
+        is_control_plane = inherited is not None
+
+    if is_control_plane:
+        creator_is_human = provenance.kind == ACTOR_KIND_HUMAN_INTERACTIVE
+        if control_plane_authority and not control_plane_authority.startswith(
+            CONTROL_PLANE_AUTHORITY_PREFIXES
+        ):
+            raise ControlPlaneAdmissionError(
+                f"control_plane_authority must start with one of "
+                f"{list(CONTROL_PLANE_AUTHORITY_PREFIXES)}; got "
+                f"{control_plane_authority!r}. The closure requires the "
+                f"justification be NAMED, not asserted."
+            )
+        if not creator_is_human and not control_plane_authority:
+            raise ControlPlaneAdmissionError(
+                f"refusing automated creation of control-plane work "
+                f"({title.strip()[:60]!r}). The Gauntlet is closed as "
+                f"construction work; reopening it requires a named "
+                f"falsifiable defect, new requirement, or verified regression. "
+                f"Pass control_plane_authority='operator:<who>' / "
+                f"'regression:<id>' / 'requirement:<id>' / 'defect:<evidence>'."
+            )
+        if not creator_is_human:
+            spawner = _creating_actor_control_plane_task(conn, provenance)
+            if spawner is not None and not control_plane_authority.startswith(
+                "operator:"
+            ):
+                raise ControlPlaneAdmissionError(
+                    f"refusing second-generation control-plane work: card "
+                    f"{spawner} is itself control-plane and may not "
+                    f"automatically create another. This is the recursion that "
+                    f"consumed 44% of board compute 2026-09-01..06. Only "
+                    f"'operator:<who>' authority admits it."
+                )
+
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -5158,7 +5234,8 @@ def create_task(
     # enabled enforcement get it stamped on new rows; an explicit True/False
     # from the caller always wins.
     gauntlet_enforced = (
-        gauntlet_enforcement_default() if gauntlet is None else bool(gauntlet)
+        _resolve_gauntlet_default(title, body) if gauntlet is None
+        else bool(gauntlet)
     )
     if gauntlet is None and not gauntlet_enforced:
         # A governed parent's enforcement must carry down to its children:
@@ -5487,9 +5564,10 @@ def create_task(
                         executor_lane, recovery_gate_cmd,
                         gauntlet_enforced,
                         actor_kind, actor_id, actor_lane, actor_run_id,
-                        creation_cause, recovery_owner
+                        creation_cause, recovery_owner,
+                        control_plane, control_plane_authority
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?, ?)
+                              ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -5524,6 +5602,8 @@ def create_task(
                         provenance.run_id,
                         provenance.cause,
                         recovery_owner,
+                        1 if is_control_plane else 0,
+                        control_plane_authority,
                     ),
                 )
                 for pid in parents:
@@ -6062,6 +6142,134 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Governance relations + atomic repair creation
 # ---------------------------------------------------------------------------
+
+
+#: Subjects that ARE the control plane. The distinction that matters: a card
+#: *about* this machinery is construction ON the control plane; a card merely
+#: *governed by* it is ordinary work. Only the former is admission-controlled.
+_CONTROL_PLANE_SUBJECT_RE = re.compile(
+    r"\b("
+    r"gauntlet"
+    r"|control[ _-]?plane"
+    r"|kanban[ _-]?lifecycle"
+    r"|verifier[ _-]?(routing|identity|linkage|return)"
+    r"|verification[ _-]?lifecycle"
+    r"|recovery[ _-]?lane"
+    r"|dispatch(er)?[ _-]?(lock|loop|tick|routing)"
+    r"|retry[ _-]?breaker"
+    r"|attempt[ _-]?(ceiling|budget)"
+    r"|observation[ _-]?timer"
+    r"|governance[ _-]?enforcement"
+    r"|self[ _-]?review"
+    r"|review[ _-]?lane"
+    r"|objective[ _-]?budget"
+    r")\b",
+    re.I,
+)
+
+#: An authority token must name WHICH of the closure's three justifications it
+#: relies on, so the claim is auditable rather than a bare boolean.
+CONTROL_PLANE_AUTHORITY_PREFIXES = (
+    "operator:",      # explicit human authorisation
+    "regression:",    # a verified regression against the contract
+    "requirement:",   # a new requirement
+    "defect:",        # falsifiable defect evidence
+)
+
+
+#: Work that MUTATES something that costs money, exposure or trust if wrong.
+#: Independent verification earns its cost here.
+_GAUNTLET_MUTATION_RE = re.compile(
+    r"\b("
+    r"deploy|roll[ _-]?out|ship|publish|go[ _-]?live|cut[ _-]?over"
+    r"|production[ _-]?(change|push|fix|config)"
+    # Bare "migration" over-matched: "pre-migration" (a test fixture) and
+    # "entity-migration PLAN (read-only, no writes)". A qualifier is required
+    # so the phrase names an actual data change.
+    r"|(schema|data|database|db)[ _-]?migrat(e|ion)"
+    r"|schema[ _-]?change|backfill|data[ _-]?deletion|purge"
+    r"|payment|invoice|stripe|billing|refund|payroll|tax[ _-]?filing"
+    r"|credential|secret|token[ _-]?rotation|key[ _-]?rotation|access[ _-]?control"
+    r"|permission[ _-]?change|firewall|port[ _-]?binding"
+    r"|polic(y|ies)[ _-]?change|legal[ _-]?filing|compliance[ _-]?change"
+    r"|customer[ _-]?facing|client[ _-]?facing|deliverable"
+    r"|cross[ _-]?(company|entity)"
+    r")\b",
+    re.I,
+)
+
+#: Work that only LOOKS at the system. Bounded by the universal attempt ceiling
+#: like everything else, but it produces findings, not changes, so demanding an
+#: independent verifier turns every hard question into a verification chain.
+#: This is what happened to t_0ce21cbe: an infra investigation that could not
+#: converge produced 59 verifier cards.
+_GAUNTLET_INVESTIGATION_RE = re.compile(
+    r"\b("
+    r"investigat(e|ion)|diagnos(e|is|tic)|debug|explor(e|atory)|research"
+    r"|read[ _-]?only|information[ _-]?gathering|triage|root[ _-]?cause"
+    r"|analys(is|e)|survey|inspect|reconnaissance|findings|report on"
+    r")\b",
+    re.I,
+)
+
+
+def gauntlet_default_for_subject(
+    title: Optional[str], body: Optional[str] = None
+) -> Optional[bool]:
+    """Whether this subject warrants independent verification by default.
+
+    ``True`` govern, ``False`` do not, ``None`` undecidable -- fall through to
+    the board-wide ``kanban.gauntlet_enforcement`` config.
+
+    Mutation is tested FIRST and wins outright. A card that both investigates
+    and deploys is a deployment. That ordering is the whole point: classifying
+    on topic would let "investigation" become the label everything wears to
+    avoid verification.
+    """
+    blob = f"{title or ''}\n{body or ''}"
+    if _GAUNTLET_MUTATION_RE.search(blob):
+        return True
+    if _GAUNTLET_INVESTIGATION_RE.search(blob):
+        return False
+    return None
+
+
+class ControlPlaneAdmissionError(RuntimeError):
+    """Automated creation of control-plane work without a named authority.
+
+    Not a failure of the work -- a refusal to let the control system enlarge
+    its own remit unsupervised.
+    """
+
+
+def control_plane_subject(
+    title: Optional[str], body: Optional[str] = None
+) -> bool:
+    """True when this card's SUBJECT is the control plane itself."""
+    return bool(_CONTROL_PLANE_SUBJECT_RE.search(f"{title or ''}\n{body or ''}"))
+
+
+def _creating_actor_control_plane_task(
+    conn: sqlite3.Connection, provenance: "ActorProvenance"
+) -> Optional[str]:
+    """The creating actor's own card, but only when it is control-plane work.
+
+    This is what makes the second-generation rule enforceable: a control-plane
+    repair must not automatically spawn another control-plane repair, which is
+    precisely the chain that ran 2026-09-01..06.
+    """
+    run_id = getattr(provenance, "run_id", None)
+    if not run_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT t.id FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.id = ? AND t.control_plane = 1",
+            (int(run_id),),
+        ).fetchone()
+    except (TypeError, ValueError, sqlite3.Error):
+        return None
+    return str(row["id"]) if row is not None else None
 
 
 class RecoveryLinkageError(RuntimeError):
@@ -9368,6 +9576,20 @@ class VerificationRequiredError(ValueError):
             f"verification_state={verification_state!r}). The required chain "
             f"is running -> review -> verified -> done."
         )
+
+
+def _resolve_gauntlet_default(
+    title: Optional[str], body: Optional[str] = None
+) -> bool:
+    """Per-card default: subject classification first, board config second.
+
+    An explicit ``gauntlet=`` argument still wins over both -- this only fills
+    in when the caller expressed no preference.
+    """
+    decided = gauntlet_default_for_subject(title, body)
+    if decided is not None:
+        return decided
+    return gauntlet_enforcement_default()
 
 
 def gauntlet_enforcement_default() -> bool:
