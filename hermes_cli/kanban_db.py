@@ -422,6 +422,17 @@ BLOCK_KIND_ERROR_RECURRED = "error_recurred"
 #: Default recurrences of one error before the loop stops on it.
 REPEATED_ERROR_LIMIT_DEFAULT = 3
 
+#: Run outcomes where the WORK failed on its own terms.
+#:
+#: Only these are charged to the repeated-error bound. A rate limit, a
+#: lease reap, a runtime cap, an orphan kill or a spawn failure is the
+#: control plane's decision, not the work's verdict — it 'ends a process
+#: that may have been making perfect progress', as the retry-counter
+#: carve-out puts it. Charging those would block a card for a reason that
+#: has nothing to do with the card, which is the opposite of the bound's
+#: purpose: catching a wrong fix being retried.
+IMPLEMENTATION_FAILURE_OUTCOMES = frozenset({"crashed", "gave_up"})
+
 VALID_BLOCK_KINDS = {
     "dependency", "needs_input", "approval_required", "capability", "transient",
     BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED,
@@ -8690,10 +8701,12 @@ def objective_error_recurrences(
     for i in range(0, len(members), _LINEAGE_SQL_CHUNK):
         batch = members[i:i + _LINEAGE_SQL_CHUNK]
         marks = ",".join("?" * len(batch))
+        outcome_marks = ",".join("?" * len(IMPLEMENTATION_FAILURE_OUTCOMES))
         for row in conn.execute(
             f"SELECT error FROM task_runs WHERE task_id IN ({marks}) "
-            "AND error IS NOT NULL AND error != ''",
-            tuple(batch),
+            "AND error IS NOT NULL AND error != '' "
+            f"AND outcome IN ({outcome_marks})",
+            tuple(batch) + tuple(sorted(IMPLEMENTATION_FAILURE_OUTCOMES)),
         ):
             if error_signature(row["error"]) == signature:
                 hits += 1
@@ -8709,9 +8722,12 @@ def repeated_error_ceiling_reached(
     not a governance policy, so it is not gated on Gauntlet enforcement.
     """
     root = _objective_lineage_root(conn, task_id)
+    outcome_marks = ",".join("?" * len(IMPLEMENTATION_FAILURE_OUTCOMES))
     row = conn.execute(
         "SELECT error FROM task_runs WHERE task_id = ? AND error IS NOT NULL "
-        "AND error != '' ORDER BY id DESC LIMIT 1", (task_id,),
+        f"AND error != '' AND outcome IN ({outcome_marks}) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,) + tuple(sorted(IMPLEMENTATION_FAILURE_OUTCOMES)),
     ).fetchone()
     if row is None:
         return (False, "", 0, repeated_error_limit(), root)

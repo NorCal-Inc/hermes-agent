@@ -191,3 +191,53 @@ class TestTheTwoBrakesAreIndependent:
         assert conn.execute(
             "SELECT block_kind FROM tasks WHERE id=?", (tid,)
         ).fetchone()["block_kind"] == kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED
+
+
+class TestInfrastructureFailuresAreNotCharged:
+    """A rate limit is not a wrong fix.
+
+    Caught by `test_rate_limit_exit_requeues_without_counting_failure`: the
+    first version of this bound counted every run error, so a recurring
+    provider 429 blocked the card. Blocking work because the provider was busy
+    is the opposite of this bound's purpose.
+
+    The codebase already states the principle for the retry counter — an
+    infrastructure termination "ends a process that may have been making
+    perfect progress, nothing about it is evidence that the work is wrong".
+    The same carve-out applies here.
+    """
+
+    RATE = "HTTP 429 rate limited by the provider, retry after 30s"
+
+    def _run(self, conn, tid, outcome, error):
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(conn, tid, outcome=outcome, error=error)
+
+    def test_rate_limited_runs_do_not_count(self, conn):
+        tid = _ready_task(conn)
+        for _ in range(kb.repeated_error_limit() + 2):
+            self._run(conn, tid, "rate_limited", self.RATE)
+        assert kb.repeated_error_ceiling_reached(conn, tid)[0] is False
+        assert kb.claim_task(conn, tid) is not None
+
+    def test_timeouts_and_reaps_do_not_count(self, conn):
+        tid = _ready_task(conn)
+        for outcome in ("timed_out", "stale", "reclaimed", "spawn_failed"):
+            for _ in range(kb.repeated_error_limit()):
+                self._run(conn, tid, outcome, "the control plane ended this run")
+        assert kb.repeated_error_ceiling_reached(conn, tid)[0] is False
+
+    def test_a_real_crash_still_counts(self, conn):
+        """Control: the carve-out must not swallow genuine failures."""
+        tid = _ready_task(conn)
+        for _ in range(kb.repeated_error_limit()):
+            self._run(conn, tid, "crashed", SAME.format(n=1))
+        assert kb.repeated_error_ceiling_reached(conn, tid)[0] is True
+
+    def test_infrastructure_noise_does_not_mask_a_real_recurrence(self, conn):
+        """Interleaved infra failures must not hide the real one."""
+        tid = _ready_task(conn)
+        for i in range(kb.repeated_error_limit()):
+            self._run(conn, tid, "rate_limited", self.RATE)
+            self._run(conn, tid, "crashed", SAME.format(n=i))
+        assert kb.repeated_error_ceiling_reached(conn, tid)[0] is True
