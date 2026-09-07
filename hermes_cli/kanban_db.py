@@ -8231,6 +8231,14 @@ def gauntlet_objective_attempt_limit() -> int:
 #: (``seen`` short-circuits), so this only caps pathological depth.
 _OBJECTIVE_LINEAGE_MAX_DEPTH = 16
 
+#: Max ids bound into one ``IN (...)`` below. SQLITE_LIMIT_VARIABLE_NUMBER is
+#: 32766 on this build but only 999 on older ones, and the frontier query binds
+#: each id TWICE, so 400 keeps us safe on both (400*2 = 800 < 999). The largest
+#: lineage observed on the live board is 60, so this only ever matters for a
+#: pathological graph -- but an unchunked bind would raise rather than degrade,
+#: and a safety control must not be the thing that throws.
+_LINEAGE_SQL_CHUNK = 400
+
 
 def _objective_lineage_root(conn: sqlite3.Connection, task_id: str) -> str:
     """Walk to the root of the objective ``task_id`` is a continuation of.
@@ -8295,25 +8303,25 @@ def _objective_lineage_members(conn: sqlite3.Connection, root: str) -> set:
     for _ in range(_OBJECTIVE_LINEAGE_MAX_DEPTH):
         if not frontier:
             break
-        marks = ",".join("?" * len(frontier))
-        rows = conn.execute(
-            f"SELECT l.child_id AS id FROM task_links l "
-            f"JOIN tasks c ON c.id = l.child_id "
-            f"WHERE l.parent_id IN ({marks}) AND c.executor_lane = ? "
-            f"UNION "
-            f"SELECT r.from_task_id AS id FROM task_relations r "
-            f"WHERE r.to_task_id IN ({marks}) AND r.relation = ?",
-            (*frontier, EXECUTOR_LANE_CODEX_VERIFY, *frontier, RELATION_REPAIRS),
-        ).fetchall()
-        nxt = [str(r["id"]) for r in rows if str(r["id"]) not in members]
+        found: list = []
+        for i in range(0, len(frontier), _LINEAGE_SQL_CHUNK):
+            batch = frontier[i:i + _LINEAGE_SQL_CHUNK]
+            marks = ",".join("?" * len(batch))
+            rows = conn.execute(
+                f"SELECT l.child_id AS id FROM task_links l "
+                f"JOIN tasks c ON c.id = l.child_id "
+                f"WHERE l.parent_id IN ({marks}) AND c.executor_lane = ? "
+                f"UNION "
+                f"SELECT r.from_task_id AS id FROM task_relations r "
+                f"WHERE r.to_task_id IN ({marks}) AND r.relation = ?",
+                (*batch, EXECUTOR_LANE_CODEX_VERIFY, *batch, RELATION_REPAIRS),
+            ).fetchall()
+            found.extend(str(r["id"]) for r in rows)
+        nxt = [i for i in dict.fromkeys(found) if i not in members]
         members.update(nxt)
         frontier = nxt
     return members
 
-
-def _gauntlet_objective_root(conn: sqlite3.Connection, task_id: str) -> str:
-    """Backwards-compatible alias for :func:`_objective_lineage_root`."""
-    return _objective_lineage_root(conn, task_id)
 
 
 def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
@@ -8325,17 +8333,16 @@ def gauntlet_objective_attempts(conn: sqlite3.Connection, task_id: str) -> int:
     objective?".
     """
     root = _objective_lineage_root(conn, task_id)
-    members = _objective_lineage_members(conn, root)
-    marks = ",".join("?" * len(members))
-    return int(conn.execute(
-        f"SELECT COUNT(*) FROM task_runs r WHERE r.task_id IN ({marks})",
-        tuple(members),
-    ).fetchone()[0])
-
-
-def _gauntlet_objective_scoped(conn: sqlite3.Connection, task_id: str) -> bool:
-    root = _gauntlet_objective_root(conn, task_id)
-    return gauntlet_required(conn, root)
+    members = sorted(_objective_lineage_members(conn, root))
+    total = 0
+    for i in range(0, len(members), _LINEAGE_SQL_CHUNK):
+        batch = members[i:i + _LINEAGE_SQL_CHUNK]
+        marks = ",".join("?" * len(batch))
+        total += int(conn.execute(
+            f"SELECT COUNT(*) FROM task_runs r WHERE r.task_id IN ({marks})",
+            tuple(batch),
+        ).fetchone()[0])
+    return total
 
 
 def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -> tuple[bool, int, int, str]:

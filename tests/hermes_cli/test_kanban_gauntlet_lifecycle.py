@@ -2183,6 +2183,38 @@ class TestObjectiveAttemptCeiling:
         assert kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED != "needs_input"
 
 
+    def test_lineage_counting_is_correct_across_sql_chunk_boundaries(
+        self, kanban_home, monkeypatch
+    ):
+        """A lineage larger than one SQL bind batch still counts exactly once.
+
+        Guards the chunked ``IN (...)`` binds: an unchunked query would raise on
+        a pathological lineage, and a safety control must never be the thing
+        that throws. Chunk size is shrunk rather than building 400+ cards.
+        """
+        monkeypatch.setattr(kb, "_LINEAGE_SQL_CHUNK", 2)
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(conn, title="chunk subject", assignee="default")
+            repairs = []
+            for i in range(7):
+                r = kb.create_task(conn, title=f"repair {i}", assignee="default")
+                kb.add_task_relation(conn, r, subject, kb.RELATION_REPAIRS)
+                repairs.append(r)
+            with kb.write_txn(conn):
+                for n, tid in enumerate([subject] + repairs):
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+                        "VALUES (?, 'default', 'done', ?, ?, 'completed')",
+                        (tid, 500 + n, 501 + n),
+                    )
+            members = kb._objective_lineage_members(conn, subject)
+            assert len(members) == 8, members
+            # 8 cards x 1 run, counted once each despite spanning 4 batches.
+            assert kb.gauntlet_objective_attempts(conn, subject) == 8
+            for r in repairs:
+                assert kb.gauntlet_objective_attempts(conn, r) == 8
+
+
 class TestCanonicalIntegrationGate:
     def test_worktree_is_rejected_until_head_reaches_canonical_ref(
         self, kanban_home, tmp_path, monkeypatch
