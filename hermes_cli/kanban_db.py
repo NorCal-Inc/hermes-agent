@@ -742,9 +742,23 @@ OBSERVATION_STATE_CLOSED = "closed"
 # card dispatched, because the disposition survives the status change.
 DISPOSITION_COMPLETED = "completed"
 DISPOSITION_OVERTAKEN_BY_EVENTS = "overtaken_by_events"
+#: Closed without completing: abandoned, superseded, or given up on.
+#:
+#: Added 2026-09-07. 316 closed cards carried no disposition at all, so
+#: two-thirds of the board could not distinguish finished from abandoned --
+#: and there was no honest way to fill it in. ``completed`` was false for them
+#: and ``overtaken_by_events`` asserts the objective is SATISFIED, which was
+#: both untrue and irreversible.
+#:
+#: Deliberately absent from :data:`IRREVERSIBLE_DISPOSITIONS`. An abandoned
+#: objective is not a finished one: the card may legitimately be picked up
+#: again, and it must never satisfy a dependency on its own. That is the whole
+#: distinction this value exists to preserve.
+DISPOSITION_ABANDONED = "abandoned"
 VALID_TERMINAL_DISPOSITIONS = {
     DISPOSITION_COMPLETED,
     DISPOSITION_OVERTAKEN_BY_EVENTS,
+    DISPOSITION_ABANDONED,
 }
 
 # ...but NOT every ending is final, and conflating the two breaks the board.
