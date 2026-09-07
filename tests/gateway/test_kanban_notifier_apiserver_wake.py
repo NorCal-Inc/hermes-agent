@@ -9,11 +9,20 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
+import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+
+# D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
+# now checks it against the profile registry, not just ``assign_task``. The
+# identities used below ("w") are synthetic and are not profile
+# directories on disk, so this module declares the registry-patching fixture
+# that already exists for exactly that reason. The gate itself is pinned in
+# tests/hermes_cli/test_kanban_assignee_validation.py.
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
 
 
 class SoftFailAdapter:
