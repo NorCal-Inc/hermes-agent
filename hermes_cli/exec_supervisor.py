@@ -636,11 +636,35 @@ def _build_claude_headless(spec: dict) -> list[str]:
     ]
 
 
+def _resolve_codex_argv_prefix() -> list[str]:
+    """Resolve Codex even when a governed worker has a stripped PATH.
+
+    Prefer the caller's PATH when it exposes a concrete Codex executable. If
+    it does not, invoke the Hermes-managed Codex JavaScript entrypoint with
+    the Hermes-managed Node binary explicitly. This avoids both PATH lookups:
+    the codex shim itself uses ``/usr/bin/env node`` and therefore is not a
+    sufficient fallback inside a restricted worker environment.
+    """
+    found = shutil.which("codex")
+    if found:
+        return [found]
+    hermes_home = Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    )
+    node = hermes_home / "node" / "bin" / "node"
+    script = (
+        hermes_home
+        / "node" / "lib" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    )
+    if node.is_file() and script.is_file():
+        return [str(node), str(script)]
+    return ["codex"]
+
+
 def _build_codex_exec(spec: dict) -> list[str]:
     prompt = _require_str(spec, "prompt")
-    binary = shutil.which("codex") or "codex"
     argv = [
-        binary,
+        *_resolve_codex_argv_prefix(),
         "exec",
         prompt,
         "--json",
@@ -681,9 +705,8 @@ def _build_codex_verify(spec: dict) -> list[str]:
     repositories remain outside the writable workspace boundary.
     """
     prompt = _require_str(spec, "prompt")
-    binary = shutil.which("codex") or "codex"
     argv = [
-        binary,
+        *_resolve_codex_argv_prefix(),
         "exec",
         prompt,
         "--json",
@@ -701,11 +724,10 @@ def _build_codex_recovery(spec: dict) -> list[str]:
     """Codex launcher for one mechanically-authorized recovery card only."""
     prompt = _require_str(spec, "prompt")
     task_id = _require_str(spec, "task_id")
-    binary = shutil.which("codex") or "codex"
     argv = [
         "/usr/bin/env",
         f"NORCAL_RECOVERY_TASK_ID={task_id}",
-        binary,
+        *_resolve_codex_argv_prefix(),
         "exec",
         prompt,
         "--json",

@@ -150,6 +150,38 @@ class TestControlPlaneAdmission:
             assert row["control_plane"] == 0
             assert row["control_plane_authority"] is None
 
+    def test_human_control_plane_subject_opens_required_verifier_first_try(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn,
+                title="Update shared boot consumer checkpoint pin",
+                assignee="default",
+                provenance=_human(),
+            )
+            kb.store_attachment_bytes(
+                conn, tid, "acceptance.txt", b"boot status complete\n",
+                content_type="text/plain", uploaded_by="test",
+            )
+            child = kb._ensure_independent_verifier_child(
+                conn, tid, implementer="default"
+            )
+            assert child is not None
+            row = conn.execute(
+                "SELECT control_plane, control_plane_authority, executor_lane "
+                "FROM tasks WHERE id=?", (child,),
+            ).fetchone()
+            assert row["control_plane"] == 1
+            assert row["control_plane_authority"] == (
+                f"operator:human-interactive-parent:{tid}"
+            )
+            assert row["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY
+            failed = conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE task_id=? AND kind='independent_verifier_child_failed'",
+                (tid,),
+            ).fetchone()[0]
+            assert failed == 0
+
 
 class TestControlPlaneInheritance:
     def test_child_inherits_classification_from_parent(self, kanban_home):

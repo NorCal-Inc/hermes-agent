@@ -396,6 +396,24 @@ def test_codex_verifier_completes_readonly_task(monkeypatch, tmp_path):
     assert complete_calls[0]["metadata"]["sandbox"] == "workspace-write-scratch; target-read-only"
 
 
+def test_codex_verifier_prompt_enforces_bounded_scope_guardrail():
+    task = type("T", (), {
+        "id": "t_guardrail",
+        "title": "Independent verification: bounded acceptance",
+        "tenant": None,
+        "workspace_path": "/tmp/verify",
+        "body": "Verify exact path and sha only.",
+    })()
+    prompt = recovery_lane._build_codex_verifier_prompt(task)
+    assert "SCOPE GUARDRAIL — deny-by-default exploration" in prompt
+    assert "Do NOT perform schema discovery" in prompt
+    assert "repository/history searches" in prompt
+    assert "profile enumeration" in prompt
+    assert "broad filesystem/database inspection" in prompt
+    assert "Stop as soon as every explicit acceptance criterion has enough evidence" in prompt
+    assert "return BLOCKER/FAIL" in prompt
+
+
 def test_atlas_verdict_parser_is_fail_closed():
     assert recovery_lane._atlas_verdict("ok\nATLAS_VERDICT: PASS") is True
     assert recovery_lane._atlas_verdict("bad\nATLAS_VERDICT: FAIL") is False

@@ -11011,6 +11011,28 @@ def _ensure_independent_verifier_child(
     # fresh timer and a fresh first alarm instead of being suppressed by the
     # retired one.
     _retire_unroutable_recheck(conn, subject_id, reason="evidence_present")
+    # A mandatory verifier is a continuation of the already-admitted subject,
+    # not fresh control-plane construction. Preserve structured operator
+    # provenance so a human-authorized control-plane subject can open its
+    # required independent verification route without weakening admission
+    # control or inferring authority from the legacy free-text created_by.
+    verifier_control_plane_authority = None
+    subject_admission = conn.execute(
+        "SELECT control_plane, control_plane_authority, actor_kind "
+        "FROM tasks WHERE id = ?",
+        (subject_id,),
+    ).fetchone()
+    if subject_admission is not None and subject_admission["control_plane"]:
+        inherited_authority = (
+            str(subject_admission["control_plane_authority"] or "").strip() or None
+        )
+        if inherited_authority and inherited_authority.startswith("operator:"):
+            verifier_control_plane_authority = inherited_authority
+        elif subject_admission["actor_kind"] == ACTOR_KIND_HUMAN_INTERACTIVE:
+            verifier_control_plane_authority = (
+                f"operator:human-interactive-parent:{subject_id}"
+            )
+
     try:
         child_id = create_task(
             conn,
@@ -11034,6 +11056,7 @@ def _ensure_independent_verifier_child(
                 if gauntlet_required(conn, subject_id)
                 else None
             ),
+            control_plane_authority=verifier_control_plane_authority,
         )
     except Exception as exc:  # pragma: no cover - defensive
         with write_txn(conn):

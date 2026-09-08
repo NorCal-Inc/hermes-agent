@@ -419,7 +419,40 @@ vault_sections.append(section(f"today's daily log index: {daily.name}", daily_vi
 PINNED_CHECKPOINT_PATH = VAULT / "Logs/daily/2026-09-07-checkpoint-post-repair-company-boundary-ent.md"
 PINNED_CHECKPOINT_SHA256 = "ac79ea9a5a699da7337fcbd32d533b19c004cb3293ddd048261e2c5bed99ed76"
 
+# Erika-specific post-checkpoint amendment. This is separate from the hash-pinned
+# company-boundary checkpoint so that recording later Erika execution corrections
+# does not mutate or invalidate the three-surface checkpoint pin.
+ERIKA_EXECUTION_AMENDMENT_PATH = VAULT / "Business/Operations/2026-09-07-erika-post-repair-execution-amendment.md"
+ERIKA_EXECUTION_AMENDMENT_SHA256 = "7866ea289296c25ea74b387d90209e0e00e83d2a3578b8bcc9189a82e839b8a7"
+
 checkpoints = sorted(glob.glob(str(VAULT / "Logs/daily/*checkpoint*.md")), key=os.path.getmtime)
+
+# Erika amendment is a required shared-boot continuity artifact once configured.
+# Missing or hash-mismatched amendment is a boot failure; never fall back to an
+# older Erika config/session record merely because it exists or has a newer mtime.
+erika_amendment_exists = ERIKA_EXECUTION_AMENDMENT_PATH.exists()
+erika_amendment_hash = sha(ERIKA_EXECUTION_AMENDMENT_PATH) if erika_amendment_exists else "UNAVAILABLE"
+erika_amendment_active = (
+    erika_amendment_exists and erika_amendment_hash == ERIKA_EXECUTION_AMENDMENT_SHA256
+)
+if not erika_amendment_exists:
+    failures.append(f"Erika execution amendment missing: {ERIKA_EXECUTION_AMENDMENT_PATH}")
+elif not erika_amendment_active:
+    failures.append(
+        f"Erika execution amendment hash mismatch: {ERIKA_EXECUTION_AMENDMENT_PATH} "
+        f"expected={ERIKA_EXECUTION_AMENDMENT_SHA256} actual={erika_amendment_hash}"
+    )
+
+erika_amendment_meta = (
+    "ERIKA POST-REPAIR EXECUTION AMENDMENT\n"
+    f"path={ERIKA_EXECUTION_AMENDMENT_PATH}\n"
+    f"sha256={erika_amendment_hash}\n"
+    f"expected_sha256={ERIKA_EXECUTION_AMENDMENT_SHA256}\n"
+    f"status={'ACTIVE' if erika_amendment_active else 'INVALID — BOOT FAILS CLOSED'}\n"
+    "authority=Erika-specific post-checkpoint execution meaning; conflicting older Erika configs/session history are historical only\n"
+    "scope=no doctrine/company-boundary/authority-hierarchy change"
+)
+vault_sections.append(section("Erika post-repair execution amendment", erika_amendment_meta))
 cp = None
 pin_configured = bool(PINNED_CHECKPOINT_PATH and PINNED_CHECKPOINT_SHA256)
 pinned_exists = PINNED_CHECKPOINT_PATH.exists() if pin_configured else False

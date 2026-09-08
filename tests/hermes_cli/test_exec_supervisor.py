@@ -90,6 +90,28 @@ def _py(code: str) -> dict:
     return {"argv": [sys.executable, "-c", code]}
 
 
+def test_codex_launcher_falls_back_to_hermes_managed_node_when_path_is_stripped(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    node = hermes_home / "node" / "bin" / "node"
+    script = hermes_home / "node" / "lib" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    node.parent.mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    node.write_bytes(b"node")
+    script.write_text("#!/usr/bin/env node\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(ex.shutil, "which", lambda name: None if name == "codex" else None)
+
+    prefix = ex._resolve_codex_argv_prefix()
+    assert prefix == [str(node), str(script)]
+    argv = ex._build_codex_verify({"prompt": "verify"})
+    assert argv[:4] == [str(node), str(script), "exec", "verify"]
+
+
+def test_codex_launcher_prefers_path_binary(monkeypatch):
+    monkeypatch.setattr(ex.shutil, "which", lambda name: "/opt/bin/codex" if name == "codex" else None)
+    assert ex._resolve_codex_argv_prefix() == ["/opt/bin/codex"]
+
+
 def _reap(pid: int, timeout: float = 5.0) -> None:
     """Best-effort: make sure a test never leaves a process behind."""
     if not pid:
