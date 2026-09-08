@@ -408,12 +408,57 @@ vault_sections.append(section(f"today's daily log index: {daily.name}", daily_vi
 # IMPORTANT: do not inject arbitrary checkpoint body text into shared boot. A checkpoint may
 # contain company-private or task-scoped context. Shared boot may compare path/hash/mtime only;
 # the checkpoint body is opened later only after task scope is known and authorized.
+#
+# Explicit checkpoint pin (t_a98b6446 / t_6f1515ba, 2026-09-07): plain mtime-sort has no
+# protection against same-day duplicate checkpoints, restored/touched-mtime files, or a
+# backup-restore silently superseding the canonical file. When the pinned path+hash below
+# resolves and verifies, it is treated as explicit authority and outranks mtime-sort for
+# company identity, routing, database topology, and repair state. Mtime-sort is permitted
+# only when no explicit pin is configured. A configured pin that is missing or hash-mismatched
+# is a boot failure and must never silently fall back to another checkpoint.
+PINNED_CHECKPOINT_PATH = VAULT / "Logs/daily/2026-09-07-checkpoint-post-repair-company-boundary-ent.md"
+PINNED_CHECKPOINT_SHA256 = "ac79ea9a5a699da7337fcbd32d533b19c004cb3293ddd048261e2c5bed99ed76"
+
 checkpoints = sorted(glob.glob(str(VAULT / "Logs/daily/*checkpoint*.md")), key=os.path.getmtime)
-if checkpoints:
+cp = None
+pin_configured = bool(PINNED_CHECKPOINT_PATH and PINNED_CHECKPOINT_SHA256)
+pinned_exists = PINNED_CHECKPOINT_PATH.exists() if pin_configured else False
+pinned_hash = sha(PINNED_CHECKPOINT_PATH) if pinned_exists else "UNAVAILABLE"
+pinned_active = pin_configured and pinned_exists and pinned_hash == PINNED_CHECKPOINT_SHA256
+if pin_configured and not pinned_active:
+    if not pinned_exists:
+        failures.append(f"pinned checkpoint missing: {PINNED_CHECKPOINT_PATH}")
+    else:
+        failures.append(
+            f"pinned checkpoint hash mismatch: {PINNED_CHECKPOINT_PATH} "
+            f"expected={PINNED_CHECKPOINT_SHA256} actual={pinned_hash}"
+        )
+    cp_meta = (
+        "LATEST CHECKPOINT METADATA ONLY (PIN INVALID — FAIL CLOSED)\n"
+        f"path={PINNED_CHECKPOINT_PATH}\n"
+        f"expected_sha256={PINNED_CHECKPOINT_SHA256}\n"
+        f"actual_sha256={pinned_hash}\n"
+        "pin_status=INVALID — no mtime fallback permitted while an explicit pin is configured\n"
+        "body_not_loaded=true"
+    )
+    vault_sections.append(section("latest checkpoint metadata: PIN INVALID", cp_meta))
+elif pinned_active:
+    cp = PINNED_CHECKPOINT_PATH
+    source_hash_parts.append(f"{cp}:{sha(cp)}")
+    cp_meta = (
+        f"LATEST CHECKPOINT METADATA ONLY (PINNED — explicit path+hash authority overrides mtime-sort)\n"
+        f"path={cp}\n"
+        f"sha256={sha(cp)}\n"
+        f"mtime={dt.datetime.fromtimestamp(cp.stat().st_mtime, tz=now.tzinfo).isoformat()}\n"
+        f"pin_status=ACTIVE — matches PINNED_CHECKPOINT_SHA256; this checkpoint outranks any stale/older checkpoint reference\n"
+        "body_not_loaded=true — open only after the current task scope authorizes it"
+    )
+    vault_sections.append(section(f"latest checkpoint metadata: {cp.name}", cp_meta))
+elif not pin_configured and checkpoints:
     cp = Path(checkpoints[-1])
     source_hash_parts.append(f"{cp}:{sha(cp)}")
     cp_meta = (
-        f"LATEST CHECKPOINT METADATA ONLY\n"
+        f"LATEST CHECKPOINT METADATA ONLY (mtime-sort fallback — no explicit pin configured)\n"
         f"path={cp}\n"
         f"sha256={sha(cp)}\n"
         f"mtime={dt.datetime.fromtimestamp(cp.stat().st_mtime, tz=now.tzinfo).isoformat()}\n"
@@ -448,8 +493,8 @@ else:
     newest_session = None
     newest_session_ts = None
 
-if checkpoints:
-    checkpoint_ts = dt.datetime.fromtimestamp(Path(checkpoints[-1]).stat().st_mtime, tz=now.tzinfo)
+if cp is not None:
+    checkpoint_ts = dt.datetime.fromtimestamp(cp.stat().st_mtime, tz=now.tzinfo)
 else:
     checkpoint_ts = None
 

@@ -52,3 +52,35 @@ def test_list_comments_after_cursor(fresh_home):
         assert kb.list_comments_after(conn, tid, after_id=c2) == []
     finally:
         conn.close()
+
+
+def test_worker_context_christopher_directive_outranks_stale_attempt(fresh_home):
+    import time
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="Hermes boot amendment",
+            body="Original body: update the boot consumer.",
+        )
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id,profile,status,outcome,started_at,ended_at,summary) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (tid, "erika", "done", "blocked", now - 120, now - 90,
+                 "STALE REASONING: this must be delegated to Claude."),
+            )
+        kb.add_comment(
+            conn, tid, "Christopher",
+            "CURRENT ORDER: do this Hermes boot amendment yourself. Do not delegate.",
+        )
+        kb.add_comment(conn, tid, "erika", "ordinary worker note")
+
+        ctx = kb.build_worker_context(conn, tid)
+        assert ctx.index("## CURRENT CHRISTOPHER DIRECTIVES") < ctx.index("## Body")
+        assert ctx.index("## Body") < ctx.index("## Prior attempts on this task")
+        assert "HISTORICAL ONLY" in ctx
+        assert ctx.count(
+            "CURRENT ORDER: do this Hermes boot amendment yourself. Do not delegate."
+        ) == 1
+        assert "comment from worker `Christopher`" not in ctx

@@ -1308,6 +1308,15 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
+        # Cross-process event nudge. Workers completing a parent touch this file
+        # when dependents become ready. The dispatcher still owns all eligibility
+        # and concurrency decisions; this only interrupts the periodic sleep.
+        _dispatch_wake_path = _kb.dispatcher_wake_path()
+        try:
+            _dispatch_wake_seen = _dispatch_wake_path.stat().st_mtime_ns
+        except OSError:
+            _dispatch_wake_seen = 0
+
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
@@ -1850,5 +1859,13 @@ class GatewayKanbanWatchersMixin:
             while slept < interval and self._running:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
+                try:
+                    _wake_now = _dispatch_wake_path.stat().st_mtime_ns
+                except OSError:
+                    _wake_now = 0
+                if _wake_now > _dispatch_wake_seen:
+                    _dispatch_wake_seen = _wake_now
+                    logger.debug("kanban dispatcher: wake signal received; running early tick")
+                    break
 
         self._release_kanban_dispatcher_lock()

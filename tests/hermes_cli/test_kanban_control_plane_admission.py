@@ -67,6 +67,8 @@ class TestControlPlaneClassifier:
         "Integrate verified self-review parent/child release repair",
         "Gauntlet circuit breaker: fresh-session checkpoint on timeout",
         "Repair: unvalidated observation timer",
+        "Bind shared boot record to canonical checkpoint",
+        "Update boot context consumer",
     ])
     def test_control_plane_subjects_are_recognised(self, title):
         assert kb.control_plane_subject(title) is True
@@ -269,6 +271,7 @@ class TestSelectiveGauntletEnforcement:
         "Update the refund policy change for LCASS",
         "Cross-entity governance change for company routing",
         "Ship the customer-facing onboarding deliverable",
+        "Update shared boot consumer checkpoint pin",
     ])
     def test_mutating_work_is_governed(self, title):
         assert kb.gauntlet_default_for_subject(title) is True

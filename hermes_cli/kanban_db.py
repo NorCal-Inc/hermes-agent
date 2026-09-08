@@ -6251,6 +6251,8 @@ _CONTROL_PLANE_SUBJECT_RE = re.compile(
     r"|self[ _-]?review"
     r"|review[ _-]?lane"
     r"|objective[ _-]?budget"
+    r"|boot[ _-]?(gate|record|context|checkpoint|consumer|surface)"
+    r"|shared[ _-]?boot"
     r")\b",
     re.I,
 )
@@ -6282,6 +6284,8 @@ _GAUNTLET_MUTATION_RE = re.compile(
     r"|polic(y|ies)[ _-]?change|legal[ _-]?filing|compliance[ _-]?change"
     r"|customer[ _-]?facing|client[ _-]?facing|deliverable"
     r"|cross[ _-]?(company|entity)"
+    r"|boot[ _-]?(gate|record|context|checkpoint|consumer|surface)"
+    r"|shared[ _-]?boot"
     r")\b",
     re.I,
 )
@@ -8157,6 +8161,27 @@ def finalize_stranded_verified_reviews(conn: sqlite3.Connection) -> int:
         ):
             completed += 1
     return completed
+
+
+DISPATCH_WAKE_FILENAME = ".dispatcher.wake"
+
+def dispatcher_wake_path() -> Path:
+    """Machine-global wake signal consumed by the gateway dispatcher."""
+    return kanban_home() / "kanban" / DISPATCH_WAKE_FILENAME
+
+def signal_dispatcher_wake() -> None:
+    """Best-effort nudge: wake the embedded dispatcher after work becomes ready.
+
+    The signal carries no task data or authority; it only shortens the wait to
+    the next ordinary dispatcher policy pass. Failure is intentionally non-fatal:
+    the periodic dispatcher remains the recovery path.
+    """
+    try:
+        path = dispatcher_wake_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    except Exception as exc:
+        _log.warning("kanban dispatcher wake signal failed: %s", exc)
 
 
 def recompute_ready(
@@ -10994,10 +11019,12 @@ def _ensure_independent_verifier_child(
                 f"Independent Gauntlet verification of {subject_id}.\n\n"
                 f"The implementer ({implementer or 'unknown'}) cannot verify "
                 f"its own work, so this card carries the verdict instead.\n\n"
-                f"Review the evidence attached to {subject_id} and finish with "
-                f"a single anchored line — `VERDICT: PASS`, `VERDICT: FAIL` or "
-                f"`VERDICT: BLOCKER` — which is returned to the subject "
-                f"automatically."
+                f"Review the subject task body and its evidence against every explicit "
+                f"requirement / acceptance criterion. For control-plane work, a PASS must "
+                f"include an anchored `ACCEPTANCE: PASS` line confirming the stated "
+                f"acceptance criteria were checked; missing acceptance confirmation fails "
+                f"closed. Finish with `VERDICT: PASS`, `VERDICT: FAIL` or `VERDICT: BLOCKER` "
+                f"on its own anchored line; the verdict is returned automatically."
             ),
             assignee="atlas",
             parents=[subject_id],
@@ -11040,6 +11067,23 @@ _VERIFIER_VERDICT_RE = re.compile(
     r"(PASS|FAIL|BLOCKER)\b",
     re.IGNORECASE | re.MULTILINE,
 )
+
+_VERIFIER_ACCEPTANCE_RE = re.compile(
+    r"^[\s>*_-]*(?:\*\*|__)?ACCEPTANCE(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"
+    r"(PASS|FAIL)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+def _parse_verifier_acceptance(*texts: Optional[str]) -> Optional[str]:
+    found: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _VERIFIER_ACCEPTANCE_RE.finditer(str(text)):
+            found.add(match.group(1).upper())
+    if len(found) != 1:
+        return None
+    return found.pop()
 
 # The same contract for the OTHER thing a verifier is asked to produce on a
 # repair leg: proof that the checks were re-run.
@@ -11319,7 +11363,7 @@ def _return_verifier_verdict_to_subjects(
         verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
         for subject_id in subjects:
             srow = conn.execute(
-                "SELECT status, verification_state FROM tasks WHERE id = ?",
+                "SELECT status, verification_state, title, body FROM tasks WHERE id = ?",
                 (subject_id,),
             ).fetchone()
             if srow is None:
@@ -11341,6 +11385,25 @@ def _return_verifier_verdict_to_subjects(
                 continue
             if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL):
                 passed = verdict == VERIFIER_VERDICT_PASS
+                if passed and control_plane_subject(srow["title"], srow["body"]):
+                    acceptance = _parse_verifier_acceptance(summary, result)
+                    if acceptance != "PASS":
+                        with write_txn(conn):
+                            _append_event(
+                                conn, subject_id, "verification_acceptance_missing",
+                                {
+                                    "verifier_task": verifier_task_id,
+                                    "verdict": verdict,
+                                    "acceptance": acceptance,
+                                    "reason": "control-plane PASS requires ACCEPTANCE: PASS",
+                                },
+                            )
+                            add_comment(
+                                conn, subject_id, "verifier-return-path",
+                                f"Independent verifier {verifier_task_id} returned PASS without "
+                                "`ACCEPTANCE: PASS`. Control-plane work remains pending verification."
+                            )
+                        continue
                 # Only a PASS may carry it: record_verification refuses a
                 # failing verdict that arrives with regression evidence, and
                 # rightly — there is nothing to bless, so nothing to prove.
@@ -13048,7 +13111,11 @@ def complete_task(
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    # If this completion released work, wake the gateway dispatcher immediately
+    # instead of making the child wait up to dispatch_interval_seconds.
+    promoted_dependents = recompute_ready(conn)
+    if promoted_dependents:
+        signal_dispatcher_wake()
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -21584,18 +21651,20 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     Order:
       1. Task title (mandatory).
-      2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
+      2. Current Christopher directives (when present; highest task-context
+         precedence and explicitly supersede conflicting older task history).
+      3. Task body (optional opening post, capped at 8 KB).
+      4. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
+      5. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
+      6. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+      7. Remaining comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
     All caps exist so worker prompts stay bounded even on pathological
@@ -21640,6 +21709,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    # Current operator directives outrank task history. Christopher may correct
+    # or narrow a task after a failed/blocked attempt; rendering that correction
+    # after stale summaries caused retries to repeat superseded reasoning.
+    all_comments = list_comments(conn, task_id)
+    operator_directives = [
+        c for c in all_comments
+        if (c.author or "").strip().casefold() == "christopher"
+    ]
+    if operator_directives:
+        lines.append("## CURRENT CHRISTOPHER DIRECTIVES — HIGHEST TASK-CONTEXT PRECEDENCE")
+        lines.append(
+            "These are newer operator instructions. If any task body, prior attempt, "
+            "parent handoff, role history, or older comment conflicts with them, follow "
+            "Christopher's newest directive. Do not revive superseded reasoning."
+        )
+        for c in reversed(operator_directives[-10:]):
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
+            age = _relative_age(c.created_at, _now)
+            ts_disp = f"{ts}, {age}" if age else ts
+            lines.append(f"### Christopher directive ({ts_disp})")
+            lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")
@@ -21717,6 +21809,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         first_shown_idx = 1
     if shown:
         lines.append("## Prior attempts on this task")
+        if operator_directives:
+            lines.append(
+                "_HISTORICAL ONLY — these attempts predate or may conflict with current "
+                "Christopher directives above. They provide failure evidence, not current authority._"
+            )
         if omitted:
             lines.append(
                 f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
@@ -21830,13 +21927,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
     # comment-storm tasks don't blow out the worker's prompt. Older
     # comments summarised in a one-line marker like prior attempts.
-    all_comments = list_comments(conn, task_id)
-    if len(all_comments) > _CTX_MAX_COMMENTS:
-        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
-        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
+    remaining_comments = [
+        c for c in all_comments
+        if (c.author or "").strip().casefold() != "christopher"
+    ]
+    if len(remaining_comments) > _CTX_MAX_COMMENTS:
+        omitted_c = len(remaining_comments) - _CTX_MAX_COMMENTS
+        shown_c = remaining_comments[-_CTX_MAX_COMMENTS:]
     else:
         omitted_c = 0
-        shown_c = all_comments
+        shown_c = remaining_comments
     if shown_c:
         lines.append("## Comment thread")
         if omitted_c:

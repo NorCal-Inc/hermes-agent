@@ -699,6 +699,34 @@ class TestIndependentVerifierReturnPath:
             assert row["verifier"] == f"{kb.EXECUTOR_LANE_CODEX_VERIFY}:{cid}"
             assert row["verifier"] != "default"
 
+    def test_control_plane_pass_requires_explicit_acceptance_confirmation(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(
+                conn, title="Bind shared boot record to canonical checkpoint"
+            )
+            cid = _run_verifier(conn, tid, "VERDICT: PASS\nImplementation ran cleanly.")
+
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "review"
+            assert subject.verification_state == kb.VERIFICATION_PENDING
+            missing = _events(conn, tid, "verification_acceptance_missing")
+            assert len(missing) == 1
+            assert missing[0][1]["verifier_task"] == cid
+
+        with kb.connect_closing() as conn:
+            tid2 = _subject_awaiting_verification(
+                conn, title="Update shared boot consumer checkpoint pin"
+            )
+            _run_verifier(
+                conn, tid2,
+                "ACCEPTANCE: PASS\nVERDICT: PASS\nAll stated acceptance criteria checked."
+            )
+            subject2 = kb.get_task(conn, tid2)
+            assert subject2.status == "done"
+            assert subject2.verification_state == kb.VERIFICATION_VERIFIED
+
     def test_fail_returns_and_routes_the_subject_back_for_repair(
         self, kanban_home
     ):
