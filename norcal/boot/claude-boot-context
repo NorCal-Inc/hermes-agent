@@ -12,6 +12,13 @@ from recovery_boot import shared_boot_complete
 LOCAL = Path("/home/chris/.claude/CLAUDE.md")
 CANON = Path("/home/chris/services/life-wiki/vault/Business/Systems/Claude-Global-CLAUDE-canonical.md")
 SHARED = str(Path(__file__).resolve().parent / "hermes-shared-boot-context")
+CANONICAL_CHECKPOINT = Path(
+    "/home/chris/services/life-wiki/vault/Logs/daily/"
+    "2026-09-07-checkpoint-post-repair-company-boundary-ent.md"
+)
+CANONICAL_CHECKPOINT_SHA256 = (
+    "ac79ea9a5a699da7337fcbd32d533b19c004cb3293ddd048261e2c5bed99ed76"
+)
 
 
 def digest(path):
@@ -19,6 +26,25 @@ def digest(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except Exception:
         return None
+
+
+def canonical_checkpoint_authority():
+    """Validate the one approved post-repair checkpoint without copying its body."""
+    try:
+        body = CANONICAL_CHECKPOINT.read_text(encoding="utf-8")
+        actual = digest(CANONICAL_CHECKPOINT)
+    except Exception as exc:
+        return False, f"unreadable: {exc}"
+    if actual != CANONICAL_CHECKPOINT_SHA256:
+        return False, f"sha256={actual or 'UNAVAILABLE'} (expected {CANONICAL_CHECKPOINT_SHA256})"
+    required = (
+        "canonical: true",
+        "supersedes: all older or stale boot/checkpoint references for the scoped state",
+    )
+    missing = [line for line in required if line not in body]
+    if missing:
+        return False, "missing authority marker(s): " + ", ".join(missing)
+    return True, "PASS"
 
 failures = []
 status = "OK"
@@ -52,6 +78,10 @@ except Exception as exc:
     shared = ""
     failures.append(f"shared boot generator exception: {exc}")
 
+checkpoint_ok, checkpoint_detail = canonical_checkpoint_authority()
+if not checkpoint_ok:
+    failures.append(f"Claude canonical checkpoint authority failed: {checkpoint_detail}")
+
 caller_sync = (os.environ.get("CLAUDE_MD_SYNC") or "not-reported").strip()
 if failures:
     boot = "DEGRADED — STOP BEFORE TASK EXECUTION"
@@ -62,6 +92,10 @@ preface = "<claude-bootstrap>\n" + "\n".join([
     f"CLAUDE BOOT STATUS: {boot}",
     f"LOCAL/CANONICAL CLAUDE.md: {status}",
     f"CALLER SYNC REPORT: {caller_sync}",
+    f"CLAUDE CANONICAL CHECKPOINT: {CANONICAL_CHECKPOINT}",
+    f"CLAUDE CHECKPOINT SHA256: {CANONICAL_CHECKPOINT_SHA256}",
+    "CLAUDE CHECKPOINT AUTHORITY: newer than all older/stale references for company identity, routing, database topology, and repair state",
+    f"CLAUDE CHECKPOINT AUTHORITY CHECK: {checkpoint_detail}",
     "Claude's CLAUDE.md is the role/rule file that must already be loaded before this SessionStart context. The shared payload below is the same doctrine/vault starting line used by Erika/Hermes.",
     *(f"FAILURE: {x}" for x in failures),
 ]) + "\n</claude-bootstrap>"
@@ -71,3 +105,5 @@ print(json.dumps({
     "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx},
     "systemMessage": f"shared boot: {boot} | CLAUDE.md: {status}",
 }))
+if failures:
+    raise SystemExit(1)
