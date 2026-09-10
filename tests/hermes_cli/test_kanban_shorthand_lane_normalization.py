@@ -350,3 +350,66 @@ class TestSelfReviewGuardStillHolds:
             # Guard still fires: the claim is refused, not silently granted.
             assert kb.claim_review_task(conn, tid) is None
             assert _events(conn, tid, "review_claim_rejected_self_review")
+
+
+class TestGauntletAtlasRoutingRegression:
+    def test_gauntlet_reviewer_atlas_preserves_subject_and_opens_child(self, kanban_home):
+        """t_a0e4c47b regression: Atlas is a child lane, never the subject."""
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="gauntlet subject", assignee="default", gauntlet=True)
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            kb.add_attachment(
+                conn, tid, filename="evidence.md",
+                stored_path=f"/tmp/{tid}/evidence.md", size=100, uploaded_by="test",
+            )
+            ok, detail = kb.request_review(
+                conn, tid, summary="ready", reviewer="atlas",
+                expected_run_id=claimed.current_run_id, with_reason=True,
+            )
+            assert ok is True, detail
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "review"
+            assert subject.verification_state == kb.VERIFICATION_PENDING
+            assert subject.executor_lane is None
+            rows = conn.execute(
+                "SELECT c.id,c.executor_lane FROM task_links l JOIN tasks c ON c.id=l.child_id "
+                "WHERE l.parent_id=? AND c.executor_lane=?",
+                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+            ).fetchall()
+            assert len(rows) == 1, [tuple(r) for r in conn.execute("SELECT kind,payload FROM task_events WHERE task_id=? ORDER BY id", (tid,)).fetchall()]
+            assert _events(conn, tid, "independent_verifier_lane_requested")
+
+    def test_orphan_codex_lane_does_not_bypass_gauntlet_completion(self, kanban_home):
+        """Defense in depth: an unlinked verifier-labelled subject remains gated."""
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="subject", assignee="default", gauntlet=True)
+            assert kb.assign_task(conn, tid, "atlas") is True
+            task = kb.get_task(conn, tid)
+            assert task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.gauntlet_required(conn, tid) is True
+            try:
+                kb.complete_task(conn, tid, result="VERDICT: FAIL\nATLAS_VERDICT: FAIL")
+            except kb.VerificationRequiredError:
+                pass
+            else:
+                raise AssertionError("unlinked codex_verify-labelled Gauntlet subject completed without verification")
+            task = kb.get_task(conn, tid)
+            assert task.status != "done"
+            assert task.terminal_disposition is None
+
+    def test_orphan_codex_lane_is_gated_even_without_gauntlet_flag(self, kanban_home):
+        """Verifier-artifact exemption requires an actual subject link."""
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="orphan verifier", assignee="default")
+            assert kb.assign_task(conn, tid, "atlas") is True
+            task = kb.get_task(conn, tid)
+            assert task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.gauntlet_required(conn, tid) is True
+            try:
+                kb.complete_task(conn, tid, result="VERDICT: FAIL\\nATLAS_VERDICT: FAIL")
+            except kb.VerificationRequiredError:
+                pass
+            else:
+                raise AssertionError("orphan codex_verify card bypassed completion gate")
+            assert kb.get_task(conn, tid).status != "done"

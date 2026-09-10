@@ -712,6 +712,8 @@ def _build_codex_verify(spec: dict) -> list[str]:
         "--json",
         "--sandbox",
         "workspace-write",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
         "--skip-git-repo-check",
     ]
     last_message_path = spec.get("last_message_path")

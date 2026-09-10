@@ -8,7 +8,7 @@ before/after file manifests whose contents are stored content-addressed
 Design decisions (Teknium-approved):
   - JSONL, not the state DB: the ledger is a durable, human-greppable audit
     trail that survives DB resets and is trivially rsync/backup friendly.
-  - The ledger covers ALL actors, tagged ``curator`` / ``agent`` / ``user``.
+  - The ledger covers ALL actors, tagged ``curator`` / ``agent`` / ``user`` / ``external``.
     The curator *invariant* (never hard-delete autonomously) is unchanged and
     applies only to autonomous actors; foreground user deletes stay
     hard-delete — but they are still ledgered so they're recoverable via
@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 ACTOR_CURATOR = "curator"
 ACTOR_AGENT = "agent"
 ACTOR_USER = "user"
-_VALID_ACTORS = {ACTOR_CURATOR, ACTOR_AGENT, ACTOR_USER}
+ACTOR_EXTERNAL = "external"
+_VALID_ACTORS = {ACTOR_CURATOR, ACTOR_AGENT, ACTOR_USER, ACTOR_EXTERNAL}
 
 # Explicit actor override for call sites that know who they are acting for:
 # the CLI sets "user", the curator's automatic-transition walk sets "curator".

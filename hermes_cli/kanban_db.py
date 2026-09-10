@@ -10010,7 +10010,22 @@ def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
     if row is None:
         return False
     if row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
-        return False
+        # A codex_verify card is exempt from recursive verifier-of-verifier
+        # gating ONLY when it is actually linked to a subject.  A Gauntlet
+        # subject that was accidentally relabelled into the verifier lane
+        # must not inherit this exemption and complete on its own FAIL report.
+        # This is the mechanical backstop for the t_a0e4c47b failure.
+        linked_subject = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,)
+        ).fetchone()
+        if linked_subject is not None:
+            return False
+        # An unlinked verifier-labelled card has no subject to receive its
+        # verdict.  It is therefore not a verifier artifact at all; keep the
+        # normal completion gate even when the card's own Gauntlet flag is
+        # false.  This closes the orphan escape hatch independently of the
+        # board-wide/per-card enforcement setting.
+        return True
     if row["gauntlet_enforced"]:
         return True
     return gauntlet_enforcement_default()
@@ -14397,13 +14412,30 @@ def request_review(
         reviewer, reviewer_lane, reviewer_from_token = _normalize_shorthand_lane(
             reviewer, None
         )
+        # On a Gauntlet subject, reviewer=atlas means "open the independent
+        # Codex verifier route".  It must NEVER relabel the subject itself as
+        # executor_lane=codex_verify, because that turns the subject into its
+        # own verification artifact and bypasses the verified-before-done gate.
+        # Preserve the subject carrier/assignee and let the post-commit routing
+        # block below create the linked verifier child.
+        requested_independent_lane = (
+            reviewer_from_token is not None
+            and reviewer_lane == EXECUTOR_LANE_CODEX_VERIFY
+            and bool(trow["gauntlet_enforced"] or gauntlet_enforcement_default())
+        )
+        if requested_independent_lane:
+            reviewer = implementer
+            reviewer_lane = None
+            reviewer_from_token_for_write = None
+        else:
+            reviewer_from_token_for_write = reviewer_from_token
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
-        lane_sql = ", executor_lane = ?" if reviewer_from_token is not None else ""
+        lane_sql = ", executor_lane = ?" if reviewer_from_token_for_write is not None else ""
         assignee_sql += lane_sql
         head: tuple[Any, ...] = ()
         if reviewer is not None:
             head = (reviewer,)
-            if reviewer_from_token is not None:
+            if reviewer_from_token_for_write is not None:
                 head += (reviewer_lane,)
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -14431,13 +14463,23 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
-        if reviewer_from_token is not None:
+        if requested_independent_lane:
+            _append_event(
+                conn, task_id, "independent_verifier_lane_requested",
+                {
+                    "from_reviewer": reviewer_from_token,
+                    "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                    "subject_executor_lane_preserved": True,
+                    "source": "request_review",
+                },
+            )
+        elif reviewer_from_token_for_write is not None:
             # Same event kind the ready-queue dispatcher and assign_task emit,
             # so the audit trail reads identically whichever path translated.
             _append_event(
                 conn, task_id, "executor_lane_normalized",
                 {
-                    "from_assignee": reviewer_from_token,
+                    "from_assignee": reviewer_from_token_for_write,
                     "assignee": reviewer,
                     "executor_lane": reviewer_lane,
                     "source": "request_review",
@@ -14507,8 +14549,15 @@ def request_review(
         ).fetchone()
         effective = assignee_now["assignee"] if assignee_now is not None else None
         conflict = _review_claim_conflict(conn, task_id, effective)
-        if conflict is not None:
-            conflict_identity, conflict_source = conflict
+        # Explicit reviewer=atlas on a Gauntlet subject is an explicit request
+        # for the independent verifier CHILD, even though the preserved subject
+        # assignee is also recorded as this phase's reviewer carrier. Do not let
+        # that provenance suppress the child route.
+        if requested_independent_lane or conflict is not None:
+            if conflict is not None:
+                conflict_identity, conflict_source = conflict
+            else:
+                conflict_identity, conflict_source = implementer or effective, "explicit_codex_lane"
             child_id = _ensure_independent_verifier_child(
                 conn, task_id, implementer=implementer,
             )

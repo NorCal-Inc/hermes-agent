@@ -1532,6 +1532,9 @@ def _handle_create(args: dict, **kw) -> str:
                         or (new_task.assignee or "").strip().lower() == "claude"
                     )
                 ),
+                human_interactive=bool(
+                    new_task and (new_task.actor_kind or "").strip().lower() == "human_interactive"
+                ),
             )
             return _ok(
                 task_id=new_tid,
@@ -1556,6 +1559,7 @@ def _maybe_auto_subscribe(
     *,
     origin_session_id: Optional[str] = None,
     direct_claude: bool = False,
+    human_interactive: bool = False,
 ) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -1586,7 +1590,9 @@ def _maybe_auto_subscribe(
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
+    - **Interactive CLI**: if no persistent session channel exists, use the configured kanban Telegram approval destination as a passive completion channel.
+
+    - **Cron / test / unattached**: no persistent delivery channel,
       no-op.
 
     Failure mode: any exception inside the function is logged at WARNING
@@ -1594,6 +1600,7 @@ def _maybe_auto_subscribe(
     We never want a notification bookkeeping failure to fail the
     kanban_create that the agent is mid-conversation about.
     """
+    cfg: dict[str, Any] = {}
     try:
         cfg = load_config()
         if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
@@ -1627,36 +1634,62 @@ def _maybe_auto_subscribe(
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
+            cli_telegram_fallback = False
             if not session_key:
                 # Direct-Claude cards created from Erika's stateless API path
                 # still carry the originating session id even though there is
-                # no push-capable platform/chat ContextVar.  For this one
-                # executor lane, register an api_server wake subscription so a
-                # completed/blocked/crashed/timed_out terminal event self-posts
-                # back into the originating Erika session.  Keep the historical
-                # no-op for ordinary CLI/cron/test tasks so we do not resurrect
-                # the over-eager HERMES_SESSION_ID subscription behavior.
+                # no push-capable platform/chat ContextVar.
                 api_origin = (origin_session_id or "").strip()
-                if not (direct_claude and api_origin):
-                    return False  # ordinary CLI / cron / test — no persistent channel
-                platform = "api_server"
-                chat_id = api_origin
+                if direct_claude and api_origin:
+                    platform = "api_server"
+                    chat_id = api_origin
+                elif human_interactive and api_origin:
+                    # An interactive CLI has no persistent socket to wake after
+                    # the command exits.  Use the operator's explicitly
+                    # configured kanban Telegram approval destination as the
+                    # completion channel instead of silently leaving the task
+                    # unsubscribed.  Cron/test/unattached tasks still no-op.
+                    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+                    fallback_chat = str(kcfg.get("approval_telegram_chat_id") or "").strip()
+                    if not fallback_chat:
+                        return False
+                    platform = "telegram"
+                    chat_id = fallback_chat
+                    cli_telegram_fallback = True
+                else:
+                    return False
             else:
                 platform = "tui"
                 chat_id = session_key
+                cli_telegram_fallback = False
+        else:
+            cli_telegram_fallback = False
         is_gateway_session = platform != "tui"
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        delivery_mode = "notify+wake" if is_gateway_session else None
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        chat_type = (
+            get_session_env("HERMES_SESSION_CHAT_TYPE", "")
+            or (str(kcfg.get("approval_telegram_chat_type") or "") if cli_telegram_fallback else "")
+            or None
+        )
+        delivery_mode = "notify" if cli_telegram_fallback else ("notify+wake" if is_gateway_session else None)
+        thread_id = (
+            get_session_env("HERMES_SESSION_THREAD_ID", "")
+            or (str(kcfg.get("approval_telegram_thread_id") or "") if cli_telegram_fallback else "")
+            or None
+        )
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
-            "default"
-            if platform == "api_server" and direct_claude
+            str(kcfg.get("approval_notifier_profile") or "default")
+            if cli_telegram_fallback
             else (
-                get_session_env("HERMES_SESSION_PROFILE", "")
-                or os.environ.get("HERMES_PROFILE")
+                "default"
+                if platform == "api_server" and direct_claude
+                else (
+                    get_session_env("HERMES_SESSION_PROFILE", "")
+                    or os.environ.get("HERMES_PROFILE")
+                )
             )
         )
         if not notifier_profile:
