@@ -8981,16 +8981,199 @@ def _block_repeated_error(conn: sqlite3.Connection, task_id: str) -> None:
         })
 
 
+# ---------------------------------------------------------------------------
+# Operator continuation grants (2026-09-14, t_b8d62378)
+# ---------------------------------------------------------------------------
+#
+# The attempt ceiling is a hard brake and stays one: the automatic budget is
+# the board-wide base limit, and nothing automated can raise it. What was
+# missing was a governed way for a human to buy a small, recorded amount of
+# extra capacity for ONE objective without weakening every other task. An
+# exhausted objective could otherwise continue only by raising the board-wide
+# limit or by editing the database; ``unblock`` just re-blocks at the next claim.
+#
+# A grant is an append-only event on the objective lineage root. The effective
+# ceiling is derived (base + sum of grants), never stored, so the base stays an
+# invariant, historical runs keep counting, and a later grant is another event.
+
+OBJECTIVE_ATTEMPT_GRANT_EVENT = "objective_attempt_budget_granted"
+#: Every grant is finite; a larger continuation needs further explicit grants.
+OBJECTIVE_ATTEMPT_GRANT_MAX = 6
+#: Process markers injected into governed executors (see ``build_worker_env``).
+_GOVERNED_RUN_ENV_MARKERS = (
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_EXECUTION_ID",
+    "HERMES_EXECUTOR_LANE",
+)
+_AUTOMATION_IDENTITIES = frozenset({
+    "default", "atlas", "system", "unknown", "dispatcher", "kanban-dispatcher",
+    "stale-supervision", "stale_supervision", "system-health-controller",
+    *VALID_EXECUTOR_LANES,
+})
+
+
+class ObjectiveAttemptGrantRefused(PermissionError):
+    """An attempt-budget grant was refused; nothing was recorded."""
+
+
+def objective_attempt_grants(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """Recorded operator grants for ``task_id``'s objective lineage, oldest first."""
+    root = _objective_lineage_root(conn, task_id)
+    grants: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
+        (root, OBJECTIVE_ATTEMPT_GRANT_EVENT),
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            added = payload.get("added_attempts")
+        except Exception:
+            continue
+        if (
+            isinstance(added, int) and not isinstance(added, bool)
+            and 1 <= added <= OBJECTIVE_ATTEMPT_GRANT_MAX
+            and payload.get("objective") == root
+        ):
+            grants.append({**payload, "event_id": int(row["id"])})
+    return grants
+
+
+def effective_objective_attempt_limit(conn: sqlite3.Connection, task_id: str) -> int:
+    """Base board limit plus this objective's operator grants."""
+    return gauntlet_objective_attempt_limit() + sum(
+        g["added_attempts"] for g in objective_attempt_grants(conn, task_id)
+    )
+
+
+def _process_ancestry() -> list[int]:
+    pids: list[int] = []
+    pid = os.getpid()
+    for _ in range(64):
+        pids.append(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if ppid <= 1:
+            break
+        pid = ppid
+    return pids
+
+
+def _governed_grant_context(conn: sqlite3.Connection, env: Mapping[str, str]) -> Optional[str]:
+    """Why this caller is automation rather than an operator, or ``None``."""
+    for marker in _GOVERNED_RUN_ENV_MARKERS:
+        if (env.get(marker) or "").strip():
+            return f"governed run marker {marker} is set"
+    ancestry = set(_process_ancestry())
+    try:
+        own_pgid = os.getpgid(0)
+    except OSError:
+        own_pgid = None
+    for row in conn.execute(
+        "SELECT id, pid, pgid FROM executions WHERE ended_at IS NULL"
+    ):
+        if row["pid"] is not None and int(row["pid"]) in ancestry:
+            return f"caller descends from live execution {row['id']}"
+        if own_pgid is not None and row["pgid"] is not None and int(row["pgid"]) == own_pgid:
+            return f"caller shares the process group of live execution {row['id']}"
+    return None
+
+
+def _automation_identity(name: str) -> bool:
+    lowered = name.strip().lower()
+    if lowered in _AUTOMATION_IDENTITIES or lowered.endswith("-lane"):
+        return True
+    try:
+        return (kanban_home() / "profiles" / name.strip()).is_dir()
+    except Exception:
+        return False
+
+
+def grant_objective_attempts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    added_attempts: int,
+    authorized_by: str,
+    reason: str,
+    env: Optional[Mapping[str, str]] = None,
+    now: Optional[int] = None,
+) -> dict:
+    """Record one finite operator grant of extra attempts for one objective.
+
+    Only raises the objective's effective ceiling. It never unblocks, claims,
+    dispatches, requests review or resets any counter. Fails closed: refused
+    for any governed run or descendant of a live execution, for any provenance
+    other than an explicitly declared ``human_interactive`` operator, and for
+    automation identities (``default``, executor lanes, profiles, controllers).
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    if isinstance(added_attempts, bool) or not isinstance(added_attempts, int) or not (
+        1 <= added_attempts <= OBJECTIVE_ATTEMPT_GRANT_MAX
+    ):
+        raise ObjectiveAttemptGrantRefused(
+            f"added_attempts must be an integer from 1 to {OBJECTIVE_ATTEMPT_GRANT_MAX}"
+        )
+    authorized_by = (authorized_by or "").strip()
+    reason = (reason or "").strip()
+    if not authorized_by or not reason:
+        raise ObjectiveAttemptGrantRefused("a grant requires authorized_by and a reason")
+    context = _governed_grant_context(conn, environ)
+    if context is not None:
+        raise ObjectiveAttemptGrantRefused(f"automation cannot grant attempts: {context}")
+    declared = (environ.get(ENV_ACTOR_KIND) or "").strip()
+    actor_id = (environ.get(ENV_ACTOR_ID) or "").strip()
+    if declared != ACTOR_KIND_HUMAN_INTERACTIVE or not actor_id:
+        raise ObjectiveAttemptGrantRefused(
+            f"a grant requires explicit operator provenance: {ENV_ACTOR_KIND}="
+            f"{ACTOR_KIND_HUMAN_INTERACTIVE} and a named {ENV_ACTOR_ID}"
+        )
+    for name in (actor_id, authorized_by):
+        if _automation_identity(name):
+            raise ObjectiveAttemptGrantRefused(
+                f"{name!r} is an automation identity and cannot authorize a grant"
+            )
+    now_ts = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            raise ObjectiveAttemptGrantRefused(f"task {task_id} not found")
+        root = _objective_lineage_root(conn, task_id)
+        status = conn.execute("SELECT status FROM tasks WHERE id = ?", (root,)).fetchone()
+        if status is None or status["status"] in ("done", "archived", "failed", "cancelled"):
+            raise ObjectiveAttemptGrantRefused(f"objective {root} is not open")
+        base = gauntlet_objective_attempt_limit()
+        prior = effective_objective_attempt_limit(conn, root)
+        payload = {
+            "objective": root,
+            "subject_requested": task_id,
+            "added_attempts": added_attempts,
+            "attempts_before": gauntlet_objective_attempts(conn, root),
+            "base_limit": base,
+            "prior_effective_limit": prior,
+            "new_effective_limit": prior + added_attempts,
+            "authorized_by": authorized_by,
+            "reason": reason,
+            "actor_kind": declared,
+            "actor_id": actor_id,
+            "authorization_source": "hermes kanban attempt-budget --grant",
+            "granted_at": now_ts,
+        }
+        _append_event(conn, root, OBJECTIVE_ATTEMPT_GRANT_EVENT, payload)
+    return payload
+
+
 def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -> tuple[bool, int, int, str]:
     """Universal. Applies to EVERY task, Gauntlet-governed or not.
 
     Retry protection is a safety control; Gauntlet verification is a governance
     policy. Coupling them meant exempting work from verification also exempted
     it from having any brakes, which is how an ungoverned task could retry
-    without bound. The two are now independent.
+    without bound. The two are now independent. The limit is the board base
+    plus any operator continuation grants recorded for this objective.
     """
     root = _objective_lineage_root(conn, task_id)
-    limit = gauntlet_objective_attempt_limit()
+    limit = effective_objective_attempt_limit(conn, root)
     attempts = gauntlet_objective_attempts(conn, root)
     return attempts >= limit, attempts, limit, root
 

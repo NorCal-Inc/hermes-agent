@@ -711,6 +711,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_budget = sub.add_parser(
+        "attempt-budget",
+        help=(
+            "Show an objective's attempt budget, or record one finite operator "
+            "grant of extra attempts (never unblocks, claims or dispatches)"
+        ),
+    )
+    p_budget.add_argument("task_id")
+    p_budget.add_argument(
+        "--grant", type=int, default=None,
+        help=f"Attempts to add for this objective lineage (1-{kb.OBJECTIVE_ATTEMPT_GRANT_MAX})",
+    )
+    p_budget.add_argument("--authorized-by", default=None,
+                          help="The human who authorized the grant (required with --grant)")
+    p_budget.add_argument("--reason", default=None,
+                          help="Why the objective needs more attempts (required with --grant)")
+    p_budget.add_argument("--json", action="store_true")
+
     p_approve = sub.add_parser(
         "approve", help="Approve a task blocked with approval_required and resume it"
     )
@@ -1505,6 +1523,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "attempt-budget": _cmd_attempt_budget,
             "approve":  _cmd_approve,
             "deny":     _cmd_deny,
             "request-review": _cmd_request_review,
@@ -2813,6 +2832,42 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             else:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_attempt_budget(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        granted = None
+        if args.grant is not None:
+            try:
+                granted = kb.grant_objective_attempts(
+                    conn, args.task_id, added_attempts=args.grant,
+                    authorized_by=args.authorized_by or "", reason=args.reason or "",
+                )
+            except kb.ObjectiveAttemptGrantRefused as exc:
+                print(f"attempt-budget grant refused: {exc}", file=sys.stderr)
+                return 2
+        root = kb._objective_lineage_root(conn, args.task_id)
+        report = {
+            "objective": root,
+            "attempts": kb.gauntlet_objective_attempts(conn, root),
+            "base_limit": kb.gauntlet_objective_attempt_limit(),
+            "effective_limit": kb.effective_objective_attempt_limit(conn, root),
+            "grants": kb.objective_attempt_grants(conn, root),
+            "granted_now": granted,
+        }
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"objective {root}: {report['attempts']} attempts, effective limit "
+              f"{report['effective_limit']} (base {report['base_limit']} + "
+              f"{len(report['grants'])} grant(s))")
+        if granted:
+            print(f"granted +{granted['added_attempts']} by {granted['authorized_by']}: "
+                  f"{granted['prior_effective_limit']} -> {granted['new_effective_limit']}")
+    return 0
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
