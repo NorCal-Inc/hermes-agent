@@ -63,6 +63,10 @@ STATE_VERSION = 1
 STATUS_OPEN = "open"
 STATUS_ESCALATED = "escalated"
 STATUS_RESOLVED = "resolved"
+#: Detected on a card under a configured recovery hold: never repaired, never
+#: individually escalated; folded into one escalation per hold.
+STATUS_HELD = "held"
+HOLD_INVARIANT = "recovery_hold"
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "health-controller.json"
 
@@ -226,6 +230,52 @@ class PassResult:
     escalated: list[str]
     open: list[str]
     resolved: list[str]
+    held: list[str] = dataclasses.field(default_factory=list)
+
+
+def recovery_holds(config: dict) -> list[dict]:
+    """Validated ``recovery_holds`` from config. Malformed holds fail closed.
+
+    Each hold is explicit and removable: ``name``, ``task_ids``, ``reason``,
+    ``authorized_by`` and ``release`` (the condition for deleting the entry).
+    A finding whose subject or any identifier in its detail is a held task is
+    detected and reported, but never recovered and never escalated on its own.
+    """
+    holds = config.get("recovery_holds") or []
+    if not isinstance(holds, list):
+        raise ValueError("recovery_holds must be a list")
+    out = []
+    for hold in holds:
+        if not isinstance(hold, dict):
+            raise ValueError("each recovery hold must be an object")
+        missing = [k for k in ("name", "task_ids", "reason", "authorized_by", "release") if not hold.get(k)]
+        ids = hold.get("task_ids")
+        if missing or not isinstance(ids, list) or not all(isinstance(i, str) and i.strip() for i in ids):
+            raise ValueError(f"malformed recovery hold {hold.get('name')!r}: missing/invalid {missing or ['task_ids']}")
+        out.append({**hold, "task_ids": sorted({i.strip() for i in ids})})
+    return out
+
+
+def hold_for(finding: Finding, holds: list[dict]) -> Optional[dict]:
+    ids = {finding.subject}
+    ids.update(v for v in finding.detail.values() if isinstance(v, str))
+    for hold in holds:
+        if ids & set(hold["task_ids"]):
+            return hold
+    return None
+
+
+class _HoldEscalation(Invariant):
+    """Carrier for the single per-hold escalation. It has no check or recovery."""
+
+    name = HOLD_INVARIANT
+    max_attempts = 0
+
+    def __init__(self, tier: str) -> None:
+        self.tier = tier
+
+    def check(self, ctx: "Context") -> list[Finding]:
+        return []
 
 
 class Controller:
@@ -247,15 +297,23 @@ class Controller:
             state["installed_at"] = now
         result = PassResult(tier, "GREEN", 0, [], [], [], [])
         self._alert_queue: list[tuple[Finding, dict]] = []
+        holds = recovery_holds(self.ctx.config)
+        held: dict[str, list[Finding]] = {}
         for inv in [i for i in self.invariants if i.tier == tier]:
             findings = self._observe(inv)
             present = {f.fingerprint for f in findings}
             result.findings += len(findings)
             for finding in findings:
+                hold = hold_for(finding, holds)
+                if hold is not None:
+                    self._hold(finding, hold, inv.tier, state, result)
+                    held.setdefault(hold["name"], []).append(finding)
+                    continue
                 self._process(inv, finding, state, result)
             self._resolve_absent(inv, present, state, result)
+        self._escalate_holds(tier, holds, held, state, result)
         self._flush_alerts()
-        if result.escalated or result.open or any(
+        if result.escalated or result.open or result.held or any(
             rec.get("status") == STATUS_ESCALATED and rec.get("tier") == tier
             for rec in state["fingerprints"].values()
         ):
@@ -271,6 +329,7 @@ class Controller:
             "recovered": len(result.recovered),
             "escalated": len(result.escalated),
             "open": len(result.open),
+            "held": len(result.held),
         })
         return result
 
@@ -292,7 +351,9 @@ class Controller:
         now = self.ctx.now()
         fp = finding.fingerprint
         rec = state["fingerprints"].get(fp)
-        if rec is None or rec.get("status") == STATUS_RESOLVED:
+        if rec is None or rec.get("status") in (STATUS_RESOLVED, STATUS_HELD):
+            # A released hold starts a fresh episode: full recovery budget,
+            # normal escalation and alerting.
             rec = {
                 "invariant": finding.invariant, "subject": finding.subject,
                 "signature": finding.signature, "tier": inv.tier,
@@ -405,12 +466,58 @@ class Controller:
                               delivered=bool(delivered), attempt=rec["alert_attempts"],
                               batch_size=len(queue))
 
+    # -- HOLD ----------------------------------------------------------------
+
+    def _hold(self, finding: Finding, hold: dict, tier: str, state: dict, result: PassResult) -> None:
+        """Record a held finding. No recovery, no individual card or alert."""
+        now = self.ctx.now()
+        fp = finding.fingerprint
+        rec = state["fingerprints"].get(fp)
+        if rec is None or rec.get("status") not in (STATUS_HELD,):
+            previous = rec.get("status") if rec else None
+            rec = {
+                "invariant": finding.invariant, "subject": finding.subject,
+                "signature": finding.signature, "tier": tier,
+                "first_seen": rec.get("first_seen", _iso(now)) if rec else _iso(now),
+                "attempts": rec.get("attempts", 0) if rec else 0, "observations": 0,
+                "status": STATUS_HELD, "held_by": hold["name"], "card_id": None,
+                "alert_delivered": True, "alert_attempts": 0,
+            }
+            state["fingerprints"][fp] = rec
+            self.store.record(now, "held", fingerprint=fp, invariant=finding.invariant,
+                              subject=finding.subject, hold=hold["name"], previous_status=previous)
+        rec["last_seen"] = _iso(now)
+        rec["observations"] = int(rec.get("observations", 0)) + 1
+        result.held.append(fp)
+
+    def _escalate_holds(self, tier: str, holds: list[dict], held: dict[str, list[Finding]],
+                        state: dict, result: PassResult) -> None:
+        """One deduplicated escalation per active hold (per tier), ids only."""
+        carrier = _HoldEscalation(tier)
+        present: set[str] = set()
+        by_name = {h["name"]: h for h in holds}
+        for name, findings in sorted(held.items()):
+            hold = by_name[name]
+            aggregate = Finding(
+                HOLD_INVARIANT, f"{name}@{tier}", "hold_active",
+                {
+                    "held_task_ids": ",".join(hold["task_ids"]),
+                    "suppressed": sorted(f"{f.invariant}:{f.subject}:{f.signature}" for f in findings),
+                    "release": hold["release"],
+                },
+            )
+            present.add(aggregate.fingerprint)
+            self._process(carrier, aggregate, state, result)
+        self._resolve_absent(carrier, present, state, result)
+
     def _resolve_absent(self, inv: Invariant, present: set[str], state: dict, result: PassResult) -> None:
         now = self.ctx.now()
         for fp, rec in state["fingerprints"].items():
             if rec.get("invariant") != inv.name or fp in present:
                 continue
-            if rec.get("status") in (STATUS_OPEN, STATUS_ESCALATED):
+            if rec.get("tier") not in (None, inv.tier):
+                continue  # the other pass owns it
+            if rec.get("status") in (STATUS_OPEN, STATUS_ESCALATED, STATUS_HELD):
                 rec["status"] = STATUS_RESOLVED
                 rec["resolved_at"] = _iso(now)
                 result.resolved.append(fp)

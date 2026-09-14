@@ -713,3 +713,175 @@ class TestLiveSnapshotRefinements:
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (inner,))
         assert shc.VerifierOfVerifier().check(_ctx(kanban_home)) == []
+
+
+# ---------------------------------------------------------------------------
+# Recovery holds (Christopher, 2026-09-14): frozen cards are detected and
+# escalated once, never repaired, released, reassigned, promoted or dispatched.
+# ---------------------------------------------------------------------------
+
+
+def _hold_config(*task_ids, **extra):
+    hold = {"name": "phase3-freeze", "task_ids": list(task_ids), "reason": "cutover frozen",
+            "authorized_by": "test", "release": "remove when the freeze is released"}
+    hold.update(extra)
+    return {"recovery_holds": [hold]}
+
+
+def _relabelled_subject(conn, title="phase 3 overlay"):
+    tid = _subject_with_route(conn, assignee="claude", title=title)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET executor_lane = ? WHERE id = ?",
+                     (kb.EXECUTOR_LANE_CODEX_VERIFY, tid))
+        kb._append_event(conn, tid, "executor_lane_normalized", {
+            "from_assignee": "atlas", "executor_lane": kb.EXECUTOR_LANE_CODEX_VERIFY,
+            "source": "assign_task"})
+    return tid
+
+
+def _deadlocked_verification_child(conn, subject):
+    child = kb.create_task(conn, title="Independent compliance verification Phase 3 overlay",
+                           assignee="reviewer", parents=[subject], gauntlet=True)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+    assert kb.claim_task(conn, child) is None
+    return child
+
+
+def _board_snapshot(conn, ids):
+    marks = ",".join("?" for _ in ids)
+    return {
+        "rows": [tuple(r) for r in conn.execute(
+            f"SELECT id, status, assignee, executor_lane, verification_state, claim_lock "
+            f"FROM tasks WHERE id IN ({marks}) ORDER BY id", ids)],
+        "events": conn.execute(f"SELECT COUNT(*) FROM task_events WHERE task_id IN ({marks})", ids).fetchone()[0],
+        "relations": conn.execute("SELECT COUNT(*) FROM task_relations").fetchone()[0],
+        "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+    }
+
+
+class TestRecoveryHold:
+    def _invariants(self):
+        return [Counting(shc.VerifierRouteOpen()), Counting(shc.SubjectLaneRelabelled()),
+                Counting(shc.VerifierChildDeadlocked()), Counting(shc.SubjectReviewRegressed())]
+
+    def test_held_cards_are_detected_but_never_mutated_across_passes(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+            verifier = kb._open_verifier_child(conn, subject)
+            child = _deadlocked_verification_child(conn, subject)
+            unroutable = _subject_without_evidence(conn, title="compliance audit")
+            held_ids = [subject, verifier, child, unroutable]
+            before = _board_snapshot(conn, held_ids)
+            tasks_before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        invariants = self._invariants()
+        ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=_hold_config(*held_ids))
+        controller = shc.Controller(ctx, invariants)
+
+        results = []
+        for _ in range(3):
+            results.append(controller.run(shc.TIER_LIGHT))
+            clock.advance(300)
+
+        assert all(inv.recoveries == 0 for inv in invariants)
+        for result in results:
+            assert result.recovered == [] and result.open == []
+            assert len(result.held) >= 3            # relabel, deadlock, unroutable
+            assert result.status == "DEGRADED"
+        assert len(results[0].escalated) == 1        # the single hold escalation
+        assert results[1].escalated == [] and results[2].escalated == []
+        assert len(alerts.sent) == 1
+        with kb.connect_closing() as conn:
+            assert _board_snapshot(conn, held_ids) == before
+            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == tasks_before + 1
+            (card,) = _health_cards(conn)
+            assert card["idempotency_key"].startswith("health:recovery_hold:")
+            assert card["status"] == "triage" and card["assignee"] is None
+            for tid in (subject, child, unroutable):
+                assert tid in card["body"]
+        state = shc.StateStore(ctx.state_dir).load()
+        held_recs = [r for r in state["fingerprints"].values() if r["invariant"] != shc.HOLD_INVARIANT]
+        assert held_recs and all(r["status"] == shc.STATUS_HELD and r["attempts"] == 0 for r in held_recs)
+
+    def test_non_held_defects_are_still_repaired_in_the_same_pass(self, kanban_home):
+        with kb.connect_closing() as conn:
+            frozen = _relabelled_subject(conn, title="frozen subject")
+            free_relabel = _relabelled_subject(conn, title="free subject")
+            free_route = _subject_evidence_after_handoff(conn, title="free route")
+        ctx = _ctx(kanban_home, config=_hold_config(frozen))
+        result = shc.Controller(ctx, self._invariants()).run(shc.TIER_LIGHT)
+        assert len(result.recovered) == 2
+        with kb.connect_closing() as conn:
+            assert kb.get_task(conn, frozen).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.get_task(conn, free_relabel).executor_lane == kb.EXECUTOR_LANE_CLAUDE
+            assert kb._open_verifier_child(conn, free_route) is not None
+
+    def test_removing_the_hold_resumes_normal_recovery(self, kanban_home):
+        clock = Clock()
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+        held_ctx = _ctx(kanban_home, clock=clock, config=_hold_config(subject))
+        assert shc.Controller(held_ctx, self._invariants()).run(shc.TIER_LIGHT).recovered == []
+        clock.advance(300)
+        released = _ctx(kanban_home, clock=clock, config={})
+        result = shc.Controller(released, self._invariants()).run(shc.TIER_LIGHT)
+        assert len(result.recovered) == 1
+        with kb.connect_closing() as conn:
+            assert kb.get_task(conn, subject).executor_lane == kb.EXECUTOR_LANE_CLAUDE
+
+    def test_hold_escalation_stays_one_card_as_suppressed_findings_change(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        with kb.connect_closing() as conn:
+            subject = _subject_with_route(conn)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (subject,))
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts,
+                                         config=_hold_config(subject)), self._invariants())
+        first = controller.run(shc.TIER_LIGHT)
+        assert len(first.held) == 1
+        clock.advance(300)
+        with kb.connect_closing() as conn:
+            # a second, different held finding appears on the same card
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET executor_lane = ? WHERE id = ?",
+                             (kb.EXECUTOR_LANE_CODEX_VERIFY, subject))
+                kb._append_event(conn, subject, "executor_lane_normalized",
+                                 {"executor_lane": kb.EXECUTOR_LANE_CODEX_VERIFY, "source": "assign_task"})
+        second = controller.run(shc.TIER_LIGHT)
+        assert len(second.held) == 2
+        with kb.connect_closing() as conn:
+            assert len(_health_cards(conn)) == 1
+        assert len(alerts.sent) == 1
+
+    def test_a_finding_that_references_a_held_card_is_held_too(self, kanban_home):
+        """Only the frozen subject is listed; its gated verification child points at it."""
+        with kb.connect_closing() as conn:
+            subject = _subject_with_route(conn)
+            child = _deadlocked_verification_child(conn, subject)
+            relations_before = conn.execute("SELECT COUNT(*) FROM task_relations").fetchone()[0]
+        deadlock = Counting(shc.VerifierChildDeadlocked())
+        result = shc.Controller(_ctx(kanban_home, config=_hold_config(subject)), [deadlock]).run(shc.TIER_LIGHT)
+        assert deadlock.recoveries == 0 and len(result.held) == 1
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_relations").fetchone()[0] == relations_before
+            assert kb.get_task(conn, child).status == "todo"
+
+    @pytest.mark.parametrize("bad", [
+        {"recovery_holds": [{"name": "x", "task_ids": ["t_1"], "reason": "r", "authorized_by": "a"}]},
+        {"recovery_holds": [{"name": "x", "task_ids": [], "reason": "r", "authorized_by": "a", "release": "z"}]},
+        {"recovery_holds": {"name": "not a list"}},
+    ])
+    def test_malformed_hold_fails_closed(self, kanban_home, bad):
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+        with pytest.raises(ValueError):
+            shc.Controller(_ctx(kanban_home, config=bad), self._invariants()).run(shc.TIER_LIGHT)
+        with kb.connect_closing() as conn:
+            assert kb.get_task(conn, subject).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+
+    def test_repository_config_holds_the_phase3_cards(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        (hold,) = shc.recovery_holds(config)
+        assert hold["task_ids"] == sorted(["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"])
+        assert "Christopher" in hold["authorized_by"] and hold["release"]

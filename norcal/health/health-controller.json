@@ -2,6 +2,15 @@
   "alert_target": null,
   "boot_gate_command": null,
   "gateway_heartbeat_max_age_seconds": 180,
+  "recovery_holds": [
+    {
+      "name": "phase3-hermes-cutover-freeze",
+      "task_ids": ["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"],
+      "reason": "Official Hermes cutover (Phase 3 overlay extraction) is frozen; its cards are detected and escalated, never auto-repaired, released, reassigned, promoted or dispatched",
+      "authorized_by": "Christopher, 2026-09-14 (t_b8d62378 Phase E, option A)",
+      "release": "Delete this entry only when Christopher separately releases the Phase 3 freeze"
+    }
+  ],
   "critical_cron_jobs": {
     "life-wiki-github-sync": {"max_age_seconds": 2700},
     "nuclear_backup": {"max_age_seconds": 93600},
