@@ -122,6 +122,26 @@ def _make_orphan_verifier(conn, *, title="stranded verifier") -> str:
     return tid
 
 
+def _attest_orphan_verifier_run(conn, tid, *, started_at, ended_at):
+    """Give a historical orphan the completing run the codex_verify lane wrote.
+
+    Every done legacy orphan on the live board that has a completing run also
+    carries ``codex_verifier_started`` on it (7/7, checked 2026-09-14). A
+    verdict from a card the lane never executed is not attributable and is not
+    spent.
+    """
+    with kb.write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, "
+            "ended_at, outcome) VALUES (?, 'default', 'done', ?, ?, 'completed')",
+            (tid, started_at, ended_at),
+        )
+        kb._append_event(
+            conn, tid, "codex_verifier_started", {"executor": "codex"},
+            run_id=cur.lastrowid,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Defect A' — a verifier is refused unless its verdict has a destination
 # ---------------------------------------------------------------------------
@@ -245,6 +265,10 @@ class TestOrphanVerifierWatchdog:
                     "created_at=?, completed_at=? WHERE id=?",
                     (int(phase["created_at"]) + 1, int(phase["created_at"]) + 2, verifier),
                 )
+            _attest_orphan_verifier_run(
+                conn, verifier, started_at=int(phase["created_at"]) + 1,
+                ended_at=int(phase["created_at"]) + 2,
+            )
 
             # The consumer spends the PASS before the orphan alarm path.
             assert kb.sweep_orphan_verifiers(conn) == []
@@ -282,6 +306,10 @@ class TestOrphanVerifierWatchdog:
                     "created_at=?, completed_at=? WHERE id=?",
                     (int(phase["created_at"]) + 1, int(phase["created_at"]) + 2, verifier),
                 )
+            _attest_orphan_verifier_run(
+                conn, verifier, started_at=int(phase["created_at"]) + 1,
+                ended_at=int(phase["created_at"]) + 2,
+            )
             assert kb.sweep_orphan_verifiers(conn) == []
             row = kb.get_task(conn, subject)
             assert row.status in ("ready", "todo")

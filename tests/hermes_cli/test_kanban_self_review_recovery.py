@@ -623,12 +623,24 @@ def _verifier_child(conn, subject_id):
     return cid
 
 
+def _attest_codex_lane_run(conn, verifier_id, run_id):
+    """Record what ``recovery_lane._claim_codex_verifier_attempt`` records when
+    the codex_verify lane actually executes a verifier run. Verdicts from a
+    run without it are not attributable to the lane (2026-09-14, run 2817)."""
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, verifier_id, "codex_verifier_started", {"executor": "codex"},
+            run_id=run_id,
+        )
+
+
 def _run_verifier(conn, subject_id, summary):
     """Dispatch and complete the independent verifier child. Returns its id."""
     cid = _verifier_child(conn, subject_id)
     assert kb.get_task(conn, cid).status == "ready"
     claimed = kb.claim_task(conn, cid)
     assert claimed is not None and claimed.status == "running"
+    _attest_codex_lane_run(conn, cid, claimed.current_run_id)
     assert kb.complete_task(
         conn, cid, summary=summary, expected_run_id=claimed.current_run_id,
     ) is True
@@ -648,9 +660,14 @@ class TestVerifiedReplayFinalization:
                 parents=[subject],
             )
             # Simulate a PASS that was durably recorded by the old process,
-            # before the auto-finalize actuator was loaded.
+            # before the auto-finalize actuator was loaded. The verifier ran
+            # and returned no verdict line, so the PASS is recorded explicitly
+            # under its attested lane identity.
+            verifier = _run_verifier(
+                conn, subject, "verifier fixture run without a verdict line",
+            )
             ok, detail = kb.record_verification(
-                conn, subject, passed=True, verifier="codex_verify:t_fixture",
+                conn, subject, passed=True, verifier=f"codex_verify:{verifier}",
                 evidence={"source": "restart-boundary-fixture"},
                 route_on_failure=False,
             )
@@ -859,6 +876,7 @@ class TestEndToEndRecovery:
             # 3. its verdict returns to the subject automatically
             verifier_run = kb.claim_task(conn, cid)
             assert verifier_run is not None
+            _attest_codex_lane_run(conn, cid, verifier_run.current_run_id)
             assert kb.complete_task(
                 conn, cid,
                 summary="VERDICT: PASS\nVerified against preserved artefacts.",

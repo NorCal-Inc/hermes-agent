@@ -1159,8 +1159,9 @@ class TestVerifierIndependence:
                 conn, tid, summary="ruling made", reviewer="default",
                 expected_run_id=claimed.current_run_id,
             )
+            # The installed reviewer; a bare lane name is not an identity.
             ok, detail = kb.record_verification(
-                conn, tid, passed=True, verifier="atlas",
+                conn, tid, passed=True, verifier="default",
             )
             assert ok is True, detail
             assert kb.get_task(conn, tid).verification_state == (
@@ -1319,6 +1320,28 @@ class TestEvidenceReadyVerifierDependency:
             executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
             parents=[parent_id], gauntlet=True,
         )
+
+    @classmethod
+    def _attested_identity(cls, conn, parent_id, cid=None, summary=None):
+        """Run a verifier child the way the codex_verify lane does and return
+        the identity it may sign with. Without a verdict line in ``summary``
+        the return path records nothing, leaving the explicit verdict under
+        test."""
+        if cid is None:
+            cid = cls._verifier_child(conn, parent_id)
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, cid)
+        assert claimed is not None and claimed.status == "running"
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, cid, "codex_verifier_started", {"executor": "codex"},
+                run_id=claimed.current_run_id,
+            )
+        assert kb.complete_task(
+            conn, cid, summary=summary or "verifier fixture run without a verdict line",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        return f"codex_verify:{cid}"
 
     # -- the deadlock is broken --------------------------------------------
 
@@ -1562,7 +1585,8 @@ class TestEvidenceReadyVerifierDependency:
 
             # And it moves only once the parent is genuinely terminal.
             ok, detail = kb.record_verification(
-                conn, pid, passed=True, verifier="atlas",
+                conn, pid, passed=True,
+                verifier=self._attested_identity(conn, pid, verifier),
             )
             assert ok is True, detail
             assert kb.complete_task(conn, pid, summary="verified") is True
@@ -1618,7 +1642,8 @@ class TestEvidenceReadyVerifierDependency:
                 expected_run_id=claimed.current_run_id,
             )
             ok, detail = kb.record_verification(
-                conn, source, passed=True, verifier="atlas",
+                conn, source, passed=True,
+                verifier=self._attested_identity(conn, source),
             )
             assert ok is True, detail
             assert kb.complete_task(conn, source, summary="verified") is True
@@ -1686,7 +1711,8 @@ class TestEvidenceReadyVerifierDependency:
         with kb.connect_closing() as conn:
             pid = self._evidence_ready_parent(conn)
             ok, detail = kb.record_verification(
-                conn, pid, passed=False, verifier="atlas",
+                conn, pid, passed=False,
+                verifier=self._attested_identity(conn, pid),
                 reason="fixture did not survive restart",
                 route_on_failure=False,
             )
@@ -1711,7 +1737,8 @@ class TestEvidenceReadyVerifierDependency:
             assert kb.get_task(conn, cid).status == "ready"
 
             ok, detail = kb.record_verification(
-                conn, pid, passed=False, verifier="atlas",
+                conn, pid, passed=False,
+                verifier=self._attested_identity(conn, pid, cid),
                 reason="fixture did not survive restart",
             )
             assert ok is True, detail
@@ -1770,15 +1797,13 @@ class TestEvidenceReadyVerifierDependency:
             cid = self._verifier_child(conn, pid)
             kb.recompute_ready(conn)
 
-            claimed = kb.claim_task(conn, cid)
-            assert claimed is not None
-            assert kb.complete_task(
-                conn, cid, summary="PASS: fixture survives restart",
-            ) is True
+            identity = self._attested_identity(
+                conn, pid, cid, summary="PASS: fixture survives restart",
+            )
             assert kb.get_task(conn, cid).status == "done"
 
             ok, detail = kb.record_verification(
-                conn, pid, passed=True, verifier="atlas",
+                conn, pid, passed=True, verifier=identity,
                 evidence={"command": "pytest -q", "exit_code": 0},
             )
             assert ok is True, detail

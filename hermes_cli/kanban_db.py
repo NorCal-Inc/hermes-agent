@@ -10405,7 +10405,21 @@ def _review_requested_implementer(
 # not exist and is not supposed to. ``_return_verifier_verdict_to_subjects``
 # also signs verdicts as ``codex_verify:<verifier_task_id>``, so the LANE ROOT
 # is what has to match, not the whole string.
-VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset(VALID_EXECUTOR_LANES | {"atlas"})
+#
+# A lane NAME is not an identity, though. Until 2026-09-14 this allow-list was
+# matched on the bare lane root, so the literal string ``codex_verify`` (or
+# ``atlas``, or the implementation lane ``claude``) rendered a binding
+# independent verdict with no verifier having run at all: t_e48487e5 was
+# refused as ``chatgpt-auditor`` at 12:19:00 and closed done/verified as
+# ``codex_verify`` 13 s later, with no verifier child and no evidence. Only the
+# independent verification lane can sign, and only as a scoped identity that
+# resolves to board state bound to the subject — see
+# :func:`_resolve_lane_verifier_identity`.
+VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset({EXECUTOR_LANE_CODEX_VERIFY})
+
+#: Every lane name (and the ``atlas`` shorthand). Recognized so a bare or
+#: foreign-lane signature gets a precise refusal instead of a profile lookup.
+_LANE_NAME_ROOTS: frozenset[str] = frozenset(VALID_EXECUTOR_LANES | {"atlas"})
 
 #: Registry classifications returned by :func:`_verifier_identity_status`.
 VERIFIER_IDENTITY_LANE = "lane"
@@ -10414,28 +10428,135 @@ VERIFIER_IDENTITY_UNKNOWN = "unknown"
 VERIFIER_IDENTITY_UNCHECKED = "unchecked"
 
 
-def _verifier_identity_status(verifier: Optional[str]) -> tuple[str, Optional[str]]:
-    """Classify a verifier identity against the profile registry.
+def _attested_codex_verifier_run(
+    conn: sqlite3.Connection, verifier_task_id: str,
+) -> Optional[int]:
+    """Return the completing run id of a codex_verify task the real lane ran.
+
+    ``executor_lane`` is only a label: an unscoped agent that happens to claim a
+    codex_verify card (2026-09-14, run 2817) can complete it too. The lane's
+    own launcher writes ``codex_verifier_started`` for the run it executes
+    (``recovery_lane._claim_codex_verifier_attempt``), so the attestation is
+    that event on the run that completed the card. ``None`` when the card is
+    not a completed codex_verify task or its completing run carries no such
+    event.
+    """
+    row = conn.execute(
+        "SELECT status, executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
+    ).fetchone()
+    if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+        return None
+    if row["status"] != "done":
+        return None
+    run = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (verifier_task_id,),
+    ).fetchone()
+    if run is None:
+        return None
+    started = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'codex_verifier_started' AND run_id = ? LIMIT 1",
+        (verifier_task_id, run["id"]),
+    ).fetchone()
+    return int(run["id"]) if started is not None else None
+
+
+def _resolve_lane_verifier_identity(
+    conn: sqlite3.Connection, identity: str, subject_id: str,
+) -> Optional[str]:
+    """Return ``None`` when a lane-scoped identity legitimately verifies *subject_id*.
+
+    Otherwise return the refusal detail. Two scoped forms are produced by the
+    system itself and are the only ones accepted:
+
+    * ``codex_verify:<verifier_task_id>`` — a codex_verify card, attested by
+      :func:`_attested_codex_verifier_run`, that verifies this subject: linked
+      as its child, or the single safe subject of a legacy orphan verifier
+      (:func:`_historical_orphan_subject_candidate`).
+    * ``codex_verify:<execution_id>`` — a completed exit-0 ``codex.verify``
+      execution recorded against this subject by the execution supervisor.
+    """
+    root, _, ref = identity.partition(":")
+    root = root.strip().lower()
+    ref = ref.strip()
+    if root not in VERIFIER_LANE_IDENTITIES:
+        return (
+            f"{identity!r} names the {root!r} lane, which is not an independent "
+            f"verification lane; only {EXECUTOR_LANE_CODEX_VERIFY}:<verifier> may sign"
+        )
+    if not ref:
+        return (
+            f"bare lane name {identity!r} is not a verifier identity; an "
+            f"independent verdict must be signed as "
+            f"{EXECUTOR_LANE_CODEX_VERIFY}:<attested verifier task or execution>"
+        )
+    if ref == subject_id:
+        return f"{identity!r} names the subject itself"
+    execution = conn.execute(
+        "SELECT task_id, command_class, status, exit_code FROM executions WHERE id = ?",
+        (ref,),
+    ).fetchone()
+    if execution is not None:
+        if (
+            execution["task_id"] == subject_id
+            and execution["command_class"] == "codex.verify"
+            and execution["status"] == "completed"
+            and execution["exit_code"] == 0
+        ):
+            return None
+        return (
+            f"{identity!r} is not a completed exit-0 codex.verify execution "
+            f"recorded against {subject_id}"
+        )
+    if _attested_codex_verifier_run(conn, ref) is None:
+        return (
+            f"{identity!r} does not resolve to a completed codex_verify task "
+            f"whose completing run was executed by the codex_verify lane"
+        )
+    if subject_id in parent_ids(conn, ref):
+        return None
+    if _historical_orphan_subject_candidate(conn, ref) == subject_id:
+        return None
+    return f"{identity!r} is not a verifier of {subject_id}"
+
+
+def _verifier_identity_status(
+    verifier: Optional[str],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    subject_id: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Classify a verifier identity for a verdict on *subject_id*.
 
     Returns ``(status, detail)``:
 
-    * ``"lane"``      — a recognized executor-lane identity (``codex_verify``,
-      ``codex_verify:t_abc123``, ``atlas``, ``claude_recovery``). Legitimate,
-      and deliberately not required to be a profile.
+    * ``"lane"``      — a scoped ``codex_verify:<verifier>`` identity that
+      resolves, for this subject, per :func:`_resolve_lane_verifier_identity`.
+      Deliberately not required to be a profile.
     * ``"profile"``   — an existing Hermes profile (``profile_exists``).
-    * ``"unknown"``   — neither. The verdict must be refused.
-    * ``"unchecked"`` — the registry could not be consulted at all (import or
-      filesystem failure). Reported as itself so an unreadable registry is
-      visible rather than masquerading as either a clean pass or a false
-      accusation; callers let the verdict through and record the gap.
+    * ``"unknown"``   — anything else, including every bare lane name and any
+      lane identity that cannot be resolved (no ``conn``/``subject_id``). The
+      verdict must be refused.
+    * ``"unchecked"`` — the profile registry could not be consulted at all
+      (import or filesystem failure). Reported as itself so an unreadable
+      registry is visible rather than masquerading as either a clean pass or a
+      false accusation; callers let the verdict through and record the gap.
     """
     if not verifier or not str(verifier).strip():
         return VERIFIER_IDENTITY_UNKNOWN, "no verifier identity supplied"
     identity = str(verifier).strip()
-    # Lane-scoped verdicts are ``<lane>:<verifier_task_id>``; match the root.
     lane_root = identity.split(":", 1)[0].strip().lower()
-    if lane_root in VERIFIER_LANE_IDENTITIES:
-        return VERIFIER_IDENTITY_LANE, lane_root
+    if lane_root in _LANE_NAME_ROOTS:
+        if conn is None or not subject_id:
+            return VERIFIER_IDENTITY_UNKNOWN, (
+                f"lane identity {identity!r} cannot be resolved without its subject"
+            )
+        refusal = _resolve_lane_verifier_identity(conn, identity, subject_id)
+        if refusal is not None:
+            return VERIFIER_IDENTITY_UNKNOWN, refusal
+        return VERIFIER_IDENTITY_LANE, identity
     try:
         from hermes_cli.profiles import profile_exists as _profile_exists
     except Exception as exc:  # pragma: no cover - defensive
@@ -10447,8 +10568,8 @@ def _verifier_identity_status(verifier: Optional[str]) -> tuple[str, Optional[st
     if exists:
         return VERIFIER_IDENTITY_PROFILE, identity
     return VERIFIER_IDENTITY_UNKNOWN, (
-        f"{identity!r} is neither an existing Hermes profile nor a recognized "
-        f"verifier lane ({', '.join(sorted(VERIFIER_LANE_IDENTITIES))})"
+        f"{identity!r} is neither an existing Hermes profile nor a scoped "
+        f"verifier-lane identity ({EXECUTOR_LANE_CODEX_VERIFY}:<verifier>)"
     )
 
 
@@ -12879,7 +13000,9 @@ def complete_task(
                     return False
                 # (a) The reviewer identity must resolve against the profile
                 # registry or the verifier-lane allow-list.
-                identity_status, identity_detail = _verifier_identity_status(reviewer)
+                identity_status, identity_detail = _verifier_identity_status(
+                    reviewer, conn=conn, subject_id=task_id,
+                )
                 if identity_status == VERIFIER_IDENTITY_UNKNOWN:
                     _append_event(
                         conn,
@@ -14932,7 +15055,9 @@ def record_verification(
         # checked this before, so any string that merely DIFFERED from the
         # implementer rendered a binding verdict — how 'chatgpt-systems'
         # closed t_023d2af6 and t_616527d7 (a live production deployment).
-        identity_status, identity_detail = _verifier_identity_status(verifier)
+        identity_status, identity_detail = _verifier_identity_status(
+            verifier, conn=conn, subject_id=task_id,
+        )
         if identity_status == VERIFIER_IDENTITY_UNKNOWN:
             _append_event(
                 conn, task_id, "verification_blocked_unknown_verifier",
