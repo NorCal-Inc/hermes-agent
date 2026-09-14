@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the NorCal system health controller light pass every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

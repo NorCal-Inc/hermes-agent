@@ -6095,6 +6095,80 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     return True
 
 
+def restore_relabelled_subject_lane(
+    conn: sqlite3.Connection, task_id: str, *, actor: str,
+) -> tuple[bool, Optional[str]]:
+    """Undo a shorthand relabel that put a Gauntlet subject on codex_verify.
+
+    The repair for damage :func:`assign_task` no longer produces but live
+    boards still carry (t_3883034a, event 151185). Restores ``executor_lane``
+    to the value the card was created with, and nothing else: status,
+    assignee, verification ledger and history are untouched, and an
+    append-only ``subject_executor_lane_restored`` event records the repair.
+
+    Refuses (returns ``(False, None)``) unless every condition that identifies
+    the damage holds: the card is on codex_verify, is not a dependency child
+    (a real verifier card always has its subject as parent), was handed off
+    for review, carries an ``executor_lane_normalized`` relabel event, is not
+    claimed, and was not itself created on codex_verify.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT executor_lane, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            or row["claim_lock"] is not None
+        ):
+            return False, None
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,),
+        ).fetchone() is not None:
+            return False, None
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_requested' LIMIT 1",
+            (task_id,),
+        ).fetchone() is None:
+            return False, None
+        relabel = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'executor_lane_normalized' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if relabel is None:
+            return False, None
+        created = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id ASC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            created_payload = json.loads(created["payload"]) if created and created["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            return False, None
+        original = created_payload.get("executor_lane") if isinstance(created_payload, dict) else None
+        if original == EXECUTOR_LANE_CODEX_VERIFY:
+            return False, None
+        cur = conn.execute(
+            "UPDATE tasks SET executor_lane = ? WHERE id = ? AND executor_lane = ? "
+            "AND claim_lock IS NULL",
+            (original, task_id, EXECUTOR_LANE_CODEX_VERIFY),
+        )
+        if cur.rowcount != 1:
+            return False, None
+        _append_event(
+            conn, task_id, "subject_executor_lane_restored",
+            {
+                "from": EXECUTOR_LANE_CODEX_VERIFY,
+                "to": original,
+                "relabel_event": int(relabel["id"]),
+                "actor": actor,
+            },
+        )
+    return True, original
+
+
 def set_model_override(
     conn: sqlite3.Connection,
     task_id: str,

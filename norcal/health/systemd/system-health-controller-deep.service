@@ -1,0 +1,10 @@
+[Unit]
+Description=NorCal system health controller - deep pass (hourly)
+OnFailure=system-health-controller-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/chris/.hermes/hermes-agent-next
+ExecStart=/home/chris/.hermes/hermes-agent-next/venv/bin/python /home/chris/.hermes/hermes-agent-next/norcal/health/system_health_controller.py run --tier deep
+TimeoutStartSec=900
+Nice=10
