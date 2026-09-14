@@ -5988,9 +5988,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     # signature has no executor_lane parameter to conflict with), so it sets
     # the lane outright rather than deferring to whatever lane the row carries.
     profile, lane, from_token = _normalize_shorthand_lane(requested, None)
+    preserved_subject_implementer: Optional[str] = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, executor_lane "
+            "SELECT status, claim_lock, assignee, executor_lane, "
+            "gauntlet_enforced, verification_state "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6001,49 +6003,88 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        lane_sql = ", executor_lane = ?" if from_token is not None else ""
-        lane_params: tuple[Any, ...] = (lane,) if from_token is not None else ()
-        # Compare the whole executor identity, not just the profile string: a
-        # task already on assignee='default' that is being moved onto the
-        # codex_verify lane IS a reassignment, and must not inherit the
-        # previous executor's failure streak just because the carrier profile
-        # name happens to be unchanged.
-        changed = row["assignee"] != profile or (
-            from_token is not None and row["executor_lane"] != lane
+        # Same carve-out request_review applies: on a Gauntlet subject that is
+        # awaiting verification, "atlas" means "open the independent verifier
+        # route", never "make the subject its own verification artifact". On
+        # 2026-09-14 ``reassign t_3883034a atlas`` relabelled the parked subject
+        # to executor_lane=codex_verify (event 151185).
+        preserve_subject = (
+            lane == EXECUTOR_LANE_CODEX_VERIFY
+            and from_token is not None
+            and row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            and bool(row["gauntlet_enforced"] or gauntlet_enforcement_default())
+            and (
+                row["verification_state"] == VERIFICATION_PENDING
+                or row["status"] in ("review", "triage")
+            )
         )
-        if changed:
-            # The retry guard is scoped to the task/profile combination. A
-            # human reassigning the task is an explicit recovery action, so the
-            # new profile should not inherit the previous profile's streak.
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL" + lane_sql + " WHERE id = ?",
-                (profile, *lane_params, task_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE tasks SET assignee = ?" + lane_sql + " WHERE id = ?",
-                (profile, *lane_params, task_id),
-            )
-        if from_token is not None:
-            # Same event kind the ready-queue dispatcher emits, so the audit
-            # trail reads identically whichever path did the translation.
+        if preserve_subject:
             _append_event(
-                conn, task_id, "executor_lane_normalized",
+                conn, task_id, "independent_verifier_lane_requested",
                 {
-                    "from_assignee": from_token,
-                    "assignee": profile,
-                    "executor_lane": lane,
+                    "from_reviewer": from_token,
+                    "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                    "subject_executor_lane_preserved": True,
                     "source": "assign_task",
                     "status": row["status"],
                 },
             )
-        _append_event(
-            conn, task_id, "assigned",
-            {"assignee": profile, "requested": requested, "executor_lane": lane}
-            if from_token is not None
-            else {"assignee": profile},
-        )
+            preserved_subject_implementer = _review_requested_implementer(
+                conn, task_id, row["assignee"],
+            ) or ""
+        else:
+            lane_sql = ", executor_lane = ?" if from_token is not None else ""
+            lane_params: tuple[Any, ...] = (lane,) if from_token is not None else ()
+            # Compare the whole executor identity, not just the profile string: a
+            # task already on assignee='default' that is being moved onto the
+            # codex_verify lane IS a reassignment, and must not inherit the
+            # previous executor's failure streak just because the carrier profile
+            # name happens to be unchanged.
+            changed = row["assignee"] != profile or (
+                from_token is not None and row["executor_lane"] != lane
+            )
+            if changed:
+                # The retry guard is scoped to the task/profile combination. A
+                # human reassigning the task is an explicit recovery action, so the
+                # new profile should not inherit the previous profile's streak.
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                    "last_failure_error = NULL" + lane_sql + " WHERE id = ?",
+                    (profile, *lane_params, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?" + lane_sql + " WHERE id = ?",
+                    (profile, *lane_params, task_id),
+                )
+            if from_token is not None:
+                # Same event kind the ready-queue dispatcher emits, so the audit
+                # trail reads identically whichever path did the translation.
+                _append_event(
+                    conn, task_id, "executor_lane_normalized",
+                    {
+                        "from_assignee": from_token,
+                        "assignee": profile,
+                        "executor_lane": lane,
+                        "source": "assign_task",
+                        "status": row["status"],
+                    },
+                )
+            _append_event(
+                conn, task_id, "assigned",
+                {"assignee": profile, "requested": requested, "executor_lane": lane}
+                if from_token is not None
+                else {"assignee": profile},
+            )
+    if preserved_subject_implementer is not None:
+        # Post-commit, like request_review's routing block: the preserved
+        # subject is durable first, and opening the route is evidence-gated
+        # and fail-closed inside the helper.
+        if gauntlet_required(conn, task_id):
+            _ensure_independent_verifier_child(
+                conn, task_id, implementer=preserved_subject_implementer or None,
+            )
+        return True
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(
@@ -14168,6 +14209,14 @@ def block_task(
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
+        # An infrastructure-class block (the control plane ended the executor —
+        # timeout, stale, lost controller) is not the work re-blocking for the
+        # same cause, and must never count toward the loop. On 2026-09-14 an
+        # executor timeout (t_3883034a event 151138) was counted as recurrence
+        # 1, so the agent's first real blocker (151172) hit the limit and moved
+        # a subject awaiting verification into triage, where nothing resumes it.
+        if (event_payload_extra or {}).get("failure_class") == "infrastructure":
+            recurrences = prev_recurrences
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route

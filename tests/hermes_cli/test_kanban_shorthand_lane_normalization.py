@@ -418,3 +418,60 @@ class TestGauntletAtlasRoutingRegression:
             else:
                 raise AssertionError("orphan codex_verify card bypassed completion gate")
             assert kb.get_task(conn, tid).status != "done"
+
+
+# ---------------------------------------------------------------------------
+# assign_task honors the Gauntlet-subject carve-out too (2026-09-14)
+#
+# ``hermes kanban reassign t_3883034a atlas`` (12:45:28) relabelled the
+# subject itself to executor_lane=codex_verify (event 151185) while it awaited
+# verification, turning it into its own verification artifact. request_review
+# already refused that relabel and opened a linked verifier child instead;
+# assign_task did not.
+# ---------------------------------------------------------------------------
+
+
+def _gauntlet_subject_in_verification(conn, *, title="phase 3 subject"):
+    tid = kb.create_task(conn, title=title, assignee="default", gauntlet=True)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None and claimed.status == "running"
+    kb.add_attachment(
+        conn, tid, filename="phase3-evidence-min.md",
+        stored_path=f"/tmp/{tid}/phase3-evidence-min.md", size=512,
+        uploaded_by="claude-lane",
+    )
+    ok, detail = kb.request_review(
+        conn, tid, summary="overlay extracted", force=True, with_reason=True,
+    )
+    assert ok is True, detail
+    task = kb.get_task(conn, tid)
+    assert task.verification_state == kb.VERIFICATION_PENDING
+    return tid
+
+
+class TestAssignTaskPreservesGauntletSubjects:
+    @pytest.mark.parametrize("parked_status", ["review", "triage"])
+    def test_assign_atlas_opens_the_verifier_route_instead_of_relabelling(
+        self, kanban_home, parked_status
+    ):
+        with kb.connect_closing() as conn:
+            tid = _gauntlet_subject_in_verification(conn)
+            if parked_status != "review":
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = ? WHERE id = ?", (parked_status, tid),
+                    )
+
+            assert kb.assign_task(conn, tid, "atlas") is True
+
+            subject = kb.get_task(conn, tid)
+            assert subject.assignee == "default"
+            assert subject.executor_lane is None
+            assert subject.status == parked_status
+            assert _events(conn, tid, "executor_lane_normalized") == []
+            requested = _events(conn, tid, "independent_verifier_lane_requested")
+            assert requested and requested[-1]["source"] == "assign_task"
+            assert requested[-1]["subject_executor_lane_preserved"] is True
+            child = kb._open_verifier_child(conn, tid)
+            assert child is not None
+            assert kb.get_task(conn, child).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
