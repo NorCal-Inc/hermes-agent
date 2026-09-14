@@ -246,6 +246,7 @@ class Controller:
         if not state.get("installed_at"):
             state["installed_at"] = now
         result = PassResult(tier, "GREEN", 0, [], [], [], [])
+        self._alert_queue: list[tuple[Finding, dict]] = []
         for inv in [i for i in self.invariants if i.tier == tier]:
             findings = self._observe(inv)
             present = {f.fingerprint for f in findings}
@@ -253,6 +254,7 @@ class Controller:
             for finding in findings:
                 self._process(inv, finding, state, result)
             self._resolve_absent(inv, present, state, result)
+        self._flush_alerts()
         if result.escalated or result.open or any(
             rec.get("status") == STATUS_ESCALATED and rec.get("tier") == tier
             for rec in state["fingerprints"].values()
@@ -370,18 +372,38 @@ class Controller:
         result.escalated.append(finding.fingerprint)
 
     def _deliver_alert(self, finding: Finding, rec: dict) -> None:
+        """Queue the fingerprint's alert; the pass sends one batched message."""
         if rec.get("alert_delivered") or int(rec.get("alert_attempts", 0)) >= MAX_ALERT_ATTEMPTS:
             return
-        subject, text = alert_text(finding, rec)
+        self._alert_queue.append((finding, rec))
+
+    def _flush_alerts(self) -> None:
+        """One delivery-checked message per pass, covering every queued fingerprint.
+
+        Each fingerprint is still alerted exactly once (retried only while
+        undelivered); batching keeps a backlog discovered in one pass from
+        becoming a burst of separate messages.
+        """
+        queue, self._alert_queue = self._alert_queue, []
+        if not queue:
+            return
+        blocks = [alert_text(finding, rec) for finding, rec in queue]
+        if len(blocks) == 1:
+            subject, text = blocks[0]
+        else:
+            subject = f"[health] {len(blocks)} conditions DEGRADED"
+            text = "\n\n".join(body for _, body in blocks)
         try:
             delivered, detail = self.ctx.send_alert(subject, text)
         except Exception as exc:
             delivered, detail = False, f"{type(exc).__name__}: {str(exc)[:200]}"
-        rec["alert_attempts"] = int(rec.get("alert_attempts", 0)) + 1
-        rec["alert_delivered"] = bool(delivered)
-        rec["alert_detail"] = detail
-        self.store.record(self.ctx.now(), "alert", fingerprint=finding.fingerprint,
-                          delivered=bool(delivered), attempt=rec["alert_attempts"])
+        for finding, rec in queue:
+            rec["alert_attempts"] = int(rec.get("alert_attempts", 0)) + 1
+            rec["alert_delivered"] = bool(delivered)
+            rec["alert_detail"] = detail
+            self.store.record(self.ctx.now(), "alert", fingerprint=finding.fingerprint,
+                              delivered=bool(delivered), attempt=rec["alert_attempts"],
+                              batch_size=len(queue))
 
     def _resolve_absent(self, inv: Invariant, present: set[str], state: dict, result: PassResult) -> None:
         now = self.ctx.now()
@@ -491,6 +513,11 @@ class VerifierRouteOpen(Invariant):
         with ctx.kanban() as conn:
             for row in _pending_gauntlet_subjects(conn):
                 tid = row["id"]
+                if row["status"] != "review":
+                    # A blocked subject already carries its blocker record, and a
+                    # triaged one is subject_review_regressed's: routing is only
+                    # judged for subjects parked in the review lane.
+                    continue
                 if row["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY:
                     continue  # a verifier card is not a subject; see relabel invariant
                 requested = _review_requested_at(conn, tid)
@@ -505,10 +532,9 @@ class VerifierRouteOpen(Invariant):
                 evidence = kb.subject_has_evidence(conn, tid)
                 out.append(Finding(
                     self.name, tid,
-                    "no_route:" + ("evidence_ready" if evidence else "evidence_missing")
-                    + f":{row['status']}",
+                    "no_route:" + ("evidence_ready" if evidence else "evidence_missing"),
                     {"status": row["status"], "evidence": evidence},
-                    recoverable=bool(evidence and row["status"] == "review"),
+                    recoverable=bool(evidence),
                 ))
         return out
 
@@ -660,7 +686,13 @@ class SubjectReviewRegressed(Invariant):
 
 
 class VerifierOfVerifier(Invariant):
-    """No codex_verify card may verify another codex_verify card."""
+    """No live codex_verify card may verify another codex_verify card.
+
+    A parent that is itself a relabelled SUBJECT (no parent of its own, handed
+    off for review, carrying a lane-normalization event) is excluded: that is
+    ``subject_lane_relabelled`` damage, and on the 2026-09-14 board all six
+    codex_verify -> codex_verify edges were exactly that shape.
+    """
 
     name = "verifier_of_verifier"
     tier = TIER_DEEP
@@ -673,7 +705,14 @@ class VerifierOfVerifier(Invariant):
                 "SELECT c.id AS child, p.id AS parent FROM task_links l "
                 "JOIN tasks c ON c.id = l.child_id JOIN tasks p ON p.id = l.parent_id "
                 "WHERE c.executor_lane = ? AND p.executor_lane = ? "
-                "AND c.status NOT IN ('archived')",
+                "AND c.status NOT IN ('done', 'archived') "
+                "AND NOT ("
+                "  NOT EXISTS (SELECT 1 FROM task_links pl WHERE pl.child_id = p.id) "
+                "  AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = p.id "
+                "              AND e.kind = 'review_requested') "
+                "  AND EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = p.id "
+                "              AND n.kind = 'executor_lane_normalized')"
+                ")",
                 (kb.EXECUTOR_LANE_CODEX_VERIFY, kb.EXECUTOR_LANE_CODEX_VERIFY),
             ).fetchall()
             for row in rows:

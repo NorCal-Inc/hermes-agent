@@ -660,3 +660,56 @@ class TestBoundariesAndSilence:
         assert capsys.readouterr().out == ""
         beat = json.loads((tmp_path / "state" / "heartbeat-light.json").read_text())
         assert beat["status"] == "GREEN"
+
+
+# ---------------------------------------------------------------------------
+# Refinements from the live-snapshot evidence pass (2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveSnapshotRefinements:
+    def test_one_batched_alert_covers_every_new_escalation(self, kanban_home):
+        alerts = Alerts()
+        ctx = _ctx(kanban_home, alerts=alerts)
+        with kb.connect_closing() as conn:
+            first = _subject_without_evidence(conn, title="first")
+            second = _subject_without_evidence(conn, title="second")
+        result = shc.Controller(ctx, [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        assert len(result.escalated) == 2
+        assert len(alerts.sent) == 1
+        assert first in alerts.sent[0][1] and second in alerts.sent[0][1]
+        state = shc.StateStore(ctx.state_dir).load()
+        assert all(rec["alert_delivered"] and rec["alert_attempts"] == 1
+                   for rec in state["fingerprints"].values())
+
+    def test_blocked_subject_is_not_judged_for_routing(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_evidence_after_handoff(conn)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        assert shc.VerifierRouteOpen().check(_ctx(kanban_home)) == []
+
+    def test_relabelled_subject_is_not_reported_as_verifier_of_verifier(self, kanban_home):
+        """All six codex_verify->codex_verify edges on the live board were this shape."""
+        with kb.connect_closing() as conn:
+            tid = _subject_with_route(conn, assignee="claude")
+            assert kb._open_verifier_child(conn, tid) is not None
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET executor_lane = ? WHERE id = ?",
+                             (kb.EXECUTOR_LANE_CODEX_VERIFY, tid))
+                kb._append_event(conn, tid, "executor_lane_normalized", {
+                    "from_assignee": "atlas", "executor_lane": kb.EXECUTOR_LANE_CODEX_VERIFY,
+                    "source": "assign_task"})
+        ctx = _ctx(kanban_home)
+        assert shc.VerifierOfVerifier().check(ctx) == []
+        assert [f.subject for f in shc.SubjectLaneRelabelled().check(ctx)] == [tid]
+
+    def test_finished_verifier_chains_are_history_not_health(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = _subject_with_route(conn)
+            outer = kb._open_verifier_child(conn, subject)
+            inner = kb.create_task(conn, title="old re-verification", assignee="atlas",
+                                   parents=[outer], gauntlet=True)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (inner,))
+        assert shc.VerifierOfVerifier().check(_ctx(kanban_home)) == []
