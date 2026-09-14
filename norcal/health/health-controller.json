@@ -1,5 +1,5 @@
 {
-  "alert_target": null,
+  "alert_target": "telegram:-1003786882754",
   "boot_gate_command": null,
   "gateway_heartbeat_max_age_seconds": 180,
   "recovery_holds": [

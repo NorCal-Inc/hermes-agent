@@ -7,8 +7,8 @@ gateway heartbeat, the canonical boot gate, `hermes config get`) and replaces no
 No LLM; silent when GREEN.
 
 - `system_health_controller.py` — controller, invariants, CLI (`run --tier light|deep [--dry-run] [--json]`, `status`).
-- `health-controller.json` — watched jobs/timers, doctrine runtime ceilings, `alert_target` (unset until deploy).
-- `systemd/` — user unit templates: light pass every 5 min, deep pass hourly, `OnFailure=` alert. **Not installed.**
+- `health-controller.json` — watched jobs/timers, doctrine runtime ceilings, `alert_target` (the Hermes Telegram "Alerts" group, the `TELEGRAM_ALERTS_CHAT_ID` channel the gateway watchdog and post-update health check already use; if that id changes, update both).
+- `systemd/` — user unit templates: light pass every 5 min, deep pass hourly, `OnFailure=` alert. Installed as user units (Phase E Gate 6, 2026-09-14).
 
 ## v1 scope (Christopher, 2026-09-14)
 
