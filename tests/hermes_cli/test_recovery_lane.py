@@ -23,6 +23,7 @@ Covers:
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 from pathlib import Path
 
@@ -456,12 +457,14 @@ def test_codex_verifier_fail_completes_so_verdict_can_return_to_subject(monkeypa
 
 
 def test_direct_claude_executor_completes_with_attachment(monkeypatch):
+    # Harvesting requires a task-owned scratch workspace (<workspaces_root>/<id>).
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "/tmp")
     task = _make_recovery_task(
         executor_lane=kb.EXECUTOR_LANE_CLAUDE,
         recovery_gate_cmd=None,
         body="Read-only audit. Attach the final brief as a file.",
         workspace_kind="scratch",
-        workspace_path="/tmp/claude-direct-test",
+        workspace_path="/tmp/t_recover",
     )
     conn = object()
     complete_calls = []
@@ -481,11 +484,11 @@ def test_direct_claude_executor_completes_with_attachment(monkeypatch):
     )
     monkeypatch.setattr(
         recovery_lane, "_changed_workspace_files",
-        lambda cwd, before: [Path("/tmp/claude-direct-test/skill-audit.md")],
+        lambda cwd, before: [Path("/tmp/t_recover/skill-audit.md")],
     )
     monkeypatch.setattr(
         recovery_lane, "_attach_changed_files",
-        lambda c, tid, files: ["/tmp/claude-direct-test/skill-audit.md"],
+        lambda c, tid, files: [str(f) for f in files],
     )
     monkeypatch.setattr(
         recovery_lane.kb, "complete_task",
@@ -507,8 +510,121 @@ def test_direct_claude_executor_completes_with_attachment(monkeypatch):
     assert block_calls == []
     assert complete_calls[0]["metadata"]["executor_lane"] == "claude"
     assert complete_calls[0]["metadata"]["attached_files"] == [
-        "/tmp/claude-direct-test/skill-audit.md"
+        "/tmp/t_recover/skill-audit.md"
     ]
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-14 t_b8d62378: evidence harvesting is scoped to the task
+# ---------------------------------------------------------------------------
+
+# The files run 2822 attached from its HERMES_HOME ``dir`` workspace
+# (task_attachments 763-777), relative to that workspace. The live board's own
+# ``kanban.db-wal``/``-shm`` are stood in for by copies so the test cannot
+# disturb its sandbox database.
+_T_B8_HARVESTED = (
+    "cron/ticker_heartbeat", "cron/ticker_last_success",
+    "norcal/boot/__pycache__/recovery_boot.cpython-312.pyc",
+    "archive/kanban.db-shm", "archive/kanban.db-wal", "kanban (1).db-shm", "kanban (1).db-wal",
+    "logs/agent.log", "logs/gateway.log", "logs/orion-api.log",
+    "state/skill-integrity.status.json", "gateway.heartbeat",
+    "state/board_watch_state.json",
+)
+
+
+def _run_direct_claude(monkeypatch, tid, writes):
+    def fake_invoke(prompt, cwd, timeout, *, task_id=None):
+        for path, data in writes.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        return recovery_lane.AttemptResult(
+            "claude", 0, '{"result":"stopped; no changes"}', "",
+            execution_id="x_fake_claude",
+            execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        )
+
+    monkeypatch.setattr(recovery_lane, "_claim_direct_claude_attempt", lambda c, t, r: True)
+    monkeypatch.setattr(recovery_lane, "_invoke_claude", fake_invoke)
+    return recovery_lane.run_claude_executor(tid)
+
+
+def test_shared_hermes_home_workspace_is_never_harvested(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="Build recursive health controller", assignee="default",
+            body="Attach the evidence packet before handoff.",
+            workspace_kind="dir", workspace_path=str(kanban_home),
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+        )
+        assert kb.claim_task(conn, tid)
+    for rel in _T_B8_HARVESTED:
+        target = kanban_home / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"before")
+    writes = {kanban_home / rel: b"changed during the run" for rel in _T_B8_HARVESTED}
+
+    assert _run_direct_claude(monkeypatch, tid, writes) == 0
+
+    with kb.connect_closing() as conn:
+        assert kb.list_attachments(conn, tid) == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        (reason,) = [
+            json.loads(r["payload"])["reason"] for r in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'", (tid,))
+        ]
+    assert str(kb.task_attachments_dir(tid)) in reason and "not task-owned" in reason
+    assert not kb.task_attachments_dir(tid).exists() or not any(kb.task_attachments_dir(tid).iterdir())
+
+
+def test_task_owned_scratch_harvests_artifacts_but_never_logs_or_databases(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="audit brief", assignee="default",
+            body="Attach the final brief.", executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+        )
+        root = kb.resolve_workspace(kb.get_task(conn, tid))
+        kb.set_workspace_path(conn, tid, str(root))
+        assert kb.claim_task(conn, tid)
+    writes = {
+        root / "brief.md": b"# brief\n",
+        root / "notes" / "findings.txt": b"evidence\n",
+        root / "run.log": b"log\n",
+        root / "logs" / "orion-api.log": b"company log\n",
+        root / "state.db-wal": b"wal\n",
+        root / "__pycache__" / "x.cpython-312.pyc": b"pyc\n",
+        root / ".env.local": b"KEY=value\n",
+        root / "gateway.log.1": b"rotated\n",
+        root / "secrets" / "token.txt": b"not evidence\n",
+        root / "logs" / "board_watch_state.json": b"{}\n",
+    }
+
+    assert _run_direct_claude(monkeypatch, tid, writes) == 0
+
+    with kb.connect_closing() as conn:
+        names = sorted(a.filename for a in kb.list_attachments(conn, tid))
+        assert kb.get_task(conn, tid).status != "blocked"
+    assert names == ["brief.md", "findings.txt"]
+
+
+def test_task_owned_workspace_scope(kanban_home):
+    def task(**kw):
+        return _make_recovery_task(executor_lane=kb.EXECUTOR_LANE_CLAUDE, recovery_gate_cmd=None, **kw)
+
+    scratch = kb.workspaces_root() / "t_recover"
+    assert recovery_lane._task_owned_workspace(
+        task(workspace_kind="scratch", workspace_path=str(scratch))) == scratch.resolve()
+    assert recovery_lane._task_owned_workspace(
+        task(workspace_kind="dir", workspace_path=str(kanban_home))) is None
+    assert recovery_lane._task_owned_workspace(
+        task(workspace_kind="scratch", workspace_path="/tmp/claude-direct-test")) is None
+    assert recovery_lane._task_owned_workspace(
+        task(workspace_kind="dir", workspace_path=str(kb.workspaces_root()))) is None
+    repo_wt = kanban_home / "repo" / ".worktrees" / "t_recover"
+    assert recovery_lane._task_owned_workspace(
+        task(workspace_kind="worktree", workspace_path=str(repo_wt))) == repo_wt.resolve()
+    assert recovery_lane._task_owned_workspace(
+        task(workspace_kind="worktree", workspace_path=str(repo_wt.parent / "t_other"))) is None
 
 
 def test_register_attachment_dir_files_makes_files_first_class(kanban_home):

@@ -1108,6 +1108,116 @@ class TestStaleDispositionActuator:
                 "SELECT status FROM tasks WHERE id=?", (tid,)
             ).fetchone()["status"] == "blocked"
 
+    # -- 2026-09-14 t_b8d62378: age alone must never release an owner-held park --
+
+    def _infrastructure_park(self, conn, monkeypatch, *, parked_at):
+        """Reproduce t_b8d62378 events 151305-151369: a claude-lane attempt is
+        timed out by the control plane, parked needs_input/infrastructure, and
+        the lane posts its resume comment."""
+        from hermes_cli import exec_supervisor as ex
+
+        monkeypatch.setattr(kb.time, "time", lambda: float(parked_at - 600))
+        tid = kb.create_task(
+            conn, title="Build recursive health controller", assignee="default",
+            gauntlet=True, max_runtime_seconds=300,
+        )
+        assert kb.claim_task(conn, tid)
+        execution = ex.create_execution(
+            conn, executor_type="claude", command_class="claude.headless",
+            cwd="/tmp", task_id=tid, max_runtime_s=300, now=parked_at - 600,
+        )
+        monkeypatch.setattr(kb.time, "time", lambda: float(parked_at))
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE executions SET status='timed_out', ended_at=? WHERE id=?",
+                (parked_at, execution.id),
+            )
+        assert kb.block_task(
+            conn, tid,
+            reason="Direct Claude executor was terminated by the control plane "
+                   "(infrastructure), not by a failure of the work.",
+            kind="needs_input",
+            event_payload_extra={
+                "execution_id": execution.id,
+                "execution_status": "timed_out",
+                "failure_class": "infrastructure",
+            },
+        )
+        kb.add_comment(conn, tid, "claude-lane", "[claude] rc=124 timed out")
+        return tid, execution.id
+
+    def _sweep(self, conn, monkeypatch, now, timeout):
+        monkeypatch.setattr(kb.time, "time", lambda: float(now))
+        stale = kb.detect_stale_gauntlet_work(
+            conn, stale_timeout_seconds=timeout, realert_seconds=timeout, now=now,
+        )
+        return stale, kb.resolve_stale_gauntlet_dispositions(conn, stale, now=now)
+
+    def test_park_released_hours_after_timeout_is_withheld(self, kanban_home, monkeypatch):
+        parked_at = 1_789_409_538  # run 2819 blocked at 13:12:18 CDT
+        with kb.connect_closing() as conn:
+            tid, execution_id = self._infrastructure_park(conn, monkeypatch, parked_at=parked_at)
+            before = conn.execute(
+                "SELECT status, block_kind, claim_lock, current_run_id FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+
+            # 17:12:24 CDT: 14,406 s parked against the live 14,400 s threshold.
+            stale, result = self._sweep(conn, monkeypatch, parked_at + 14_406, 14_400)
+            assert [e.task_id for e in stale] == [tid]
+            assert result["infrastructure_released"] == []
+            assert result["unresolved"] == [tid]
+            # Every later sweep of the same episode stays withheld, recorded once.
+            again = kb.resolve_stale_gauntlet_dispositions(conn, stale, now=parked_at + 15_006)
+            assert again["infrastructure_released"] == []
+
+            row = conn.execute(
+                "SELECT status, block_kind, claim_lock, current_run_id FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            assert tuple(row) == tuple(before) and row["status"] == "blocked"
+            kinds = _kinds(conn, tid)
+            assert "unblocked" not in kinds
+            assert not any(
+                p and p.get("action") == "infrastructure_recovery_released"
+                for k, p in _events(conn, tid, "gauntlet_stale_disposition")
+            )
+            withheld = _events(conn, tid, "infrastructure_release_withheld")
+            assert len(withheld) == 1
+            assert withheld[0][1]["reason"] == "retry_window_expired"
+            assert withheld[0][1]["execution_id"] == execution_id
+            # The record is not lifecycle progress: the card stays stale.
+            assert kb._last_meaningful_event(conn, tid)["kind"] != "infrastructure_release_withheld"
+            assert kb.claim_task(conn, tid) is None
+
+    def test_same_park_is_withheld_at_the_doctrine_threshold_too(self, kanban_home, monkeypatch):
+        parked_at = 1_789_409_538
+        with kb.connect_closing() as conn:
+            tid, _ = self._infrastructure_park(conn, monkeypatch, parked_at=parked_at)
+            stale, result = self._sweep(conn, monkeypatch, parked_at + 14_406, 300)
+            assert [e.task_id for e in stale] == [tid]
+            assert result["infrastructure_released"] == []
+            assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "blocked"
+
+    def test_owner_comment_holds_a_fresh_park(self, kanban_home, monkeypatch):
+        parked_at = 1_789_409_538
+        with kb.connect_closing() as conn:
+            tid, _ = self._infrastructure_park(conn, monkeypatch, parked_at=parked_at)
+            kb.add_comment(conn, tid, "christopher", "I am taking this one directly; hold it.")
+            stale, result = self._sweep(conn, monkeypatch, parked_at + 360, 300)
+            assert [e.task_id for e in stale] == [tid]
+            assert result["infrastructure_released"] == []
+            assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "blocked"
+            (withheld,) = _events(conn, tid, "infrastructure_release_withheld")
+            assert withheld[1]["reason"] == "owner_engaged"
+
+    def test_fresh_untouched_park_is_still_retried_per_doctrine(self, kanban_home, monkeypatch):
+        parked_at = 1_789_409_538
+        with kb.connect_closing() as conn:
+            tid, _ = self._infrastructure_park(conn, monkeypatch, parked_at=parked_at)
+            stale, result = self._sweep(conn, monkeypatch, parked_at + 360, 300)
+            assert result["infrastructure_released"] == [tid]
+            assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"
+            assert _events(conn, tid, "infrastructure_release_withheld") == []
+
 
     def test_existing_open_gauntlet_verifier_missing_runtime_is_normalized(self, kanban_home):
         with kb.connect_closing() as conn:

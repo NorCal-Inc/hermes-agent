@@ -208,7 +208,10 @@ def _build_claude_task_prompt(task: kb.Task) -> str:
         "- Work only within the authority/scope stated in the task body.",
         "- Treat read-only/no-mutation wording as binding.",
         "- Never print or expose secrets or credential values.",
-        "- If a file/brief/artifact is requested, create it in the current task workspace.",
+        "- If a file/brief/artifact is requested, write it into this card's attachment "
+        f"directory: {kb.task_attachments_dir(task.id)}. Only that directory and a "
+        "workspace owned by this card are ever attached; shared logs, databases and "
+        "other files are not evidence.",
         "- Run the narrow verification appropriate to the task before stopping.",
         "- End with a concise factual result: what you did, exact evidence/tests, and any blocker.",
     ])
@@ -370,6 +373,51 @@ def _claim_codex_verifier_attempt(conn, task_id: str, run_id: Optional[int]) -> 
             return False
         kb._append_event(conn, task_id, kind, {"executor": "codex"}, run_id=run_id)
     return True
+
+
+# Automatic evidence harvesting is scoped to a workspace the task owns. On
+# 2026-09-14 (t_b8d62378 runs 2822/2824/2826) a card whose ``dir`` workspace was
+# the shared HERMES_HOME attached the live kanban.db WAL, broad agent/gateway
+# logs and a company-owned orion-api.log as "changed workspace files". Anything
+# outside a task-owned workspace must be written deliberately into the task's
+# attachment directory; log, database, bytecode and credential classes are
+# never harvested even inside one.
+_HARVEST_DENIED_DIRS = frozenset({"__pycache__", ".git", "logs", "log", "node_modules", "secrets"})
+_HARVEST_DENIED_SUFFIXES = (
+    ".log", ".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3",
+    ".sqlite-wal", ".sqlite-shm", ".pyc", ".pyo", ".pem", ".key",
+)
+
+
+def _task_owned_workspace(task: kb.Task) -> Optional[Path]:
+    """The workspace root when it belongs to this task alone, else ``None``."""
+    if not task.workspace_path:
+        return None
+    root = Path(task.workspace_path).expanduser().resolve(strict=False)
+    if root == (kb.workspaces_root() / task.id).resolve(strict=False):
+        return root
+    if (
+        task.workspace_kind == "worktree"
+        and root.name == task.id
+        and root.parent.name == ".worktrees"
+    ):
+        return root
+    return None
+
+
+def _harvestable(path: Path, root: Path) -> bool:
+    try:
+        rel = path.resolve(strict=False).relative_to(root)
+    except ValueError:
+        return False
+    if any(part in _HARVEST_DENIED_DIRS for part in rel.parts[:-1]):
+        return False
+    name = path.name.lower()
+    return not (
+        name.startswith(".env")
+        or name.endswith(_HARVEST_DENIED_SUFFIXES)
+        or ".log." in name
+    )
 
 
 def _attach_changed_files(conn, task_id: str, files: list[Path]) -> list[str]:
@@ -571,8 +619,12 @@ def run_claude_executor(task_id: str) -> int:
         if not should_run:
             return 1
 
-        track_files = task.workspace_kind == "scratch" or "attach" in (task.body or "").lower()
-        before = _snapshot_workspace(cwd) if track_files else {}
+        requires_attachment = "attach" in (task.body or "").lower()
+        harvest_root = _task_owned_workspace(task)
+        track_files = harvest_root is not None and (
+            task.workspace_kind == "scratch" or requires_attachment
+        )
+        before = _snapshot_workspace(str(harvest_root)) if track_files else {}
         attempt = _invoke_claude(
             _build_claude_task_prompt(task), cwd, timeout, task_id=task_id,
         )
@@ -621,7 +673,10 @@ def run_claude_executor(task_id: str) -> int:
                 )
             return 0 if ok else 1
 
-        changed = _changed_workspace_files(cwd, before) if track_files else []
+        changed = [
+            path for path in _changed_workspace_files(str(harvest_root), before)
+            if _harvestable(path, harvest_root)
+        ] if track_files else []
         attached = _attach_changed_files(conn, task_id, changed) if changed else []
         # A direct executor may write an artifact straight into the canonical
         # per-task attachment directory. Register those files as first-class
@@ -632,14 +687,17 @@ def run_claude_executor(task_id: str) -> int:
             has_registered_attachment = bool(kb.list_attachments(conn, task_id))
         except Exception:
             has_registered_attachment = bool(attached or registered_in_place)
-        requires_attachment = "attach" in (task.body or "").lower()
         if requires_attachment and not has_registered_attachment:
             ok = kb.block_task(
                 conn,
                 task_id,
                 reason=(
                     "Direct Claude executor exited successfully but the task required an "
-                    "attached artifact and no changed workspace file was produced."
+                    "attached artifact and no changed workspace file was produced. "
+                    f"Evidence must be written into {kb.task_attachments_dir(task_id)}"
+                    + ("" if harvest_root is not None else
+                       "; this card's workspace is not task-owned, so nothing in it "
+                       "is attached automatically.")
                 ),
                 kind="needs_input",
                 expected_run_id=expected_run_id,
@@ -658,6 +716,11 @@ def run_claude_executor(task_id: str) -> int:
             "duration_seconds": round(time.time() - started_at, 1),
             "changed_workspace_files": [str(p) for p in changed],
             "attached_files": attached + registered_in_place,
+            "evidence_harvest": (
+                "task_owned_workspace" if track_files
+                else "refused_workspace_not_task_owned" if harvest_root is None
+                else "not_requested"
+            ),
         }
         try:
             ok = kb.complete_task(

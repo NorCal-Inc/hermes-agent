@@ -326,6 +326,9 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     "lifecycle_stall_cleared",
     "observation_timer_armed",
     "observation_tick",
+    # Stale supervision declining to release an owner-held park changes
+    # nothing on the card, so it must not make the card look freshly moved.
+    "infrastructure_release_withheld",
 )
 
 # ---------------------------------------------------------------------------
@@ -383,6 +386,16 @@ SUPERVISORY_PROFILE_DEFAULT = "erika"
 # entirely.
 DEFAULT_GAUNTLET_STALE_TIMEOUT_SECONDS = 14400
 DEFAULT_GAUNTLET_STALE_REALERT_SECONDS = 14400
+
+# Stale supervision releases an infrastructure-parked attempt only as the
+# prompt retry the five-minute doctrine requires (operations.md v2.31: a
+# timed-out attempt is retried from preserved history). Age is never the
+# authority to release: a park that has outlived this window, or that anyone
+# other than an executor lane has commented on since, is owner-held. On
+# 2026-09-14 ``t_b8d62378`` was released 4 h after its timeout, into work an
+# owner was directing off-board, and burned its whole attempt budget.
+INFRASTRUCTURE_AUTO_RELEASE_WINDOW_SECONDS = 900
+AUTOMATION_COMMENT_AUTHORS = frozenset({"stale-supervision", "system-health-controller"})
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -12556,6 +12569,64 @@ def clear_resolved_lifecycle_stalls(
     return cleared
 
 
+def _infrastructure_release_withheld(
+    conn: sqlite3.Connection,
+    task_id: str,
+    block_event_id: int,
+    execution: sqlite3.Row,
+    now_ts: int,
+) -> Optional[str]:
+    """Why an infrastructure park must stay parked, or ``None`` to release it."""
+    if now_ts - int(execution["ended_at"]) > INFRASTRUCTURE_AUTO_RELEASE_WINDOW_SECONDS:
+        return "retry_window_expired"
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' AND id > ?",
+        (task_id, block_event_id),
+    ):
+        try:
+            author = str(json.loads(row["payload"] or "{}").get("author") or "")
+        except Exception:
+            author = ""
+        if not (author.endswith("-lane") or author in AUTOMATION_COMMENT_AUTHORS):
+            return "owner_engaged"
+    return None
+
+
+def _record_infrastructure_release_withheld(
+    conn: sqlite3.Connection,
+    task_id: str,
+    execution: sqlite3.Row,
+    reason: str,
+    now_ts: int,
+) -> None:
+    """One record per parked execution; the card itself is not touched."""
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'infrastructure_release_withheld'",
+        (task_id,),
+    ):
+        try:
+            if json.loads(row["payload"] or "{}").get("execution_id") == execution["id"]:
+                return
+        except Exception:
+            continue
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "infrastructure_release_withheld",
+            {
+                "reason": reason,
+                "execution_id": execution["id"],
+                "execution_status": execution["status"],
+                "parked_seconds": now_ts - int(execution["ended_at"]),
+                "detected_at": now_ts,
+                "source": "stale_supervision",
+            },
+        )
+
+
 def resolve_stale_gauntlet_dispositions(
     conn: sqlite3.Connection,
     stale: Iterable["GauntletStaleTask"],
@@ -12678,7 +12749,19 @@ def resolve_stale_gauntlet_dispositions(
                     "WHERE id = ? AND task_id = ? AND ended_at IS NOT NULL LIMIT 1",
                     (linked_execution_id, task_id),
                 ).fetchone()
+            withheld = None
             if (
+                execution is not None
+                and execution["status"] in ("timed_out", "stale", "terminated")
+            ):
+                withheld = _infrastructure_release_withheld(
+                    conn, task_id, int(current_block["id"]), execution, now_ts,
+                )
+            if withheld is not None:
+                _record_infrastructure_release_withheld(
+                    conn, task_id, execution, withheld, now_ts,
+                )
+            elif (
                 execution is not None
                 and execution["status"] in ("timed_out", "stale", "terminated")
             ):
