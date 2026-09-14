@@ -11543,6 +11543,19 @@ def _ensure_independent_verifier_child(
                 f"operator:human-interactive-parent:{subject_id}"
             )
 
+    # A subject on a repair leg owes regression proof with its next PASS, and
+    # only the verifier that re-ran the checks can hand it over (the return
+    # path parses an anchored REGRESSION: line). The brief never said so, so an
+    # honest PASS on a repair leg was refused and the next verifier spent
+    # another objective attempt on the same unanswerable brief (2026-09-14).
+    regression_brief = (
+        "\n\nThis subject is on a repair leg: an earlier verdict failed. Before any "
+        "PASS, rerun the relevant regression checks yourself, and justify the PASS "
+        "with one anchored line beginning exactly `REGRESSION:` that states what you "
+        f"reran and whether it passed, for example `{VERIFIER_REGRESSION_BRIEF_EXAMPLE}`. "
+        "A PASS without that line is refused and the subject stays unverified."
+        if regression_evidence_required(conn, subject_id) else ""
+    )
     try:
         child_id = create_task(
             conn,
@@ -11557,6 +11570,7 @@ def _ensure_independent_verifier_child(
                 f"acceptance criteria were checked; missing acceptance confirmation fails "
                 f"closed. Finish with `VERDICT: PASS`, `VERDICT: FAIL` or `VERDICT: BLOCKER` "
                 f"on its own anchored line; the verdict is returned automatically."
+                f"{regression_brief}"
             ),
             assignee="atlas",
             parents=[subject_id],
@@ -11665,6 +11679,12 @@ _VERIFIER_LESSON_APPLICABILITY_RE = re.compile(
     r"\s*[:=]\s*(?:\*\*|__)?"
     r"(?P<detail>.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
+)
+
+#: The declaration shown to verifiers of repair-leg subjects; a test holds it to
+#: :func:`_parse_verifier_regression` so the brief and the parser cannot drift.
+VERIFIER_REGRESSION_BRIEF_EXAMPLE = (
+    "REGRESSION: pytest -q tests/hermes_cli/test_example.py -> exit 0, 12 passed"
 )
 
 _VERIFIER_REGRESSION_RE = re.compile(

@@ -1355,6 +1355,66 @@ class TestRepairLegPassReturnsWithoutRelay:
             assert "verification_failed" in _kinds(conn, tid)
             assert kb.get_task(conn, tid).regression_required is True
 
+    # -- 2026-09-14 t_b8d62378: the verifier contract names what the gate needs --
+
+    def test_repair_leg_verifier_brief_requires_the_regression_declaration(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _armed_for_repair(conn)
+            _repair_and_hand_off(conn, tid)
+            body = kb.get_task(conn, _verifier_child(conn, tid)).body
+        assert "rerun the relevant regression checks" in body
+        assert "one anchored line beginning exactly `REGRESSION:`" in body
+        assert "what you reran and whether it passed" in body
+        assert kb.VERIFIER_REGRESSION_BRIEF_EXAMPLE in body
+        # The example in the brief is a declaration the unchanged parser accepts.
+        proof = kb._parse_verifier_regression(kb.VERIFIER_REGRESSION_BRIEF_EXAMPLE)
+        assert proof is not None and kb._validate_regression_evidence(proof)[0] is True
+
+    def test_first_pass_verifier_brief_is_unchanged(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            assert kb.get_task(conn, tid).regression_required is False
+            body = kb.get_task(conn, _verifier_child(conn, tid)).body
+        assert "REGRESSION" not in body
+        assert body.endswith("on its own anchored line; the verdict is returned automatically.")
+
+    def test_prose_about_rerunning_is_not_manufactured_into_proof(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _armed_for_repair(conn)
+            _repair_and_hand_off(conn, tid)
+            _run_verifier(conn, tid, "I reran the regression checks and they all passed.\n\nVERDICT: PASS")
+            task = kb.get_task(conn, tid)
+            assert task.verification_state != kb.VERIFICATION_VERIFIED
+            assert task.regression_required is True
+            assert "verification_blocked_no_regression" in _kinds(conn, tid)
+
+    def test_a_refused_declaration_does_not_loop_verifier_children(self, kanban_home):
+        """After a PASS is refused for a missing declaration, repeated supervision ticks
+        open at most one further verifier child, it does not dispatch on its own, and no
+        attempts are spent. The gate stays closed; nothing retries in a loop."""
+        with kb.connect_closing() as conn:
+            tid = _armed_for_repair(conn)
+            _repair_and_hand_off(conn, tid)
+            _run_verifier(conn, tid, "Looks fine.\n\nVERDICT: PASS")
+            attempts = kb.gauntlet_objective_attempts(conn, tid)
+            opened = {kb._ensure_independent_verifier_child(conn, tid, implementer="default")
+                      for _ in range(10)} - {None}
+            assert len(opened) <= 1
+            for cid in opened:
+                assert kb.claim_task(conn, cid) is None
+            assert {kb._ensure_independent_verifier_child(conn, tid, implementer="default")
+                    for _ in range(10)} - {None} == opened
+            children = conn.execute(
+                "SELECT COUNT(*) FROM task_links l JOIN tasks c ON c.id = l.child_id "
+                "WHERE l.parent_id = ? AND c.executor_lane = ?",
+                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+            ).fetchone()[0]
+            task = kb.get_task(conn, tid)
+            assert kb.gauntlet_objective_attempts(conn, tid) == attempts
+        assert children <= 3        # first FAIL verifier, the refused PASS verifier, one retry
+        assert task.verification_state != kb.VERIFICATION_VERIFIED
+        assert task.regression_required is True
+
 
 class TestVerifierRegressionParsing:
     @pytest.mark.parametrize("text,expected", [
