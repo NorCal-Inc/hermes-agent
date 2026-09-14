@@ -229,3 +229,118 @@ class TestDispatchReportsTheLock:
         from hermes_cli import kanban as kc
 
         assert "does not take the board lock" in kc.run_slash("dispatch -h")
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-14: the handoff surfaces refuse; the core keeps recording
+#
+# t_3883034a (run 2814) handed off through the CLI with rich but
+# non-qualifying run metadata and no attachment, so the verifier route never
+# opened (event 151076); t_15d87799 (run 2818) handed off with no summary and
+# no metadata at all and became unroutable (151244). The CLI required nothing;
+# the tool required only a summary. The core stays non-refusing (see the
+# module docstring). The two entry surfaces refuse instead, while the
+# implementer still holds the context and the fix is one attach or two
+# metadata keys.
+# ---------------------------------------------------------------------------
+
+QUALIFYING_METADATA = {
+    "changed_files": ["hermes_cli/kanban_db.py"],
+    "verification": ["pytest -q tests/hermes_cli/test_kanban_handoff_evidence_gate.py"],
+}
+
+
+def _worker_gauntlet_task(monkeypatch, *, title="gauntlet work"):
+    with kb.connect() as db:
+        tid = kb.create_task(db, title=title, assignee="builder")
+        assert kb.set_gauntlet_enforced(db, tid, True) is True
+        claimed = kb.claim_task(db, tid, claimer="builder:1")
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    return tid, claimed
+
+
+class TestStructuredHandoffOpensNoFalseAlarm:
+    def test_qualifying_metadata_is_materialized_before_the_route_is_judged(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as db:
+            tid, claimed = _gauntlet_task_ready_to_hand_off(db)
+            assert kb.request_review(
+                db, tid, summary="implemented X", metadata=QUALIFYING_METADATA,
+                expected_run_id=claimed.current_run_id,
+            ) is True
+            assert len(kb.list_attachments(db, tid)) == 1
+            assert "verification_route_unopened" not in _kinds(db, tid)
+
+
+class TestEvidenceGapPredicate:
+    def test_names_what_is_missing(self, kanban_home):
+        with kb.connect_closing() as db:
+            tid, _ = _gauntlet_task_ready_to_hand_off(db)
+            gap = kb.review_handoff_evidence_gap(db, tid, {"tests_run": 7})
+            assert gap is not None
+            assert "changed_files" in gap and "verification" in gap
+            assert "hermes kanban attach" in gap
+
+    def test_satisfied_by_attachment_or_qualifying_metadata(self, kanban_home):
+        with kb.connect_closing() as db:
+            tid, _ = _gauntlet_task_ready_to_hand_off(db)
+            assert kb.review_handoff_evidence_gap(db, tid, QUALIFYING_METADATA) is None
+            _attach(db, tid)
+            assert kb.review_handoff_evidence_gap(db, tid, None) is None
+
+    def test_ordinary_work_owes_nothing(self, kanban_home):
+        with kb.connect_closing() as db:
+            tid = kb.create_task(db, title="ordinary", assignee="worker")
+            assert kb.review_handoff_evidence_gap(db, tid, None) is None
+
+
+class TestHandoffSurfacesRefuseEvidencelessGauntletWork:
+    def test_tool_refuses_prose_only_handoff(self, kanban_home, monkeypatch):
+        from tools import kanban_tools as tools
+
+        tid, _ = _worker_gauntlet_task(monkeypatch)
+        result = json.loads(tools._handle_request_review({
+            "summary": "Implemented the overlay; 36 core regressions passed.",
+            "metadata": {"core_regressions": "36 passed"},
+        }))
+        assert "error" in result
+        assert "changed_files" in result["error"]
+        with kb.connect_closing() as db:
+            assert kb.get_task(db, tid).status == "running"
+            assert "review_requested" not in _kinds(db, tid)
+
+    def test_tool_accepts_structured_handoff(self, kanban_home, monkeypatch):
+        from tools import kanban_tools as tools
+
+        tid, _ = _worker_gauntlet_task(monkeypatch)
+        result = json.loads(tools._handle_request_review({
+            "summary": "Implemented X.",
+            "metadata": dict(QUALIFYING_METADATA),
+        }))
+        assert result.get("ok") is True, result
+        with kb.connect_closing() as db:
+            assert kb.get_task(db, tid).status == "review"
+
+    def test_cli_refuses_evidenceless_handoff(self, kanban_home, monkeypatch):
+        from hermes_cli import kanban as kc
+
+        tid, _ = _worker_gauntlet_task(monkeypatch, title="cli gauntlet work")
+        output = kc.run_slash(f"request-review {tid} --summary 'ready' --force")
+        assert "changed_files" in output
+        assert "Requested review" not in output
+        with kb.connect_closing() as db:
+            assert kb.get_task(db, tid).status == "running"
+
+    def test_cli_accepts_after_attaching_evidence(self, kanban_home, monkeypatch):
+        from hermes_cli import kanban as kc
+
+        tid, _ = _worker_gauntlet_task(monkeypatch, title="cli attached work")
+        with kb.connect_closing() as db:
+            _attach(db, tid)
+        output = kc.run_slash(f"request-review {tid} --summary 'ready' --force")
+        assert "Requested review" in output

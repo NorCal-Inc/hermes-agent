@@ -36,12 +36,13 @@ from hermes_cli import exec_supervisor as ex
 from hermes_cli import kanban_db as kb
 
 
-# A verifier identity the registry can actually resolve. Verdicts are refused
-# unless the signer is an existing profile or a recognized verifier lane (D4),
-# and `codex_verify` is a lane that is independent of the "default" implementer
-# these tests use — so it exercises the regression chain rather than tripping
-# the identity or independence gates on the way in.
-VERIFIER = "codex_verify"
+# A verifier identity the registry can actually resolve, independent of the
+# "default" implementer these tests use, so the test exercises the regression
+# chain rather than tripping the identity or independence gates on the way in.
+# It used to be the bare lane name `codex_verify`; since 2026-09-14 (the
+# t_e48487e5 false VERIFIED) a lane name is never a verifier identity, so this
+# is a real profile directory created in the isolated HERMES_HOME.
+VERIFIER = "auditor"
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1214,7 @@ class TestGauntletIntegration:
         self, kanban_home, workroot, policy
     ):
         """The supervisor changes who owns the process, not the chain."""
+        (kanban_home / "profiles" / VERIFIER).mkdir(parents=True)
         with kb.connect_closing() as conn:
             tid = _gauntlet_task(conn)
         ex.run_supervised(

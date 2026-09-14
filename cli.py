@@ -20621,6 +20621,22 @@ def main(
             # model's vision input.
             single_query_image_urls: list[str] = []
             _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+            if not _kanban_task_id and isinstance(query, str) and query.lstrip().startswith(
+                "work kanban task "
+            ):
+                # A dispatcher worker whose Kanban scope env was stripped in
+                # transit (e.g. an env-resetting wrapper) must not fall through
+                # to an unscoped agent loop with board-mutating tools. Fail
+                # closed before any agent, prompt, or toolset is built.
+                from hermes_cli.kanban_db import dispatcher_worker_query_task_id
+
+                _stripped_task_id = dispatcher_worker_query_task_id(query)
+                if _stripped_task_id:
+                    sys.stderr.write(
+                        f"kanban worker for {_stripped_task_id} started without "
+                        "HERMES_KANBAN_TASK; refusing to run unscoped\n"
+                    )
+                    sys.exit(2)
             if _kanban_task_id:
                 try:
                     from hermes_cli import kanban_db as _kb

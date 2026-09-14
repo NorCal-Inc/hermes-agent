@@ -1,0 +1,32 @@
+{
+  "alert_target": null,
+  "boot_gate_command": null,
+  "gateway_heartbeat_max_age_seconds": 180,
+  "critical_cron_jobs": {
+    "life-wiki-github-sync": {"max_age_seconds": 2700},
+    "nuclear_backup": {"max_age_seconds": 93600},
+    "nuclear-backup-drive-validation": {"max_age_seconds": 93600},
+    "dr-backup-verify": {"max_age_seconds": 93600},
+    "deploy-drift-watchdog": {"max_age_seconds": 25200},
+    "life-wiki-daily-validation": {"max_age_seconds": 93600},
+    "nightly-executive-continuity-reconciliation": {"max_age_seconds": 93600},
+    "gauntlet-progress-census": {"max_age_seconds": 900, "pause_max_age_seconds": 604800},
+    "executive-significant-change-watch": {"max_age_seconds": 900, "pause_max_age_seconds": 604800}
+  },
+  "critical_user_timers": {
+    "hermes-ops-supervisor.timer": {"max_age_seconds": 600},
+    "hermes-skill-ledger-reconcile.timer": {"max_age_seconds": 1200},
+    "hermes-kanban-hygiene.timer": {"max_age_seconds": 93600},
+    "hermes-lesson-candidate-review.timer": {"max_age_seconds": 93600},
+    "hermes-postgres-backup.timer": {"max_age_seconds": 93600},
+    "website-reboot-health.timer": {"max_age_seconds": 50400},
+    "gauntlet-progress-calibration.timer": {"max_age_seconds": 14400},
+    "system-health-controller-light.timer": {"max_age_seconds": 900},
+    "system-health-controller-deep.timer": {"max_age_seconds": 7500}
+  },
+  "expected_runtime_config": {
+    "execution.max_runtime_seconds": "300",
+    "kanban.dispatch_stale_timeout_seconds": "300",
+    "kanban.gauntlet_stale_timeout_seconds": "300"
+  }
+}

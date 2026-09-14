@@ -19,11 +19,11 @@ module pins each one shut (defect D4 remainder, evidence packet for
 (c) ASSIGNEE — independence was tested against the ``review_requested``
     implementer only, never against the task's own ``assignee``.
 
-The registry check is deliberately an ALLOW-LIST, not a bare ``profile_exists``
-call: ``codex_verify`` and its shorthand ``atlas`` are executor LANES, not
-profile directories — ``~/.hermes/profiles/atlas/`` does not exist and is not
-supposed to — and the codex_verify return path signs verdicts as
-``codex_verify:<verifier_task_id>``.
+The registry check is deliberately not a bare ``profile_exists`` call:
+``codex_verify`` is an executor LANE, not a profile directory, and the
+codex_verify return path signs verdicts as ``codex_verify:<verifier_task_id>``.
+A lane NAME is still not an identity — see
+``TestBareLaneNameIsNotAVerifierIdentity`` (the t_e48487e5 false VERIFIED).
 
 The assignee arm of (c) carries a carve-out that is load-bearing rather than a
 softening: the sanctioned independence recovery is to REASSIGN a parked task to
@@ -171,36 +171,186 @@ class TestUnregisteredVerifierIsRefused:
             assert (ok, detail) == (True, kb.VERIFICATION_VERIFIED)
 
 
-class TestVerifierLaneAllowList:
-    """``codex_verify``/``atlas`` are lanes, not profiles — and must still work.
+def _attested_verifier(conn, subject_id, *, attest=True, parents=None):
+    """Run a codex_verify card to completion the way the real lane does.
 
-    A bare ``profile_exists`` gate would have broken the ONE sanctioned
-    independent-verification route on the board.
+    ``attest`` writes the ``codex_verifier_started`` event that
+    ``recovery_lane._claim_codex_verifier_attempt`` records for the run it
+    actually executes; leaving it out reproduces an unscoped agent completing
+    the card. The summary carries no verdict line, so the return path records
+    nothing and the verdict under test is the explicit one.
+    """
+    if not kb.list_attachments(conn, subject_id):
+        kb.add_attachment(
+            conn, subject_id, filename="EVIDENCE.md",
+            stored_path=f"/tmp/{subject_id}/EVIDENCE.md", size=64,
+            uploaded_by="claude-lane",
+        )
+    cid = kb.create_task(
+        conn, title="independent codex verification", assignee="default",
+        executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+        parents=list(parents) if parents is not None else [subject_id],
+        gauntlet=True,
+    )
+    kb.recompute_ready(conn)
+    claimed = kb.claim_task(conn, cid)
+    assert claimed is not None and claimed.status == "running"
+    if attest:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, cid, "codex_verifier_started", {"executor": "codex"},
+                run_id=claimed.current_run_id,
+            )
+    assert kb.complete_task(
+        conn, cid, summary="fixture verifier run without a verdict line",
+        expected_run_id=claimed.current_run_id,
+    ) is True
+    assert kb.get_task(conn, cid).status == "done"
+    return cid
+
+
+class TestBareLaneNameIsNotAVerifierIdentity:
+    """Regression for the t_e48487e5 false VERIFIED (2026-09-14 12:19:13).
+
+    The allow-list used to match the bare lane root, so typing a lane name
+    rendered a binding "independent" verdict with no verifier having run.
+    A lane name is not an identity: only an attested codex_verify verifier
+    bound to the subject may sign.
     """
 
     @pytest.mark.parametrize(
         "verifier",
-        ["codex_verify", "atlas", "claude_recovery", "codex_verify:t_fb23ac0a"],
+        [
+            "codex_verify",
+            "atlas",
+            "claude",
+            "claude_recovery",
+            "codex_verify:",
+            "codex_verify:t_fb23ac0a",  # scoped, but resolves to nothing
+            "claude:t_fb23ac0a",
+            "atlas:t_fb23ac0a",
+        ],
     )
-    def test_lane_identities_are_accepted(self, kanban_home, registry, verifier):
-        registry("default", "alice")  # no lane name is a profile
+    def test_lane_names_and_unresolvable_lane_identities_are_refused(
+        self, kanban_home, registry, verifier
+    ):
+        registry("default", "alice")
         with kb.connect_closing() as conn:
             tid = _parked_for_review(conn, implementer="alice")
             ok, detail = kb.record_verification(
                 conn, tid, passed=True, verifier=verifier,
             )
+            assert ok is False, detail
+            assert "not a registered identity" in detail
+            assert kb.get_task(conn, tid).verification_state == (
+                kb.VERIFICATION_PENDING
+            )
+            blocked = _events(conn, tid, "verification_blocked_unknown_verifier")
+            assert [p["verifier"] for _, p in blocked] == [verifier.strip().lower()]
+
+    def test_the_t_e48487e5_sequence_cannot_close_the_task(
+        self, kanban_home, registry
+    ):
+        """Refused as an unknown identity, then retried with the lane name."""
+        registry("default", "alice")
+        with kb.connect_closing() as conn:
+            tid = _parked_for_review(conn, implementer="alice")
+            first, _ = kb.record_verification(
+                conn, tid, passed=True, verifier="chatgpt-auditor",
+            )
+            second, detail = kb.record_verification(
+                conn, tid, passed=True, verifier="codex_verify",
+            )
+            assert (first, second) == (False, False)
+            assert "bare lane name" in detail
+            task = kb.get_task(conn, tid)
+            assert task.status == "review"
+            assert task.verification_state == kb.VERIFICATION_PENDING
+            assert not _events(conn, tid, "verification_passed")
+            assert len(_events(conn, tid, "verification_blocked_unknown_verifier")) == 2
+
+    def test_attested_linked_verifier_signs_normally(self, kanban_home, registry):
+        registry("default", "alice")
+        with kb.connect_closing() as conn:
+            tid = _parked_for_review(conn, implementer="alice")
+            cid = _attested_verifier(conn, tid)
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier=f"codex_verify:{cid}",
+            )
             assert (ok, detail) == (True, kb.VERIFICATION_VERIFIED), detail
 
-    def test_lane_root_is_what_matches_not_the_whole_string(self):
-        """``codex_verify:<task>`` is how the return path signs a verdict —
-        see ``_return_verifier_verdict_to_subjects``."""
-        status, _ = kb._verifier_identity_status("codex_verify:t_30e58898")
-        assert status == kb.VERIFIER_IDENTITY_LANE
+    def test_unattested_verifier_card_cannot_sign(self, kanban_home, registry):
+        """The run-2817 shape: a codex_verify card completed by something
+        other than the codex_verify lane."""
+        registry("default", "alice")
+        with kb.connect_closing() as conn:
+            tid = _parked_for_review(conn, implementer="alice")
+            cid = _attested_verifier(conn, tid, attest=False)
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier=f"codex_verify:{cid}",
+            )
+            assert ok is False
+            assert "executed by the codex_verify lane" in detail
+            assert kb.get_task(conn, tid).verification_state == (
+                kb.VERIFICATION_PENDING
+            )
 
-    def test_a_lookalike_prefix_is_not_a_lane(self):
+    def test_attested_verifier_of_another_subject_cannot_sign(
+        self, kanban_home, registry
+    ):
+        registry("default", "alice")
+        with kb.connect_closing() as conn:
+            tid = _parked_for_review(conn, implementer="alice")
+            other = _parked_for_review(conn, implementer="alice")
+            cid = _attested_verifier(conn, other)
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier=f"codex_verify:{cid}",
+            )
+            assert ok is False
+            assert f"is not a verifier of {tid}" in detail
+
+    def test_completed_codex_verify_execution_on_the_subject_signs(
+        self, kanban_home, registry
+    ):
+        registry("default", "alice")
+        with kb.connect_closing() as conn:
+            tid = _parked_for_review(conn, implementer="alice")
+            other = _parked_for_review(conn, implementer="alice")
+
+            def _execution(eid, task_id, *, command_class="codex.verify",
+                           status="completed", exit_code=0):
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "INSERT INTO executions (id, task_id, executor_type, "
+                        "command_class, cwd, nonce, controller_token, ownership, "
+                        "started_at, heartbeat_at, status, exit_code, created_at) "
+                        "VALUES (?, ?, 'codex', ?, '/tmp', 'n', 'tok', "
+                        "'supervisor', 1, 1, ?, ?, 1)",
+                        (eid, task_id, command_class, status, exit_code),
+                    )
+
+            _execution("x_foreign", other)
+            _execution("x_failed", tid, status="failed", exit_code=1)
+            _execution("x_good", tid)
+            for bad in ("x_foreign", "x_failed"):
+                ok, _ = kb.record_verification(
+                    conn, tid, passed=True, verifier=f"codex_verify:{bad}",
+                )
+                assert ok is False
+            ok, detail = kb.record_verification(
+                conn, tid, passed=True, verifier="codex_verify:x_good",
+            )
+            assert (ok, detail) == (True, kb.VERIFICATION_VERIFIED), detail
+
+    def test_lane_identity_without_a_subject_is_unknown(self):
+        status, detail = kb._verifier_identity_status("codex_verify:t_30e58898")
+        assert status == kb.VERIFIER_IDENTITY_UNKNOWN
+        assert "cannot be resolved" in detail
+
+    def test_a_lookalike_prefix_is_not_a_lane(self, registry):
         status, detail = kb._verifier_identity_status("codex_verifyish")
         assert status == kb.VERIFIER_IDENTITY_UNKNOWN
-        assert "codex_verify" in detail  # the message names the real lanes
+        assert "codex_verify" in detail  # the message names the real lane
 
 
 class TestUnreadableRegistry:
@@ -474,8 +624,8 @@ class TestVerifierIdentityStatus:
         assert status == kb.VERIFIER_IDENTITY_UNCHECKED
         assert "registry offline" in detail
 
-    def test_every_valid_executor_lane_is_an_allowed_verifier_identity(self):
-        """Pins the allow-list to the lane constants rather than a copy of
-        them, so a new lane cannot silently become an unverifiable one."""
-        assert kb.VALID_EXECUTOR_LANES <= kb.VERIFIER_LANE_IDENTITIES
-        assert "atlas" in kb.VERIFIER_LANE_IDENTITIES
+    def test_only_the_independent_verification_lane_may_sign(self):
+        """Implementation and recovery lanes are never verifier identities."""
+        assert kb.VERIFIER_LANE_IDENTITIES == frozenset({kb.EXECUTOR_LANE_CODEX_VERIFY})
+        assert kb.EXECUTOR_LANE_CLAUDE not in kb.VERIFIER_LANE_IDENTITIES
+        assert kb.EXECUTOR_LANE_CLAUDE_RECOVERY not in kb.VERIFIER_LANE_IDENTITIES

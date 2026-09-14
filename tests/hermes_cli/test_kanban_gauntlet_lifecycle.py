@@ -417,7 +417,7 @@ class TestVerdictStaleness:
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
             kb.request_review(
-                conn, tid, summary="impl", reviewer="default",
+                conn, tid, summary="impl", reviewer="reviewer",
                 expected_run_id=run_id,
             )
             reviewer_run = kb.claim_review_task(conn, tid)
@@ -457,8 +457,8 @@ def _fail_then_repair(conn, tid, run_id, *, summary="fixed", reviewer="default")
 
     ``reviewer`` names who the repair round is handed to (default matches
     the original implementer identity, as most callers here don't care;
-    pass a distinct identity when the test needs implicit auto-approval to
-    be legitimate second-party review rather than the same profile).
+    pass a distinct identity whenever the test claims the review run — on a
+    Gauntlet subject the implementer is refused at selection).
     """
     kb.request_review(
         conn, tid, summary="impl", reviewer="default", expected_run_id=run_id,
@@ -793,7 +793,7 @@ class TestReviewerRunApproval:
     def test_inline_approval_of_a_repair_needs_the_proof(self, kanban_home):
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
-            _fail_then_repair(conn, tid, run_id)
+            _fail_then_repair(conn, tid, run_id, reviewer="reviewer")
             reviewer_run = kb.claim_review_task(conn, tid)
             assert reviewer_run is not None
 
@@ -841,8 +841,8 @@ class TestReviewerRunApproval:
     def test_inline_approval_rejects_a_malformed_proof(self, kanban_home):
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
-            _fail_then_repair(conn, tid, run_id)
-            kb.claim_review_task(conn, tid)
+            _fail_then_repair(conn, tid, run_id, reviewer="reviewer")
+            assert kb.claim_review_task(conn, tid) is not None
             with pytest.raises(kb.VerificationRequiredError) as exc:
                 kb.complete_task(
                     conn, tid, summary="approved",
@@ -1159,8 +1159,9 @@ class TestVerifierIndependence:
                 conn, tid, summary="ruling made", reviewer="default",
                 expected_run_id=claimed.current_run_id,
             )
+            # The installed reviewer; a bare lane name is not an identity.
             ok, detail = kb.record_verification(
-                conn, tid, passed=True, verifier="atlas",
+                conn, tid, passed=True, verifier="default",
             )
             assert ok is True, detail
             assert kb.get_task(conn, tid).verification_state == (
@@ -1194,17 +1195,19 @@ class TestVerifierIndependence:
                 conn, tid, summary="ruling made", reviewer="erika",
                 expected_run_id=claimed.current_run_id,
             )
-            reviewer_run = kb.claim_review_task(conn, tid)
-            assert reviewer_run is not None
-
-            assert kb.complete_task(conn, tid, summary="approved") is False
+            # Since 2026-09-14 (t_3883034a run 2816) selection asks the verdict
+            # gate's question first: the implementer installed as its own
+            # reviewer never gets a review run to approve inline.
+            assert kb.claim_review_task(conn, tid) is None
+            refused = _events(conn, tid, kind="review_claim_rejected_self_review")
+            assert refused and refused[-1][1]["conflict_source"] == "implementer"
 
             task = kb.get_task(conn, tid)
             assert task.verification_state != kb.VERIFICATION_VERIFIED
-            assert task.status != "done"
-            assert len(
-                _events(conn, tid, kind="verification_blocked_self_review")
-            ) == 1
+            assert task.status == "review"
+            with pytest.raises(kb.VerificationRequiredError):
+                kb.complete_task(conn, tid, summary="approved")
+            assert kb.get_task(conn, tid).status != "done"
 
 
 @pytest.mark.real_profile_registry
@@ -1319,6 +1322,28 @@ class TestEvidenceReadyVerifierDependency:
             executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
             parents=[parent_id], gauntlet=True,
         )
+
+    @classmethod
+    def _attested_identity(cls, conn, parent_id, cid=None, summary=None):
+        """Run a verifier child the way the codex_verify lane does and return
+        the identity it may sign with. Without a verdict line in ``summary``
+        the return path records nothing, leaving the explicit verdict under
+        test."""
+        if cid is None:
+            cid = cls._verifier_child(conn, parent_id)
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, cid)
+        assert claimed is not None and claimed.status == "running"
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, cid, "codex_verifier_started", {"executor": "codex"},
+                run_id=claimed.current_run_id,
+            )
+        assert kb.complete_task(
+            conn, cid, summary=summary or "verifier fixture run without a verdict line",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        return f"codex_verify:{cid}"
 
     # -- the deadlock is broken --------------------------------------------
 
@@ -1541,6 +1566,83 @@ class TestEvidenceReadyVerifierDependency:
 
     # -- the carve-out is not a hole ---------------------------------------
 
+    # -- verifier-specific dependency semantics (2026-09-14, t_4d21959c) ------
+    #
+    # The carve-out used to key only on executor_lane=codex_verify, so a
+    # registered-profile verifier child of an evidence-ready subject could
+    # never be released: t_4d21959c (compliance_worker) was created at
+    # 12:48:32, force-promoted at 12:49:03 and demoted by claim_rejected
+    # parents_not_done one second later. The typed ``verifies`` relation is
+    # the structured statement that a linked child is the subject's verifier.
+
+    def test_verifies_relation_releases_a_profile_verifier_child(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            verifier = kb.create_task(
+                conn, title="independent compliance verification",
+                assignee="reviewer", parents=[pid], gauntlet=True,
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "todo"
+
+            assert kb.add_task_relation(
+                conn, verifier, pid, "verifies", created_by="test",
+            ) is True
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "ready"
+            claimed = kb.claim_task(conn, verifier)
+            assert claimed is not None and claimed.status == "running"
+            assert "claim_rejected" not in [k for k, _ in _events(conn, verifier)]
+            # The subject itself is untouched: still awaiting its verdict.
+            assert kb.get_task(conn, pid).verification_state == kb.VERIFICATION_PENDING
+
+    def test_verifies_relation_never_releases_the_implementer(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn, assignee="default")
+            same_party = kb.create_task(
+                conn, title="self verification", assignee="default",
+                parents=[pid], gauntlet=True,
+            )
+            kb.add_task_relation(conn, same_party, pid, "verifies", created_by="test")
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, same_party).status == "todo"
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ?", (same_party,),
+                )
+            assert kb.claim_task(conn, same_party) is None
+            assert kb.get_task(conn, same_party).status == "todo"
+
+    def test_verifies_relation_requires_the_dependency_link(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            unlinked = kb.create_task(
+                conn, title="unlinked verifier", assignee="reviewer", gauntlet=True,
+            )
+            with pytest.raises(ValueError, match="dependency link"):
+                kb.add_task_relation(conn, unlinked, pid, "verifies", created_by="test")
+
+    def test_forced_promotion_refuses_when_the_claim_gate_would_reject(
+        self, kanban_home
+    ):
+        """The t_4d21959c flap: force promoted, claim demoted, nothing ran."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            child = kb.create_task(
+                conn, title="compliance verification", assignee="reviewer",
+                parents=[pid], gauntlet=True,
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo"
+
+            ok, reason = kb.promote_task(
+                conn, child, actor="operator", reason="unblock", force=True,
+            )
+            assert ok is False
+            assert "claim" in reason and pid in reason
+            assert kb.get_task(conn, child).status == "todo"
+            assert "promoted_manual" not in [k for k, _ in _events(conn, child)]
+
     def test_ordinary_child_still_requires_terminal_parent(self, kanban_home):
         """The carve-out is lane-scoped. A non-verifier child of the very same
         evidence-ready parent must not move until the parent is genuinely
@@ -1562,7 +1664,8 @@ class TestEvidenceReadyVerifierDependency:
 
             # And it moves only once the parent is genuinely terminal.
             ok, detail = kb.record_verification(
-                conn, pid, passed=True, verifier="atlas",
+                conn, pid, passed=True,
+                verifier=self._attested_identity(conn, pid, verifier),
             )
             assert ok is True, detail
             assert kb.complete_task(conn, pid, summary="verified") is True
@@ -1618,7 +1721,8 @@ class TestEvidenceReadyVerifierDependency:
                 expected_run_id=claimed.current_run_id,
             )
             ok, detail = kb.record_verification(
-                conn, source, passed=True, verifier="atlas",
+                conn, source, passed=True,
+                verifier=self._attested_identity(conn, source),
             )
             assert ok is True, detail
             assert kb.complete_task(conn, source, summary="verified") is True
@@ -1686,7 +1790,8 @@ class TestEvidenceReadyVerifierDependency:
         with kb.connect_closing() as conn:
             pid = self._evidence_ready_parent(conn)
             ok, detail = kb.record_verification(
-                conn, pid, passed=False, verifier="atlas",
+                conn, pid, passed=False,
+                verifier=self._attested_identity(conn, pid),
                 reason="fixture did not survive restart",
                 route_on_failure=False,
             )
@@ -1711,7 +1816,8 @@ class TestEvidenceReadyVerifierDependency:
             assert kb.get_task(conn, cid).status == "ready"
 
             ok, detail = kb.record_verification(
-                conn, pid, passed=False, verifier="atlas",
+                conn, pid, passed=False,
+                verifier=self._attested_identity(conn, pid, cid),
                 reason="fixture did not survive restart",
             )
             assert ok is True, detail
@@ -1770,15 +1876,13 @@ class TestEvidenceReadyVerifierDependency:
             cid = self._verifier_child(conn, pid)
             kb.recompute_ready(conn)
 
-            claimed = kb.claim_task(conn, cid)
-            assert claimed is not None
-            assert kb.complete_task(
-                conn, cid, summary="PASS: fixture survives restart",
-            ) is True
+            identity = self._attested_identity(
+                conn, pid, cid, summary="PASS: fixture survives restart",
+            )
             assert kb.get_task(conn, cid).status == "done"
 
             ok, detail = kb.record_verification(
-                conn, pid, passed=True, verifier="atlas",
+                conn, pid, passed=True, verifier=identity,
                 evidence={"command": "pytest -q", "exit_code": 0},
             )
             assert ok is True, detail
@@ -1869,9 +1973,15 @@ class TestSelfReviewBlockedImplementationHandoff:
             assert kb.get_task(conn, parent).completed_at is None
 
     def test_review_run_self_review_block_releases_only_governed_implementation(
-        self, kanban_home,
+        self, kanban_home, monkeypatch,
     ):
-        """Reproduce the production sequence with distinct implementation/review runs."""
+        """Reproduce the production sequence with distinct implementation/review runs.
+
+        Selection now refuses the implementer before a review run opens
+        (2026-09-14), so this historical board state can no longer be produced
+        by a claim. Boards still carry it, and the release predicate must keep
+        reading it: the pre-fix selection rule is reproduced for the one claim.
+        """
         with kb.connect_closing() as conn:
             parent = kb.create_task(
                 conn, title="governed decision", assignee="default", gauntlet=True,
@@ -1886,7 +1996,9 @@ class TestSelfReviewBlockedImplementationHandoff:
                 summary="decision ready for independent review", reviewer="default",
                 expected_run_id=implementation_run)
 
-            review_task = kb.claim_review_task(conn, parent, claimer="same-identity")
+            with monkeypatch.context() as pre_fix:
+                pre_fix.setattr(kb, "_review_claim_conflict", lambda *a, **k: None)
+                review_task = kb.claim_review_task(conn, parent, claimer="same-identity")
             assert review_task is not None
             review_run = review_task.current_run_id
             assert review_run != implementation_run

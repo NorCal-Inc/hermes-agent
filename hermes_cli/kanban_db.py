@@ -619,10 +619,19 @@ RELATION_UMBRELLA = "umbrella"
 #: it exists so an evidence pointer is discoverable without rewriting the scope
 #: of the card being pointed at.
 RELATION_EVIDENCE = "evidence"
+#: ``from`` is the independent verifier of its dependency parent ``to``. The one
+#: relation readiness reads, and only to RELAX a gate: it lets a registered
+#: verifier child that is already linked to an evidence-ready subject run before
+#: that subject is terminal, exactly as the codex_verify lane label always has
+#: (``_EVIDENCE_READY_PARENT_SQL``). It never releases the subject's
+#: implementer. Before it existed a profile verifier could not be released at
+#: all — t_4d21959c, 2026-09-14.
+RELATION_VERIFIES = "verifies"
 VALID_TASK_RELATIONS = {
     RELATION_REPAIRS,
     RELATION_UMBRELLA,
     RELATION_EVIDENCE,
+    RELATION_VERIFIES,
 }
 
 #: Relations a governed repair card MUST carry, established in the same
@@ -5979,9 +5988,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     # signature has no executor_lane parameter to conflict with), so it sets
     # the lane outright rather than deferring to whatever lane the row carries.
     profile, lane, from_token = _normalize_shorthand_lane(requested, None)
+    preserved_subject_implementer: Optional[str] = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, executor_lane "
+            "SELECT status, claim_lock, assignee, executor_lane, "
+            "gauntlet_enforced, verification_state "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5992,49 +6003,88 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        lane_sql = ", executor_lane = ?" if from_token is not None else ""
-        lane_params: tuple[Any, ...] = (lane,) if from_token is not None else ()
-        # Compare the whole executor identity, not just the profile string: a
-        # task already on assignee='default' that is being moved onto the
-        # codex_verify lane IS a reassignment, and must not inherit the
-        # previous executor's failure streak just because the carrier profile
-        # name happens to be unchanged.
-        changed = row["assignee"] != profile or (
-            from_token is not None and row["executor_lane"] != lane
+        # Same carve-out request_review applies: on a Gauntlet subject that is
+        # awaiting verification, "atlas" means "open the independent verifier
+        # route", never "make the subject its own verification artifact". On
+        # 2026-09-14 ``reassign t_3883034a atlas`` relabelled the parked subject
+        # to executor_lane=codex_verify (event 151185).
+        preserve_subject = (
+            lane == EXECUTOR_LANE_CODEX_VERIFY
+            and from_token is not None
+            and row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            and bool(row["gauntlet_enforced"] or gauntlet_enforcement_default())
+            and (
+                row["verification_state"] == VERIFICATION_PENDING
+                or row["status"] in ("review", "triage")
+            )
         )
-        if changed:
-            # The retry guard is scoped to the task/profile combination. A
-            # human reassigning the task is an explicit recovery action, so the
-            # new profile should not inherit the previous profile's streak.
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL" + lane_sql + " WHERE id = ?",
-                (profile, *lane_params, task_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE tasks SET assignee = ?" + lane_sql + " WHERE id = ?",
-                (profile, *lane_params, task_id),
-            )
-        if from_token is not None:
-            # Same event kind the ready-queue dispatcher emits, so the audit
-            # trail reads identically whichever path did the translation.
+        if preserve_subject:
             _append_event(
-                conn, task_id, "executor_lane_normalized",
+                conn, task_id, "independent_verifier_lane_requested",
                 {
-                    "from_assignee": from_token,
-                    "assignee": profile,
-                    "executor_lane": lane,
+                    "from_reviewer": from_token,
+                    "required_lane": EXECUTOR_LANE_CODEX_VERIFY,
+                    "subject_executor_lane_preserved": True,
                     "source": "assign_task",
                     "status": row["status"],
                 },
             )
-        _append_event(
-            conn, task_id, "assigned",
-            {"assignee": profile, "requested": requested, "executor_lane": lane}
-            if from_token is not None
-            else {"assignee": profile},
-        )
+            preserved_subject_implementer = _review_requested_implementer(
+                conn, task_id, row["assignee"],
+            ) or ""
+        else:
+            lane_sql = ", executor_lane = ?" if from_token is not None else ""
+            lane_params: tuple[Any, ...] = (lane,) if from_token is not None else ()
+            # Compare the whole executor identity, not just the profile string: a
+            # task already on assignee='default' that is being moved onto the
+            # codex_verify lane IS a reassignment, and must not inherit the
+            # previous executor's failure streak just because the carrier profile
+            # name happens to be unchanged.
+            changed = row["assignee"] != profile or (
+                from_token is not None and row["executor_lane"] != lane
+            )
+            if changed:
+                # The retry guard is scoped to the task/profile combination. A
+                # human reassigning the task is an explicit recovery action, so the
+                # new profile should not inherit the previous profile's streak.
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                    "last_failure_error = NULL" + lane_sql + " WHERE id = ?",
+                    (profile, *lane_params, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?" + lane_sql + " WHERE id = ?",
+                    (profile, *lane_params, task_id),
+                )
+            if from_token is not None:
+                # Same event kind the ready-queue dispatcher emits, so the audit
+                # trail reads identically whichever path did the translation.
+                _append_event(
+                    conn, task_id, "executor_lane_normalized",
+                    {
+                        "from_assignee": from_token,
+                        "assignee": profile,
+                        "executor_lane": lane,
+                        "source": "assign_task",
+                        "status": row["status"],
+                    },
+                )
+            _append_event(
+                conn, task_id, "assigned",
+                {"assignee": profile, "requested": requested, "executor_lane": lane}
+                if from_token is not None
+                else {"assignee": profile},
+            )
+    if preserved_subject_implementer is not None:
+        # Post-commit, like request_review's routing block: the preserved
+        # subject is durable first, and opening the route is evidence-gated
+        # and fail-closed inside the helper.
+        if gauntlet_required(conn, task_id):
+            _ensure_independent_verifier_child(
+                conn, task_id, implementer=preserved_subject_implementer or None,
+            )
+        return True
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(
@@ -6043,6 +6093,80 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ("assignee", "executor_lane") if from_token is not None else ("assignee",),
     )
     return True
+
+
+def restore_relabelled_subject_lane(
+    conn: sqlite3.Connection, task_id: str, *, actor: str,
+) -> tuple[bool, Optional[str]]:
+    """Undo a shorthand relabel that put a Gauntlet subject on codex_verify.
+
+    The repair for damage :func:`assign_task` no longer produces but live
+    boards still carry (t_3883034a, event 151185). Restores ``executor_lane``
+    to the value the card was created with, and nothing else: status,
+    assignee, verification ledger and history are untouched, and an
+    append-only ``subject_executor_lane_restored`` event records the repair.
+
+    Refuses (returns ``(False, None)``) unless every condition that identifies
+    the damage holds: the card is on codex_verify, is not a dependency child
+    (a real verifier card always has its subject as parent), was handed off
+    for review, carries an ``executor_lane_normalized`` relabel event, is not
+    claimed, and was not itself created on codex_verify.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT executor_lane, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            or row["claim_lock"] is not None
+        ):
+            return False, None
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,),
+        ).fetchone() is not None:
+            return False, None
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_requested' LIMIT 1",
+            (task_id,),
+        ).fetchone() is None:
+            return False, None
+        relabel = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'executor_lane_normalized' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if relabel is None:
+            return False, None
+        created = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id ASC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            created_payload = json.loads(created["payload"]) if created and created["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            return False, None
+        original = created_payload.get("executor_lane") if isinstance(created_payload, dict) else None
+        if original == EXECUTOR_LANE_CODEX_VERIFY:
+            return False, None
+        cur = conn.execute(
+            "UPDATE tasks SET executor_lane = ? WHERE id = ? AND executor_lane = ? "
+            "AND claim_lock IS NULL",
+            (original, task_id, EXECUTOR_LANE_CODEX_VERIFY),
+        )
+        if cur.rowcount != 1:
+            return False, None
+        _append_event(
+            conn, task_id, "subject_executor_lane_restored",
+            {
+                "from": EXECUTOR_LANE_CODEX_VERIFY,
+                "to": original,
+                "relabel_event": int(relabel["id"]),
+                "actor": actor,
+            },
+        )
+    return True, original
 
 
 def set_model_override(
@@ -6390,10 +6514,12 @@ def add_task_relation(
     orphan window in :func:`create_repair_task` structurally absent rather
     than merely narrow.
 
-    Never touches ``task_links``, so it can never change readiness, promotion
-    or dependency gating for either card. That is what lets an evidence
-    pointer be added to a live card (``t_c5c2929d``) without rewriting or
-    re-scoping it.
+    Never touches ``task_links``. Only ``verifies`` is read by readiness, and
+    only to release a verifier child that is ALREADY a dependency child of its
+    subject (see :data:`RELATION_VERIFIES`); every other relation can never
+    change readiness, promotion or dependency gating for either card. That is
+    what lets an evidence pointer be added to a live card (``t_c5c2929d``)
+    without rewriting or re-scoping it.
     """
     if relation not in VALID_TASK_RELATIONS:
         raise ValueError(
@@ -6406,6 +6532,15 @@ def add_task_relation(
         missing = _find_missing_parents(conn, [from_task_id, to_task_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        if relation == RELATION_VERIFIES and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (to_task_id, from_task_id),
+        ).fetchone() is None:
+            raise ValueError(
+                f"{from_task_id} can only verify {to_task_id} through an existing "
+                f"dependency link ({to_task_id} -> {from_task_id}); a verifier "
+                f"whose verdict has no destination is an orphan"
+            )
         cur = conn.execute(
             "INSERT OR IGNORE INTO task_relations "
             "(from_task_id, to_task_id, relation, created_at, created_by) "
@@ -8379,7 +8514,27 @@ def subject_has_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 _EVIDENCE_READY_PARENT_SQL = f"""
-    (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
+    (
+        (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
+        -- A registered-profile verifier declared by the typed relation. Never
+        -- the subject's implementer: that identity cannot verify its own work,
+        -- so it is not released to try (selection and verdict must agree).
+        OR EXISTS (
+            SELECT 1 FROM task_relations vr
+             WHERE vr.from_task_id = :child
+               AND vr.to_task_id = p.id
+               AND vr.relation = :verifies_rel
+               AND COALESCE((SELECT c.assignee FROM tasks c WHERE c.id = :child), '')
+                   <> COALESCE((
+                       SELECT json_extract(rq.payload, '$.implementer')
+                         FROM task_events rq
+                        WHERE rq.task_id = p.id
+                          AND rq.kind = 'review_requested'
+                          AND json_valid(rq.payload)
+                        ORDER BY rq.id DESC LIMIT 1
+                   ), p.assignee, '')
+        )
+    )
     AND p.verification_state = :pending
     AND EXISTS (
         SELECT 1 FROM task_verifications v
@@ -8529,6 +8684,7 @@ _UNSATISFIED_PARENTS_SQL = f"""
 """
 
 _PARENT_GATE_PARAMS = {
+    "verifies_rel": RELATION_VERIFIES,
     "verify_lane": EXECUTOR_LANE_CODEX_VERIFY,
     "implement_lane": EXECUTOR_LANE_CLAUDE,
     "pending": VERIFICATION_PENDING,
@@ -10405,7 +10561,21 @@ def _review_requested_implementer(
 # not exist and is not supposed to. ``_return_verifier_verdict_to_subjects``
 # also signs verdicts as ``codex_verify:<verifier_task_id>``, so the LANE ROOT
 # is what has to match, not the whole string.
-VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset(VALID_EXECUTOR_LANES | {"atlas"})
+#
+# A lane NAME is not an identity, though. Until 2026-09-14 this allow-list was
+# matched on the bare lane root, so the literal string ``codex_verify`` (or
+# ``atlas``, or the implementation lane ``claude``) rendered a binding
+# independent verdict with no verifier having run at all: t_e48487e5 was
+# refused as ``chatgpt-auditor`` at 12:19:00 and closed done/verified as
+# ``codex_verify`` 13 s later, with no verifier child and no evidence. Only the
+# independent verification lane can sign, and only as a scoped identity that
+# resolves to board state bound to the subject — see
+# :func:`_resolve_lane_verifier_identity`.
+VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset({EXECUTOR_LANE_CODEX_VERIFY})
+
+#: Every lane name (and the ``atlas`` shorthand). Recognized so a bare or
+#: foreign-lane signature gets a precise refusal instead of a profile lookup.
+_LANE_NAME_ROOTS: frozenset[str] = frozenset(VALID_EXECUTOR_LANES | {"atlas"})
 
 #: Registry classifications returned by :func:`_verifier_identity_status`.
 VERIFIER_IDENTITY_LANE = "lane"
@@ -10414,28 +10584,135 @@ VERIFIER_IDENTITY_UNKNOWN = "unknown"
 VERIFIER_IDENTITY_UNCHECKED = "unchecked"
 
 
-def _verifier_identity_status(verifier: Optional[str]) -> tuple[str, Optional[str]]:
-    """Classify a verifier identity against the profile registry.
+def _attested_codex_verifier_run(
+    conn: sqlite3.Connection, verifier_task_id: str,
+) -> Optional[int]:
+    """Return the completing run id of a codex_verify task the real lane ran.
+
+    ``executor_lane`` is only a label: an unscoped agent that happens to claim a
+    codex_verify card (2026-09-14, run 2817) can complete it too. The lane's
+    own launcher writes ``codex_verifier_started`` for the run it executes
+    (``recovery_lane._claim_codex_verifier_attempt``), so the attestation is
+    that event on the run that completed the card. ``None`` when the card is
+    not a completed codex_verify task or its completing run carries no such
+    event.
+    """
+    row = conn.execute(
+        "SELECT status, executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
+    ).fetchone()
+    if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+        return None
+    if row["status"] != "done":
+        return None
+    run = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (verifier_task_id,),
+    ).fetchone()
+    if run is None:
+        return None
+    started = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'codex_verifier_started' AND run_id = ? LIMIT 1",
+        (verifier_task_id, run["id"]),
+    ).fetchone()
+    return int(run["id"]) if started is not None else None
+
+
+def _resolve_lane_verifier_identity(
+    conn: sqlite3.Connection, identity: str, subject_id: str,
+) -> Optional[str]:
+    """Return ``None`` when a lane-scoped identity legitimately verifies *subject_id*.
+
+    Otherwise return the refusal detail. Two scoped forms are produced by the
+    system itself and are the only ones accepted:
+
+    * ``codex_verify:<verifier_task_id>`` — a codex_verify card, attested by
+      :func:`_attested_codex_verifier_run`, that verifies this subject: linked
+      as its child, or the single safe subject of a legacy orphan verifier
+      (:func:`_historical_orphan_subject_candidate`).
+    * ``codex_verify:<execution_id>`` — a completed exit-0 ``codex.verify``
+      execution recorded against this subject by the execution supervisor.
+    """
+    root, _, ref = identity.partition(":")
+    root = root.strip().lower()
+    ref = ref.strip()
+    if root not in VERIFIER_LANE_IDENTITIES:
+        return (
+            f"{identity!r} names the {root!r} lane, which is not an independent "
+            f"verification lane; only {EXECUTOR_LANE_CODEX_VERIFY}:<verifier> may sign"
+        )
+    if not ref:
+        return (
+            f"bare lane name {identity!r} is not a verifier identity; an "
+            f"independent verdict must be signed as "
+            f"{EXECUTOR_LANE_CODEX_VERIFY}:<attested verifier task or execution>"
+        )
+    if ref == subject_id:
+        return f"{identity!r} names the subject itself"
+    execution = conn.execute(
+        "SELECT task_id, command_class, status, exit_code FROM executions WHERE id = ?",
+        (ref,),
+    ).fetchone()
+    if execution is not None:
+        if (
+            execution["task_id"] == subject_id
+            and execution["command_class"] == "codex.verify"
+            and execution["status"] == "completed"
+            and execution["exit_code"] == 0
+        ):
+            return None
+        return (
+            f"{identity!r} is not a completed exit-0 codex.verify execution "
+            f"recorded against {subject_id}"
+        )
+    if _attested_codex_verifier_run(conn, ref) is None:
+        return (
+            f"{identity!r} does not resolve to a completed codex_verify task "
+            f"whose completing run was executed by the codex_verify lane"
+        )
+    if subject_id in parent_ids(conn, ref):
+        return None
+    if _historical_orphan_subject_candidate(conn, ref) == subject_id:
+        return None
+    return f"{identity!r} is not a verifier of {subject_id}"
+
+
+def _verifier_identity_status(
+    verifier: Optional[str],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    subject_id: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Classify a verifier identity for a verdict on *subject_id*.
 
     Returns ``(status, detail)``:
 
-    * ``"lane"``      — a recognized executor-lane identity (``codex_verify``,
-      ``codex_verify:t_abc123``, ``atlas``, ``claude_recovery``). Legitimate,
-      and deliberately not required to be a profile.
+    * ``"lane"``      — a scoped ``codex_verify:<verifier>`` identity that
+      resolves, for this subject, per :func:`_resolve_lane_verifier_identity`.
+      Deliberately not required to be a profile.
     * ``"profile"``   — an existing Hermes profile (``profile_exists``).
-    * ``"unknown"``   — neither. The verdict must be refused.
-    * ``"unchecked"`` — the registry could not be consulted at all (import or
-      filesystem failure). Reported as itself so an unreadable registry is
-      visible rather than masquerading as either a clean pass or a false
-      accusation; callers let the verdict through and record the gap.
+    * ``"unknown"``   — anything else, including every bare lane name and any
+      lane identity that cannot be resolved (no ``conn``/``subject_id``). The
+      verdict must be refused.
+    * ``"unchecked"`` — the profile registry could not be consulted at all
+      (import or filesystem failure). Reported as itself so an unreadable
+      registry is visible rather than masquerading as either a clean pass or a
+      false accusation; callers let the verdict through and record the gap.
     """
     if not verifier or not str(verifier).strip():
         return VERIFIER_IDENTITY_UNKNOWN, "no verifier identity supplied"
     identity = str(verifier).strip()
-    # Lane-scoped verdicts are ``<lane>:<verifier_task_id>``; match the root.
     lane_root = identity.split(":", 1)[0].strip().lower()
-    if lane_root in VERIFIER_LANE_IDENTITIES:
-        return VERIFIER_IDENTITY_LANE, lane_root
+    if lane_root in _LANE_NAME_ROOTS:
+        if conn is None or not subject_id:
+            return VERIFIER_IDENTITY_UNKNOWN, (
+                f"lane identity {identity!r} cannot be resolved without its subject"
+            )
+        refusal = _resolve_lane_verifier_identity(conn, identity, subject_id)
+        if refusal is not None:
+            return VERIFIER_IDENTITY_UNKNOWN, refusal
+        return VERIFIER_IDENTITY_LANE, identity
     try:
         from hermes_cli.profiles import profile_exists as _profile_exists
     except Exception as exc:  # pragma: no cover - defensive
@@ -10447,8 +10724,8 @@ def _verifier_identity_status(verifier: Optional[str]) -> tuple[str, Optional[st
     if exists:
         return VERIFIER_IDENTITY_PROFILE, identity
     return VERIFIER_IDENTITY_UNKNOWN, (
-        f"{identity!r} is neither an existing Hermes profile nor a recognized "
-        f"verifier lane ({', '.join(sorted(VERIFIER_LANE_IDENTITIES))})"
+        f"{identity!r} is neither an existing Hermes profile nor a scoped "
+        f"verifier-lane identity ({EXECUTOR_LANE_CODEX_VERIFY}:<verifier>)"
     )
 
 
@@ -10690,15 +10967,16 @@ def _review_claim_conflict(
     reservation, so a candidate the claim path will reject never consumes the
     slot it reserved.
 
-    An identity deliberately installed as THIS phase's reviewer is never
-    pre-empted, even when it happens to equal the implementer. That is the
-    whole distinction the live defect turns on: ``request_review(reviewer=None)``
-    installs nobody and leaves the implementer in the seat by default, whereas
-    ``request_review(reviewer=X)`` / ``assign_task`` are a caller stating who
-    reviews. Selection defers to that statement; the VERDICT gate does not —
-    ``_verifier_independence_conflict`` still refuses an implementer-signed
-    verdict there, so an installed self-reviewer can still request changes or
-    escalate, and still cannot bless the work.
+    An identity deliberately installed as THIS phase's reviewer is not
+    pre-empted — ``request_review(reviewer=X)`` / ``assign_task`` are a caller
+    stating who reviews — UNLESS that identity is the implementer. Selection
+    used to defer to the installation even then, while the verdict gate
+    (``_verifier_independence_conflict``) refused it: on 2026-09-14 the CLI
+    handed ``t_3883034a`` to ``--reviewer default`` for work ``default``
+    implemented, selection opened review run 2816 for ``default`` (event
+    151161) and the verdict gate refused it (151169), with no verifier route
+    opened in between. Selection and verdict now agree: the implementer never
+    reviews its own Gauntlet work, installed or not.
     """
     if not assignee:
         return None
@@ -10707,9 +10985,11 @@ def _review_claim_conflict(
         return candidate, "refused"
     if not gauntlet_required(conn, task_id):
         return None
-    if candidate in _phase_reviewer_identities(conn, task_id):
-        return None
     implementer = _review_requested_implementer(conn, task_id, assignee)
+    if candidate in _phase_reviewer_identities(conn, task_id):
+        if implementer and candidate == implementer:
+            return candidate, "implementer"
+        return None
     return _verifier_independence_conflict(
         conn, task_id, candidate, implementer=implementer, assignee=assignee,
     )
@@ -11399,6 +11679,10 @@ def _return_verifier_verdict_to_subjects(
             return
         verdict = _parse_verifier_verdict(summary, result)
         verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+        # The lane label is not proof the lane ran: on 2026-09-14 (run 2817) an
+        # unscoped agent claimed a codex_verify card. Only a completing run the
+        # codex_verify launcher attested may return a verdict.
+        attested_run = _attested_codex_verifier_run(conn, verifier_task_id)
         for subject_id in subjects:
             srow = conn.execute(
                 "SELECT status, verification_state, title, body FROM tasks WHERE id = ?",
@@ -11419,6 +11703,26 @@ def _return_verifier_verdict_to_subjects(
                             "reason": "subject is not awaiting a verdict",
                             "verification_state": srow["verification_state"],
                         },
+                    )
+                continue
+            if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL) and attested_run is None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, subject_id, "verifier_verdict_unattested",
+                        {
+                            "verifier_task": verifier_task_id,
+                            "verdict": verdict,
+                            "reason": (
+                                "completing run carries no codex_verifier_started "
+                                "attestation from the codex_verify lane"
+                            ),
+                        },
+                    )
+                    add_comment(
+                        conn, subject_id, "verifier-return-path",
+                        f"Verifier card {verifier_task_id} reported {verdict}, but the "
+                        "codex_verify lane did not execute its completing run. No "
+                        "verdict was written; this task stays in verification.",
                     )
                 continue
             if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL):
@@ -12879,7 +13183,9 @@ def complete_task(
                     return False
                 # (a) The reviewer identity must resolve against the profile
                 # registry or the verifier-lane allow-list.
-                identity_status, identity_detail = _verifier_identity_status(reviewer)
+                identity_status, identity_detail = _verifier_identity_status(
+                    reviewer, conn=conn, subject_id=task_id,
+                )
                 if identity_status == VERIFIER_IDENTITY_UNKNOWN:
                     _append_event(
                         conn,
@@ -13977,6 +14283,14 @@ def block_task(
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
+        # An infrastructure-class block (the control plane ended the executor —
+        # timeout, stale, lost controller) is not the work re-blocking for the
+        # same cause, and must never count toward the loop. On 2026-09-14 an
+        # executor timeout (t_3883034a event 151138) was counted as recurrence
+        # 1, so the agent's first real blocker (151172) hit the limit and moved
+        # a subject awaiting verification into triage, where nothing resumes it.
+        if (event_payload_extra or {}).get("failure_class") == "infrastructure":
+            recurrences = prev_recurrences
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -14208,6 +14522,37 @@ def _qualifying_review_evidence(
     return bool(edges)
 
 
+def review_handoff_evidence_gap(
+    conn: sqlite3.Connection, task_id: str, metadata: Any,
+) -> Optional[str]:
+    """Why a Gauntlet review handoff would carry no verifiable evidence, or ``None``.
+
+    Read by the CLI and tool handoff surfaces before calling
+    :func:`request_review`. ``None`` when the task is not Gauntlet-enforced,
+    already has evidence (:func:`subject_has_evidence`), or ``metadata`` would
+    materialize a packet (:func:`_qualifying_review_evidence`). A prose summary
+    never counts: it is not falsifiable.
+    """
+    row = conn.execute(
+        "SELECT gauntlet_enforced FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if not (row["gauntlet_enforced"] or gauntlet_enforcement_default()):
+        return None
+    if subject_has_evidence(conn, task_id):
+        return None
+    if _qualifying_review_evidence(conn, task_id, metadata):
+        return None
+    return (
+        f"{task_id} is Gauntlet-enforced and this handoff carries no verifiable "
+        "evidence, so no independent verifier could ever be routed. Attach it "
+        f"first (hermes kanban attach {task_id} <file>) or hand off with "
+        "structured metadata carrying non-empty 'changed_files' and "
+        "'verification' lists."
+    )
+
+
 def _materialize_review_evidence(
     conn: sqlite3.Connection,
     task_id: str,
@@ -14328,26 +14673,10 @@ def request_review(
         # first one not progressing (53 ticks). Both closed within one tick of
         # evidence arriving, with reasons ``evidence_present`` and
         # ``progress_resumed`` -- the system knew the blocker the whole time
-        # and had nowhere to say it. This is where it says it.
-        if (
-            (trow["gauntlet_enforced"] or gauntlet_enforcement_default())
-            and not subject_has_evidence(conn, task_id)
-        ):
-            _append_event(
-                conn,
-                task_id,
-                "verification_route_unopened",
-                {
-                    "reason": "gauntlet subject entered review carrying no "
-                              "evidence packet and inheriting none from a "
-                              "verified parent; the independent-verifier "
-                              "pre-flight will decline to open a route, so "
-                              "nothing can return a verdict on this card",
-                    "remedy": "attach falsifiable evidence "
-                              "(hermes kanban attach <task_id> <file>), or "
-                              "hand off with structured run metadata",
-                },
-            )
+        # and had nowhere to say it. The record is written below, once the
+        # structured-metadata packet has had its chance to materialize.
+        # (The CLI and tool entry surfaces refuse such a handoff outright via
+        # ``review_handoff_evidence_gap``; this core stays non-refusing.)
         implementer = trow["assignee"]
         if reviewer is None:
             changes_run = conn.execute(
@@ -14517,6 +14846,28 @@ def request_review(
             reason="implementation handed off for verification",
         )
         _materialize_review_evidence(conn, task_id, run_id, summary, metadata)
+        # Judged only after materialization: on 2026-09-14 a handoff whose
+        # metadata did qualify still logged a false "no evidence" record,
+        # because this check used to run before the packet was written.
+        if (
+            (trow["gauntlet_enforced"] or gauntlet_enforcement_default())
+            and not subject_has_evidence(conn, task_id)
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "verification_route_unopened",
+                {
+                    "reason": "gauntlet subject entered review carrying no "
+                              "evidence packet and inheriting none from a "
+                              "verified parent; the independent-verifier "
+                              "pre-flight will decline to open a route, so "
+                              "nothing can return a verdict on this card",
+                    "remedy": "attach falsifiable evidence "
+                              "(hermes kanban attach <task_id> <file>), or "
+                              "hand off with structured run metadata",
+                },
+            )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
         _append_event(
@@ -14932,7 +15283,9 @@ def record_verification(
         # checked this before, so any string that merely DIFFERED from the
         # implementer rendered a binding verdict — how 'chatgpt-systems'
         # closed t_023d2af6 and t_616527d7 (a live production deployment).
-        identity_status, identity_detail = _verifier_identity_status(verifier)
+        identity_status, identity_detail = _verifier_identity_status(
+            verifier, conn=conn, subject_id=task_id,
+        )
         if identity_status == VERIFIER_IDENTITY_UNKNOWN:
             _append_event(
                 conn, task_id, "verification_blocked_unknown_verifier",
@@ -16248,6 +16601,27 @@ def promote_task(
                 f"unsatisfied parent dependencies: "
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
+    elif not _parents_satisfied(conn, task_id):
+        # --force cannot beat the claim-time invariant: claim_task re-reads
+        # _parents_satisfied and demotes the card straight back. On 2026-09-14
+        # t_4d21959c was force-promoted at 12:49:03 and demoted by
+        # claim_rejected parents_not_done one second later — a flap that looked
+        # like an unblock and ran nothing. Say so instead of reporting success.
+        blocking = [
+            r["id"] for r in conn.execute(
+                "SELECT t.id FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ? AND t.status NOT IN ('done', 'archived') "
+                "ORDER BY t.id",
+                (task_id,),
+            )
+        ]
+        return False, (
+            f"the claim gate would reject {task_id}: parent(s) "
+            f"{', '.join(blocking) or '(unknown)'} not satisfied, and claim_task "
+            f"would demote a forced promotion straight back. Finish the parent, "
+            f"or, if this card is the parent's independent verifier, declare it "
+            f"with a 'verifies' relation"
+        )
 
     if dry_run:
         return True, None
@@ -21216,6 +21590,41 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _worker_hermes_argv() -> list[str]:
+    """Return the argv prefix for a dispatcher-spawned Kanban worker.
+
+    Workers are always launched through the dispatcher's own interpreter,
+    never through a ``$HERMES_BIN`` / ``PATH`` lookup. The worker's task
+    scope travels only in the environment ``_default_spawn`` builds
+    (``HERMES_KANBAN_TASK``, ``HERMES_KANBAN_DB``, run id, claim lock), and a
+    resolved ``hermes`` may be a wrapper that resets it: on 2026-09-14 a
+    dispatcher run under sudo resolved the root-owned ``sudo -n -u chris``
+    wrapper via ``secure_path``, ``env_reset`` stripped the Kanban scope, and
+    runs 2814/2816/2817 skipped the executor-lane bypass and ran as unscoped
+    ``default`` agents. The running interpreter has already imported
+    ``hermes_cli``, so the module form is always a working Hermes.
+    """
+    return _module_hermes_argv()
+
+
+KANBAN_WORKER_QUERY_PREFIX = "work kanban task "
+_KANBAN_WORKER_QUERY_RE = re.compile(r"^work kanban task (t_[A-Za-z0-9]+)$")
+
+
+def dispatcher_worker_query_task_id(query: object) -> Optional[str]:
+    """Return the task id when ``query`` is exactly the dispatcher worker prompt.
+
+    ``_default_spawn`` passes ``chat -q "work kanban task <id>"``. That argv
+    survives an environment reset even when the Kanban scope variables do
+    not, so the CLI uses this to refuse a worker whose scope was stripped
+    instead of running it as an unscoped agent.
+    """
+    if not isinstance(query, str):
+        return None
+    match = _KANBAN_WORKER_QUERY_RE.match(query.strip())
+    return match.group(1) if match else None
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -21438,7 +21847,7 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    prompt = f"{KANBAN_WORKER_QUERY_PREFIX}{task.id}"
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -21545,7 +21954,7 @@ def _default_spawn(
     env.pop("HERMES_TUI", None)
 
     cmd = [
-        *_resolve_hermes_argv(),
+        *_worker_hermes_argv(),
         "-p", profile_arg,
         "--cli",
         # The chat parser defaults --source to "cli" and writes that value

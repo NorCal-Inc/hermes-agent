@@ -623,12 +623,24 @@ def _verifier_child(conn, subject_id):
     return cid
 
 
+def _attest_codex_lane_run(conn, verifier_id, run_id):
+    """Record what ``recovery_lane._claim_codex_verifier_attempt`` records when
+    the codex_verify lane actually executes a verifier run. Verdicts from a
+    run without it are not attributable to the lane (2026-09-14, run 2817)."""
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, verifier_id, "codex_verifier_started", {"executor": "codex"},
+            run_id=run_id,
+        )
+
+
 def _run_verifier(conn, subject_id, summary):
     """Dispatch and complete the independent verifier child. Returns its id."""
     cid = _verifier_child(conn, subject_id)
     assert kb.get_task(conn, cid).status == "ready"
     claimed = kb.claim_task(conn, cid)
     assert claimed is not None and claimed.status == "running"
+    _attest_codex_lane_run(conn, cid, claimed.current_run_id)
     assert kb.complete_task(
         conn, cid, summary=summary, expected_run_id=claimed.current_run_id,
     ) is True
@@ -648,9 +660,14 @@ class TestVerifiedReplayFinalization:
                 parents=[subject],
             )
             # Simulate a PASS that was durably recorded by the old process,
-            # before the auto-finalize actuator was loaded.
+            # before the auto-finalize actuator was loaded. The verifier ran
+            # and returned no verdict line, so the PASS is recorded explicitly
+            # under its attested lane identity.
+            verifier = _run_verifier(
+                conn, subject, "verifier fixture run without a verdict line",
+            )
             ok, detail = kb.record_verification(
-                conn, subject, passed=True, verifier="codex_verify:t_fixture",
+                conn, subject, passed=True, verifier=f"codex_verify:{verifier}",
                 evidence={"source": "restart-boundary-fixture"},
                 route_on_failure=False,
             )
@@ -787,6 +804,35 @@ class TestIndependentVerifierReturnPath:
             )
             assert len(_events(conn, tid2, "verifier_verdict_unreadable")) == 1
 
+    @pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
+    def test_verdict_from_a_run_the_lane_never_executed_is_not_returned(
+        self, kanban_home, verdict
+    ):
+        """Regression 2026-09-14 (run 2817): an unscoped agent claimed the
+        codex_verify card and could complete it with a verdict line. The
+        ``executor_lane`` column is only a label; without the lane's own
+        ``codex_verifier_started`` on the completing run nothing is returned."""
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            cid = _verifier_child(conn, tid)
+            claimed = kb.claim_task(conn, cid)
+            assert claimed is not None and claimed.status == "running"
+            assert kb.complete_task(
+                conn, cid, summary=f"VERDICT: {verdict}\nChecked it myself.",
+                expected_run_id=claimed.current_run_id,
+            ) is True
+
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "review"
+            assert subject.verification_state == kb.VERIFICATION_PENDING
+            unattested = _events(conn, tid, "verifier_verdict_unattested")
+            assert len(unattested) == 1
+            assert unattested[0][1]["verifier_task"] == cid
+            assert unattested[0][1]["verdict"] == verdict
+            assert _events(conn, tid, "verifier_verdict_returned") == []
+            assert _events(conn, tid, "verification_passed") == []
+            assert _events(conn, tid, "verification_failed") == []
+
     def test_ordinary_task_completion_has_no_return_path(self, kanban_home):
         """Only the codex_verify lane returns verdicts to its parents."""
         with kb.connect_closing() as conn:
@@ -859,6 +905,7 @@ class TestEndToEndRecovery:
             # 3. its verdict returns to the subject automatically
             verifier_run = kb.claim_task(conn, cid)
             assert verifier_run is not None
+            _attest_codex_lane_run(conn, cid, verifier_run.current_run_id)
             assert kb.complete_task(
                 conn, cid,
                 summary="VERDICT: PASS\nVerified against preserved artefacts.",
@@ -1475,3 +1522,74 @@ class TestVerifierGateKeysOnEvidenceNotCompletion:
             subject = kb.get_task(conn, tid)
             assert subject.status == "review"
             assert subject.verification_state == kb.VERIFICATION_PENDING
+
+
+# ---------------------------------------------------------------------------
+# An installed reviewer who IS the implementer is not an independent reviewer
+#
+# Live 2026-09-14, t_3883034a: the CLI handoff passed ``--reviewer default``
+# for work implemented by ``default``. The installed-reviewer exemption let
+# selection hand ``default`` its own review (run 2816, event 151161) while the
+# verdict gate refused it two minutes later (151169) -- selection and verdict
+# disagreed about who is independent, and no verifier route was opened.
+# ---------------------------------------------------------------------------
+
+
+def _subject_handed_to_itself(conn, *, implementer="default"):
+    tid = kb.create_task(conn, title="phase 3 overlay", assignee=implementer, gauntlet=True)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None and claimed.status == "running"
+    kb.add_attachment(
+        conn, tid, filename="phase3-evidence-min.md",
+        stored_path=f"/tmp/{tid}/phase3-evidence-min.md", size=512,
+        uploaded_by="claude-lane",
+    )
+    assert kb.request_review(
+        conn, tid, summary="overlay extracted", reviewer=implementer, force=True,
+    ) is True
+    return tid
+
+
+class TestInstalledSelfReviewerIsNotSelected:
+    def test_implementer_installed_as_reviewer_is_refused_at_selection(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = _subject_handed_to_itself(conn)
+
+            assert kb.claim_review_task(conn, tid) is None
+            refused = _events(conn, tid, "review_claim_rejected_self_review")
+            assert refused, "selection must refuse the implementer before a run opens"
+            assert refused[-1][1]["candidate"] == "default"
+            assert refused[-1][1]["conflict_source"] == "implementer"
+            # No review run was opened, so no verdict was manufactured to refuse.
+            assert _events(conn, tid, "verification_blocked_self_review") == []
+            assert kb.get_task(conn, tid).status == "review"
+
+    def test_the_handoff_opens_the_independent_route_instead(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_handed_to_itself(conn)
+
+            required = _events(conn, tid, "independent_verification_required")
+            assert len(required) == 1
+            assert required[0][1]["conflict_identity"] == "default"
+            cid = kb._open_verifier_child(conn, tid)
+            assert cid is not None
+            assert required[0][1]["verifier_task"] == cid
+            assert kb.get_task(conn, cid).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+
+    def test_an_independent_installed_reviewer_is_still_selected(self, kanban_home):
+        """Control: the exemption still serves a reviewer who is not the implementer."""
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="decision", assignee="erika", gauntlet=True)
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            kb.add_attachment(
+                conn, tid, filename="DECISION.md",
+                stored_path=f"/tmp/{tid}/DECISION.md", size=64,
+            )
+            assert kb.request_review(
+                conn, tid, summary="ruling made", reviewer="default",
+                expected_run_id=claimed.current_run_id,
+            ) is True
+            assert kb._review_claim_conflict(conn, tid, "default") is None

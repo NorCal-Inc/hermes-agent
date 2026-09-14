@@ -1,0 +1,8 @@
+[Unit]
+Description=Alert that the NorCal system health controller itself failed (%i)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/chris/.hermes/hermes-agent-next
+# ALERT_TARGET is set at deploy (Phase E); without it the failure is still in the journal.
+ExecStart=/bin/sh -c 'test -n "$ALERT_TARGET" && exec /home/chris/.hermes/hermes-agent-next/venv/bin/python -m hermes_cli.main send --to "$ALERT_TARGET" --subject "[health] controller unit failed" --quiet "%i failed: the system health controller could not complete a pass"'

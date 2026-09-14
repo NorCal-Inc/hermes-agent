@@ -93,6 +93,14 @@ def _independent_verifier_reports(conn, subject_id, report):
     )
     claimed = kb.claim_task(conn, cid)
     assert claimed is not None and claimed.status == "running"
+    # What recovery_lane records when the codex_verify lane actually executes
+    # this run. A verdict from a run the lane never executed is not returned
+    # (2026-09-14, run 2817). It is written on the VERIFIER card only.
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, cid, "codex_verifier_started", {"executor": "codex"},
+            run_id=claimed.current_run_id,
+        )
     # The verifier's ONLY output is its report. Nothing else in this test
     # touches the subject's verification state.
     assert kb.complete_task(

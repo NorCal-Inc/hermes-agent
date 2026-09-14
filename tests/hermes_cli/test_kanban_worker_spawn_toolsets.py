@@ -62,7 +62,7 @@ agent:
 
     from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 
@@ -105,7 +105,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     from hermes_cli import kanban_db as kb
     from hermes_cli._parser import build_top_level_parser
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -177,7 +177,7 @@ def test_default_spawn_escapes_gateway_systemd_cgroup(monkeypatch, tmp_path):
 
     from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
     real_which = kb.shutil.which
     monkeypatch.setattr(
         kb.shutil,
@@ -233,7 +233,7 @@ def test_default_spawn_keeps_direct_popen_outside_gateway(monkeypatch, tmp_path)
 
     from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -251,3 +251,76 @@ def test_default_spawn_keeps_direct_popen_outside_gateway(monkeypatch, tmp_path)
 
     assert pid == 4242
     assert captured["cmd"][0] == "hermes"
+
+
+def _spawn_capturing(monkeypatch, tmp_path, kb):
+    """Run _default_spawn outside the gateway and capture argv + env."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    captured = {}
+
+    class FakeProc:
+        pid = 4343
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    return captured
+
+
+def _env_resetting_wrapper(tmp_path) -> Path:
+    """A `hermes` on PATH that stands in for an env-resetting sudo wrapper."""
+    bindir = tmp_path / "wrapper-bin"
+    bindir.mkdir()
+    wrapper = bindir / "hermes"
+    wrapper.write_text("#!/bin/sh\nexec env -i /bin/false \"$@\"\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_default_spawn_never_launches_worker_through_path_wrapper(monkeypatch, tmp_path):
+    """Regression 2026-09-14 (runs 2814/2816/2817): a PATH-resolved `hermes`
+    wrapper reset the worker env, stripping HERMES_KANBAN_TASK, so the worker
+    skipped the executor-lane bypass and ran as an unscoped default agent.
+    Workers must launch through the dispatcher's own interpreter."""
+    import sys
+
+    from hermes_cli import kanban_db as kb
+
+    wrapper = _env_resetting_wrapper(tmp_path)
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setenv("PATH", f"{wrapper.parent}:/usr/bin:/bin")
+
+    captured = _spawn_capturing(monkeypatch, tmp_path, kb)
+
+    assert captured["cmd"][:3] == [sys.executable, "-m", "hermes_cli.main"]
+    assert str(wrapper) not in captured["cmd"]
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["cmd"][-2:] == ["-q", "work kanban task t_spawn_tools"]
+
+
+def test_default_spawn_ignores_hermes_bin_wrapper_for_workers(monkeypatch, tmp_path):
+    """An explicit HERMES_BIN wrapper is equally able to reset the worker env."""
+    import sys
+
+    from hermes_cli import kanban_db as kb
+
+    wrapper = _env_resetting_wrapper(tmp_path)
+    monkeypatch.setenv("HERMES_BIN", str(wrapper))
+
+    captured = _spawn_capturing(monkeypatch, tmp_path, kb)
+
+    assert captured["cmd"][:3] == [sys.executable, "-m", "hermes_cli.main"]
+    assert str(wrapper) not in captured["cmd"]

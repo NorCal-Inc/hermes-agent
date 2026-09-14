@@ -126,7 +126,7 @@ def test_migration_adds_provider_override_column(conn):
 
 
 def _spawn_and_capture(monkeypatch, tmp_path, task):
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:

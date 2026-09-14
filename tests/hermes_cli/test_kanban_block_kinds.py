@@ -189,3 +189,60 @@ def test_approval_required_auto_subscribes_before_block_event(kanban_home: Path)
         assert sub["delivery_mode"] == "notify+wake"
         blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
         assert sub["last_event_id"] < blocked.id
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure-class blocks are not a blocked loop (2026-09-14, t_3883034a)
+#
+# The loop breaker compared only the block KIND. An executor timeout the
+# control plane recorded as needs_input with failure_class=infrastructure
+# (event 151138, 12:38:38) was counted as the first recurrence, so the agent's
+# own first real blocker (151172, 12:42:45) hit the limit and moved a subject
+# out of review into triage, where nothing can resume it.
+# ---------------------------------------------------------------------------
+
+INFRA = {"failure_class": "infrastructure", "execution_status": "timed_out"}
+
+
+def test_infrastructure_block_does_not_count_toward_the_loop(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="timed out then blocked")
+        assert kb.block_task(
+            conn, tid, reason="[claude] timed out", kind="needs_input",
+            event_payload_extra=INFRA,
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="independent reviewer identity required",
+            kind="needs_input",
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 1
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+
+
+def test_repeated_infrastructure_blocks_never_route_to_triage(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="flaky executor")
+        for _ in range(3):
+            assert kb.block_task(
+                conn, tid, reason="[claude] timed out", kind="needs_input",
+                event_payload_extra=INFRA,
+            )
+            assert kb.get_task(conn, tid).status == "blocked"
+            kb.unblock_task(conn, tid)
+            _make_running_again(conn, tid)
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+
+
+def test_same_cause_work_blocks_still_break_the_loop(kanban_home: Path) -> None:
+    """Control: the breaker itself is untouched for real blockers."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="real loop")
+        kb.block_task(conn, tid, reason="need input", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="need input", kind="needs_input")
+        assert kb.get_task(conn, tid).status == "triage"
