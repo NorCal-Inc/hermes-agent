@@ -1566,6 +1566,83 @@ class TestEvidenceReadyVerifierDependency:
 
     # -- the carve-out is not a hole ---------------------------------------
 
+    # -- verifier-specific dependency semantics (2026-09-14, t_4d21959c) ------
+    #
+    # The carve-out used to key only on executor_lane=codex_verify, so a
+    # registered-profile verifier child of an evidence-ready subject could
+    # never be released: t_4d21959c (compliance_worker) was created at
+    # 12:48:32, force-promoted at 12:49:03 and demoted by claim_rejected
+    # parents_not_done one second later. The typed ``verifies`` relation is
+    # the structured statement that a linked child is the subject's verifier.
+
+    def test_verifies_relation_releases_a_profile_verifier_child(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            verifier = kb.create_task(
+                conn, title="independent compliance verification",
+                assignee="reviewer", parents=[pid], gauntlet=True,
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "todo"
+
+            assert kb.add_task_relation(
+                conn, verifier, pid, "verifies", created_by="test",
+            ) is True
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, verifier).status == "ready"
+            claimed = kb.claim_task(conn, verifier)
+            assert claimed is not None and claimed.status == "running"
+            assert "claim_rejected" not in [k for k, _ in _events(conn, verifier)]
+            # The subject itself is untouched: still awaiting its verdict.
+            assert kb.get_task(conn, pid).verification_state == kb.VERIFICATION_PENDING
+
+    def test_verifies_relation_never_releases_the_implementer(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn, assignee="default")
+            same_party = kb.create_task(
+                conn, title="self verification", assignee="default",
+                parents=[pid], gauntlet=True,
+            )
+            kb.add_task_relation(conn, same_party, pid, "verifies", created_by="test")
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, same_party).status == "todo"
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ?", (same_party,),
+                )
+            assert kb.claim_task(conn, same_party) is None
+            assert kb.get_task(conn, same_party).status == "todo"
+
+    def test_verifies_relation_requires_the_dependency_link(self, kanban_home):
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            unlinked = kb.create_task(
+                conn, title="unlinked verifier", assignee="reviewer", gauntlet=True,
+            )
+            with pytest.raises(ValueError, match="dependency link"):
+                kb.add_task_relation(conn, unlinked, pid, "verifies", created_by="test")
+
+    def test_forced_promotion_refuses_when_the_claim_gate_would_reject(
+        self, kanban_home
+    ):
+        """The t_4d21959c flap: force promoted, claim demoted, nothing ran."""
+        with kb.connect_closing() as conn:
+            pid = self._evidence_ready_parent(conn)
+            child = kb.create_task(
+                conn, title="compliance verification", assignee="reviewer",
+                parents=[pid], gauntlet=True,
+            )
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo"
+
+            ok, reason = kb.promote_task(
+                conn, child, actor="operator", reason="unblock", force=True,
+            )
+            assert ok is False
+            assert "claim" in reason and pid in reason
+            assert kb.get_task(conn, child).status == "todo"
+            assert "promoted_manual" not in [k for k, _ in _events(conn, child)]
+
     def test_ordinary_child_still_requires_terminal_parent(self, kanban_home):
         """The carve-out is lane-scoped. A non-verifier child of the very same
         evidence-ready parent must not move until the parent is genuinely

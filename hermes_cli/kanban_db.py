@@ -619,10 +619,19 @@ RELATION_UMBRELLA = "umbrella"
 #: it exists so an evidence pointer is discoverable without rewriting the scope
 #: of the card being pointed at.
 RELATION_EVIDENCE = "evidence"
+#: ``from`` is the independent verifier of its dependency parent ``to``. The one
+#: relation readiness reads, and only to RELAX a gate: it lets a registered
+#: verifier child that is already linked to an evidence-ready subject run before
+#: that subject is terminal, exactly as the codex_verify lane label always has
+#: (``_EVIDENCE_READY_PARENT_SQL``). It never releases the subject's
+#: implementer. Before it existed a profile verifier could not be released at
+#: all — t_4d21959c, 2026-09-14.
+RELATION_VERIFIES = "verifies"
 VALID_TASK_RELATIONS = {
     RELATION_REPAIRS,
     RELATION_UMBRELLA,
     RELATION_EVIDENCE,
+    RELATION_VERIFIES,
 }
 
 #: Relations a governed repair card MUST carry, established in the same
@@ -6390,10 +6399,12 @@ def add_task_relation(
     orphan window in :func:`create_repair_task` structurally absent rather
     than merely narrow.
 
-    Never touches ``task_links``, so it can never change readiness, promotion
-    or dependency gating for either card. That is what lets an evidence
-    pointer be added to a live card (``t_c5c2929d``) without rewriting or
-    re-scoping it.
+    Never touches ``task_links``. Only ``verifies`` is read by readiness, and
+    only to release a verifier child that is ALREADY a dependency child of its
+    subject (see :data:`RELATION_VERIFIES`); every other relation can never
+    change readiness, promotion or dependency gating for either card. That is
+    what lets an evidence pointer be added to a live card (``t_c5c2929d``)
+    without rewriting or re-scoping it.
     """
     if relation not in VALID_TASK_RELATIONS:
         raise ValueError(
@@ -6406,6 +6417,15 @@ def add_task_relation(
         missing = _find_missing_parents(conn, [from_task_id, to_task_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        if relation == RELATION_VERIFIES and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (to_task_id, from_task_id),
+        ).fetchone() is None:
+            raise ValueError(
+                f"{from_task_id} can only verify {to_task_id} through an existing "
+                f"dependency link ({to_task_id} -> {from_task_id}); a verifier "
+                f"whose verdict has no destination is an orphan"
+            )
         cur = conn.execute(
             "INSERT OR IGNORE INTO task_relations "
             "(from_task_id, to_task_id, relation, created_at, created_by) "
@@ -8379,7 +8399,27 @@ def subject_has_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 _EVIDENCE_READY_PARENT_SQL = f"""
-    (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
+    (
+        (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
+        -- A registered-profile verifier declared by the typed relation. Never
+        -- the subject's implementer: that identity cannot verify its own work,
+        -- so it is not released to try (selection and verdict must agree).
+        OR EXISTS (
+            SELECT 1 FROM task_relations vr
+             WHERE vr.from_task_id = :child
+               AND vr.to_task_id = p.id
+               AND vr.relation = :verifies_rel
+               AND COALESCE((SELECT c.assignee FROM tasks c WHERE c.id = :child), '')
+                   <> COALESCE((
+                       SELECT json_extract(rq.payload, '$.implementer')
+                         FROM task_events rq
+                        WHERE rq.task_id = p.id
+                          AND rq.kind = 'review_requested'
+                          AND json_valid(rq.payload)
+                        ORDER BY rq.id DESC LIMIT 1
+                   ), p.assignee, '')
+        )
+    )
     AND p.verification_state = :pending
     AND EXISTS (
         SELECT 1 FROM task_verifications v
@@ -8529,6 +8569,7 @@ _UNSATISFIED_PARENTS_SQL = f"""
 """
 
 _PARENT_GATE_PARAMS = {
+    "verifies_rel": RELATION_VERIFIES,
     "verify_lane": EXECUTOR_LANE_CODEX_VERIFY,
     "implement_lane": EXECUTOR_LANE_CLAUDE,
     "pending": VERIFICATION_PENDING,
@@ -16437,6 +16478,27 @@ def promote_task(
                 f"unsatisfied parent dependencies: "
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
+    elif not _parents_satisfied(conn, task_id):
+        # --force cannot beat the claim-time invariant: claim_task re-reads
+        # _parents_satisfied and demotes the card straight back. On 2026-09-14
+        # t_4d21959c was force-promoted at 12:49:03 and demoted by
+        # claim_rejected parents_not_done one second later — a flap that looked
+        # like an unblock and ran nothing. Say so instead of reporting success.
+        blocking = [
+            r["id"] for r in conn.execute(
+                "SELECT t.id FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ? AND t.status NOT IN ('done', 'archived') "
+                "ORDER BY t.id",
+                (task_id,),
+            )
+        ]
+        return False, (
+            f"the claim gate would reject {task_id}: parent(s) "
+            f"{', '.join(blocking) or '(unknown)'} not satisfied, and claim_task "
+            f"would demote a forced promotion straight back. Finish the parent, "
+            f"or, if this card is the parent's independent verifier, declare it "
+            f"with a 'verifies' relation"
+        )
 
     if dry_run:
         return True, None
