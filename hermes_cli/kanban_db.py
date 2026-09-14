@@ -21548,6 +21548,13 @@ def _default_spawn(
         *_resolve_hermes_argv(),
         "-p", profile_arg,
         "--cli",
+        # The chat parser defaults --source to "cli" and writes that value
+        # back into HERMES_SESSION_SOURCE. Passing the worker source explicitly
+        # prevents that parser default from overwriting the dispatcher's
+        # HERMES_SESSION_SOURCE=kanban marker. Without this, Erika Kanban runs
+        # are misclassified as local interactive sessions and inherit the
+        # 8-iteration thin-executive ceiling, which can kill manager loops
+        # while they are awaiting delegated results.
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
@@ -21581,6 +21588,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--source", "kanban",
         "-q", prompt,
     ])
     if task.goal_mode:
