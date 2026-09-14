@@ -329,6 +329,14 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     # Stale supervision declining to release an owner-held park changes
     # nothing on the card, so it must not make the card look freshly moved.
     "infrastructure_release_withheld",
+    # Supervision's own refusal/alarm/timer bookkeeping (2026-09-14). At a
+    # 300-second evaluation cadence these were written on every tick for an
+    # evidence-less review card, each one reset the stall episode, and the
+    # card re-alarmed every five minutes whatever the re-alert window said.
+    "independent_verification_unroutable",
+    "INDEPENDENT_VERIFICATION_UNROUTABLE",
+    "observation_timer_closed",
+    "supervisory_alarm_delivery_failed",
 )
 
 # ---------------------------------------------------------------------------
@@ -11104,6 +11112,17 @@ def _unroutable_alarm_is_owed(
         payload={"observation": UNROUTABLE_VERIFICATION_TIMER_KIND},
         now=now_ts,
     )
+    # The recheck keeps observing on its 300-second grid; repeating the same
+    # unresolved alarm follows the stale re-alert window instead
+    # (operations.md stale-supervision amendment, 2026-09-14).
+    last = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? "
+        "AND kind = 'independent_verification_unroutable' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    realert = gauntlet_stale_realert_default()
+    if last is not None and (realert <= 0 or now_ts - int(last["created_at"]) < realert):
+        return False
     return True
 
 
@@ -19103,6 +19122,9 @@ class GauntletStaleTask:
     last_event_id: Optional[int]
     last_event_at: Optional[int]
     last_event_kind: Optional[str]
+    # False for an unchanged episode inside its re-alert window: still stale
+    # and still evaluated for recovery, but not to be announced again.
+    alert_due: bool = True
 
 
 def _last_meaningful_event(
@@ -19153,6 +19175,7 @@ def detect_stale_gauntlet_work(
     stale_timeout_seconds: Optional[int] = None,
     realert_seconds: Optional[int] = None,
     now: Optional[int] = None,
+    include_suppressed: bool = False,
 ) -> list["GauntletStaleTask"]:
     """Find Gauntlet-enforced work that has been parked mid-chain and forgotten.
 
@@ -19182,11 +19205,17 @@ def detect_stale_gauntlet_work(
     has happened since — a new episode, which alerts immediately once it goes
     stale again — or (b) ``realert_seconds`` has elapsed since the last alert
     for the same unchanged episode. ``realert_seconds=0`` means an unchanged
-    episode alerts exactly once, ever.
+    episode alerts exactly once, ever. A change in the card's stale reasons
+    (for example ``regression_required`` appearing) is a material change and
+    alerts immediately even inside the window.
 
     Returns the cards alerted on THIS scan (suppressed duplicates are not
     returned — the event is the surface, and returning them would re-spam any
-    consumer of the dispatch result). ``stale_timeout_seconds=0`` disables
+    consumer of the dispatch result). With ``include_suppressed=True`` the
+    suppressed cards are returned too, marked ``alert_due=False`` and with no
+    event written, so recovery keeps evaluating every stale card on the
+    detection cadence while notification follows the re-alert cadence
+    (operations.md stale-supervision amendment, 2026-09-14). ``stale_timeout_seconds=0`` disables
     detection entirely and returns ``[]``. Both windows default to the live
     config values when not passed explicitly.
     """
@@ -19249,8 +19278,16 @@ def detect_stale_gauntlet_work(
         if age < timeout:
             continue
 
-        # Episode de-duplication. The marker is the last meaningful event id;
-        # equality means nothing durable has happened since we last said so.
+        status = str(row["status"])
+        verification_state = row["verification_state"]
+        regression_required = bool(row["regression_required"])
+        reasons = _gauntlet_stale_reasons(
+            status, verification_state, regression_required,
+        )
+
+        # Episode de-duplication. The marker is the last meaningful event id
+        # plus the stale reasons; equality means nothing durable or material
+        # has happened since we last said so.
         prev = conn.execute(
             "SELECT payload, created_at FROM task_events "
             "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
@@ -19263,19 +19300,26 @@ def detect_stale_gauntlet_work(
                 prev_payload = {}
             same_episode = (
                 prev_payload.get("last_event_id", "__missing__") == last_event_id
+                and prev_payload.get("reasons", reasons) == reasons
             )
-            if same_episode:
-                if realert <= 0:
-                    continue
-                if now_ts - int(prev["created_at"]) < realert:
-                    continue
+            if same_episode and (
+                realert <= 0 or now_ts - int(prev["created_at"]) < realert
+            ):
+                if include_suppressed:
+                    stale.append(GauntletStaleTask(
+                        task_id=tid,
+                        status=status,
+                        verification_state=verification_state,
+                        regression_required=regression_required,
+                        age_seconds=int(age),
+                        reasons=reasons,
+                        last_event_id=last_event_id,
+                        last_event_at=last_at,
+                        last_event_kind=last_event_kind,
+                        alert_due=False,
+                    ))
+                continue
 
-        status = str(row["status"])
-        verification_state = row["verification_state"]
-        regression_required = bool(row["regression_required"])
-        reasons = _gauntlet_stale_reasons(
-            status, verification_state, regression_required,
-        )
         payload = {
             "age_seconds": int(age),
             "status": status,
@@ -20819,12 +20863,17 @@ def _dispatch_once_locked(
     # wrapped, because an observability pass must never be able to take a
     # dispatcher tick down with it.
     try:
+        # Detection/recovery cadence and notification cadence are independent
+        # controls: every stale card is evaluated for recovery on each tick,
+        # while only cards whose episode is due are announced.
         _stale_entries = detect_stale_gauntlet_work(
             conn,
             stale_timeout_seconds=gauntlet_stale_timeout_seconds,
             realert_seconds=gauntlet_stale_realert_seconds,
+            include_suppressed=True,
         )
-        result.gauntlet_stale = [entry.task_id for entry in _stale_entries]
+        _due_entries = [entry for entry in _stale_entries if entry.alert_due]
+        result.gauntlet_stale = [entry.task_id for entry in _due_entries]
         # Recovery half: deterministic stale dispositions run before alarm
         # delivery. A card that was successfully routed/reconciled/released in
         # this same tick must not then receive a stale alarm from the pre-action
@@ -20837,7 +20886,7 @@ def _dispatch_once_locked(
         ):
             _resolved_stale_ids.update(_dispositions.get(_key, []))
         _alarm_entries = [
-            entry for entry in _stale_entries
+            entry for entry in _due_entries
             if entry.task_id not in _resolved_stale_ids
         ]
         # Delivery half of the same pass. Clearing runs FIRST so a card that

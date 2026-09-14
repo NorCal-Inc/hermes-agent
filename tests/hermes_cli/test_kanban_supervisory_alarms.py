@@ -806,6 +806,91 @@ class TestDispatchWiring:
         assert stalled not in seen
         assert stalled not in result.lifecycle_alarms
 
+    # -- 2026-09-14 stale-supervision amendment: 300 s detection/recovery,
+    #    86,400 s repeat notification, independent controls --
+
+    def _tick(self, monkeypatch, at, seen=None):
+        monkeypatch.setattr(kb.time, "time", lambda: float(at))
+        with kb.connect_closing() as conn:
+            return kb.dispatch_once(
+                conn, max_spawn=0,
+                gauntlet_stale_timeout_seconds=300,
+                gauntlet_stale_realert_seconds=86_400,
+            )
+
+    def test_suppressed_episode_is_still_evaluated_every_tick_but_alarmed_once_a_day(
+        self, kanban_home, routed, monkeypatch,
+    ):
+        now = 2_000_000_000
+        monkeypatch.setattr(kb.time, "time", lambda: float(now))
+        with kb.connect_closing() as conn:
+            stalled = _park_stale(conn, age=20_000, now=now)
+
+        evaluated: list[list[str]] = []
+        real_resolve = kb.resolve_stale_gauntlet_dispositions
+
+        def _spy(conn, entries, **kw):
+            evaluated.append([entry.task_id for entry in entries])
+            return real_resolve(conn, entries, **kw)
+
+        monkeypatch.setattr(kb, "resolve_stale_gauntlet_dispositions", _spy)
+
+        monkeypatch.setattr(kb, "gauntlet_stale_realert_default", lambda: 86_400)
+        first = self._tick(monkeypatch, now)
+        assert stalled in first.gauntlet_stale and stalled in first.lifecycle_alarms
+        steps = range(300, 3_900, 300)  # one hour of 5-minute ticks
+        for step in steps:
+            again = self._tick(monkeypatch, now + step)
+            assert stalled not in again.gauntlet_stale
+            assert stalled not in again.lifecycle_alarms
+        assert all(stalled in ids for ids in evaluated) and len(evaluated) == 1 + len(steps)
+        with kb.connect_closing() as conn:
+            assert len(_events(conn, stalled, kb.GAUNTLET_STALE_EVENT)) == 1
+            assert len(_events(conn, stalled, kb.NO_LIFECYCLE_PROGRESS_EVENT)) == 1
+            # The evidence-less subject's unroutable alarm is not repeated either,
+            # while its internal recheck keeps ticking on the 5-minute grid.
+            assert len(_events(conn, stalled, "INDEPENDENT_VERIFICATION_UNROUTABLE")) == 1
+            assert len(_events(conn, stalled, "observation_tick")) >= 10
+
+        day_later = self._tick(monkeypatch, now + 86_400 + 300)
+        assert stalled in day_later.lifecycle_alarms
+        with kb.connect_closing() as conn:
+            assert len(_events(conn, stalled, kb.NO_LIFECYCLE_PROGRESS_EVENT)) == 2
+
+    def test_material_reason_change_alerts_inside_the_suppression_window(
+        self, kanban_home, routed, monkeypatch,
+    ):
+        now = 2_000_000_000
+        monkeypatch.setattr(kb.time, "time", lambda: float(now))
+        with kb.connect_closing() as conn:
+            stalled = _park_stale(conn, age=20_000, now=now)
+        assert stalled in self._tick(monkeypatch, now).lifecycle_alarms
+        assert stalled not in self._tick(monkeypatch, now + 300).lifecycle_alarms
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET regression_required = 1 WHERE id = ?", (stalled,))
+        escalated = self._tick(monkeypatch, now + 600)
+        assert stalled in escalated.lifecycle_alarms
+        with kb.connect_closing() as conn:
+            (_, latest) = _events(conn, stalled, kb.GAUNTLET_STALE_EVENT)[-1]
+            assert "regression_required" in latest["reasons"]
+
+    def test_suppressed_scan_entries_write_nothing(self, kanban_home, monkeypatch):
+        now = 2_000_000_000
+        monkeypatch.setattr(kb.time, "time", lambda: float(now))
+        with kb.connect_closing() as conn:
+            stalled = _park_stale(conn, age=20_000, now=now)
+            (first,) = kb.detect_stale_gauntlet_work(
+                conn, stale_timeout_seconds=300, realert_seconds=86_400, now=now)
+            assert first.alert_due
+            before = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+            assert kb.detect_stale_gauntlet_work(
+                conn, stale_timeout_seconds=300, realert_seconds=86_400, now=now + 300) == []
+            (suppressed,) = kb.detect_stale_gauntlet_work(
+                conn, stale_timeout_seconds=300, realert_seconds=86_400, now=now + 300,
+                include_suppressed=True)
+            assert suppressed.task_id == stalled and suppressed.alert_due is False
+            assert conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] == before
+
     def test_routing_failure_does_not_take_the_tick_down(
         self, kanban_home, monkeypatch,
     ):

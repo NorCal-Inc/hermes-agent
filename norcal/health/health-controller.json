@@ -36,6 +36,7 @@
   "expected_runtime_config": {
     "execution.max_runtime_seconds": "300",
     "kanban.dispatch_stale_timeout_seconds": "300",
-    "kanban.gauntlet_stale_timeout_seconds": "300"
+    "kanban.gauntlet_stale_timeout_seconds": "300",
+    "kanban.gauntlet_stale_realert_seconds": "86400"
   }
 }
