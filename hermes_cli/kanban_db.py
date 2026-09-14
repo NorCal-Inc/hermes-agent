@@ -21216,6 +21216,41 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _worker_hermes_argv() -> list[str]:
+    """Return the argv prefix for a dispatcher-spawned Kanban worker.
+
+    Workers are always launched through the dispatcher's own interpreter,
+    never through a ``$HERMES_BIN`` / ``PATH`` lookup. The worker's task
+    scope travels only in the environment ``_default_spawn`` builds
+    (``HERMES_KANBAN_TASK``, ``HERMES_KANBAN_DB``, run id, claim lock), and a
+    resolved ``hermes`` may be a wrapper that resets it: on 2026-09-14 a
+    dispatcher run under sudo resolved the root-owned ``sudo -n -u chris``
+    wrapper via ``secure_path``, ``env_reset`` stripped the Kanban scope, and
+    runs 2814/2816/2817 skipped the executor-lane bypass and ran as unscoped
+    ``default`` agents. The running interpreter has already imported
+    ``hermes_cli``, so the module form is always a working Hermes.
+    """
+    return _module_hermes_argv()
+
+
+KANBAN_WORKER_QUERY_PREFIX = "work kanban task "
+_KANBAN_WORKER_QUERY_RE = re.compile(r"^work kanban task (t_[A-Za-z0-9]+)$")
+
+
+def dispatcher_worker_query_task_id(query: object) -> Optional[str]:
+    """Return the task id when ``query`` is exactly the dispatcher worker prompt.
+
+    ``_default_spawn`` passes ``chat -q "work kanban task <id>"``. That argv
+    survives an environment reset even when the Kanban scope variables do
+    not, so the CLI uses this to refuse a worker whose scope was stripped
+    instead of running it as an unscoped agent.
+    """
+    if not isinstance(query, str):
+        return None
+    match = _KANBAN_WORKER_QUERY_RE.match(query.strip())
+    return match.group(1) if match else None
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -21438,7 +21473,7 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    prompt = f"{KANBAN_WORKER_QUERY_PREFIX}{task.id}"
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -21545,7 +21580,7 @@ def _default_spawn(
     env.pop("HERMES_TUI", None)
 
     cmd = [
-        *_resolve_hermes_argv(),
+        *_worker_hermes_argv(),
         "-p", profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
