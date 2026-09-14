@@ -1522,3 +1522,74 @@ class TestVerifierGateKeysOnEvidenceNotCompletion:
             subject = kb.get_task(conn, tid)
             assert subject.status == "review"
             assert subject.verification_state == kb.VERIFICATION_PENDING
+
+
+# ---------------------------------------------------------------------------
+# An installed reviewer who IS the implementer is not an independent reviewer
+#
+# Live 2026-09-14, t_3883034a: the CLI handoff passed ``--reviewer default``
+# for work implemented by ``default``. The installed-reviewer exemption let
+# selection hand ``default`` its own review (run 2816, event 151161) while the
+# verdict gate refused it two minutes later (151169) -- selection and verdict
+# disagreed about who is independent, and no verifier route was opened.
+# ---------------------------------------------------------------------------
+
+
+def _subject_handed_to_itself(conn, *, implementer="default"):
+    tid = kb.create_task(conn, title="phase 3 overlay", assignee=implementer, gauntlet=True)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None and claimed.status == "running"
+    kb.add_attachment(
+        conn, tid, filename="phase3-evidence-min.md",
+        stored_path=f"/tmp/{tid}/phase3-evidence-min.md", size=512,
+        uploaded_by="claude-lane",
+    )
+    assert kb.request_review(
+        conn, tid, summary="overlay extracted", reviewer=implementer, force=True,
+    ) is True
+    return tid
+
+
+class TestInstalledSelfReviewerIsNotSelected:
+    def test_implementer_installed_as_reviewer_is_refused_at_selection(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = _subject_handed_to_itself(conn)
+
+            assert kb.claim_review_task(conn, tid) is None
+            refused = _events(conn, tid, "review_claim_rejected_self_review")
+            assert refused, "selection must refuse the implementer before a run opens"
+            assert refused[-1][1]["candidate"] == "default"
+            assert refused[-1][1]["conflict_source"] == "implementer"
+            # No review run was opened, so no verdict was manufactured to refuse.
+            assert _events(conn, tid, "verification_blocked_self_review") == []
+            assert kb.get_task(conn, tid).status == "review"
+
+    def test_the_handoff_opens_the_independent_route_instead(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_handed_to_itself(conn)
+
+            required = _events(conn, tid, "independent_verification_required")
+            assert len(required) == 1
+            assert required[0][1]["conflict_identity"] == "default"
+            cid = kb._open_verifier_child(conn, tid)
+            assert cid is not None
+            assert required[0][1]["verifier_task"] == cid
+            assert kb.get_task(conn, cid).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+
+    def test_an_independent_installed_reviewer_is_still_selected(self, kanban_home):
+        """Control: the exemption still serves a reviewer who is not the implementer."""
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="decision", assignee="erika", gauntlet=True)
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            kb.add_attachment(
+                conn, tid, filename="DECISION.md",
+                stored_path=f"/tmp/{tid}/DECISION.md", size=64,
+            )
+            assert kb.request_review(
+                conn, tid, summary="ruling made", reviewer="default",
+                expected_run_id=claimed.current_run_id,
+            ) is True
+            assert kb._review_claim_conflict(conn, tid, "default") is None

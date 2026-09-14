@@ -10811,15 +10811,16 @@ def _review_claim_conflict(
     reservation, so a candidate the claim path will reject never consumes the
     slot it reserved.
 
-    An identity deliberately installed as THIS phase's reviewer is never
-    pre-empted, even when it happens to equal the implementer. That is the
-    whole distinction the live defect turns on: ``request_review(reviewer=None)``
-    installs nobody and leaves the implementer in the seat by default, whereas
-    ``request_review(reviewer=X)`` / ``assign_task`` are a caller stating who
-    reviews. Selection defers to that statement; the VERDICT gate does not —
-    ``_verifier_independence_conflict`` still refuses an implementer-signed
-    verdict there, so an installed self-reviewer can still request changes or
-    escalate, and still cannot bless the work.
+    An identity deliberately installed as THIS phase's reviewer is not
+    pre-empted — ``request_review(reviewer=X)`` / ``assign_task`` are a caller
+    stating who reviews — UNLESS that identity is the implementer. Selection
+    used to defer to the installation even then, while the verdict gate
+    (``_verifier_independence_conflict``) refused it: on 2026-09-14 the CLI
+    handed ``t_3883034a`` to ``--reviewer default`` for work ``default``
+    implemented, selection opened review run 2816 for ``default`` (event
+    151161) and the verdict gate refused it (151169), with no verifier route
+    opened in between. Selection and verdict now agree: the implementer never
+    reviews its own Gauntlet work, installed or not.
     """
     if not assignee:
         return None
@@ -10828,9 +10829,11 @@ def _review_claim_conflict(
         return candidate, "refused"
     if not gauntlet_required(conn, task_id):
         return None
-    if candidate in _phase_reviewer_identities(conn, task_id):
-        return None
     implementer = _review_requested_implementer(conn, task_id, assignee)
+    if candidate in _phase_reviewer_identities(conn, task_id):
+        if implementer and candidate == implementer:
+            return candidate, "implementer"
+        return None
     return _verifier_independence_conflict(
         conn, task_id, candidate, implementer=implementer, assignee=assignee,
     )

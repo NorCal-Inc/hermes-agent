@@ -57,9 +57,9 @@ def _events(conn, tid, kind):
     return [json.loads(r["payload"]) if r["payload"] else None for r in rows]
 
 
-def _park_in_review(conn, *, title="implementation"):
+def _park_in_review(conn, *, title="implementation", implementer="default"):
     """Drive a task to status 'review' the way a real implementer does."""
-    tid = kb.create_task(conn, title=title, assignee="default")
+    tid = kb.create_task(conn, title=title, assignee=implementer)
     claimed = kb.claim_task(conn, tid)
     assert claimed is not None and claimed.status == "running"
     ok, detail = kb.request_review(
@@ -298,7 +298,12 @@ class TestNormalizedReviewCardIsSpawnable:
         performs, so it reads the difference the dispatcher would.
         """
         with kb.connect_closing() as conn:
-            stuck = _park_in_review(conn, title="stuck the old way")
+            # Implemented by another (real) profile: the normalized carrier
+            # 'default' must be claimable as a reviewer, not as the
+            # implementer's self — on a codex_verify-labelled card the
+            # implementer is refused at selection.
+            (kanban_home / "profiles" / "erika").mkdir(parents=True)
+            stuck = _park_in_review(conn, title="stuck the old way", implementer="erika")
             # Simulate a pre-fix row: written by a legacy surface, direct SQL.
             with kb.write_txn(conn):
                 conn.execute(

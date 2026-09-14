@@ -417,7 +417,7 @@ class TestVerdictStaleness:
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
             kb.request_review(
-                conn, tid, summary="impl", reviewer="default",
+                conn, tid, summary="impl", reviewer="reviewer",
                 expected_run_id=run_id,
             )
             reviewer_run = kb.claim_review_task(conn, tid)
@@ -457,8 +457,8 @@ def _fail_then_repair(conn, tid, run_id, *, summary="fixed", reviewer="default")
 
     ``reviewer`` names who the repair round is handed to (default matches
     the original implementer identity, as most callers here don't care;
-    pass a distinct identity when the test needs implicit auto-approval to
-    be legitimate second-party review rather than the same profile).
+    pass a distinct identity whenever the test claims the review run — on a
+    Gauntlet subject the implementer is refused at selection).
     """
     kb.request_review(
         conn, tid, summary="impl", reviewer="default", expected_run_id=run_id,
@@ -793,7 +793,7 @@ class TestReviewerRunApproval:
     def test_inline_approval_of_a_repair_needs_the_proof(self, kanban_home):
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
-            _fail_then_repair(conn, tid, run_id)
+            _fail_then_repair(conn, tid, run_id, reviewer="reviewer")
             reviewer_run = kb.claim_review_task(conn, tid)
             assert reviewer_run is not None
 
@@ -841,8 +841,8 @@ class TestReviewerRunApproval:
     def test_inline_approval_rejects_a_malformed_proof(self, kanban_home):
         with kb.connect_closing() as conn:
             tid, run_id = _executing(conn)
-            _fail_then_repair(conn, tid, run_id)
-            kb.claim_review_task(conn, tid)
+            _fail_then_repair(conn, tid, run_id, reviewer="reviewer")
+            assert kb.claim_review_task(conn, tid) is not None
             with pytest.raises(kb.VerificationRequiredError) as exc:
                 kb.complete_task(
                     conn, tid, summary="approved",
@@ -1195,17 +1195,19 @@ class TestVerifierIndependence:
                 conn, tid, summary="ruling made", reviewer="erika",
                 expected_run_id=claimed.current_run_id,
             )
-            reviewer_run = kb.claim_review_task(conn, tid)
-            assert reviewer_run is not None
-
-            assert kb.complete_task(conn, tid, summary="approved") is False
+            # Since 2026-09-14 (t_3883034a run 2816) selection asks the verdict
+            # gate's question first: the implementer installed as its own
+            # reviewer never gets a review run to approve inline.
+            assert kb.claim_review_task(conn, tid) is None
+            refused = _events(conn, tid, kind="review_claim_rejected_self_review")
+            assert refused and refused[-1][1]["conflict_source"] == "implementer"
 
             task = kb.get_task(conn, tid)
             assert task.verification_state != kb.VERIFICATION_VERIFIED
-            assert task.status != "done"
-            assert len(
-                _events(conn, tid, kind="verification_blocked_self_review")
-            ) == 1
+            assert task.status == "review"
+            with pytest.raises(kb.VerificationRequiredError):
+                kb.complete_task(conn, tid, summary="approved")
+            assert kb.get_task(conn, tid).status != "done"
 
 
 @pytest.mark.real_profile_registry
@@ -1894,9 +1896,15 @@ class TestSelfReviewBlockedImplementationHandoff:
             assert kb.get_task(conn, parent).completed_at is None
 
     def test_review_run_self_review_block_releases_only_governed_implementation(
-        self, kanban_home,
+        self, kanban_home, monkeypatch,
     ):
-        """Reproduce the production sequence with distinct implementation/review runs."""
+        """Reproduce the production sequence with distinct implementation/review runs.
+
+        Selection now refuses the implementer before a review run opens
+        (2026-09-14), so this historical board state can no longer be produced
+        by a claim. Boards still carry it, and the release predicate must keep
+        reading it: the pre-fix selection rule is reproduced for the one claim.
+        """
         with kb.connect_closing() as conn:
             parent = kb.create_task(
                 conn, title="governed decision", assignee="default", gauntlet=True,
@@ -1911,7 +1919,9 @@ class TestSelfReviewBlockedImplementationHandoff:
                 summary="decision ready for independent review", reviewer="default",
                 expected_run_id=implementation_run)
 
-            review_task = kb.claim_review_task(conn, parent, claimer="same-identity")
+            with monkeypatch.context() as pre_fix:
+                pre_fix.setattr(kb, "_review_claim_conflict", lambda *a, **k: None)
+                review_task = kb.claim_review_task(conn, parent, claimer="same-identity")
             assert review_task is not None
             review_run = review_task.current_run_id
             assert review_run != implementation_run
