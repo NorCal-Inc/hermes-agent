@@ -2897,6 +2897,10 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        evidence_gap = kb.review_handoff_evidence_gap(conn, tid, metadata)
+        if evidence_gap is not None:
+            print(f"cannot request review: {evidence_gap}", file=sys.stderr)
+            return 1
         ok, reason = kb.request_review(
             conn,
             tid,

@@ -14358,6 +14358,37 @@ def _qualifying_review_evidence(
     return bool(edges)
 
 
+def review_handoff_evidence_gap(
+    conn: sqlite3.Connection, task_id: str, metadata: Any,
+) -> Optional[str]:
+    """Why a Gauntlet review handoff would carry no verifiable evidence, or ``None``.
+
+    Read by the CLI and tool handoff surfaces before calling
+    :func:`request_review`. ``None`` when the task is not Gauntlet-enforced,
+    already has evidence (:func:`subject_has_evidence`), or ``metadata`` would
+    materialize a packet (:func:`_qualifying_review_evidence`). A prose summary
+    never counts: it is not falsifiable.
+    """
+    row = conn.execute(
+        "SELECT gauntlet_enforced FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if not (row["gauntlet_enforced"] or gauntlet_enforcement_default()):
+        return None
+    if subject_has_evidence(conn, task_id):
+        return None
+    if _qualifying_review_evidence(conn, task_id, metadata):
+        return None
+    return (
+        f"{task_id} is Gauntlet-enforced and this handoff carries no verifiable "
+        "evidence, so no independent verifier could ever be routed. Attach it "
+        f"first (hermes kanban attach {task_id} <file>) or hand off with "
+        "structured metadata carrying non-empty 'changed_files' and "
+        "'verification' lists."
+    )
+
+
 def _materialize_review_evidence(
     conn: sqlite3.Connection,
     task_id: str,
@@ -14478,26 +14509,10 @@ def request_review(
         # first one not progressing (53 ticks). Both closed within one tick of
         # evidence arriving, with reasons ``evidence_present`` and
         # ``progress_resumed`` -- the system knew the blocker the whole time
-        # and had nowhere to say it. This is where it says it.
-        if (
-            (trow["gauntlet_enforced"] or gauntlet_enforcement_default())
-            and not subject_has_evidence(conn, task_id)
-        ):
-            _append_event(
-                conn,
-                task_id,
-                "verification_route_unopened",
-                {
-                    "reason": "gauntlet subject entered review carrying no "
-                              "evidence packet and inheriting none from a "
-                              "verified parent; the independent-verifier "
-                              "pre-flight will decline to open a route, so "
-                              "nothing can return a verdict on this card",
-                    "remedy": "attach falsifiable evidence "
-                              "(hermes kanban attach <task_id> <file>), or "
-                              "hand off with structured run metadata",
-                },
-            )
+        # and had nowhere to say it. The record is written below, once the
+        # structured-metadata packet has had its chance to materialize.
+        # (The CLI and tool entry surfaces refuse such a handoff outright via
+        # ``review_handoff_evidence_gap``; this core stays non-refusing.)
         implementer = trow["assignee"]
         if reviewer is None:
             changes_run = conn.execute(
@@ -14667,6 +14682,28 @@ def request_review(
             reason="implementation handed off for verification",
         )
         _materialize_review_evidence(conn, task_id, run_id, summary, metadata)
+        # Judged only after materialization: on 2026-09-14 a handoff whose
+        # metadata did qualify still logged a false "no evidence" record,
+        # because this check used to run before the packet was written.
+        if (
+            (trow["gauntlet_enforced"] or gauntlet_enforcement_default())
+            and not subject_has_evidence(conn, task_id)
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "verification_route_unopened",
+                {
+                    "reason": "gauntlet subject entered review carrying no "
+                              "evidence packet and inheriting none from a "
+                              "verified parent; the independent-verifier "
+                              "pre-flight will decline to open a route, so "
+                              "nothing can return a verdict on this card",
+                    "remedy": "attach falsifiable evidence "
+                              "(hermes kanban attach <task_id> <file>), or "
+                              "hand off with structured run metadata",
+                },
+            )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
         _append_event(

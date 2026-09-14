@@ -985,6 +985,9 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
+            evidence_gap = kb.review_handoff_evidence_gap(conn, tid, metadata)
+            if evidence_gap is not None:
+                return tool_error(f"could not request review: {evidence_gap}")
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
