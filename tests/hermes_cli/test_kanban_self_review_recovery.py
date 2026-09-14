@@ -804,6 +804,35 @@ class TestIndependentVerifierReturnPath:
             )
             assert len(_events(conn, tid2, "verifier_verdict_unreadable")) == 1
 
+    @pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
+    def test_verdict_from_a_run_the_lane_never_executed_is_not_returned(
+        self, kanban_home, verdict
+    ):
+        """Regression 2026-09-14 (run 2817): an unscoped agent claimed the
+        codex_verify card and could complete it with a verdict line. The
+        ``executor_lane`` column is only a label; without the lane's own
+        ``codex_verifier_started`` on the completing run nothing is returned."""
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            cid = _verifier_child(conn, tid)
+            claimed = kb.claim_task(conn, cid)
+            assert claimed is not None and claimed.status == "running"
+            assert kb.complete_task(
+                conn, cid, summary=f"VERDICT: {verdict}\nChecked it myself.",
+                expected_run_id=claimed.current_run_id,
+            ) is True
+
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "review"
+            assert subject.verification_state == kb.VERIFICATION_PENDING
+            unattested = _events(conn, tid, "verifier_verdict_unattested")
+            assert len(unattested) == 1
+            assert unattested[0][1]["verifier_task"] == cid
+            assert unattested[0][1]["verdict"] == verdict
+            assert _events(conn, tid, "verifier_verdict_returned") == []
+            assert _events(conn, tid, "verification_passed") == []
+            assert _events(conn, tid, "verification_failed") == []
+
     def test_ordinary_task_completion_has_no_return_path(self, kanban_home):
         """Only the codex_verify lane returns verdicts to its parents."""
         with kb.connect_closing() as conn:

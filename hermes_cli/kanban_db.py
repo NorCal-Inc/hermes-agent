@@ -11520,6 +11520,10 @@ def _return_verifier_verdict_to_subjects(
             return
         verdict = _parse_verifier_verdict(summary, result)
         verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+        # The lane label is not proof the lane ran: on 2026-09-14 (run 2817) an
+        # unscoped agent claimed a codex_verify card. Only a completing run the
+        # codex_verify launcher attested may return a verdict.
+        attested_run = _attested_codex_verifier_run(conn, verifier_task_id)
         for subject_id in subjects:
             srow = conn.execute(
                 "SELECT status, verification_state, title, body FROM tasks WHERE id = ?",
@@ -11540,6 +11544,26 @@ def _return_verifier_verdict_to_subjects(
                             "reason": "subject is not awaiting a verdict",
                             "verification_state": srow["verification_state"],
                         },
+                    )
+                continue
+            if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL) and attested_run is None:
+                with write_txn(conn):
+                    _append_event(
+                        conn, subject_id, "verifier_verdict_unattested",
+                        {
+                            "verifier_task": verifier_task_id,
+                            "verdict": verdict,
+                            "reason": (
+                                "completing run carries no codex_verifier_started "
+                                "attestation from the codex_verify lane"
+                            ),
+                        },
+                    )
+                    add_comment(
+                        conn, subject_id, "verifier-return-path",
+                        f"Verifier card {verifier_task_id} reported {verdict}, but the "
+                        "codex_verify lane did not execute its completing run. No "
+                        "verdict was written; this task stays in verification.",
                     )
                 continue
             if verdict in (VERIFIER_VERDICT_PASS, VERIFIER_VERDICT_FAIL):
