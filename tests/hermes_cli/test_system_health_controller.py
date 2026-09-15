@@ -1674,3 +1674,352 @@ class TestEscalationCardsDispositioned:
         assert inv.check(_ctx(kanban_home, clock=lambda: time.time() + 86400)) == []
         (finding,) = inv.check(_ctx(kanban_home, clock=lambda: time.time() + 8 * 86400))
         assert finding.signature == "undispositioned_past_threshold" and finding.detail["count"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# F2 — endpoint health, watcher integrity, repository drift, company isolation
+# (Christopher, 2026-09-14). Company probes run against real local HTTP servers
+# so the no-content and dormant-exclusion guarantees are proven on the wire.
+# ---------------------------------------------------------------------------
+
+import contextlib as _contextlib  # noqa: E402
+import http.server  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+
+SECRET_BODY = b"SECRET-CUSTOMER-DATA card=4242 ssn=123-45-6789"
+
+
+@_contextlib.contextmanager
+def _health_server(status=200, delay=0.0, body_delay=0.0):
+    hits: list[dict] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
+            if delay:
+                time.sleep(delay)
+            self.send_response(status)
+            self.send_header("Set-Cookie", "session=SECRET-COOKIE")
+            self.send_header("X-Diagnostic", "SECRET-HEADER")
+            self.send_header("Content-Length", str(len(SECRET_BODY)))
+            self.end_headers()
+            self.wfile.flush()
+            if body_delay:
+                time.sleep(body_delay)
+            try:
+                self.wfile.write(SECRET_BODY)
+            except OSError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/api/healthz", hits
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _probe_block(entities, excluded=(("ENT-001", "North Caledonia"),), record_dir=None, timeout=2):
+    block = {
+        "authorized_by": "Christopher, 2026-09-14 (test)",
+        "boundaries": "status line only",
+        "timeout_seconds": timeout,
+        "entities": [{"entity_id": eid, "name": name, "service": svc, "url": url}
+                     for eid, name, svc, url in entities],
+        "excluded_entities": [{"entity_id": eid, "name": name, "reason": "dormant"} for eid, name in excluded],
+    }
+    if record_dir is not None:
+        block["record_dir"] = str(record_dir)
+    block["authorization_sha256"] = shc.company_probe_authorization_digest(block)
+    return {"company_health_probes": block}
+
+
+class TestF2Contract:
+    def test_f2_invariants_are_detection_only_and_registered(self):
+        names = {inv.name for inv in shc.default_invariants()}
+        for cls in shc.F2_DETECT_ONLY:
+            assert cls.recover is shc.Invariant.recover, cls.__name__
+            assert cls.name in names
+
+    @pytest.mark.parametrize("url", ["http://example.com/health", "https://127.0.0.1:1/health",
+                                     "http://user:pw@127.0.0.1:1/health", "http://10.0.0.5:5160/api/healthz"])
+    def test_probe_refuses_non_loopback_tls_or_credentialed_urls(self, url):
+        with pytest.raises(ValueError):
+            shc._http_probe(url, 1)
+
+    def test_repository_config_probes_exactly_the_authorized_active_companies(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        block = config["company_health_probes"]
+        assert shc._company_probe_problem(block) is None
+        assert {e["entity_id"]: e["name"] for e in block["entities"]} == {
+            "ENT-004": "Orion Formation Services", "ENT-003": "Logos Covenant", "ENT-007": "The Glass Pepper"}
+        assert {e["entity_id"] for e in block["excluded_entities"]} == {"ENT-001", "ENT-002"}
+        assert all(e["url"].startswith("http://127.0.0.1:") for e in block["entities"])
+        assert "Christopher" in block["authorized_by"]
+        assert "http://127.0.0.1:8082" not in json.dumps(config)   # north caledonia's unit is never probed
+
+
+class TestCompanyHealthEndpoints:
+    def test_healthy_probe_records_only_the_allowed_fields_and_reads_no_content(self, kanban_home, tmp_path):
+        record_dir = tmp_path / "company-health"
+        with _health_server(200) as (url, hits):
+            config = _probe_block([("ENT-004", "Orion", "orion-api", url)], record_dir=record_dir)
+            assert shc.CompanyHealthEndpoints().check(_ctx(kanban_home, config=config)) == []
+        (hit,) = hits
+        assert "authorization" not in hit["headers"] and "cookie" not in hit["headers"]
+        path = record_dir / "ENT-004.json"
+        record = json.loads(path.read_text())
+        assert set(record) == {"entity_id", "service", "timestamp", "http_status", "latency_ms", "result"}
+        assert record["http_status"] == 200 and record["result"] == "HEALTHY"
+        assert b"SECRET" not in path.read_bytes()
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_a_dry_run_probe_writes_no_company_record(self, kanban_home, tmp_path):
+        record_dir = tmp_path / "company-health"
+        with _health_server(503) as (url, hits):
+            config = _probe_block([("ENT-007", "Glass Pepper", "glass-pepper-api", url)], record_dir=record_dir)
+            findings = shc.CompanyHealthEndpoints().check(_ctx(kanban_home, config=config, dry_run=True))
+        assert [f.signature for f in findings] == ["HTTP_5XX"] and len(hits) == 1
+        assert not record_dir.exists()
+
+    def test_the_probe_returns_on_the_status_line_without_waiting_for_the_body(self):
+        with _health_server(200, body_delay=2.0) as (url, _):
+            started = time.monotonic()
+            coarse, status, _latency = shc._http_probe(url, 5)
+            elapsed = time.monotonic() - started
+        assert (coarse, status) == ("HEALTHY", 200)
+        assert elapsed < 1.5, "the probe waited for (read) the response body"
+
+    def test_failed_company_probe_escalates_coarse_state_without_a_shared_card(self, kanban_home, tmp_path):
+        clock, alerts = Clock(), Alerts()
+        with _health_server(503) as (url, _hits):
+            config = _probe_block([("ENT-003", "Logos", "logos-covenant-api", url)], record_dir=tmp_path / "rec")
+            controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts, config=config),
+                                        [shc.CompanyHealthEndpoints()])
+            assert controller.run(shc.TIER_LIGHT).escalated == []      # confirm cycle
+            clock.advance(300)
+            assert len(controller.run(shc.TIER_LIGHT).escalated) == 1
+        (subject, text) = alerts.sent[0]
+        assert "ENT-003" in text and "HTTP_5XX" in text and "company lane" in text
+        for leaked in ("503", "SECRET", "logos-covenant-api", "Logos"):
+            assert leaked not in text and leaked not in subject
+        with kb.connect_closing() as conn:
+            assert _health_cards(conn) == []
+        (rec,) = shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+        assert rec["route"] == "company" and rec["card_id"] is None
+
+    def test_unreachable_and_timeout(self, kanban_home, tmp_path):
+        with _health_server(200) as (url, _):
+            dead = url
+        with _health_server(200, delay=1.5) as (slow, _):
+            config = _probe_block([("ENT-004", "Orion", "orion-api", dead),
+                                   ("ENT-007", "Glass Pepper", "glass-pepper-api", slow)],
+                                  record_dir=tmp_path / "rec", timeout=0.3)
+            findings = shc.CompanyHealthEndpoints().check(_ctx(kanban_home, config=config))
+        assert _signatures(findings) == [("ENT-004", "UNREACHABLE"), ("ENT-007", "TIMEOUT")]
+        assert all(f.route == "company" for f in findings)
+
+    def test_dormant_company_with_a_reachable_endpoint_is_never_polled(self, kanban_home, tmp_path):
+        with _health_server(200) as (active_url, active_hits), _health_server(200) as (dormant_url, dormant_hits):
+            config = _probe_block([("ENT-004", "Orion", "orion-api", active_url)],
+                                  excluded=[("ENT-001", "North Caledonia")], record_dir=tmp_path / "rec")
+            assert shc.CompanyHealthEndpoints().check(_ctx(kanban_home, config=config)) == []
+            assert len(active_hits) == 1 and dormant_hits == []
+            assert not (tmp_path / "rec" / "ENT-001.json").exists()
+
+    def test_listing_a_dormant_company_fails_closed_and_probes_nothing(self, kanban_home, tmp_path):
+        with _health_server(200) as (active_url, active_hits), _health_server(200) as (dormant_url, dormant_hits):
+            config = _probe_block([("ENT-004", "Orion", "orion-api", active_url),
+                                   ("ENT-001", "North Caledonia", "northcaledonia-api", dormant_url)],
+                                  excluded=[("ENT-001", "North Caledonia")], record_dir=tmp_path / "rec")
+            findings = shc.CompanyHealthEndpoints().check(_ctx(kanban_home, config=config))
+            assert _signatures(findings) == [("company_health_probes", "probe_authorization_invalid:excluded_entity_listed")]
+            assert active_hits == [] and dormant_hits == []
+
+    def test_an_unauthorized_addition_to_the_probe_set_probes_nothing(self, kanban_home, tmp_path):
+        with _health_server(200) as (url, hits), _health_server(200) as (extra_url, extra_hits):
+            config = _probe_block([("ENT-004", "Orion", "orion-api", url)], record_dir=tmp_path / "rec")
+            config["company_health_probes"]["entities"].append(
+                {"entity_id": "ENT-005", "name": "Trip Tracker", "service": "triptracker", "url": extra_url})
+            findings = shc.CompanyHealthEndpoints().check(_ctx(kanban_home, config=config))
+            assert _signatures(findings) == [("company_health_probes", "probe_authorization_invalid:authorization_digest_mismatch")]
+            assert hits == [] and extra_hits == []
+
+
+class TestSharedEndpointsAndUnits:
+    def test_shared_endpoint_health(self, kanban_home):
+        with _health_server(200) as (ok, _), _health_server(502) as (bad, _):
+            config = {"shared_health_endpoints": {"gateway": ok, "command-center": bad}}
+            findings = shc.SharedEndpointsHealthy().check(_ctx(kanban_home, config=config))
+        assert _signatures(findings) == [("command-center", "HTTP_5XX")]
+        assert findings[0].detail == {"http_status": "502"} and findings[0].route == "shared"
+
+    def test_shared_units_must_be_active(self, kanban_home):
+        seen = []
+
+        def runner(argv, timeout):
+            seen.append(argv)
+            unit = argv[-1]
+            return (0, "active\n") if unit in ("hermes-gateway.service", "caddy.service") else (3, "failed\n")
+
+        config = {"shared_user_units": ["hermes-gateway.service", "life-wiki-api.service"],
+                  "shared_system_units": ["caddy.service", "postgresql@16-main.service"]}
+        findings = shc.SharedUnitsActive().check(_ctx(kanban_home, config=config, run_command=runner))
+        assert _signatures(findings) == [("life-wiki-api.service", "not_active:failed"),
+                                         ("postgresql@16-main.service", "not_active:failed")]
+        assert ["systemctl", "--user", "is-active", "hermes-gateway.service"] in seen
+        assert ["systemctl", "is-active", "caddy.service"] in seen
+
+
+class TestWatcherIntegrity:
+    def test_service_results_unit_files_crontab_and_script_pins(self, kanban_home, tmp_path):
+        good = tmp_path / "good.sh"
+        good.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        drifted = tmp_path / "drifted.sh"
+        drifted.write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
+
+        def runner(argv, timeout):
+            if "list-timers" in argv:
+                return 0, json.dumps([{"unit": "a.timer", "activates": "a.service"},
+                                      {"unit": "b.timer", "activates": "b.service"}])
+            if "is-failed" in argv:
+                return (0, "failed\n") if argv[-1] == "b.service" else (1, "inactive\n")
+            if "list-unit-files" in argv:
+                return 0, json.dumps([{"unit_file": "present-runner.service"}])
+            if argv[:2] == ["crontab", "-l"]:
+                return 0, "*/5 * * * * TOKEN=do-not-store /x/watchdog.sh\n"
+            return 1, ""
+
+        config = {
+            "critical_user_timers": {"a.timer": {}, "b.timer": {}},
+            "expected_user_unit_files": ["present-runner.service", "missing-runner.service"],
+            "crontab_watchers": ["watchdog.sh", "reaper.sh"],
+            "pinned_scripts": {str(good): shc._sha256_file(good), str(drifted): "0" * 64,
+                               str(tmp_path / "gone.sh"): "0" * 64},
+        }
+        findings = shc.WatcherIntegrity().check(_ctx(kanban_home, config=config, run_command=runner))
+        assert _signatures(findings) == sorted([
+            ("b.service", "timer_service_failed"),
+            ("missing-runner.service", "unit_file_missing"),
+            ("reaper.sh", "crontab_entry_missing"),
+            (str(drifted), "script_checksum_drift"),
+            (str(tmp_path / "gone.sh"), "script_missing"),
+        ])
+        assert "do-not-store" not in json.dumps([f.detail for f in findings])
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(repo), *args],
+                   check=True, capture_output=True, text=True)
+
+
+class TestRepositoryDrift:
+    def test_dirty_unpushed_and_deploy_drift_verdicts(self, kanban_home, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "a.txt").write_text("a", encoding="utf-8")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-q", "-m", "one")
+        _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        (repo / "b.txt").write_text("b", encoding="utf-8")
+        _git(repo, "add", "b.txt")
+        _git(repo, "commit", "-q", "-m", "two")
+        (repo / "dirty.txt").write_text("x", encoding="utf-8")
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        _git(clean, "init", "-q")
+        state = tmp_path / "drift.json"
+        state.write_text(json.dumps({"verdict": "DRIFT", "ran_at": "2020-01-01T00:00:00Z"}), encoding="utf-8")
+        config = {"repository_drift": {"deploy_drift_state": str(state), "deploy_drift_max_age_seconds": 25200,
+                                       "watched_repositories": [
+                                           {"name": "runtime", "path": str(repo), "upstream": "origin/main"},
+                                           {"name": "doctrine", "path": str(clean), "upstream": None},
+                                           {"name": "missing", "path": str(tmp_path / "nope"), "upstream": None}]}}
+        findings = shc.RepositoryDrift().check(_ctx(kanban_home, clock=time.time, config=config,
+                                                    run_command=shc.run_command))
+        assert _signatures(findings) == sorted([
+            ("deploy-drift-check", "deploy_drift_verdict:DRIFT"), ("deploy-drift-check", "deploy_drift_stale"),
+            ("runtime", "worktree_dirty"), ("runtime", "unpushed_commits"), ("missing", "repo_unreadable")])
+
+    def test_clean_state_is_healthy(self, kanban_home, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        state = tmp_path / "drift.json"
+        state.write_text(json.dumps({"verdict": "CLEAN", "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}),
+                         encoding="utf-8")
+        config = {"repository_drift": {"deploy_drift_state": str(state),
+                                       "watched_repositories": [{"name": "r", "path": str(repo), "upstream": None}]}}
+        assert shc.RepositoryDrift().check(_ctx(kanban_home, clock=time.time, config=config,
+                                                run_command=shc.run_command)) == []
+
+
+ISOLATION_COMPANIES = {
+    "ENT-003": {"tokens": ["logos"], "lead_profiles": ["logos_covenant_lead"]},
+    "ENT-004": {"tokens": ["orion"], "lead_profiles": ["orion_formation_services_lead"]},
+}
+
+
+class TestCompanyIsolation:
+    def _config(self, watch_since, rc=0):
+        return {"company_isolation": {"registry_check_command": ["entity-registry-check"],
+                                      "isolation_watch_since": watch_since, "companies": ISOLATION_COMPANIES}}
+
+    def _board(self, conn):
+        orion_card = kb.create_task(conn, title="orion work", assignee="orion_formation_services_lead")
+        shared_card = kb.create_task(conn, title="infra work", assignee="worker")
+        kb.add_attachment(conn, orion_card, filename="orion-funnel.md", stored_path="/tmp/a", size=1, uploaded_by="lead")
+        kb.add_attachment(conn, orion_card, filename="orion-api.log", stored_path="/tmp/b", size=1, uploaded_by="lead")
+        kb.add_attachment(conn, orion_card, filename="logos-invoice.pdf", stored_path="/tmp/c", size=1, uploaded_by="lead")
+        kb.add_attachment(conn, shared_card, filename="Orion-API.log", stored_path="/tmp/d", size=1, uploaded_by="claude-lane")
+        kb.add_attachment(conn, shared_card, filename="agent.log", stored_path="/tmp/e", size=1, uploaded_by="claude-lane")
+        kb.add_attachment(conn, shared_card, filename="PHASE-D-EVIDENCE.md", stored_path="/tmp/f", size=1, uploaded_by="op")
+        return orion_card, shared_card
+
+    def test_new_boundary_attachments_are_unsafe_per_card(self, kanban_home):
+        with kb.connect_closing() as conn:
+            orion_card, shared_card = self._board(conn)
+        runner = lambda argv, timeout: (0, "names ENT-004 Orion routing")  # noqa: E731
+        findings = shc.CompanyIsolation().check(_ctx(kanban_home, config=self._config(0), run_command=runner))
+        assert _signatures(findings) == sorted([(orion_card, "boundary_attachments_on_card"),
+                                                (shared_card, "boundary_attachments_on_card")])
+        counts = {f.subject: f.detail["count"] for f in findings}
+        assert counts == {orion_card: "1", shared_card: "2"}     # own-company files on its lead card are not foreign
+        assert all(f.unsafe for f in findings)
+        blob = json.dumps([(f.subject, f.signature, f.detail) for f in findings]).lower()
+        assert "orion" not in blob and "logos" not in blob and ".log" not in blob
+
+    def test_history_is_one_unsafe_inventory_finding_and_is_never_excepted(self, kanban_home):
+        with kb.connect_closing() as conn:
+            orion_card, shared_card = self._board(conn)
+        alerts = Alerts()
+        condition = "company_isolation|attachment-boundary-inventory|historical_boundary_attachment_inventory"
+        config = {**self._config(int(time.time()) + 3600),
+                  **_governed(_exception("would-hide", "preserved_condition", [condition]))}
+        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=config,
+                                     run_command=lambda argv, t: (0, "")),
+                                [shc.CompanyIsolation()]).run(shc.TIER_DEEP)
+        assert result.status == shc.AGGREGATE_ESCALATED and result.held == []
+        state = shc.StateStore(_ctx(kanban_home).state_dir).load()
+        (rec,) = [r for r in state["fingerprints"].values() if r["invariant"] == "company_isolation"]
+        assert rec["subject"] == "attachment-boundary-inventory" and rec["escalation_reason"] == "unsafe"
+        with kb.connect_closing() as conn:
+            (card,) = [c for c in _health_cards(conn) if "company_isolation" in c["title"]]
+        assert orion_card in card["body"] and shared_card in card["body"]
+        assert "orion-api" not in card["body"].lower() and "orion-api" not in alerts.sent[0][1].lower()
+
+    @pytest.mark.parametrize("rc,signature", [(1, "registry_runtime_drift"), (2, "registry_check_incomplete"),
+                                              (127, "registry_check_failed:rc=127"), (0, None)])
+    def test_registry_check_exit_codes_output_discarded(self, kanban_home, rc, signature):
+        config = {"company_isolation": {"registry_check_command": ["entity-registry-check"], "companies": {}}}
+        findings = shc.CompanyIsolation().check(_ctx(kanban_home, config=config,
+                                                      run_command=lambda argv, t: (rc, "ENT-004 Orion secret routing")))
+        assert [f.signature for f in findings] == ([signature] if signature else [])
+        assert "Orion" not in json.dumps([f.detail for f in findings])

@@ -96,6 +96,9 @@ _AGGREGATE_PRECEDENCE = (
     ("exception", AGGREGATE_GREEN_WITH_HOLDS),
 )
 
+ROUTE_SHARED = "shared"
+ROUTE_COMPANY = "company"
+
 EXCEPTION_KIND_RECOVERY_HOLD = "recovery_hold"
 EXCEPTION_KIND_PRESERVED = "preserved_condition"
 EXCEPTION_KINDS = (EXCEPTION_KIND_RECOVERY_HOLD, EXCEPTION_KIND_PRESERVED)
@@ -138,6 +141,11 @@ class Finding:
     #: unsafe finding is never covered by an exception, never recovered, and
     #: escalates immediately. Not part of the fingerprint.
     unsafe: bool = False
+    #: ``shared`` escalates with a governed card on the shared board plus the
+    #: shared alert. ``company`` (company health probes, Christopher F2
+    #: 2026-09-14) never creates a shared card: only the coarse shared summary
+    #: Erika needs is sent, and she routes it to the owning company lane.
+    route: str = "shared"
 
     @property
     def condition(self) -> str:
@@ -731,11 +739,16 @@ class Controller:
     def _escalate(self, finding: Finding, rec: dict, reason: str, result: PassResult) -> None:
         now = self.ctx.now()
         card_new = True
-        try:
-            card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, reason)
-            card_error = None
-        except Exception as exc:
-            card_id, card_error = None, f"{type(exc).__name__}: {str(exc)[:200]}"
+        card_error = None
+        if finding.route == ROUTE_COMPANY:
+            # Company health never becomes a shared card (F2 boundary).
+            card_id = None
+            rec["route"] = ROUTE_COMPANY
+        else:
+            try:
+                card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, reason)
+            except Exception as exc:
+                card_id, card_error = None, f"{type(exc).__name__}: {str(exc)[:200]}"
         rec["status"] = STATUS_ESCALATED
         rec["escalated_at"] = _iso(now)
         rec["escalation_reason"] = reason
@@ -858,7 +871,9 @@ def alert_text(finding: Finding, rec: dict) -> tuple[str, str]:
         f"fingerprint: {finding.fingerprint}",
         f"reason: {rec.get('escalation_reason')}",
         f"attempts: {rec.get('attempts', 0)}",
-        f"card: {rec.get('card_id') or 'NOT CREATED: ' + str(rec.get('card_error'))}",
+        (f"card: none (company lane; Erika routes to the owning Team Leader)"
+         if rec.get("route") == ROUTE_COMPANY else
+         f"card: {rec.get('card_id') or 'NOT CREATED: ' + str(rec.get('card_error'))}"),
     ]
     return subject, "\n".join(lines)
 
@@ -2100,6 +2115,351 @@ class EscalationCardsDispositioned(Invariant):
                         {"count": str(len(rows)), "oldest": rows[0]["id"]})]
 
 
+# ---------------------------------------------------------------------------
+# F2 detect-only invariants (Christopher, 2026-09-14): endpoint health (shared
+# and authorized active companies), watcher integrity, repository drift,
+# company isolation. No recovery.
+# ---------------------------------------------------------------------------
+
+HEALTH_HEALTHY = "HEALTHY"
+HEALTH_UNREACHABLE = "UNREACHABLE"
+HEALTH_TIMEOUT = "TIMEOUT"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _http_probe(url: str, timeout: float) -> tuple[str, Optional[int], int]:
+    """Minimal, non-content health probe: ``(coarse, http_status, latency_ms)``.
+
+    Unauthenticated GET to a loopback ``http`` URL only. No credentials, no
+    cookies, no custom auth headers; redirects are not followed; the response
+    body and headers are never read or returned — only the status line.
+    """
+    import http.client
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if parts.scheme != "http" or parts.hostname not in _LOOPBACK_HOSTS or parts.username or parts.password:
+        raise ValueError("health probes are limited to unauthenticated loopback http URLs")
+    path = parts.path or "/"
+    started = time.monotonic()
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    try:
+        conn.request("GET", path, headers={"Connection": "close", "User-Agent": "norcal-health-probe"})
+        response = conn.getresponse()
+        status = int(response.status)
+        response.close()  # the body is never read
+    except (socket.timeout, TimeoutError):
+        return HEALTH_TIMEOUT, None, int((time.monotonic() - started) * 1000)
+    except (OSError, http.client.HTTPException):
+        return HEALTH_UNREACHABLE, None, int((time.monotonic() - started) * 1000)
+    finally:
+        conn.close()
+    latency = int((time.monotonic() - started) * 1000)
+    coarse = HEALTH_HEALTHY if 200 <= status < 300 else f"HTTP_{status // 100}XX"
+    return coarse, status, latency
+
+
+def company_probe_authorization_digest(block: dict) -> str:
+    """sha256 over the authorized probe set, exclusions and authorizer."""
+    scope = {
+        "authorized_by": block.get("authorized_by"),
+        "entities": sorted(
+            (str(e.get("entity_id")), str(e.get("service")), str(e.get("url")))
+            for e in (block.get("entities") or []) if isinstance(e, dict)
+        ),
+        "excluded": sorted(str(e.get("entity_id")) for e in (block.get("excluded_entities") or [])
+                           if isinstance(e, dict)),
+    }
+    return hashlib.sha256(json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _company_probe_problem(block: dict) -> Optional[str]:
+    if not str(block.get("authorized_by") or "").strip():
+        return "missing_authorized_by"
+    entities = block.get("entities")
+    excluded = block.get("excluded_entities")
+    if not isinstance(entities, list) or not isinstance(excluded, list):
+        return "malformed"
+    excluded_ids = {str(e.get("entity_id")) for e in excluded if isinstance(e, dict)}
+    for entry in entities:
+        if not isinstance(entry, dict) or not all(str(entry.get(k) or "").strip()
+                                                  for k in ("entity_id", "service", "url")):
+            return "malformed_entity"
+        if str(entry["entity_id"]) in excluded_ids:
+            return "excluded_entity_listed"   # excluded always wins: probe nothing
+    if block.get("authorization_sha256") != company_probe_authorization_digest(block):
+        return "authorization_digest_mismatch"
+    return None
+
+
+class CompanyHealthEndpoints(Invariant):
+    """Active company health through a minimal, non-content probe.
+
+    "Active company health may be observed through a minimal, non-content health
+    probe. Dormant companies are excluded. Company health observations never
+    become shared company data." (Christopher, 2026-09-14.) Only the authorized
+    entities are probed; excluded (dormant) entities are never contacted. The
+    exact status code and latency go only to a per-entity 0600 record; shared
+    findings carry the entity id and coarse state, and route to the company lane.
+    """
+
+    name = "company_health_endpoints"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = ("company_health_probes (Christopher-authorized set, pinned by authorization_sha256): "
+              "unauthenticated loopback GET of each active entity's designated health endpoint, status line only")
+    failure = ("an authorized entity's health endpoint is UNREACHABLE, TIMEOUT or not 2xx for 2 cycles; or the "
+               "probe authorization is invalid (then nothing is probed)")
+    evidence = ("<coarse state> on subject = entity id (route company: no shared card); per-entity record "
+                "<record_dir>/<entity_id>.json with entity_id, service, timestamp, http_status, latency_ms, result; "
+                "probe_authorization_invalid:<problem> on subject company_health_probes")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        block = ctx.config.get("company_health_probes")
+        if not block:
+            return []
+        problem = _company_probe_problem(block)
+        if problem:
+            return [Finding(self.name, "company_health_probes", f"probe_authorization_invalid:{problem}", {})]
+        timeout = float(block.get("timeout_seconds", 5))
+        record_dir = Path(os.path.expanduser(block.get("record_dir") or
+                                             str(ctx.state_dir / "company-health")))
+        out: list[Finding] = []
+        for entry in block["entities"]:
+            coarse, status, latency = _http_probe(entry["url"], timeout)
+            if not ctx.dry_run:
+                record_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(record_dir, 0o700)
+                path = record_dir / f"{entry['entity_id']}.json"
+                _atomic_write_json(path, {
+                    "entity_id": entry["entity_id"], "service": entry["service"],
+                    "timestamp": _iso(ctx.now()), "http_status": status,
+                    "latency_ms": latency, "result": coarse,
+                })
+                os.chmod(path, 0o600)
+            if coarse != HEALTH_HEALTHY:
+                out.append(Finding(self.name, entry["entity_id"], coarse,
+                                   {"entity_id": entry["entity_id"], "service": entry["service"]},
+                                   route=ROUTE_COMPANY))
+        return out
+
+
+class SharedEndpointsHealthy(Invariant):
+    name = "shared_endpoints_healthy"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = "shared_health_endpoints: loopback GET of shared-infrastructure health routes (same status-line-only probe)"
+    failure = "a shared endpoint is UNREACHABLE, TIMEOUT or not 2xx for 2 cycles"
+    evidence = "<coarse state> on subject = endpoint name; detail http_status"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        endpoints = ctx.config.get("shared_health_endpoints") or {}
+        timeout = float(ctx.config.get("shared_probe_timeout_seconds", 5))
+        out: list[Finding] = []
+        for name, url in endpoints.items():
+            coarse, status, _ = _http_probe(url, timeout)
+            if coarse != HEALTH_HEALTHY:
+                out.append(Finding(self.name, name, coarse, {"http_status": str(status)}))
+        return out
+
+
+class SharedUnitsActive(Invariant):
+    name = "shared_units_active"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = "systemctl [--user] is-active for shared_user_units and shared_system_units (shared infrastructure only)"
+    failure = "a shared service unit is not active for 2 cycles"
+    evidence = "not_active:<state> on subject = unit"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        out: list[Finding] = []
+        for scope, units in (("--user", ctx.config.get("shared_user_units") or []),
+                             (None, ctx.config.get("shared_system_units") or [])):
+            for unit in units:
+                argv = ["systemctl"] + ([scope] if scope else []) + ["is-active", unit]
+                _, text = ctx.run_command(argv, 30)
+                state = text.strip() or "unknown"
+                if state != "active":
+                    out.append(Finding(self.name, unit, f"not_active:{state}", {}))
+        return out
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class WatcherIntegrity(Invariant):
+    """Watcher-of-watchers completeness beyond job freshness."""
+
+    name = "watcher_integrity"
+    tier = TIER_DEEP
+    source = ("systemctl --user list-timers/is-failed (a critical timer's service result), "
+              "systemctl --user list-unit-files --output=json (expected_user_unit_files), crontab -l "
+              "(presence of crontab_watchers only; lines never stored), sha256 of pinned_scripts")
+    failure = ("a critical timer's service is failed; an expected unit file is not installed; a crontab watcher "
+               "entry is missing; a pinned watcher script is missing or its sha256 changed (freshness of "
+               "crontab watchers is not observable: they log only when they act)")
+    evidence = ("timer_service_failed on subject = service | unit_file_missing | crontab_entry_missing | "
+                "script_missing | script_checksum_drift on subject = script path")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        out: list[Finding] = []
+        timers = ctx.config.get("critical_user_timers") or {}
+        if timers:
+            rc, text = ctx.run_command(["systemctl", "--user", "list-timers", "--all", "--output=json"], 30)
+            try:
+                listed = {t.get("unit"): t for t in json.loads(text)} if rc == 0 else {}
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                listed = {}
+            for unit in timers:
+                service = (listed.get(unit) or {}).get("activates")
+                if not service:
+                    continue  # timer listing gaps are critical_timers_active's findings
+                _, state = ctx.run_command(["systemctl", "--user", "is-failed", service], 30)
+                if state.strip() == "failed":
+                    out.append(Finding(self.name, service, "timer_service_failed", {}))
+        expected = ctx.config.get("expected_user_unit_files") or []
+        if expected:
+            rc, text = ctx.run_command(["systemctl", "--user", "list-unit-files", "--output=json"], 30)
+            try:
+                present = {u.get("unit_file") for u in json.loads(text)} if rc == 0 else None
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                present = None
+            if present is None:
+                out.append(Finding(self.name, "systemd-user", f"unit_file_listing_failed:rc={rc}", {}))
+            else:
+                out.extend(Finding(self.name, unit, "unit_file_missing", {})
+                           for unit in expected if unit not in present)
+        watchers = ctx.config.get("crontab_watchers") or []
+        if watchers:
+            rc, crontab = ctx.run_command(["crontab", "-l"], 30)
+            for script in watchers:
+                if rc != 0 or script not in crontab:
+                    out.append(Finding(self.name, script, "crontab_entry_missing", {}))
+            del crontab
+        for raw_path, pinned in (ctx.config.get("pinned_scripts") or {}).items():
+            path = Path(os.path.expanduser(raw_path))
+            if not path.is_file():
+                out.append(Finding(self.name, raw_path, "script_missing", {}))
+            elif _sha256_file(path) != pinned:
+                out.append(Finding(self.name, raw_path, "script_checksum_drift", {}))
+        return out
+
+
+class RepositoryDrift(Invariant):
+    name = "repository_drift"
+    tier = TIER_DEEP
+    source = ("~/.hermes/state/deploy-drift-check.json (deploy-drift-check.sh verdict over the company/service "
+              "repos, used coarse) and git --no-optional-locks status / rev-list against the local upstream ref "
+              "for watched_repositories (no fetch)")
+    failure = ("deploy-drift verdict not CLEAN or older than deploy_drift_max_age_seconds; a watched shared "
+               "repository has uncommitted changes, commits not on its upstream, or is behind it")
+    evidence = ("deploy_drift_verdict:<v> | deploy_drift_stale | deploy_drift_unreadable | worktree_dirty | "
+                "unpushed_commits | behind_upstream | repo_unreadable (subject = repository name; counts in detail)")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        out: list[Finding] = []
+        cfg = ctx.config.get("repository_drift") or {}
+        if not cfg:
+            return []
+        state_path = Path(os.path.expanduser(cfg["deploy_drift_state"]))
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            out.append(Finding(self.name, "deploy-drift-check", f"deploy_drift_unreadable:{type(exc).__name__}", {}))
+        else:
+            if state.get("verdict") != "CLEAN":
+                out.append(Finding(self.name, "deploy-drift-check", f"deploy_drift_verdict:{state.get('verdict')}", {}))
+            ran = _parse_ts(str(state.get("ran_at") or "").replace("Z", "+00:00"))
+            if ran is None or ctx.now() - ran > int(cfg.get("deploy_drift_max_age_seconds", 25200)):
+                out.append(Finding(self.name, "deploy-drift-check", "deploy_drift_stale", {}))
+        for repo in cfg.get("watched_repositories") or []:
+            path = os.path.expanduser(repo["path"])
+            rc, text = ctx.run_command(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"], 30)
+            if rc != 0:
+                out.append(Finding(self.name, repo["name"], "repo_unreadable", {}))
+                continue
+            dirty = len([ln for ln in text.splitlines() if ln.strip()])
+            if dirty:
+                out.append(Finding(self.name, repo["name"], "worktree_dirty", {"entries": str(dirty)}))
+            upstream = repo.get("upstream")
+            if upstream:
+                for signature, spec in (("unpushed_commits", f"{upstream}..HEAD"),
+                                        ("behind_upstream", f"HEAD..{upstream}")):
+                    rc, count = ctx.run_command(["git", "-C", path, "rev-list", "--count", spec], 30)
+                    if rc == 0 and count.strip().isdigit() and int(count.strip()) > 0:
+                        out.append(Finding(self.name, repo["name"], signature, {"commits": count.strip()}))
+        return out
+
+
+class CompanyIsolation(Invariant):
+    """Active-company isolation and routing integrity. Boundary findings are unsafe."""
+
+    name = "company_isolation"
+    tier = TIER_DEEP
+    source = ("~/.local/bin/entity-registry-check exit code (output discarded); kanban.db task_attachments "
+              "filenames on cards, matched against company_isolation.company_tokens / lead_profiles and "
+              "recovery_lane._HARVEST_DENIED_SUFFIXES (filenames never recorded)")
+    failure = ("registry/runtime routing drift (exit 1) or an incomplete check (exit 2); a card assigned to one "
+               "company's lead carrying another company's files; a non-company card carrying company-named or "
+               "runtime-state files. New occurrences (since isolation_watch_since) are per card; the historical "
+               "set is one inventory finding. All attachment findings are unsafe: never excepted, escalated at once")
+    evidence = ("registry_runtime_drift | registry_check_incomplete | registry_check_failed:rc=<n> | "
+                "boundary_attachments_on_card (subject card, detail count) | "
+                "historical_boundary_attachment_inventory (detail card count and ids)")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        cfg = ctx.config.get("company_isolation") or {}
+        if not cfg:
+            return []
+        from hermes_cli import recovery_lane
+        out: list[Finding] = []
+        command = cfg.get("registry_check_command")
+        if command:
+            rc, _ = ctx.run_command([os.path.expanduser(part) for part in command], 120)
+            if rc == 1:
+                out.append(Finding(self.name, "entity-registry", "registry_runtime_drift", {}))
+            elif rc == 2:
+                out.append(Finding(self.name, "entity-registry", "registry_check_incomplete", {}))
+            elif rc != 0:
+                out.append(Finding(self.name, "entity-registry", f"registry_check_failed:rc={rc}", {}))
+        companies = cfg.get("companies") or {}
+        lead_to_company = {lead: cid for cid, spec in companies.items() for lead in spec.get("lead_profiles", [])}
+        watch_since = int(cfg.get("isolation_watch_since") or 0)
+        counts: dict[str, int] = {}
+        historical: dict[str, int] = {}
+        with ctx.kanban() as conn:
+            for row in conn.execute(
+                "SELECT a.task_id, a.filename, a.created_at, t.assignee FROM task_attachments a "
+                "JOIN tasks t ON t.id = a.task_id"
+            ).fetchall():
+                name = str(row["filename"] or "").lower()
+                owner = lead_to_company.get(row["assignee"] or "")
+                foreign = [cid for cid, spec in companies.items() if cid != owner
+                           and any(tok in name for tok in spec.get("tokens", []))]
+                runtime = (owner is None and (name.endswith(recovery_lane._HARVEST_DENIED_SUFFIXES)
+                                              or name.startswith(".env") or ".log." in name))
+                if not foreign and not runtime:
+                    continue
+                bucket = counts if int(row["created_at"] or 0) >= watch_since else historical
+                bucket[row["task_id"]] = bucket.get(row["task_id"], 0) + 1
+        for task_id, n in sorted(counts.items()):
+            out.append(Finding(self.name, task_id, "boundary_attachments_on_card", {"count": str(n)}, unsafe=True))
+        if historical:
+            ids = sorted(historical)
+            out.append(Finding(self.name, "attachment-boundary-inventory", "historical_boundary_attachment_inventory",
+                               {"cards": str(len(ids)), "card_ids": ",".join(ids)[:1500]}, unsafe=True))
+        return out
+
+
+F2_DETECT_ONLY = (CompanyHealthEndpoints, SharedEndpointsHealthy, SharedUnitsActive, WatcherIntegrity,
+                  RepositoryDrift, CompanyIsolation)
+
 #: F1 invariants are detection only: none defines a recovery.
 F1_DETECT_ONLY = (
     ReadyBacklogExplained, RunLeaseConsistency, VerdictReturnedToSubject, VerifierChildStalledInTodo,
@@ -2123,6 +2483,9 @@ def default_invariants() -> list[Invariant]:
         VerifierChildStalledInTodo(),
         GatewayPlatformsConnected(),
         ResourceThresholds(),
+        CompanyHealthEndpoints(),
+        SharedEndpointsHealthy(),
+        SharedUnitsActive(),
         VerifierOfVerifier(),
         VerifiedClosureAttributable(),
         CriticalTimersActive(),
@@ -2135,6 +2498,9 @@ def default_invariants() -> list[Invariant]:
         LifeWikiDailyNote(),
         BackupResults(),
         EscalationCardsDispositioned(),
+        WatcherIntegrity(),
+        RepositoryDrift(),
+        CompanyIsolation(),
     ]
 
 

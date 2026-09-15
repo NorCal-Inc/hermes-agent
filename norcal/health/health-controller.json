@@ -110,5 +110,67 @@
     "postgres_max_age_seconds": 93600,
     "postgres_min_bytes": 1048576
   },
-  "escalation_card_max_undispositioned_seconds": 604800
+  "escalation_card_max_undispositioned_seconds": 604800,
+  "company_health_probes": {
+    "authorized_by": "Christopher, 2026-09-14, in session (F2 company health probe set: Orion Formation Services, Logos Covenant, The Glass Pepper only; this explicit authorization governs even where older manifests conflict)",
+    "boundaries": "Designated health endpoint only; unauthenticated loopback GET; record only entity/service id, timestamp, HTTP status code, latency/timeout result; never bodies, headers, cookies, auth material, logs, customer data, database output or diagnostic payloads; no shared Kanban card; coarse state only in shared findings",
+    "timeout_seconds": 5,
+    "record_dir": "~/.hermes/state/system-health-controller/company-health",
+    "entities": [
+      {"entity_id": "ENT-004", "name": "Orion Formation Services", "service": "orion-api", "url": "http://127.0.0.1:5160/api/healthz"},
+      {"entity_id": "ENT-003", "name": "Logos Covenant", "service": "logos-covenant-api", "url": "http://127.0.0.1:5150/api/healthz"},
+      {"entity_id": "ENT-007", "name": "The Glass Pepper", "service": "glass-pepper-api", "url": "http://127.0.0.1:5170/api/healthz"}
+    ],
+    "excluded_entities": [
+      {"entity_id": "ENT-001", "name": "North Caledonia", "reason": "dormant/hidden (Christopher, 2026-09-14)"},
+      {"entity_id": "ENT-002", "name": "NCASS / LCASS (lcass-llc)", "reason": "dormant (Christopher, 2026-09-14)"}
+    ],
+    "registry_inconsistency": "Logged for later registry reconciliation, not edited in F2: entity-registry.md has no status field and no LCASS row; doctrine-v2/scopes marks Logos dormant and NorCal (parent) active; Glass Pepper absent from the scope manifests.",
+    "authorization_sha256": "da639ae541f456a616a1552227bf938133b1f22c14af350194cc103fb7c95519"
+  },
+  "shared_probe_timeout_seconds": 5,
+  "shared_health_endpoints": {
+    "hermes-gateway-8644": "http://127.0.0.1:8644/health",
+    "hermes-gateway-8085": "http://127.0.0.1:8085/health",
+    "command-center": "http://127.0.0.1:5130/api/status",
+    "life-wiki-api": "http://127.0.0.1:5100/api/healthz",
+    "life-wiki-web": "http://127.0.0.1:5181/"
+  },
+  "shared_user_units": ["hermes-gateway.service", "NorCal_Hermes.service", "life-wiki-api.service", "life-wiki-web.service", "norcal-opsbridge.service", "erika-phone.service"],
+  "shared_system_units": ["caddy.service", "postgresql@16-main.service"],
+  "expected_user_unit_files": ["hermes-claude-workspace-runner.service", "hermes-gpt-workspace-runner.service"],
+  "crontab_watchers": ["hermes_gateway_watchdog.sh", "hermes_isolated_backend_reaper.sh"],
+  "pinned_scripts": {
+    "~/.hermes/scripts/life-wiki-github-sync.sh": "2cbacc4865f4596891954e4b4acf852d88da73b7e061dab39d6f9b060a48f0ee",
+    "~/.hermes/scripts/nuclear_backup.sh": "2bc479f3101f68330a7bf65c55a29c31d7c5af1f8c7c72e5c30e7933acd7dfce",
+    "~/.hermes/scripts/dr-backup-verify.sh": "a4d3cee1ea4676b067a37b8d19501ff5c0312048dae02b63be393b516ce31007",
+    "~/.hermes/scripts/deploy-drift-check.sh": "e7e472608020ef173c14904b01e8ce2c9532206c4ec9b6e2cba002e500490b1f",
+    "~/.hermes/scripts/life-wiki-nightly-validate.sh": "83356d5c9f1f46a2042e4f69cd3c42f7b7da30dd05027ee0f27ecce23fd18b2b",
+    "~/.hermes/scripts/gauntlet-progress-census-delayed.sh": "eb43ee839cb50f7e3e19e57e389fbfd951ae4244a8544360968c33ba791c8f2b",
+    "~/.hermes/scripts/executive-significant-change-watch.py": "6603f24ca71ad6e4239e27dfaf54d05c23d9b41f1ed9bc55762fd614591f8959",
+    "~/.hermes/scripts/hermes_gateway_watchdog.sh": "05469d9709df0eeef029ccd79e708ba17e4b68840000c87515ca8f8653856f71",
+    "~/.hermes/scripts/hermes_isolated_backend_reaper.sh": "b9916991bf113f6ad55f4a3ba3943070e1e072b5b0e2cb4b911e39e16343be87"
+  },
+  "repository_drift": {
+    "deploy_drift_state": "~/.hermes/state/deploy-drift-check.json",
+    "deploy_drift_max_age_seconds": 25200,
+    "watched_repositories": [
+      {"name": "hermes-agent-next", "path": "~/.hermes/hermes-agent-next", "upstream": "origin/main"},
+      {"name": "doctrine", "path": "~/.hermes/doctrine", "upstream": null}
+    ]
+  },
+  "company_isolation": {
+    "registry_check_command": ["~/.local/bin/entity-registry-check"],
+    "isolation_watch_since": 1789443912,
+    "companies": {
+      "ENT-002": {"tokens": ["ncass", "lcass"], "lead_profiles": ["ncass_lead"]},
+      "ENT-003": {"tokens": ["logos"], "lead_profiles": ["logos_covenant_lead"]},
+      "ENT-004": {"tokens": ["orion"], "lead_profiles": ["orion_formation_services_lead"]},
+      "ENT-005": {"tokens": ["triptracker", "trip-tracker", "trip_tracker"], "lead_profiles": ["triptracker_lead"]},
+      "ENT-006": {"tokens": ["clhubbard"], "lead_profiles": ["clhubbard_lead"]},
+      "ENT-007": {"tokens": ["glass-pepper", "glass_pepper", "glasspepper"], "lead_profiles": ["the_glass_pepper_lead"]},
+      "ENT-008": {"tokens": ["nexora"], "lead_profiles": ["nexora_biotide_lead"]},
+      "ENT-009": {"tokens": ["african-heartbeat", "africanheartbeat", "african_heartbeat"], "lead_profiles": ["alana---african-heartbeat"]}
+    }
+  }
 }

@@ -34,6 +34,27 @@ print them with `venv/bin/python norcal/health/system_health_controller.py invar
 `health-controller.json`. Full table and calibration evidence:
 `Business/Operations/2026-09-14-system-health-controller-t_b8d62378.md` §18.
 
+### F2 invariants and boundaries (Christopher, 2026-09-14)
+
+Light: `company_health_endpoints`, `shared_endpoints_healthy`, `shared_units_active`. Deep:
+`watcher_integrity`, `repository_drift`, `company_isolation`. Detection only.
+
+**Company health probes** — "Active company health may be observed through a minimal, non-content
+health probe. Dormant companies are excluded. Company health observations never become shared company
+data." The probe set in `company_health_probes` (Orion Formation Services ENT-004, Logos Covenant ENT-003,
+The Glass Pepper ENT-007) is pinned by `authorization_sha256`; North Caledonia ENT-001 and NCASS/LCASS
+ENT-002 are excluded. An unrecorded change, or listing an excluded entity, probes nothing. Probes are an
+unauthenticated loopback `GET` that reads only the status line (never body, headers or cookies). The exact
+status code and latency go only to `~/.hermes/state/system-health-controller/company-health/<ENT>.json`
+(0600); findings carry the entity id and a coarse state (`UNREACHABLE`, `TIMEOUT`, `HTTP_4XX`, `HTTP_5XX`),
+route `company`: no shared Kanban card is ever created, and the shared alert is the coarse summary Erika
+routes to the owning Team Leader. Re-pin with `company_probe_authorization_digest` only after a recorded
+authorization change.
+
+**Company isolation** findings (another company's files on a lead card; company-named or runtime-state
+files on a non-company card; the historical inventory) are `unsafe`: never covered by a governed exception,
+escalated at once. Filenames are never recorded — card ids and counts only.
+
 Escalation is exactly once per fingerprint: one `triage` card (unassigned, tenant-less,
 `idempotency_key=health:<invariant>:<fingerprint>`, system provenance, `defect:` authority) and one
 delivery-checked `hermes send` alert carrying identifiers and signatures only. A card that already
