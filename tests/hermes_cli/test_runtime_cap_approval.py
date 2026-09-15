@@ -270,6 +270,20 @@ class TestUnapproved:
             assert kb.approved_runtime_cap(conn, tid) is None
         assert _direct_claude_grant(monkeypatch, tid) == 300
 
+    def test_raising_a_human_approved_cap_is_not_approved(
+        self, kanban_home, baseline, monkeypatch,
+    ):
+        """An approval covers the cap it names, not whatever the card says later."""
+        with kb.connect_closing() as conn:
+            tid = _card(conn, cap=None)
+            kb.approve_runtime_cap(conn, tid, 900, approved_by="christopher", reason="r")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET max_runtime_seconds=7200 WHERE id=?", (tid,),
+                )
+            assert kb.approved_runtime_cap(conn, tid) is None
+        assert _direct_claude_grant(monkeypatch, tid) == 300
+
     @pytest.mark.parametrize("payload", [
         {"max_runtime_seconds": 1800, "previous": 300},
         {"max_runtime_seconds": 1800, "previous": 300, "actor_kind": "human_instructed"},
