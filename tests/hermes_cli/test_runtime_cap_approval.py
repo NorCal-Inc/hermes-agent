@@ -499,6 +499,17 @@ class TestOnlyAHumanOperatorCanApprove:
                 _approve(conn, tid, 2700)
             assert _cap(conn, tid) == 300 and _raise_events(conn, tid) == 0
 
+    def test_a_named_operator_is_required_even_without_a_profiles_directory(self, kanban_home):
+        """The actor-id check stands on its own, not on how '' resolves against profiles/."""
+        import shutil
+
+        shutil.rmtree(kanban_home / "profiles")
+        with kb.connect_closing() as conn:
+            tid = _card(conn, cap=300)
+            with pytest.raises(kb.RuntimeCapApprovalRefused, match="operator provenance"):
+                _approve(conn, tid, 2700, env={kb.ENV_ACTOR_KIND: kb.ACTOR_KIND_HUMAN_INTERACTIVE})
+            assert _cap(conn, tid) == 300 and _raise_events(conn, tid) == 0
+
     def test_refused_when_sharing_a_running_workers_process_group(self, kanban_home):
         """A detached-looking child of the worker still shares its process group."""
         import subprocess
