@@ -55,7 +55,7 @@ from __future__ import annotations
 import json
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -816,6 +816,31 @@ def _invoke_recovery_claude(
     )
 
 
+def _execution_policy_for(task_id: Optional[str]) -> Optional[ex.ExecutionPolicy]:
+    """The policy one card's supervised executions run under.
+
+    ``None`` means the supervisor's own live policy, whose
+    ``execution.max_runtime_seconds`` is the baseline ceiling for every card.
+    Only a card carrying an approved override (``kb.approved_runtime_cap``:
+    the governed ladder or a named human approval) gets that ceiling raised to
+    its cap. Failing to establish the approval falls back to the baseline --
+    a lookup error must never grant time.
+    """
+    if not task_id:
+        return None
+    try:
+        with kb.connect_closing() as conn:
+            approved = kb.approved_runtime_cap(conn, task_id)
+    except Exception:
+        return None
+    if approved is None:
+        return None
+    policy = ex.load_policy()
+    if approved <= policy.max_runtime_seconds:
+        return None
+    return replace(policy, max_runtime_seconds=approved)
+
+
 def _supervised_attempt(
     executor: str,
     command_class: str,
@@ -840,6 +865,7 @@ def _supervised_attempt(
             cwd=cwd,
             task_id=task_id,
             timeout=timeout,
+            policy=_execution_policy_for(task_id),
             # This lane performs its own Gauntlet handoff after the gate runs.
             route_task=False,
         )
@@ -928,6 +954,7 @@ def _run_gate(
             cwd=cwd,
             task_id=task_id,
             timeout=timeout,
+            policy=_execution_policy_for(task_id),
             route_task=False,
         )
     except ex.ExecutionPolicyError as exc:

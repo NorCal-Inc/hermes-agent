@@ -9389,6 +9389,105 @@ def _runtime_cap_ladder_step(
             }, run_id=run_id)
 
 
+#: Where an approved per-card runtime cap is recorded. Christopher, 2026-09-15:
+#: *"Set the normal global execution ceiling to 300 seconds, but make the
+#: smallest tested code change necessary so explicitly authorized per-card
+#: runtime caps can exceed that baseline."* ``execution.max_runtime_seconds``
+#: bounds every supervised execution; a card's own ``max_runtime_seconds`` may
+#: only exceed it when the cap was granted by the ladder or by a named human
+#: approval, both of which leave a ``runtime_cap_raised`` event.
+RUNTIME_CAP_APPROVAL_EVENT = "runtime_cap_raised"
+RUNTIME_CAP_APPROVAL_SOURCE_LADDER = "runtime_cap_ladder"
+RUNTIME_CAP_APPROVAL_ACTOR_KIND = "human_instructed"
+
+
+def approved_runtime_cap(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """The card's cap if it is an approved override, else ``None``.
+
+    Approved means the card's newest ``runtime_cap_raised`` event names exactly
+    the cap the card carries now, and that event came from the governed ladder
+    (at a rung this card may reach) or from a named human instruction. A cap
+    set any other way -- at creation, by a worker's ``kanban_create`` call, or
+    changed after its approval -- is not approved, so a card cannot raise
+    itself past the baseline by writing a bigger number.
+    """
+    row = conn.execute(
+        "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["max_runtime_seconds"] is None:
+        return None
+    cap = int(row["max_runtime_seconds"])
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, RUNTIME_CAP_APPROVAL_EVENT),
+    ).fetchone()
+    if event is None:
+        return None
+    try:
+        payload = json.loads(event["payload"] or "{}")
+        granted = int(payload.get("max_runtime_seconds"))
+    except (TypeError, ValueError):
+        return None
+    if granted != cap:
+        return None
+    if payload.get("source") == RUNTIME_CAP_APPROVAL_SOURCE_LADDER:
+        if cap in RUNTIME_CAP_LADDER and cap <= _runtime_cap_ladder_ceiling(conn, task_id):
+            return cap
+        return None
+    if (
+        payload.get("actor_kind") == RUNTIME_CAP_APPROVAL_ACTOR_KIND
+        and str(payload.get("actor_id") or "").strip()
+    ):
+        return cap
+    return None
+
+
+def approve_runtime_cap(
+    conn: sqlite3.Connection,
+    task_id: str,
+    seconds: int,
+    *,
+    approved_by: str,
+    reason: str,
+) -> int:
+    """Record a named human approval of a per-card runtime cap.
+
+    The only path besides the ladder that lets a card run longer than
+    ``execution.max_runtime_seconds``. Not exposed to worker tools. Raises
+    ``ValueError`` without writing anything when the approver, reason or cap
+    is missing, or the card does not exist.
+    """
+    approved_by = str(approved_by or "").strip()
+    reason = str(reason or "").strip()
+    if not approved_by:
+        raise ValueError("approve_runtime_cap requires approved_by")
+    if not reason:
+        raise ValueError("approve_runtime_cap requires reason")
+    seconds = int(seconds)
+    if seconds <= 0:
+        raise ValueError("approve_runtime_cap requires a positive cap")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ?",
+            (seconds, task_id),
+        )
+        _append_event(conn, task_id, RUNTIME_CAP_APPROVAL_EVENT, {
+            "max_runtime_seconds": seconds,
+            "previous": row["max_runtime_seconds"],
+            "actor_kind": RUNTIME_CAP_APPROVAL_ACTOR_KIND,
+            "actor_id": approved_by,
+            "reason": reason,
+            "source": "human_approval",
+        })
+    return seconds
+
+
 def gauntlet_canonical_ref() -> str:
     try:
         from hermes_cli.config import load_config_readonly
