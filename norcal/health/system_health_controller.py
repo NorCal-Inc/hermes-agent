@@ -27,6 +27,14 @@ detected condition to an actionable disposition::
 No LLM is involved. Alerts and cards carry identifiers, statuses and failure
 signatures only — never task titles, bodies, or company data.
 
+State model. ``strict`` (the default, and what an absent ``state_model`` means)
+reports GREEN or DEGRADED, and any held finding is DEGRADED. The TEMPORARY
+``governed_exceptions`` model (Christopher, 2026-09-14, stabilization only; see
+the README) reports GREEN, GREEN_WITH_HOLDS, RECOVERY, DEGRADED or ESCALATED:
+conditions covered by a valid, owner-approved governed exception are still
+observed on every pass and stay visible, but no longer force DEGRADED. Deleting
+the ``state_model`` key restores strict semantics without rewriting history.
+
 Run: ``venv/bin/python norcal/health/system_health_controller.py run --tier light``
 """
 
@@ -68,6 +76,41 @@ STATUS_RESOLVED = "resolved"
 STATUS_HELD = "held"
 HOLD_INVARIANT = "recovery_hold"
 
+#: ``state_model`` values. Strict is the original GREEN/DEGRADED semantics.
+STATE_MODEL_STRICT = "strict"
+#: TEMPORARY stabilization model (Christopher, 2026-09-14). Revert by deleting
+#: ``state_model`` from the config; nothing else has to change.
+STATE_MODEL_GOVERNED = "governed_exceptions"
+STATE_MODELS = (STATE_MODEL_STRICT, STATE_MODEL_GOVERNED)
+
+AGGREGATE_GREEN = "GREEN"
+AGGREGATE_GREEN_WITH_HOLDS = "GREEN_WITH_HOLDS"
+AGGREGATE_RECOVERY = "RECOVERY"
+AGGREGATE_DEGRADED = "DEGRADED"
+AGGREGATE_ESCALATED = "ESCALATED"
+#: Most severe first; the pass reports the first class that has a member.
+_AGGREGATE_PRECEDENCE = (
+    ("escalated", AGGREGATE_ESCALATED),
+    ("degraded", AGGREGATE_DEGRADED),
+    ("recovery", AGGREGATE_RECOVERY),
+    ("exception", AGGREGATE_GREEN_WITH_HOLDS),
+)
+
+EXCEPTION_KIND_RECOVERY_HOLD = "recovery_hold"
+EXCEPTION_KIND_PRESERVED = "preserved_condition"
+EXCEPTION_KINDS = (EXCEPTION_KIND_RECOVERY_HOLD, EXCEPTION_KIND_PRESERVED)
+EXCEPTION_VALIDITY_INVARIANT = "governed_exception_valid"
+
+#: Escalation reasons. The governed model classifies an escalated fingerprint
+#: as ESCALATED only when automatic repair was tried and failed, or the finding
+#: is unsafe; every other escalation is an actionable DEGRADED fault.
+ESCALATION_NOT_RECOVERABLE = "not_recoverable"
+ESCALATION_BUDGET_EXHAUSTED = "recovery_budget_exhausted"
+ESCALATION_UNSAFE = "unsafe"
+ESCALATION_FROZEN_UNCOVERED = "frozen_condition_not_covered"
+ESCALATION_EXCEPTION_INVALID = "governed_exception_invalid"
+_ESCALATED_CLASS_REASONS = (ESCALATION_BUDGET_EXHAUSTED, ESCALATION_UNSAFE)
+
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "health-controller.json"
 
 
@@ -91,10 +134,19 @@ class Finding:
     signature: str
     detail: dict = dataclasses.field(default_factory=dict)
     recoverable: bool = False
+    #: Security-sensitive or boundary-violating. Under the governed model an
+    #: unsafe finding is never covered by an exception, never recovered, and
+    #: escalates immediately. Not part of the fingerprint.
+    unsafe: bool = False
+
+    @property
+    def condition(self) -> str:
+        """``invariant|subject|signature`` — what a governed exception names."""
+        return f"{self.invariant}|{self.subject}|{self.signature}"
 
     @property
     def fingerprint(self) -> str:
-        raw = f"{self.invariant}|{self.subject}|{self.signature}".encode()
+        raw = self.condition.encode()
         return hashlib.sha256(raw).hexdigest()[:16]
 
 
@@ -224,13 +276,16 @@ class StateStore:
 @dataclasses.dataclass
 class PassResult:
     tier: str
-    status: str  # GREEN | DEGRADED
+    status: str  # strict: GREEN | DEGRADED; governed: see AGGREGATE_*
     findings: int
     recovered: list[str]
     escalated: list[str]
     open: list[str]
     resolved: list[str]
     held: list[str] = dataclasses.field(default_factory=list)
+    state_model: str = STATE_MODEL_STRICT
+    #: Governed model only: fingerprint counts per class for this tier.
+    classes: dict = dataclasses.field(default_factory=dict)
 
 
 def recovery_holds(config: dict) -> list[dict]:
@@ -256,13 +311,140 @@ def recovery_holds(config: dict) -> list[dict]:
     return out
 
 
-def hold_for(finding: Finding, holds: list[dict]) -> Optional[dict]:
+def _finding_ids(finding: Finding) -> set:
     ids = {finding.subject}
     ids.update(v for v in finding.detail.values() if isinstance(v, str))
+    return ids
+
+
+def hold_for(finding: Finding, holds: list[dict]) -> Optional[dict]:
+    ids = _finding_ids(finding)
     for hold in holds:
         if ids & set(hold["task_ids"]):
             return hold
     return None
+
+
+# ---------------------------------------------------------------------------
+# Governed-exception state model (TEMPORARY — Christopher, 2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+def state_model(config: dict) -> str:
+    """The configured state model. Unknown values fail closed (the pass raises)."""
+    model = config.get("state_model", STATE_MODEL_STRICT)
+    if model not in STATE_MODELS:
+        raise ValueError(f"state_model must be one of {STATE_MODELS}, got {model!r}")
+    return model
+
+
+def exception_authorization_digest(entry: dict) -> str:
+    """sha256 over an exception's scope and authorization record.
+
+    The config pins this value, so widening the covered conditions, adding task
+    ids, changing owner/authorizer/dates or the expiry without re-recording the
+    digest invalidates the exception (DEGRADED). It detects unrecorded edits;
+    it is not a signature and does not authenticate the author.
+    """
+    scope = {
+        "kind": entry.get("kind"),
+        "task_ids": sorted(entry.get("task_ids") or []),
+        "conditions": sorted(entry.get("conditions") or []),
+        "owner": entry.get("owner"),
+        "authorized_by": entry.get("authorized_by"),
+        "created": entry.get("created"),
+        "expires_at": entry.get("expires_at"),
+    }
+    return hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _exception_problem(entry: dict, seen: set, now: float) -> Optional[str]:
+    if entry.get("kind") not in EXCEPTION_KINDS:
+        return "unknown_kind"
+    if entry["name"] in seen:
+        return "duplicate_name"
+    for key in ("owner", "reason", "authorized_by", "review_condition"):
+        if not str(entry.get(key) or "").strip():
+            return f"missing_{key}"
+    try:
+        _dt.date.fromisoformat(str(entry.get("created") or ""))
+    except ValueError:
+        return "invalid_created"
+    conditions = entry.get("conditions")
+    if (not isinstance(conditions, list) or not conditions
+            or not all(isinstance(c, str) and len(c.split("|")) == 3 and all(c.split("|"))
+                       for c in conditions)):
+        return "invalid_conditions"
+    if entry["kind"] == EXCEPTION_KIND_RECOVERY_HOLD:
+        ids = entry.get("task_ids")
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i.strip() for i in ids):
+            return "invalid_task_ids"
+    if entry.get("authorization_sha256") != exception_authorization_digest(entry):
+        return "authorization_digest_mismatch"
+    expires = entry.get("expires_at")
+    if expires not in (None, ""):
+        ts = _parse_ts(expires)
+        if ts is None:
+            return "invalid_expires_at"
+        if now >= ts:
+            return "expired"
+    return None
+
+
+def governed_exceptions(config: dict, now: float) -> tuple[list[dict], list[tuple[str, str]], set]:
+    """Validate the governed-exception block.
+
+    Returns ``(valid, invalid, frozen_task_ids)``. A malformed block raises (the
+    pass fails and ``OnFailure=`` alerts). A malformed or expired *entry* is
+    reported as an actionable ``governed_exception_valid`` finding instead, and
+    covers nothing. Task ids named by any recovery-hold entry — valid or not —
+    stay frozen against automatic mutation: invalidity never releases frozen work.
+    """
+    block = config.get("governed_exceptions")
+    if not isinstance(block, dict):
+        raise ValueError("state_model 'governed_exceptions' requires a governed_exceptions object")
+    if block.get("temporary") is not True:
+        raise ValueError("governed_exceptions must declare temporary: true")
+    for key in ("authorized_by", "purpose", "revert"):
+        if not str(block.get(key) or "").strip():
+            raise ValueError(f"governed_exceptions is missing {key!r}")
+    entries = block.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("governed_exceptions.entries must be a list")
+    valid: list[dict] = []
+    invalid: list[tuple[str, str]] = []
+    frozen: set = set()
+    seen: set = set()
+    for index, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            invalid.append((f"entry-{index}", "not_an_object"))
+            continue
+        name = str(raw.get("name") or "").strip() or f"entry-{index}"
+        entry = {**raw, "name": name}
+        if entry.get("kind") == EXCEPTION_KIND_RECOVERY_HOLD and isinstance(entry.get("task_ids"), list):
+            frozen.update(i.strip() for i in entry["task_ids"] if isinstance(i, str) and i.strip())
+        problem = "missing_name" if not str(raw.get("name") or "").strip() else _exception_problem(entry, seen, now)
+        seen.add(name)
+        if problem:
+            invalid.append((name, problem))
+        else:
+            valid.append(entry)
+    return valid, invalid, frozen
+
+
+class _GovernanceCarrier(Invariant):
+    """Carrier for controller-generated findings about the exceptions themselves."""
+
+    max_attempts = 0
+
+    def __init__(self, name: str, tier: str) -> None:
+        self.name = name
+        self.tier = tier
+
+    def check(self, ctx: "Context") -> list[Finding]:
+        return []
 
 
 class _HoldEscalation(Invariant):
@@ -295,32 +477,39 @@ class Controller:
         state = self.store.load()
         if not state.get("installed_at"):
             state["installed_at"] = now
-        result = PassResult(tier, "GREEN", 0, [], [], [], [])
+        model = state_model(self.ctx.config)
+        result = PassResult(tier, "GREEN", 0, [], [], [], [], state_model=model)
         self._alert_queue: list[tuple[Finding, dict]] = []
         holds = recovery_holds(self.ctx.config)
-        held: dict[str, list[Finding]] = {}
-        for inv in [i for i in self.invariants if i.tier == tier]:
-            findings = self._observe(inv)
-            present = {f.fingerprint for f in findings}
-            result.findings += len(findings)
-            for finding in findings:
-                hold = hold_for(finding, holds)
-                if hold is not None:
-                    self._hold(finding, hold, inv.tier, state, result)
-                    held.setdefault(hold["name"], []).append(finding)
-                    continue
-                self._process(inv, finding, state, result)
-            self._resolve_absent(inv, present, state, result)
-        self._escalate_holds(tier, holds, held, state, result)
+        governed: dict = {}
+        if model == STATE_MODEL_GOVERNED:
+            governed = self._observe_governed(tier, holds, state, result, now)
+        else:
+            held: dict[str, list[Finding]] = {}
+            for inv in [i for i in self.invariants if i.tier == tier]:
+                findings = self._observe(inv)
+                present = {f.fingerprint for f in findings}
+                result.findings += len(findings)
+                for finding in findings:
+                    hold = hold_for(finding, holds)
+                    if hold is not None:
+                        self._hold(finding, hold, inv.tier, state, result)
+                        held.setdefault(hold["name"], []).append(finding)
+                        continue
+                    self._process(inv, finding, state, result)
+                self._resolve_absent(inv, present, state, result)
+            self._escalate_holds(tier, holds, held, state, result)
         self._flush_alerts()
-        if result.escalated or result.open or result.held or any(
+        if model == STATE_MODEL_GOVERNED:
+            result.status, result.classes = self._classify(tier, state, governed["valid_names"])
+        elif result.escalated or result.open or result.held or any(
             rec.get("status") == STATUS_ESCALATED and rec.get("tier") == tier
             for rec in state["fingerprints"].values()
         ):
             result.status = "DEGRADED"
         state.setdefault("last_pass", {})[tier] = _iso(now)
         self.store.save(state)
-        self.store.write_heartbeat(tier, {
+        beat = {
             "tier": tier,
             "finished_at": _iso(self.ctx.now()),
             "finished_ts": self.ctx.now(),
@@ -330,8 +519,125 @@ class Controller:
             "escalated": len(result.escalated),
             "open": len(result.open),
             "held": len(result.held),
-        })
+        }
+        if model == STATE_MODEL_GOVERNED:
+            beat.update({
+                "state_model": model,
+                "state_model_temporary": True,
+                "classes": result.classes,
+                "exceptions": governed["summary"],
+                "invalid_exceptions": governed["invalid"],
+            })
+        self.store.write_heartbeat(tier, beat)
         return result
+
+    # -- GOVERNED EXCEPTIONS (temporary model) --------------------------------
+
+    def _observe_governed(self, tier: str, holds: list[dict], state: dict,
+                          result: PassResult, now: float) -> dict:
+        """OBSERVE/CLASSIFY under the governed-exception model.
+
+        Every invariant still runs. A finding whose exact condition is named by
+        a valid exception is recorded ``held`` (visible, never recovered). A
+        finding on a frozen task that no valid exception names — a new or
+        changed condition — is processed without recovery and is actionable.
+        An unsafe finding is never covered and escalates at once.
+        """
+        valid, invalid, frozen = governed_exceptions(self.ctx.config, now)
+        for hold in holds:
+            frozen.update(hold["task_ids"])
+        by_condition = {c: entry for entry in valid for c in entry["conditions"]}
+        matched: dict[str, list[Finding]] = {}
+        for inv in [i for i in self.invariants if i.tier == tier]:
+            findings = self._observe(inv)
+            present = {f.fingerprint for f in findings}
+            result.findings += len(findings)
+            for finding in findings:
+                entry = None if finding.unsafe else by_condition.get(finding.condition)
+                if entry is not None:
+                    self._hold(finding, entry, inv.tier, state, result)
+                    matched.setdefault(entry["name"], []).append(finding)
+                elif finding.unsafe:
+                    self._process(inv, dataclasses.replace(finding, recoverable=False),
+                                  state, result, reason_override=ESCALATION_UNSAFE)
+                elif _finding_ids(finding) & frozen:
+                    self._process(inv, dataclasses.replace(finding, recoverable=False),
+                                  state, result, reason_override=ESCALATION_FROZEN_UNCOVERED)
+                else:
+                    self._process(inv, finding, state, result)
+            self._resolve_absent(inv, present, state, result)
+
+        validity = _GovernanceCarrier(EXCEPTION_VALIDITY_INVARIANT, tier)
+        invalid_present: set[str] = set()
+        for name, problem in invalid:
+            finding = Finding(EXCEPTION_VALIDITY_INVARIANT, f"{name}@{tier}",
+                              f"invalid:{problem}", {"exception": name})
+            invalid_present.add(finding.fingerprint)
+            result.findings += 1
+            self._process(validity, finding, state, result,
+                          reason_override=ESCALATION_EXCEPTION_INVALID)
+        self._resolve_absent(validity, invalid_present, state, result)
+
+        self._escalate_exceptions(tier, valid, matched, state, result)
+        summary = [{
+            "name": e["name"], "kind": e["kind"], "owner": e["owner"],
+            "authorized_by": e["authorized_by"], "created": e["created"],
+            "review_condition": e["review_condition"], "expires_at": e.get("expires_at"),
+            "conditions_present_this_pass": len(matched.get(e["name"], [])),
+        } for e in valid]
+        return {
+            "valid_names": {e["name"] for e in valid},
+            "summary": summary,
+            "invalid": [f"{name}:{problem}" for name, problem in invalid],
+        }
+
+    def _escalate_exceptions(self, tier: str, valid: list[dict], matched: dict[str, list[Finding]],
+                             state: dict, result: PassResult) -> None:
+        """One deduplicated, visible record per active exception (per tier)."""
+        carrier = _HoldEscalation(tier)
+        present: set[str] = set()
+        by_name = {e["name"]: e for e in valid}
+        for name, findings in sorted(matched.items()):
+            entry = by_name[name]
+            aggregate = Finding(
+                HOLD_INVARIANT, f"{name}@{tier}", "hold_active",
+                {
+                    "kind": entry["kind"],
+                    "owner": entry["owner"],
+                    "authorized_by": entry["authorized_by"],
+                    "created": entry["created"],
+                    "review_condition": entry["review_condition"],
+                    "expires_at": entry.get("expires_at"),
+                    "suppressed": sorted(f.condition for f in findings),
+                },
+            )
+            present.add(aggregate.fingerprint)
+            self._process(carrier, aggregate, state, result)
+        self._resolve_absent(carrier, present, state, result)
+
+    def _classify(self, tier: str, state: dict, valid_names: set) -> tuple[str, dict]:
+        """Aggregate this tier's live fingerprints into one governed status."""
+        classes = {"escalated": 0, "degraded": 0, "recovery": 0, "exception": 0}
+        for rec in state["fingerprints"].values():
+            if rec.get("tier") != tier or rec.get("status") == STATUS_RESOLVED:
+                continue
+            status = rec.get("status")
+            if status == STATUS_HELD:
+                cls = "exception"
+            elif rec.get("invariant") == HOLD_INVARIANT:
+                name = str(rec.get("subject") or "").rsplit("@", 1)[0]
+                cls = "exception" if name in valid_names else "degraded"
+            elif status == STATUS_ESCALATED:
+                cls = "escalated" if rec.get("escalation_reason") in _ESCALATED_CLASS_REASONS else "degraded"
+            elif status == STATUS_OPEN and int(rec.get("attempts") or 0) > 0:
+                cls = "recovery"
+            else:
+                cls = "degraded"
+            classes[cls] += 1
+        for cls, aggregate in _AGGREGATE_PRECEDENCE:
+            if classes[cls]:
+                return aggregate, classes
+        return AGGREGATE_GREEN, classes
 
     # -- OBSERVE -----------------------------------------------------------
 
@@ -347,7 +653,8 @@ class Controller:
 
     # -- CLASSIFY / RECOVER / REVALIDATE / ESCALATE --------------------------
 
-    def _process(self, inv: Invariant, finding: Finding, state: dict, result: PassResult) -> None:
+    def _process(self, inv: Invariant, finding: Finding, state: dict, result: PassResult,
+                 reason_override: Optional[str] = None) -> None:
         now = self.ctx.now()
         fp = finding.fingerprint
         rec = state["fingerprints"].get(fp)
@@ -397,13 +704,14 @@ class Controller:
                 self.store.record(self.ctx.now(), "green", fingerprint=fp, via="recovery")
                 return
             if rec["attempts"] >= inv.max_attempts:
-                self._escalate(finding, rec, "recovery_budget_exhausted", result)
+                self._escalate(finding, rec, ESCALATION_BUDGET_EXHAUSTED, result)
             else:
                 result.open.append(fp)
             return
 
-        reason = "not_recoverable" if not finding.recoverable else "recovery_budget_exhausted"
-        if rec["observations"] < max(1, inv.confirm_cycles):
+        reason = reason_override or (
+            ESCALATION_NOT_RECOVERABLE if not finding.recoverable else ESCALATION_BUDGET_EXHAUSTED)
+        if reason != ESCALATION_UNSAFE and rec["observations"] < max(1, inv.confirm_cycles):
             result.open.append(fp)
             return
         self._escalate(finding, rec, reason, result)
@@ -475,6 +783,7 @@ class Controller:
         rec = state["fingerprints"].get(fp)
         if rec is None or rec.get("status") not in (STATUS_HELD,):
             previous = rec.get("status") if rec else None
+            previous_card = rec.get("card_id") or rec.get("previous_card_id") if rec else None
             rec = {
                 "invariant": finding.invariant, "subject": finding.subject,
                 "signature": finding.signature, "tier": tier,
@@ -483,6 +792,9 @@ class Controller:
                 "status": STATUS_HELD, "held_by": hold["name"], "card_id": None,
                 "alert_delivered": True, "alert_attempts": 0,
             }
+            if previous_card:
+                # A hold never hides an earlier escalation: keep its card pointer.
+                rec["previous_card_id"] = previous_card
             state["fingerprints"][fp] = rec
             self.store.record(now, "held", fingerprint=fp, invariant=finding.invariant,
                               subject=finding.subject, hold=hold["name"], previous_status=previous)
@@ -1190,7 +1502,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         state = StateStore(ctx.state_dir).load()
         print(json.dumps({fp: {k: rec.get(k) for k in (
             "invariant", "subject", "signature", "status", "attempts", "card_id",
-            "alert_delivered")} for fp, rec in state["fingerprints"].items()}, indent=2))
+            "alert_delivered", "held_by", "escalation_reason", "previous_card_id")}
+            for fp, rec in state["fingerprints"].items()}, indent=2))
         return 0
     result = Controller(ctx, default_invariants()).run(args.tier)
     # Silent when GREEN unless asked. Handled findings are not a crash: exit 0

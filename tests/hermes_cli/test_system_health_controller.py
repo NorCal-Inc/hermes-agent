@@ -885,3 +885,287 @@ class TestRecoveryHold:
         (hold,) = shc.recovery_holds(config)
         assert hold["task_ids"] == sorted(["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"])
         assert "Christopher" in hold["authorized_by"] and hold["release"]
+
+
+# ---------------------------------------------------------------------------
+# Governed-exception state model (TEMPORARY stabilization, Christopher,
+# 2026-09-14): GREEN / GREEN_WITH_HOLDS / RECOVERY / DEGRADED / ESCALATED.
+# ---------------------------------------------------------------------------
+
+
+PHASE3_IDS = ["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"]
+
+
+def _exception(name, kind, conditions, *, task_ids=None, expires_at=None, **overrides):
+    entry = {
+        "name": name, "kind": kind, "conditions": list(conditions),
+        "owner": "Christopher", "reason": "test reason",
+        "authorized_by": "Christopher, 2026-09-14 (test)", "created": "2026-09-14",
+        "review_condition": "review when the backlog is cleared", "expires_at": expires_at,
+    }
+    if task_ids is not None:
+        entry["task_ids"] = list(task_ids)
+    entry.update(overrides)
+    entry["authorization_sha256"] = shc.exception_authorization_digest(entry)
+    return entry
+
+
+def _governed(*entries, recovery_holds=None, model=shc.STATE_MODEL_GOVERNED):
+    config = {
+        "governed_exceptions": {
+            "temporary": True, "authorized_by": "Christopher, 2026-09-14 (test)",
+            "purpose": "stabilization", "revert": "delete state_model",
+            "entries": list(entries),
+        },
+    }
+    if model is not None:
+        config["state_model"] = model
+    if recovery_holds is not None:
+        config["recovery_holds"] = recovery_holds
+    return config
+
+
+def _bare_lane_verified_closure(conn, title="Recover degraded shared boot gate"):
+    tid = kb.create_task(conn, title=title, assignee="default", gauntlet=True)
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "verification_passed",
+                         {"verifier": "codex_verify", "source": "record_verification"})
+        conn.execute("UPDATE tasks SET status = 'done', verification_state = ? WHERE id = ?",
+                     (kb.VERIFICATION_VERIFIED, tid))
+    return tid
+
+
+def _relabel_condition(tid, status="review"):
+    return f"subject_lane_relabelled|{tid}|subject_on_codex_verify_lane:{status}"
+
+
+class TestGovernedExceptionStateModel:
+    def test_no_holds_and_no_faults_is_green(self, kanban_home):
+        result = shc.Controller(_ctx(kanban_home, config=_governed()),
+                                [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_GREEN
+        beat = shc.StateStore(kanban_home / "state" / "system-health-controller").read_heartbeat("light")
+        assert beat["status"] == "GREEN" and beat["state_model"] == "governed_exceptions"
+        assert beat["state_model_temporary"] is True
+
+    def test_only_valid_frozen_phase3_holds_is_green_with_holds(self, kanban_home):
+        alerts = Alerts()
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+            before = _board_snapshot(conn, [subject])
+        inv = Counting(shc.SubjectLaneRelabelled())
+        config = _governed(_exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)],
+                                      task_ids=[subject]))
+        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=config), [inv]).run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_GREEN_WITH_HOLDS
+        assert inv.recoveries == 0 and len(result.held) == 1
+        assert result.classes == {"escalated": 0, "degraded": 0, "recovery": 0, "exception": 2}
+        with kb.connect_closing() as conn:
+            assert _board_snapshot(conn, [subject])["rows"] == before["rows"]
+            (card,) = _health_cards(conn)          # the exception stays visible
+            assert card["idempotency_key"].startswith("health:recovery_hold:")
+        assert len(alerts.sent) == 1
+
+    def test_only_preserved_false_verified_records_is_green_with_holds(self, kanban_home):
+        with kb.connect_closing() as conn:
+            first = _bare_lane_verified_closure(conn)
+            second = _bare_lane_verified_closure(conn, title="second")
+            events_before = [_kinds(conn, first), _kinds(conn, second)]
+        conditions = [f"verified_closure_attributable|{t}|verified_by_bare_or_missing_identity"
+                      for t in (first, second)]
+        config = _governed(_exception("preserved-false-verified", "preserved_condition", conditions,
+                                      owner="Erika"))
+        result = shc.Controller(_ctx(kanban_home, config=config),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert result.status == shc.AGGREGATE_GREEN_WITH_HOLDS and len(result.held) == 2
+        with kb.connect_closing() as conn:
+            assert [_kinds(conn, first), _kinds(conn, second)] == events_before
+            for tid in (first, second):
+                task = kb.get_task(conn, tid)
+                assert (task.status, task.verification_state) == ("done", kb.VERIFICATION_VERIFIED)
+        beat = shc.StateStore(kanban_home / "state" / "system-health-controller").read_heartbeat("deep")
+        (summary,) = beat["exceptions"]
+        assert summary["owner"] == "Erika" and summary["conditions_present_this_pass"] == 2
+
+    def test_valid_hold_plus_real_actionable_fault_is_degraded(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+            _subject_without_evidence(conn, title="active work, no evidence")
+        config = _governed(_exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)],
+                                      task_ids=[subject]))
+        result = shc.Controller(_ctx(kanban_home, config=config),
+                                [shc.SubjectLaneRelabelled(), shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_DEGRADED
+        assert result.classes["degraded"] == 1 and result.classes["exception"] == 2
+
+    @pytest.mark.parametrize("breakage", ["expired", "digest", "missing_owner"])
+    def test_expired_or_invalid_hold_is_degraded_and_frozen_work_stays_frozen(self, kanban_home, breakage):
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+        if breakage == "expired":
+            entry = _exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)],
+                               task_ids=[subject], expires_at="2020-01-01T00:00:00+00:00")
+        elif breakage == "digest":   # scope widened after authorization was recorded
+            entry = _exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)],
+                               task_ids=[subject])
+            entry["conditions"].append(f"verifier_route_open|{subject}|no_route:evidence_missing")
+        else:
+            entry = _exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)],
+                               task_ids=[subject], owner="")
+        inv = Counting(shc.SubjectLaneRelabelled())
+        ctx = _ctx(kanban_home, config=_governed(entry))
+        result = shc.Controller(ctx, [inv]).run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_DEGRADED
+        assert inv.recoveries == 0 and result.held == []
+        with kb.connect_closing() as conn:
+            assert kb.get_task(conn, subject).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+        beat = shc.StateStore(ctx.state_dir).read_heartbeat("light")
+        assert beat["invalid_exceptions"] and beat["exceptions"] == []
+        state = shc.StateStore(ctx.state_dir).load()
+        (validity,) = [r for r in state["fingerprints"].values()
+                       if r["invariant"] == shc.EXCEPTION_VALIDITY_INVARIANT]
+        assert validity["escalation_reason"] == shc.ESCALATION_EXCEPTION_INVALID
+        assert validity["subject"] == "phase3-freeze@light" and validity["card_id"]
+
+    def test_an_invalid_exception_is_itself_an_actionable_fault(self, kanban_home):
+        """Nothing it names is present, so only its own invalidity can degrade the pass."""
+        alerts = Alerts()
+        stale = _exception("expired-preservation", "preserved_condition",
+                           ["verified_closure_attributable|t_gone|verified_by_bare_or_missing_identity"],
+                           expires_at="2020-01-01")
+        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=_governed(stale)),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert result.status == shc.AGGREGATE_DEGRADED
+        assert len(alerts.sent) == 1 and "invalid:expired" in alerts.sent[0][1]
+
+    def test_active_repair_is_recovery(self, kanban_home):
+        with kb.connect_closing() as conn:
+            _subject_evidence_after_handoff(conn)
+        route = Counting(shc.VerifierRouteOpen(), recover_noop=True)
+        result = shc.Controller(_ctx(kanban_home, config=_governed()), [route]).run(shc.TIER_LIGHT)
+        assert route.recoveries == 1 and len(result.open) == 1
+        assert result.status == shc.AGGREGATE_RECOVERY
+
+    def test_repair_that_exhausts_its_budget_is_escalated(self, kanban_home):
+        clock = Clock()
+        with kb.connect_closing() as conn:
+            _subject_evidence_after_handoff(conn)
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, config=_governed()),
+                                    [Counting(shc.VerifierRouteOpen(), recover_noop=True)])
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_RECOVERY
+        clock.advance(300)
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_ESCALATED
+
+    def test_unsafe_fault_is_escalated_at_once_even_on_an_excepted_condition(self, kanban_home):
+        class BoundaryBreach(shc.Invariant):
+            name = "company_boundary"
+            tier = shc.TIER_LIGHT
+            confirm_cycles = 3
+            recoveries = 0
+
+            def check(self, ctx):
+                return [shc.Finding(self.name, "t_x", "cross_lane_attachment", {},
+                                    recoverable=True, unsafe=True)]
+
+            def recover(self, ctx, finding):
+                BoundaryBreach.recoveries += 1
+                return shc.RecoveryOutcome(True, "should_never_run")
+
+        alerts = Alerts()
+        config = _governed(_exception("would-cover", "preserved_condition",
+                                      ["company_boundary|t_x|cross_lane_attachment"]))
+        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=config),
+                                [BoundaryBreach()]).run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_ESCALATED
+        assert BoundaryBreach.recoveries == 0 and result.held == []
+        assert len(alerts.sent) == 1 and "reason: unsafe" in alerts.sent[0][1]
+
+    def test_held_condition_is_rechecked_every_pass_and_a_material_change_degrades(self, kanban_home):
+        clock = Clock()
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+        inv = Counting(shc.SubjectLaneRelabelled())
+        ctx = _ctx(kanban_home, clock=clock, config=_governed(
+            _exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)], task_ids=[subject])))
+        controller = shc.Controller(ctx, [inv])
+        for expected_checks in (1, 2, 3):
+            assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_GREEN_WITH_HOLDS
+            assert inv.checks == expected_checks
+            clock.advance(300)
+        state = shc.StateStore(ctx.state_dir).load()
+        (held,) = [r for r in state["fingerprints"].values() if r["status"] == shc.STATUS_HELD]
+        assert held["held_by"] == "phase3-freeze" and held["observations"] == 3
+
+        with kb.connect_closing() as conn:   # the frozen card changes: a new condition
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (subject,))
+        changed = controller.run(shc.TIER_LIGHT)
+        assert changed.status == shc.AGGREGATE_DEGRADED
+        assert inv.recoveries == 0
+        with kb.connect_closing() as conn:
+            assert kb.get_task(conn, subject).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+        state = shc.StateStore(ctx.state_dir).load()
+        assert any(r["escalation_reason"] == shc.ESCALATION_FROZEN_UNCOVERED
+                   for r in state["fingerprints"].values() if r.get("escalation_reason"))
+
+    def test_existing_escalation_card_pointer_survives_the_switch_to_held(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _bare_lane_verified_closure(conn)
+        ctx_strict = _ctx(kanban_home, config={})
+        shc.Controller(ctx_strict, [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        (card_id,) = [r["card_id"] for r in shc.StateStore(ctx_strict.state_dir).load()["fingerprints"].values()]
+        config = _governed(_exception("preserved", "preserved_condition",
+                                      [f"verified_closure_attributable|{tid}|verified_by_bare_or_missing_identity"]))
+        shc.Controller(_ctx(kanban_home, config=config), [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        recs = shc.StateStore(ctx_strict.state_dir).load()["fingerprints"].values()
+        (held,) = [r for r in recs if r["status"] == shc.STATUS_HELD]
+        assert held["previous_card_id"] == card_id
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT status FROM tasks WHERE id = ?", (card_id,)).fetchone()[0] == "triage"
+
+    def test_removing_the_state_model_flag_restores_strict_semantics(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = _relabelled_subject(conn)
+        entry = _exception("phase3-freeze", "recovery_hold", [_relabel_condition(subject)], task_ids=[subject])
+        strict_hold = [{"name": "phase3-freeze", "task_ids": [subject], "reason": "frozen",
+                        "authorized_by": "test", "release": "on release"}]
+        governed = _governed(entry, recovery_holds=strict_hold)
+        assert shc.Controller(_ctx(kanban_home, config=governed),
+                              [shc.SubjectLaneRelabelled()]).run(shc.TIER_LIGHT).status == "GREEN_WITH_HOLDS"
+
+        reverted = _governed(entry, recovery_holds=strict_hold, model=None)   # flag deleted
+        ctx = _ctx(kanban_home, config=reverted)
+        inv = Counting(shc.SubjectLaneRelabelled())
+        result = shc.Controller(ctx, [inv]).run(shc.TIER_LIGHT)
+        assert result.status == "DEGRADED" and result.state_model == shc.STATE_MODEL_STRICT
+        assert inv.recoveries == 0 and len(result.held) == 1      # original hold semantics
+        beat = shc.StateStore(ctx.state_dir).read_heartbeat("light")
+        assert "state_model" not in beat and beat["status"] == "DEGRADED"
+        with kb.connect_closing() as conn:
+            assert kb.get_task(conn, subject).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+
+    @pytest.mark.parametrize("bad", [
+        {"state_model": "lenient"},
+        {"state_model": "governed_exceptions"},
+        {"state_model": "governed_exceptions", "governed_exceptions": {"temporary": False, "authorized_by": "a",
+                                                                      "purpose": "p", "revert": "r", "entries": []}},
+    ])
+    def test_malformed_state_model_fails_closed(self, kanban_home, bad):
+        with pytest.raises(ValueError):
+            shc.Controller(_ctx(kanban_home, config=bad), [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+
+    def test_repository_config_governed_exceptions_are_valid_and_temporary(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        assert config["state_model"] == shc.STATE_MODEL_GOVERNED
+        block = config["governed_exceptions"]
+        assert block["temporary"] is True and "Christopher" in block["authorized_by"] and block["revert"]
+        valid, invalid, frozen = shc.governed_exceptions(config, time.time())
+        assert invalid == []
+        by_kind = {e["kind"]: e for e in valid}
+        hold = by_kind["recovery_hold"]
+        assert sorted(hold["task_ids"]) == sorted(PHASE3_IDS)
+        assert frozen == set(PHASE3_IDS)
+        (strict_hold,) = shc.recovery_holds(config)
+        assert hold["name"] == strict_hold["name"]      # same aggregate fingerprint and card
+        preserved = by_kind["preserved_condition"]["conditions"]
+        assert {c.split("|")[1] for c in preserved} == {"t_e48487e5", "t_29c7a57b"}

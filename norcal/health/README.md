@@ -29,6 +29,42 @@ exists (e.g. after lost state) suppresses a repeat alert.
 
 State, ledger and heartbeats: `~/.hermes/state/system-health-controller/`.
 
+## State model — TEMPORARY governed exceptions (Christopher, 2026-09-14)
+
+`state_model` selects how a pass reports. **Absent or `strict`** is the original behaviour:
+GREEN or DEGRADED, and any held finding is DEGRADED. **`governed_exceptions`** is a temporary
+stabilization measure so the controller can report a healthy runtime while intentionally frozen
+or historically preserved conditions remain:
+
+| Status | Meaning |
+|---|---|
+| `GREEN` | no actionable fault, no recovery in flight, nothing escalated, no exception active |
+| `GREEN_WITH_HOLDS` | healthy; only conditions named by a valid governed exception remain (still observed every pass, visible in the heartbeat and state, one deduplicated card per exception) |
+| `RECOVERY` | an allowlisted repair ran and has not revalidated yet (budget left) |
+| `DEGRADED` | an actionable fault: detect-only escalation, a condition not yet confirmed, a new/changed condition on a frozen card (`frozen_condition_not_covered`), or an invalid/expired exception (`governed_exception_valid`) |
+| `ESCALATED` | automatic repair failed its budget, or the finding is unsafe (security/boundary) — never covered by an exception, escalated at once |
+
+Precedence when several apply: ESCALATED > DEGRADED > RECOVERY > GREEN_WITH_HOLDS > GREEN.
+
+Each entry in `governed_exceptions.entries` names **exact conditions** (`invariant|subject|signature`),
+`kind` (`recovery_hold` also freezes `task_ids`; `preserved_condition`), `owner`, `reason`,
+`authorized_by`, `created`, `review_condition`, optional `expires_at`, and `authorization_sha256`
+(`exception_authorization_digest`) pinning scope + authorization. An edited scope, a digest mismatch,
+a missing field or a past expiry makes the entry invalid: it covers nothing and reports DEGRADED.
+Task ids under **any** recovery hold — valid or not, and `recovery_holds` too — are never
+automatically mutated. A condition on a frozen card that the exception does not name is DEGRADED.
+Holds never hide an earlier escalation card (`previous_card_id` is kept).
+
+**Revert:** delete the `state_model` key. Strict GREEN/DEGRADED returns immediately; the
+`governed_exceptions` block is then ignored and can be removed at leisure; no board or ledger
+history is rewritten. Review and revert once the backlog and the historical incidents are resolved
+(`Business/Operations/2026-09-14-system-health-controller-t_b8d62378.md` §17).
+
+Current entries: `phase3-hermes-cutover-freeze` (four exact Phase 3 conditions; owner Christopher;
+review when the freeze is released) and `preserved-false-verified-records` (`t_e48487e5`,
+`t_29c7a57b`; owner Erika; review on her incident ruling). `t_69440ff2` is deliberately **not**
+covered — no authorization names it.
+
 ## Verify
 
 ```

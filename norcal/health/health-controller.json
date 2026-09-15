@@ -2,6 +2,48 @@
   "alert_target": "telegram:-1003786882754",
   "boot_gate_command": null,
   "gateway_heartbeat_max_age_seconds": 180,
+  "state_model": "governed_exceptions",
+  "governed_exceptions": {
+    "temporary": true,
+    "authorized_by": "Christopher, 2026-09-14, in session (t_b8d62378: temporary governed-exception state model)",
+    "purpose": "Temporary stabilization: intentionally frozen, owner-approved or historically preserved conditions stay observed and visible every pass but report GREEN_WITH_HOLDS instead of forcing DEGRADED",
+    "revert": "Delete the state_model key (strict GREEN/DEGRADED semantics return; recovery_holds keep the Phase 3 cards frozen). Review and revert once the backlog and the historical incidents are resolved. No history is rewritten either way.",
+    "entries": [
+      {
+        "name": "phase3-hermes-cutover-freeze",
+        "kind": "recovery_hold",
+        "task_ids": ["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"],
+        "conditions": [
+          "subject_lane_relabelled|t_3883034a|subject_on_codex_verify_lane:triage",
+          "subject_review_regressed|t_3883034a|pending_subject_in_triage",
+          "verifier_child_deadlocked|t_4d21959c|verifier_child_gated:undeclared",
+          "verifier_route_open|t_15d87799|no_route:evidence_missing"
+        ],
+        "owner": "Christopher (official Hermes cutover / Phase 3 freeze)",
+        "reason": "Official Hermes cutover (Phase 3 overlay extraction) is frozen; these exact conditions on its cards are known and intentionally left unrepaired",
+        "authorized_by": "Christopher, 2026-09-14, in session (recovery hold option A; governed-exception state model)",
+        "created": "2026-09-14",
+        "review_condition": "Christopher releases the Phase 3 freeze: delete this entry and the recovery_holds entry together. Any other condition on these cards is not covered and reports DEGRADED.",
+        "expires_at": null,
+        "authorization_sha256": "c5316f3c3ca47fbc19018b6f2556fef053b275b58bab4de36dc16be7182041ad"
+      },
+      {
+        "name": "preserved-false-verified-records",
+        "kind": "preserved_condition",
+        "conditions": [
+          "verified_closure_attributable|t_e48487e5|verified_by_bare_or_missing_identity",
+          "verified_closure_attributable|t_29c7a57b|verified_by_bare_or_missing_identity"
+        ],
+        "owner": "Erika (false-VERIFIED integrity incident adjudication)",
+        "reason": "Historical false-VERIFIED closures preserved as evidence; they must never be rewritten, so the condition cannot clear by repair",
+        "authorized_by": "Christopher, 2026-09-14, in session (governed-exception state model)",
+        "created": "2026-09-14",
+        "review_condition": "Erika rules on the t_e48487e5 / t_29c7a57b integrity incident, or the temporary governed-exception model is reverted",
+        "expires_at": null,
+        "authorization_sha256": "849b0248417ea26628a572c30371498d42200b82cd6743a24a4a090d0f7ee233"
+      }
+    ]
+  },
   "recovery_holds": [
     {
       "name": "phase3-hermes-cutover-freeze",
