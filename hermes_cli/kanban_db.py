@@ -9178,6 +9178,57 @@ def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -
     return attempts >= limit, attempts, limit, root
 
 
+def _in_flight_verifier_for_subject(
+    conn: sqlite3.Connection, subject_id: str
+) -> Optional[tuple[str, int]]:
+    """The independent verifier already running against ``subject_id``'s open review, if any.
+
+    Returns ``(verifier_task_id, run_id)`` only when ALL of these hold:
+
+    * the subject is itself not a ``codex_verify`` card (a verifier is never an
+      exempt subject -- no verifier-of-verifier);
+    * the subject is parked in ``review`` with ``verification_state='pending'``;
+    * a ``codex_verify`` child linked to it is ``running`` on an open current run;
+    * that run started during the subject's current review phase (at or after
+      its latest ``review_requested``) -- a leftover from an earlier phase is not
+      this phase's verifier.
+
+    Used by :func:`_block_objective_attempt_ceiling`: the verifier's claim was the
+    attempt the ceiling allowed, so its verdict must still be able to land in the
+    review lane (2026-09-15, ``t_b8d62378`` events 158976-158993).
+    """
+    srow = conn.execute(
+        "SELECT status, verification_state, executor_lane FROM tasks WHERE id = ?",
+        (subject_id,),
+    ).fetchone()
+    if (
+        srow is None
+        or srow["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY
+        or srow["status"] != "review"
+        or srow["verification_state"] != VERIFICATION_PENDING
+    ):
+        return None
+    phase = conn.execute(
+        "SELECT MAX(created_at) AS at FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested'",
+        (subject_id,),
+    ).fetchone()
+    if phase is None or phase["at"] is None:
+        return None
+    row = conn.execute(
+        "SELECT c.id AS id, r.id AS run_id FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id "
+        "JOIN task_runs r ON r.id = c.current_run_id "
+        "WHERE l.parent_id = ? AND c.executor_lane = ? AND c.status = 'running' "
+        "AND r.ended_at IS NULL AND r.started_at >= ? "
+        "ORDER BY r.started_at ASC, r.id ASC LIMIT 1",
+        (subject_id, EXECUTOR_LANE_CODEX_VERIFY, int(phase["at"])),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["id"]), int(row["run_id"])
+
+
 def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> None:
     reached, attempts, limit, root = _objective_attempt_ceiling_reached(conn, task_id)
     if not reached:
@@ -9191,6 +9242,20 @@ def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> 
     for tid in dict.fromkeys((root, task_id)):
         row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
         if row is None or row["status"] in ("done", "archived", "failed", "cancelled"):
+            continue
+        in_flight = _in_flight_verifier_for_subject(conn, tid)
+        if in_flight is not None:
+            # The ceiling still refuses every NEW claim (each caller returns
+            # None after this call). What it must not do is pull a subject out
+            # of the review lane while the verifier whose claim WAS the last
+            # allowed attempt is running: record_verification only accepts a
+            # verdict from ``review``, so blocking here strands a valid PASS or
+            # FAIL. Once that verifier ends -- verdict or not -- this exemption
+            # no longer matches and the next ceiling check blocks as before.
+            _emit_once_this_phase(conn, tid, "objective_attempt_ceiling_verdict_pending", {
+                "objective": root, "attempts": attempts, "limit": limit,
+                "verifier_task": in_flight[0], "verifier_run": in_flight[1],
+            })
             continue
         conn.execute(
             "UPDATE tasks SET status='blocked', block_kind=?, "
