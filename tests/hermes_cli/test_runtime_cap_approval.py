@@ -379,9 +379,12 @@ class TestForgedRecordsDoNotCount:
         {"max_runtime_seconds": 1800, "previous": 300, "source": "human_approval",
          "authorization_source": "kanban_db.approve_runtime_cap", "approved_by": "christopher",
          "actor_kind": "human_interactive", "actor_id": "christopher", "reason": " "},
+        {"max_runtime_seconds": 1800, "previous": 300, "source": "operator",
+         "authorization_source": "kanban_db.approve_runtime_cap", "approved_by": "christopher",
+         "actor_kind": "human_interactive", "actor_id": "christopher", "reason": "wrong source"},
     ], ids=["codex-forgery", "retired-2026-09-07", "no-provenance", "legacy-unattributed",
             "malformed", "no-authorization-source", "wrong-actor-kind", "automation-approver",
-            "profile-actor", "blank-reason"])
+            "profile-actor", "blank-reason", "wrong-source"])
     def test_a_record_claiming_approval_is_not_approval(
         self, kanban_home, baseline, monkeypatch, payload,
     ):
@@ -495,6 +498,26 @@ class TestOnlyAHumanOperatorCanApprove:
             with pytest.raises(kb.RuntimeCapApprovalRefused, match="worker"):
                 _approve(conn, tid, 2700)
             assert _cap(conn, tid) == 300 and _raise_events(conn, tid) == 0
+
+    def test_refused_when_sharing_a_running_workers_process_group(self, kanban_home):
+        """A detached-looking child of the worker still shares its process group."""
+        import subprocess
+
+        sibling = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            assert sibling.pid not in kb._process_ancestry()
+            with kb.connect_closing() as conn:
+                tid = _card(conn, cap=300)
+                worker = _card(conn, cap=300)
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET status='running', worker_pid=? WHERE id=?",
+                                 (sibling.pid, worker))
+                with pytest.raises(kb.RuntimeCapApprovalRefused, match="process group"):
+                    _approve(conn, tid, 2700)
+                assert _cap(conn, tid) == 300 and _raise_events(conn, tid) == 0
+        finally:
+            sibling.kill()
+            sibling.wait()
 
     @pytest.mark.parametrize("kwargs", [
         {"approved_by": "", "reason": "r"},
