@@ -510,6 +510,52 @@ class TestOnlyAHumanOperatorCanApprove:
                 _approve(conn, tid, 2700, env={kb.ENV_ACTOR_KIND: kb.ACTOR_KIND_HUMAN_INTERACTIVE})
             assert _cap(conn, tid) == 300 and _raise_events(conn, tid) == 0
 
+    @pytest.mark.parametrize("identity", [
+        "overall_manager", "triptracker_lead", "compliance_worker", "marketing_agent",
+        "ops-supervisor", "system-health-controller", "kanban-dispatcher", "atlas-codex-lane",
+        "stale_supervision", "codex_verify", "some_verifier", "nightly-bot",
+    ])
+    def test_role_shaped_identities_are_refused_without_a_profiles_directory(
+        self, kanban_home, identity,
+    ):
+        """Identity rejection must not depend on what happens to exist on disk.
+
+        x_11bf8cfd8180c2ee accepted HERMES_ACTOR_ID=overall_manager in an isolated
+        home because _automation_identity partly consults HERMES_HOME/profiles.
+        """
+        import shutil
+
+        shutil.rmtree(kanban_home / "profiles")
+        with kb.connect_closing() as conn:
+            tid = _card(conn, cap=300)
+            with pytest.raises(kb.RuntimeCapApprovalRefused, match="automation identity"):
+                _approve(conn, tid, 2700,
+                         env={kb.ENV_ACTOR_KIND: kb.ACTOR_KIND_HUMAN_INTERACTIVE,
+                              kb.ENV_ACTOR_ID: identity})
+            with pytest.raises(kb.RuntimeCapApprovalRefused, match="automation identity"):
+                _approve(conn, tid, 2700, approved_by=identity)
+            assert _cap(conn, tid) == 300 and _raise_events(conn, tid) == 0
+
+    @pytest.mark.parametrize("field", ["approved_by", "actor_id"])
+    def test_a_record_naming_a_role_shaped_identity_is_not_approval(
+        self, kanban_home, baseline, monkeypatch, field,
+    ):
+        import shutil
+
+        shutil.rmtree(kanban_home / "profiles")
+        payload = {
+            "max_runtime_seconds": 1800, "previous": 300, "source": "human_approval",
+            "authorization_source": "kanban_db.approve_runtime_cap",
+            "approved_by": "christopher", "actor_kind": "human_interactive",
+            "actor_id": "christopher", "reason": "role identity",
+        }
+        payload[field] = "overall_manager"
+        with kb.connect_closing() as conn:
+            tid = _card(conn, cap=1800)
+            _forge(conn, tid, payload)
+            assert kb.approved_runtime_cap(conn, tid) is None
+        assert _direct_claude_grant(monkeypatch, tid) == 300
+
     def test_refused_when_sharing_a_running_workers_process_group(self, kanban_home):
         """A detached-looking child of the worker still shares its process group."""
         import subprocess

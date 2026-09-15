@@ -9454,6 +9454,32 @@ def _valid_ladder_raise(
     return timeouts >= RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG
 
 
+#: Role-shaped identities. ``_automation_identity`` knows a short hard-coded
+#: set, ``*-lane``, and whatever happens to have a directory under the ACTIVE
+#: HERMES_HOME -- so on a board whose profiles live elsewhere, an identity like
+#: ``overall_manager`` read as human (independent verification
+#: x_11bf8cfd8180c2ee). An approval must never depend on filesystem contents,
+#: so these role words are refused wherever they appear in the name.
+_AUTOMATION_ROLE_WORDS = (
+    "worker", "lead", "agent", "manager", "bot", "automation", "dispatcher",
+    "supervisor", "controller", "verifier", "swarm", "daemon", "service",
+    "executor", "lane", "auditor", "atlas", "system",
+)
+_AUTOMATION_ROLE_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:" + "|".join(_AUTOMATION_ROLE_WORDS) + r")(?:[^a-z0-9]|$)"
+)
+
+
+def _automation_style_identity(name: str) -> bool:
+    """Whether ``name`` is an automation identity, filesystem or not."""
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return True
+    if _automation_identity(lowered):
+        return True
+    return bool(_AUTOMATION_ROLE_RE.search(lowered))
+
+
 def _valid_human_approval(payload: dict) -> bool:
     """Whether ``payload`` is in the format only ``approve_runtime_cap`` writes."""
     if payload.get("source") != RUNTIME_CAP_APPROVAL_SOURCE_HUMAN:
@@ -9465,8 +9491,7 @@ def _valid_human_approval(payload: dict) -> bool:
     if not str(payload.get("reason") or "").strip():
         return False
     for key in ("approved_by", "actor_id"):
-        name = str(payload.get(key) or "").strip()
-        if not name or _automation_identity(name):
+        if _automation_style_identity(payload.get(key)):
             return False
     return True
 
@@ -9576,7 +9601,7 @@ def approve_runtime_cap(
             f"{ACTOR_KIND_HUMAN_INTERACTIVE} and a named {ENV_ACTOR_ID}"
         )
     for name in (actor_id, approved_by):
-        if _automation_identity(name):
+        if _automation_style_identity(name):
             raise RuntimeCapApprovalRefused(
                 f"{name!r} is an automation identity and cannot approve a runtime cap"
             )
