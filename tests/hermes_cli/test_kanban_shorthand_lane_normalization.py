@@ -419,37 +419,6 @@ class TestGauntletAtlasRoutingRegression:
                 raise AssertionError("orphan codex_verify card bypassed completion gate")
             assert kb.get_task(conn, tid).status != "done"
 
-    def test_unlinked_request_review_verifier_still_completes_its_verdict(
-        self, kanban_home
-    ):
-        """Removing the dependency edge for dispatch must not verify the verifier."""
-        with kb.connect_closing() as conn:
-            subject = kb.create_task(
-                conn, title="subject", assignee="default", gauntlet=True,
-            )
-            claimed = kb.claim_task(conn, subject)
-            assert claimed is not None
-            kb.add_attachment(
-                conn, subject, filename="evidence.md",
-                stored_path=f"/tmp/{subject}/evidence.md", size=128,
-                uploaded_by="test",
-            )
-            ok, detail = kb.request_review(
-                conn, subject, summary="evidence ready", force=True, with_reason=True,
-            )
-            assert ok is True, detail
-            child = kb._open_verifier_child(conn, subject)
-            assert child is not None
-            assert kb.get_task(conn, child).created_by == "kanban:request_review"
-
-            assert kb.unlink_tasks(conn, subject, child) is True
-            assert kb.gauntlet_required(conn, child) is False
-            assert kb.complete_task(
-                conn, child,
-                result="VERDICT: FAIL\nATLAS_VERDICT: FAIL",
-            ) is True
-            assert kb.get_task(conn, child).status == "done"
-
 
 # ---------------------------------------------------------------------------
 # assign_task honors the Gauntlet-subject carve-out too (2026-09-14)

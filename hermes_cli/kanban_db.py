@@ -10445,19 +10445,6 @@ def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if linked_subject is not None:
             return False
-        # The independent-verifier dispatcher may remove the dependency edge
-        # before claiming the child so the subject's completion state cannot
-        # gate the verifier itself.  Preserve the verifier identity through
-        # the creation path as well: request_review-created verifier cards
-        # carry this immutable provenance string, while an arbitrary card
-        # relabelled to codex_verify does not.  Without this fallback the
-        # normal unlink-before-dispatch path re-enters the generic
-        # verifier-of-verifier gate and parks a real verdict in review.
-        provenance = conn.execute(
-            "SELECT created_by FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if provenance is not None and provenance["created_by"] == "kanban:request_review":
-            return False
         # An unlinked verifier-labelled card has no subject to receive its
         # verdict.  It is therefore not a verifier artifact at all; keep the
         # normal completion gate even when the card's own Gauntlet flag is
