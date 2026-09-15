@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -1169,3 +1170,507 @@ class TestGovernedExceptionStateModel:
         assert hold["name"] == strict_hold["name"]      # same aggregate fingerprint and card
         preserved = by_kind["preserved_condition"]["conditions"]
         assert {c.split("|")[1] for c in preserved} == {"t_e48487e5", "t_29c7a57b"}
+
+
+# ---------------------------------------------------------------------------
+# F1 — detect-only invariants (Christopher, 2026-09-14). Every scenario injects
+# the fault on an isolated board or filesystem and proves a healthy case stays
+# silent. No F1 invariant defines a recovery.
+# ---------------------------------------------------------------------------
+
+
+def _signatures(findings):
+    return sorted((f.subject, f.signature) for f in findings)
+
+
+class TestF1Contract:
+    def test_every_invariant_documents_source_failure_evidence_and_tier(self):
+        for inv in shc.default_invariants():
+            assert inv.tier in shc.TIERS, inv.name
+            for field in ("source", "failure", "evidence"):
+                assert str(getattr(inv, field)).strip(), f"{inv.name} has no {field}"
+
+    def test_invariants_command_prints_the_metadata_without_touching_anything(self, capsys):
+        assert shc.main(["invariants"]) == 0
+        listed = {row["name"]: row for row in json.loads(capsys.readouterr().out)}
+        assert set(listed) == {inv.name for inv in shc.default_invariants()}
+        assert listed["resource_thresholds"]["tier"] == "light" and listed["resource_thresholds"]["detect_only"]
+        assert not listed["verifier_route_open"]["detect_only"]
+
+    def test_f1_invariants_are_detection_only(self):
+        names = {inv.name for inv in shc.default_invariants()}
+        for cls in shc.F1_DETECT_ONLY:
+            assert cls.recover is shc.Invariant.recover, cls.__name__
+            assert cls.name in names
+
+    def test_f1_findings_mutate_nothing_but_their_escalation_card(self, kanban_home):
+        clock = Clock()
+        with kb.connect_closing() as conn:
+            a = kb.create_task(conn, title="a", assignee="worker")
+            b = kb.create_task(conn, title="b", assignee="worker")
+            with kb.write_txn(conn):
+                conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (a, b))
+                conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (b, a))
+            before = _board_snapshot(conn, [a, b])
+        result = shc.Controller(_ctx(kanban_home, clock=clock), [shc.TaskGraphIntegrity()]).run(shc.TIER_DEEP)
+        assert len(result.escalated) == 1 and result.recovered == []
+        with kb.connect_closing() as conn:
+            assert _board_snapshot(conn, [a, b]) == before
+            assert len(_health_cards(conn)) == 1
+
+    def test_escalation_card_carries_the_last_recovery_attempt(self, kanban_home):
+        clock = Clock()
+        route = Counting(shc.VerifierRouteOpen(), recover_noop=True)
+        with kb.connect_closing() as conn:
+            _subject_evidence_after_handoff(conn)
+        controller = shc.Controller(_ctx(kanban_home, clock=clock), [route])
+        controller.run(shc.TIER_LIGHT)
+        clock.advance(300)
+        controller.run(shc.TIER_LIGHT)
+        with kb.connect_closing() as conn:
+            (card,) = _health_cards(conn)
+        assert "last recovery: `noop_for_test` applied=False" in card["body"]
+
+    def test_repository_config_carries_the_f1_settings(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        assert config["required_gateway_platforms"] == ["telegram", "api_server", "webhook"]
+        assert config["control_defect_watch_since"] == 1789427640   # ded3b68681 deploy, 18:14 CDT
+        assert config["resource_thresholds"]["disk_used_pct"] == 90
+        assert config["life_wiki_daily_note"]["cutoff_hour"] == 6
+
+
+class TestReadyBacklogExplained:
+    def _stranded(self, conn):
+        tid = kb.create_task(conn, title="waiting", assignee="worker")
+        assert kb.get_task(conn, tid).status == "ready"
+        return tid
+
+    def test_spawnable_unclaimed_backlog_is_a_finding(self, kanban_home, monkeypatch):
+        monkeypatch.setattr(kb, "resolve_max_in_progress", lambda configured: 5)
+        with kb.connect_closing() as conn:
+            tid = self._stranded(conn)
+        findings = shc.ReadyBacklogExplained().check(_ctx(kanban_home))
+        assert _signatures(findings) == [(tid, "spawnable_ready_unclaimed")]
+
+    def test_fresh_ready_work_is_healthy(self, kanban_home, monkeypatch):
+        monkeypatch.setattr(kb, "resolve_max_in_progress", lambda configured: 5)
+        with kb.connect_closing() as conn:
+            self._stranded(conn)
+        assert shc.ReadyBacklogExplained().check(_ctx(kanban_home, clock=time.time)) == []
+
+    def test_a_full_concurrency_cap_explains_the_wait(self, kanban_home, monkeypatch):
+        monkeypatch.setattr(kb, "resolve_max_in_progress", lambda configured: 0)
+        with kb.connect_closing() as conn:
+            self._stranded(conn)
+        assert shc.ReadyBacklogExplained().check(_ctx(kanban_home)) == []
+
+    def test_a_respawn_guard_explains_the_wait(self, kanban_home, monkeypatch):
+        monkeypatch.setattr(kb, "resolve_max_in_progress", lambda configured: 5)
+        monkeypatch.setattr(kb, "check_respawn_guard", lambda conn, tid, lane="ready": "rate_limit_cooldown")
+        with kb.connect_closing() as conn:
+            self._stranded(conn)
+        assert shc.ReadyBacklogExplained().check(_ctx(kanban_home)) == []
+
+    def test_an_assignee_nothing_can_spawn_is_a_finding(self, kanban_home, monkeypatch):
+        from hermes_cli import profiles
+        with kb.connect_closing() as conn:
+            tid = self._stranded(conn)
+        monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+        findings = shc.ReadyBacklogExplained().check(_ctx(kanban_home))
+        assert _signatures(findings) == [(tid, "ready_assignee_not_spawnable")]
+
+
+class TestRunLeaseConsistency:
+    def test_a_live_claim_with_its_open_run_is_healthy(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="work", assignee="worker")
+            assert kb.claim_task(conn, tid) is not None
+        assert shc.RunLeaseConsistency().check(_ctx(kanban_home, clock=time.time)) == []
+
+    def test_expired_claim_that_nothing_reclaimed(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="work", assignee="worker")
+            kb.claim_task(conn, tid)
+        late = lambda: time.time() + kb.DEFAULT_CLAIM_TTL_SECONDS + 3600  # noqa: E731
+        findings = shc.RunLeaseConsistency().check(_ctx(kanban_home, clock=late))
+        assert _signatures(findings) == [(tid, "running_claim_expired_unreclaimed")]
+
+    def test_running_card_whose_run_already_ended(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="work", assignee="worker")
+            claimed = kb.claim_task(conn, tid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE task_runs SET ended_at = ? WHERE id = ?",
+                             (int(time.time()), claimed.current_run_id))
+        findings = shc.RunLeaseConsistency().check(_ctx(kanban_home, clock=time.time))
+        assert _signatures(findings) == [(tid, "running_without_open_run")]
+
+    def test_open_run_left_behind_by_a_card_that_moved_on(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="work", assignee="worker")
+            claimed = kb.claim_task(conn, tid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        findings = shc.RunLeaseConsistency().check(_ctx(kanban_home, clock=time.time))
+        assert _signatures(findings) == [(tid, f"open_run_detached:{claimed.current_run_id}")]
+
+    def test_live_execution_whose_heartbeat_went_stale(self, kanban_home):
+        from hermes_cli import exec_supervisor
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="work", assignee="worker")
+            record = exec_supervisor.create_execution(
+                conn, executor_type="claude", command_class="claude.headless", cwd="/tmp", task_id=tid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE executions SET status = 'running', heartbeat_at = ? WHERE id = ?",
+                             (int(time.time()) - 5000, record.id))
+        findings = shc.RunLeaseConsistency().check(_ctx(kanban_home, clock=time.time))
+        assert _signatures(findings) == [(tid, f"execution_heartbeat_stale_unreconciled:{record.id}")]
+
+
+class TestVerdictReturnedToSubject:
+    def _finished_child(self, conn, completed_at):
+        subject = _subject_with_route(conn)
+        child = kb._open_verifier_child(conn, subject)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                         (int(completed_at), child))
+        return subject, child
+
+    def test_finished_verifier_whose_verdict_never_arrived(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject, child = self._finished_child(conn, time.time())
+        findings = shc.VerdictReturnedToSubject().check(_ctx(kanban_home))
+        assert _signatures(findings) == [(subject, f"verifier_done_verdict_undelivered:{child}")]
+        assert findings[0].detail["verdict"] == "none"
+
+    @pytest.mark.parametrize("kind", ["verifier_verdict_returned", "verification_blocker_returned",
+                                      "verifier_verdict_unreadable"])
+    def test_any_return_path_event_counts_as_delivered(self, kanban_home, kind):
+        with kb.connect_closing() as conn:
+            subject, child = self._finished_child(conn, time.time())
+            with kb.write_txn(conn):
+                kb._append_event(conn, subject, kind, {"verifier_task": child, "verdict": "BLOCKER"})
+        assert shc.VerdictReturnedToSubject().check(_ctx(kanban_home)) == []
+
+    def test_a_just_finished_verifier_is_given_time(self, kanban_home):
+        clock = Clock()
+        with kb.connect_closing() as conn:
+            self._finished_child(conn, clock() - 30)
+        assert shc.VerdictReturnedToSubject().check(_ctx(kanban_home, clock=clock)) == []
+
+
+class TestVerifierChildStalledInTodo:
+    def test_codex_verifier_parked_in_todo_is_a_finding(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = _subject_with_route(conn)
+            child = kb._open_verifier_child(conn, subject)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
+        findings = shc.VerifierChildStalledInTodo().check(_ctx(kanban_home))
+        assert _signatures(findings) == [(child, "codex_verifier_child_stalled_in_todo")]
+
+    def test_a_ready_verifier_is_healthy(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = _subject_with_route(conn)
+            assert kb.get_task(conn, kb._open_verifier_child(conn, subject)).status == "ready"
+        assert shc.VerifierChildStalledInTodo().check(_ctx(kanban_home)) == []
+
+
+class TestGatewayPlatformsConnected:
+    CONFIG = {"required_gateway_platforms": ["telegram", "api_server", "webhook"]}
+
+    def _write(self, home, **overrides):
+        pid = os.getpid()
+        doc = {"pid": pid, "gateway_state": "running", "platforms": {
+            "telegram": {"state": "connected", "writer_pid": pid},
+            "api_server": {"state": "connected", "writer_pid": pid},
+            "webhook": {"state": "connected", "writer_pid": pid},
+        }}
+        doc.update(overrides)
+        (home / "gateway_state.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def test_all_required_platforms_connected_is_healthy(self, kanban_home):
+        self._write(kanban_home)
+        assert shc.GatewayPlatformsConnected().check(_ctx(kanban_home, config=self.CONFIG)) == []
+
+    def test_platform_faults(self, kanban_home):
+        pid = os.getpid()
+        self._write(kanban_home, platforms={
+            "telegram": {"state": "disconnected", "writer_pid": pid},
+            "webhook": {"state": "connected", "writer_pid": pid + 99999},
+        })
+        findings = shc.GatewayPlatformsConnected().check(_ctx(kanban_home, config=self.CONFIG))
+        assert _signatures(findings) == [
+            ("api_server", "platform_missing"),
+            ("telegram", "platform_state:disconnected"),
+            ("webhook", "platform_writer_not_gateway"),
+        ]
+
+    def test_dead_gateway_pid_and_unreadable_state(self, kanban_home):
+        self._write(kanban_home, pid=2 ** 22 + 4321)
+        assert _signatures(shc.GatewayPlatformsConnected().check(_ctx(kanban_home, config=self.CONFIG))) == [
+            ("gateway", "gateway_pid_dead")]
+        (kanban_home / "gateway_state.json").unlink()
+        (sig,) = shc.GatewayPlatformsConnected().check(_ctx(kanban_home, config=self.CONFIG))
+        assert sig.signature.startswith("gateway_state_unreadable:")
+
+    def test_unconfigured_is_silent(self, kanban_home):
+        assert shc.GatewayPlatformsConnected().check(_ctx(kanban_home, config={})) == []
+
+
+class _Vfs:
+    def __init__(self, used_pct, inode_pct):
+        self.f_blocks, self.f_bfree = 1000, 1000 - used_pct * 10
+        self.f_bavail = self.f_bfree
+        self.f_files, self.f_ffree = 1000, 1000 - inode_pct * 10
+        self.f_favail = self.f_ffree
+
+
+class TestResourceThresholds:
+    CONFIG = {"resource_thresholds": {"paths": [], "disk_used_pct": 90, "inode_used_pct": 90,
+                                      "mem_available_pct_min": 10, "mem_available_mib_min": 1536,
+                                      "swap_used_pct": 90, "load_per_cpu": 2.0, "kanban_wal_mib": 1}}
+
+    def _patch(self, monkeypatch, *, used, inodes, avail_kb, swap_free_kb, load):
+        monkeypatch.setattr(shc, "_statvfs", lambda path: _Vfs(used, inodes))
+        monkeypatch.setattr(shc, "_meminfo", lambda: {"MemTotal": 8_000_000, "MemAvailable": avail_kb,
+                                                     "SwapTotal": 4_000_000, "SwapFree": swap_free_kb})
+        monkeypatch.setattr(shc, "_loadavg5", lambda: load)
+        monkeypatch.setattr(os, "cpu_count", lambda: 4)
+
+    def test_within_thresholds_is_healthy(self, kanban_home, tmp_path, monkeypatch):
+        self._patch(monkeypatch, used=69, inodes=24, avail_kb=5_000_000, swap_free_kb=2_000_000, load=0.5)
+        config = {"resource_thresholds": {**self.CONFIG["resource_thresholds"], "paths": [str(tmp_path)]}}
+        assert shc.ResourceThresholds().check(_ctx(kanban_home, config=config)) == []
+
+    def test_every_threshold_breach_is_reported(self, kanban_home, tmp_path, monkeypatch):
+        self._patch(monkeypatch, used=95, inodes=92, avail_kb=1_000_000, swap_free_kb=100_000, load=9.0)
+        with (kanban_home / "kanban.db-wal").open("wb") as fh:
+            fh.truncate(3 * 1024 * 1024)
+        config = {"resource_thresholds": {**self.CONFIG["resource_thresholds"], "paths": [str(tmp_path)]}}
+        findings = shc.ResourceThresholds().check(_ctx(kanban_home, config=config))
+        assert {f.signature for f in findings} == {
+            f"disk_used_over:{tmp_path}", f"inodes_used_over:{tmp_path}", "memory_available_low",
+            "swap_used_over", "load_per_cpu_over", "kanban_wal_oversized"}
+
+    def test_unconfigured_is_silent(self, kanban_home):
+        assert shc.ResourceThresholds().check(_ctx(kanban_home, config={})) == []
+
+
+class TestOwnershipAndLinkage:
+    def test_live_verifier_without_subject_but_not_a_relabelled_subject(self, kanban_home):
+        with kb.connect_closing() as conn:
+            relabelled = _relabelled_subject(conn)
+            loose = kb.create_task(conn, title="verify something", assignee="worker")
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET executor_lane = ? WHERE id = ?",
+                             (kb.EXECUTOR_LANE_CODEX_VERIFY, loose))
+        findings = shc.OwnershipAndLinkage().check(_ctx(kanban_home))
+        assert _signatures(findings) == [(loose, "live_verifier_without_subject")]
+        assert relabelled not in {f.subject for f in findings}
+
+    def test_census_functions_are_consumed_for_live_cards_only(self, kanban_home, monkeypatch):
+        with kb.connect_closing() as conn:
+            live = kb.create_task(conn, title="repair", assignee="worker")
+            closed = kb.create_task(conn, title="old repair", assignee="worker")
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (closed,))
+        monkeypatch.setattr(kb, "unowned_tasks", lambda conn: [live])
+        monkeypatch.setattr(kb, "orphaned_repair_tasks", lambda conn: [live, closed])
+        monkeypatch.setattr(kb, "missing_repair_relations", lambda conn, tid: ["repairs", "umbrella"])
+        findings = shc.OwnershipAndLinkage().check(_ctx(kanban_home))
+        assert _signatures(findings) == [
+            (live, "repair_card_missing_relations:repairs,umbrella"),
+            (live, "unowned_live_card"),
+        ]
+
+
+class TestTaskGraphIntegrity:
+    def test_cycle_missing_endpoint_given_up_parent_and_unlinked_recovery(self, kanban_home):
+        with kb.connect_closing() as conn:
+            a = kb.create_task(conn, title="a", assignee="worker")
+            b = kb.create_task(conn, title="b", assignee="worker")
+            parent = kb.create_task(conn, title="exhausted", assignee="worker")
+            child = kb.create_task(conn, title="dependent", assignee="worker", parents=[parent])
+            recovery = kb.create_task(conn, title="recover gate", assignee="worker")
+            with kb.write_txn(conn):
+                conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (a, b))
+                conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (b, a))
+                conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (a, "t_deadbeef"))
+                conn.execute("UPDATE tasks SET status = 'blocked', block_kind = 'attempt_budget_exhausted' "
+                             "WHERE id = ?", (parent,))
+                conn.execute("UPDATE tasks SET executor_lane = ?, status = 'blocked' WHERE id = ?",
+                             (kb.EXECUTOR_LANE_CLAUDE_RECOVERY, recovery))
+            assert kb.get_task(conn, child).status == "todo"
+        findings = shc.TaskGraphIntegrity().check(_ctx(kanban_home))
+        assert _signatures(findings) == sorted([
+            (min(a, b), "link_cycle"),
+            (a, "link_endpoint_missing"),
+            (child, f"waiting_on_given_up_parent:{parent}"),
+            (recovery, "recovery_card_unlinked"),
+        ])
+
+    def test_an_ordinary_dag_and_a_linked_recovery_card_are_healthy(self, kanban_home):
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(conn, title="p", assignee="worker")
+            kb.create_task(conn, title="c", assignee="worker", parents=[parent])
+            recovery = kb.create_task(conn, title="recover", assignee="worker", parents=[parent])
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET executor_lane = ? WHERE id = ?",
+                             (kb.EXECUTOR_LANE_CLAUDE_RECOVERY, recovery))
+        assert shc.TaskGraphIntegrity().check(_ctx(kanban_home)) == []
+
+    def test_cycle_finder(self):
+        assert shc._cycles({"a": ["b"], "b": ["c"]}) == []
+        assert shc._cycles({"a": ["a"]}) == [frozenset({"a"})]
+        assert set(shc._cycles({"a": ["b"], "b": ["c"], "c": ["a"], "d": ["a"]})) == {frozenset("abc")}
+
+
+class TestControlDefectRegressions:
+    def _released(self, conn, *, parked_for, owner_comment=False):
+        from hermes_cli import exec_supervisor
+        tid = kb.create_task(conn, title="parked", assignee="worker")
+        record = exec_supervisor.create_execution(
+            conn, executor_type="claude", command_class="claude.headless", cwd="/tmp", task_id=tid)
+        ended = int(time.time()) - 5000
+        with kb.write_txn(conn):
+            conn.execute("UPDATE executions SET status = 'timed_out', ended_at = ? WHERE id = ?",
+                         (ended, record.id))
+            kb._append_event(conn, tid, "blocked", {"kind": "infrastructure"})
+        if owner_comment:
+            kb.add_comment(conn, tid, "christopher", "leave this parked, I am on it")
+        else:
+            kb.add_comment(conn, tid, "claude-lane", "timed out")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "gauntlet_stale_disposition", {
+                "action": "infrastructure_recovery_released", "execution_id": record.id,
+                "detected_at": ended + parked_for, "source": "stale_supervision"})
+        return tid, record.id
+
+    def test_release_past_the_retry_window(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, ex = self._released(conn, parked_for=4000)
+        findings = shc.ControlDefectRegressions().check(_ctx(kanban_home, config={"control_defect_watch_since": 0}))
+        assert _signatures(findings) == [(tid, f"stale_release_violated:retry_window_expired:{ex}")]
+        assert not findings[0].unsafe
+
+    def test_release_after_the_owner_engaged(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, ex = self._released(conn, parked_for=100, owner_comment=True)
+        findings = shc.ControlDefectRegressions().check(_ctx(kanban_home, config={"control_defect_watch_since": 0}))
+        assert _signatures(findings) == [(tid, f"stale_release_violated:owner_engaged:{ex}")]
+
+    def test_prompt_release_of_an_untouched_park_is_healthy(self, kanban_home):
+        with kb.connect_closing() as conn:
+            self._released(conn, parked_for=100)
+        assert shc.ControlDefectRegressions().check(_ctx(kanban_home, config={"control_defect_watch_since": 0})) == []
+
+    def test_harvested_denied_file_is_unsafe_and_escalates(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="shared infra", assignee="worker")
+            kb.add_attachment(conn, tid, filename="orion-api.log", stored_path="/tmp/x/orion-api.log",
+                              size=10, uploaded_by="claude-lane")
+            kb.add_attachment(conn, tid, filename="REWORK-BLOCKER.md", stored_path="/tmp/x/b.md",
+                              size=10, uploaded_by="claude-lane")
+        alerts = Alerts()
+        config = {**_governed(), "control_defect_watch_since": 0}
+        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=config),
+                                [shc.ControlDefectRegressions()]).run(shc.TIER_DEEP)
+        assert result.status == shc.AGGREGATE_ESCALATED
+        body = alerts.sent[0][1]
+        assert "harvested_denied_file:" in body and "orion" not in body.lower()
+
+    def test_attachments_before_the_watch_are_not_a_regression(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="shared infra", assignee="worker")
+            kb.add_attachment(conn, tid, filename="agent.log", stored_path="/tmp/x/agent.log",
+                              size=10, uploaded_by="claude-lane")
+        config = {"control_defect_watch_since": int(time.time()) + 3600}
+        assert shc.ControlDefectRegressions().check(_ctx(kanban_home, config=config)) == []
+
+    @pytest.mark.parametrize("payload,bad", [
+        ({"actor_kind": "human_interactive", "authorized_by": "Christopher", "actor_id": "christopher"}, False),
+        ({"actor_kind": "system", "authorized_by": "Christopher", "actor_id": "christopher"}, True),
+        ({"actor_kind": "human_interactive", "authorized_by": "default", "actor_id": "christopher"}, True),
+        ({"actor_kind": "human_interactive", "authorized_by": "Christopher", "actor_id": "claude-lane"}, True),
+    ])
+    def test_attempt_grant_provenance(self, kanban_home, payload, bad):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="objective", assignee="worker")
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, kb.OBJECTIVE_ATTEMPT_GRANT_EVENT, {**payload, "added_attempts": 2})
+        findings = shc.ControlDefectRegressions().check(_ctx(kanban_home, config={"control_defect_watch_since": 0}))
+        assert bool(findings) is bad
+        assert all(f.unsafe for f in findings)
+
+
+def _chicago_ts(hour):
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    return dt.datetime(2026, 9, 14, hour, 0, tzinfo=ZoneInfo("America/Chicago")).timestamp()
+
+
+class TestLifeWikiDailyNote:
+    def _config(self, vault):
+        return {"life_wiki_daily_note": {"vault": str(vault), "timezone": "America/Chicago", "cutoff_hour": 6}}
+
+    def test_missing_after_cutoff_present_and_before_cutoff(self, kanban_home, tmp_path):
+        vault = tmp_path / "vault"
+        (vault / "Logs" / "daily").mkdir(parents=True)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        inv = shc.LifeWikiDailyNote()
+        assert _signatures(inv.check(_ctx(kanban_home, clock=clock, config=self._config(vault)))) == [
+            ("life-wiki-daily-note", "daily_note_missing_after_cutoff:2026-09-14")]
+        clock.t = _chicago_ts(5)
+        assert inv.check(_ctx(kanban_home, clock=clock, config=self._config(vault))) == []
+        (vault / "Logs" / "daily" / "2026-09-14.md").write_text("# day\n", encoding="utf-8")
+        clock.t = _chicago_ts(7)
+        assert inv.check(_ctx(kanban_home, clock=clock, config=self._config(vault))) == []
+
+    def test_missing_vault(self, kanban_home, tmp_path):
+        findings = shc.LifeWikiDailyNote().check(_ctx(kanban_home, config=self._config(tmp_path / "nope")))
+        assert _signatures(findings) == [("life-wiki-daily-note", "vault_missing")]
+
+
+class TestBackupResults:
+    def _setup(self, tmp_path, *, verdict="OK", ran_age=60, dump_age=60, dump_bytes=2 * 1024 * 1024, dump=True):
+        state = tmp_path / "dr-backup-verify.json"
+        ran = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ran_age))
+        state.write_text(json.dumps({"verdict": verdict, "ran_at": ran}), encoding="utf-8")
+        dumps = tmp_path / "pg"
+        dumps.mkdir()
+        if dump:
+            path = dumps / "hermes-20260914T022048.dump"
+            with path.open("wb") as fh:
+                fh.truncate(dump_bytes)
+            os.utime(path, (time.time() - dump_age, time.time() - dump_age))
+        return {"backup_results": {"dr_verify_state": str(state), "dr_max_age_seconds": 93600,
+                                   "postgres_dump_dir": str(dumps), "postgres_dump_glob": "hermes-*.dump",
+                                   "postgres_max_age_seconds": 93600, "postgres_min_bytes": 1048576}}
+
+    def test_fresh_ok_results_are_healthy(self, kanban_home, tmp_path):
+        assert shc.BackupResults().check(_ctx(kanban_home, clock=time.time, config=self._setup(tmp_path))) == []
+
+    def test_failed_stale_and_small_results(self, kanban_home, tmp_path):
+        config = self._setup(tmp_path, verdict="FAIL", ran_age=200000, dump_age=200000, dump_bytes=10)
+        findings = shc.BackupResults().check(_ctx(kanban_home, clock=time.time, config=config))
+        assert {f.signature for f in findings} == {"dr_verdict:FAIL", "dr_verify_stale",
+                                                   "postgres_dump_stale", "postgres_dump_too_small"}
+
+    def test_missing_dump(self, kanban_home, tmp_path):
+        config = self._setup(tmp_path, dump=False)
+        findings = shc.BackupResults().check(_ctx(kanban_home, clock=time.time, config=config))
+        assert _signatures(findings) == [("postgres-daily", "postgres_dump_missing")]
+
+
+class TestEscalationCardsDispositioned:
+    def test_controller_cards_left_undispositioned_past_seven_days(self, kanban_home):
+        clock = Clock()
+        with kb.connect_closing() as conn:
+            _subject_without_evidence(conn)
+        shc.Controller(_ctx(kanban_home, clock=clock), [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        inv = shc.EscalationCardsDispositioned()
+        assert inv.check(_ctx(kanban_home, clock=lambda: time.time() + 86400)) == []
+        (finding,) = inv.check(_ctx(kanban_home, clock=lambda: time.time() + 8 * 86400))
+        assert finding.signature == "undispositioned_past_threshold" and finding.detail["count"] == "1"

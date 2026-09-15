@@ -22,6 +22,18 @@ Automatic recovery is limited to verifier-routing damage:
 | `subject_review_regressed`, `gateway_heartbeat_fresh`, `critical_cron_jobs_healthy`, `controller_heartbeat_fresh_deep` | light | escalate only |
 | `verifier_of_verifier`, `verified_closure_attributable`, `critical_timers_active`, `canonical_boot_complete`, `runtime_ceilings_match_doctrine`, `controller_heartbeat_fresh_light` | deep | escalate only |
 
+### F1 detect-only invariants (Christopher, 2026-09-14)
+
+No recovery; each reads an existing surface through the code that owns it. Light (5 min):
+`ready_backlog_explained`, `run_lease_consistency`, `verdict_returned_to_subject`,
+`verifier_child_stalled_in_todo`, `gateway_platforms_connected`, `resource_thresholds`. Deep (hourly):
+`ownership_and_linkage`, `task_graph_integrity`, `control_defect_regressions` (unsafe findings for
+harvested denied files and automation attempt grants), `life_wiki_daily_note`, `backup_results`,
+`escalation_cards_dispositioned`. Every invariant declares `source`, `failure`, `evidence` and `tier`;
+print them with `venv/bin/python norcal/health/system_health_controller.py invariants`. Thresholds live in
+`health-controller.json`. Full table and calibration evidence:
+`Business/Operations/2026-09-14-system-health-controller-t_b8d62378.md` §18.
+
 Escalation is exactly once per fingerprint: one `triage` card (unassigned, tenant-less,
 `idempotency_key=health:<invariant>:<fingerprint>`, system provenance, `defect:` authority) and one
 delivery-checked `hermes send` alert carrying identifiers and signatures only. A card that already

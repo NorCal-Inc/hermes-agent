@@ -162,6 +162,12 @@ class Invariant:
 
     name: str = "invariant"
     tier: str = TIER_LIGHT
+    #: Every invariant documents itself (Christopher, F1, 2026-09-14): the
+    #: authoritative source it reads, the exact failure condition, and the
+    #: evidence a finding carries. Enforced by the test suite.
+    source: str = ""
+    failure: str = ""
+    evidence: str = ""
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     #: Consecutive cycles a non-recoverable finding must persist before it
     #: escalates. >1 only for signals that are legitimately momentary.
@@ -437,6 +443,9 @@ def governed_exceptions(config: dict, now: float) -> tuple[list[dict], list[tupl
 class _GovernanceCarrier(Invariant):
     """Carrier for controller-generated findings about the exceptions themselves."""
 
+    source = "controller config governed_exceptions.entries"
+    failure = "an exception entry is malformed, expired, duplicated or its authorization digest no longer matches"
+    evidence = "invalid:<problem>; detail exception name"
     max_attempts = 0
 
     def __init__(self, name: str, tier: str) -> None:
@@ -451,6 +460,9 @@ class _HoldEscalation(Invariant):
     """Carrier for the single per-hold escalation. It has no check or recovery."""
 
     name = HOLD_INVARIANT
+    source = "controller config recovery_holds / governed_exceptions"
+    failure = "an active hold or governed exception covers findings this pass"
+    evidence = "hold_active; detail held ids or exception record and suppressed conditions"
     max_attempts = 0
 
     def __init__(self, tier: str) -> None:
@@ -851,6 +863,13 @@ def alert_text(finding: Finding, rec: dict) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+def _last_recovery_text(rec: dict) -> str:
+    last = rec.get("last_recovery")
+    if not last:
+        return "none"
+    return f"`{last.get('action')}` applied={last.get('applied')} at {last.get('at')}"
+
+
 def card_body(finding: Finding, rec: dict, reason: str) -> str:
     safe_detail = json.dumps(finding.detail, sort_keys=True, default=str)[:2000]
     return "\n".join([
@@ -862,6 +881,7 @@ def card_body(finding: Finding, rec: dict, reason: str) -> str:
         f"- fingerprint: `{finding.fingerprint}`",
         f"- escalation reason: `{reason}`",
         f"- automatic recovery attempts: {rec.get('attempts', 0)}",
+        f"- last recovery: {_last_recovery_text(rec)}",
         f"- first seen: {rec.get('first_seen')}",
         f"- detail: `{safe_detail}`",
         "",
@@ -923,6 +943,9 @@ class VerifierRouteOpen(Invariant):
 
     name = "verifier_route_open"
     tier = TIER_LIGHT
+    source = "kanban.db tasks/task_events/task_attachments via kanban_db._open_verifier_child, _phase_reviewer_identities, subject_has_evidence"
+    failure = "a Gauntlet subject pending verification in review for >60 s has no open verifier child and no installed independent reviewer"
+    evidence = "no_route:evidence_ready (recoverable) or no_route:evidence_missing; detail status, evidence"
     settle_seconds = 60
 
     def check(self, ctx: Context) -> list[Finding]:
@@ -984,6 +1007,9 @@ class SubjectLaneRelabelled(Invariant):
 
     name = "subject_lane_relabelled"
     tier = TIER_LIGHT
+    source = "kanban.db tasks.executor_lane + task_links + review_requested/executor_lane_normalized events"
+    failure = "a parentless card that was handed off for review carries the codex_verify lane after a lane normalization"
+    evidence = "subject_on_codex_verify_lane:<status>; recoverable only when unclaimed"
 
     def check(self, ctx: Context) -> list[Finding]:
         kb = _kb()
@@ -1028,6 +1054,9 @@ class VerifierChildDeadlocked(Invariant):
 
     name = "verifier_child_deadlocked"
     tier = TIER_LIGHT
+    source = "kanban.db task_links/tasks/task_relations + claim_rejected events via kanban_db._parents_satisfied"
+    failure = "a profile verification child of an evidence-ready pending subject was rejected at claim (parents_not_done) and is still gated"
+    evidence = "verifier_child_gated:declared|undeclared; detail subject, classified_as_verifier, child_is_implementer"
 
     def check(self, ctx: Context) -> list[Finding]:
         kb = _kb()
@@ -1093,6 +1122,9 @@ class SubjectReviewRegressed(Invariant):
 
     name = "subject_review_regressed"
     tier = TIER_LIGHT
+    source = "kanban.db tasks (verification_state pending, Gauntlet-required)"
+    failure = "a Gauntlet subject awaiting verification sits in triage"
+    evidence = "pending_subject_in_triage"
 
     def check(self, ctx: Context) -> list[Finding]:
         out: list[Finding] = []
@@ -1115,6 +1147,9 @@ class VerifierOfVerifier(Invariant):
 
     name = "verifier_of_verifier"
     tier = TIER_DEEP
+    source = "kanban.db task_links joined to tasks.executor_lane"
+    failure = "a live codex_verify card is the child of another codex_verify card (relabelled subjects excluded)"
+    evidence = "verifies_a_verifier; detail parent"
 
     def check(self, ctx: Context) -> list[Finding]:
         kb = _kb()
@@ -1150,6 +1185,9 @@ class VerifiedClosureAttributable(Invariant):
 
     name = "verified_closure_attributable"
     tier = TIER_DEEP
+    source = "kanban.db verification_passed and verifier_verdict_returned events via kanban_db._attested_codex_verifier_run"
+    failure = "a Gauntlet closure verified by a bare/missing lane identity, or a recorded verdict returned from an unattested verifier"
+    evidence = "verified_by_bare_or_missing_identity; verdict_returned_from_unattested_verifier (history never rewritten)"
 
     def check(self, ctx: Context) -> list[Finding]:
         kb = _kb()
@@ -1206,6 +1244,9 @@ def _parse_ts(value: Any) -> Optional[float]:
 class GatewayHeartbeatFresh(Invariant):
     name = "gateway_heartbeat_fresh"
     tier = TIER_LIGHT
+    source = "~/.hermes/state/gateway.heartbeat (gateway/shutdown_watchdog.py) updated_at"
+    failure = "heartbeat missing, unreadable, without timestamp, or older than gateway_heartbeat_max_age_seconds for 2 cycles"
+    evidence = "heartbeat_missing|heartbeat_unreadable:<exc>|heartbeat_without_timestamp|heartbeat_stale"
     confirm_cycles = 2
 
     def check(self, ctx: Context) -> list[Finding]:
@@ -1236,6 +1277,9 @@ class CriticalCronJobsHealthy(Invariant):
 
     name = "critical_cron_jobs_healthy"
     tier = TIER_LIGHT
+    source = "~/.hermes/cron/jobs.json (Hermes cron) for jobs named in critical_cron_jobs"
+    failure = "job missing, paused without reason or past pause_max_age, non-ok last_status, failure streak, delivery error, stale/never ran, or script missing"
+    evidence = "job_missing|paused_without_reason|pause_expired|last_status:<s>|failure_streak|delivery_failed|stale|never_ran|script_missing"
 
     def check(self, ctx: Context) -> list[Finding]:
         expected = ctx.config.get("critical_cron_jobs") or {}
@@ -1289,6 +1333,9 @@ class CriticalCronJobsHealthy(Invariant):
 class CriticalTimersActive(Invariant):
     name = "critical_timers_active"
     tier = TIER_DEEP
+    source = "systemctl --user list-timers --all --output=json and is-active for critical_user_timers"
+    failure = "timer not loaded, not active, or not triggered within max_age_seconds (systemd has no pause-reason field, so an inactive timer is never a reasoned pause)"
+    evidence = "timer_listing_failed:rc=<n>|timer_not_loaded|not_active:<state>|not_triggered_recently"
 
     def check(self, ctx: Context) -> list[Finding]:
         expected = ctx.config.get("critical_user_timers") or {}
@@ -1327,6 +1374,9 @@ class CriticalTimersActive(Invariant):
 class CanonicalBootComplete(Invariant):
     name = "canonical_boot_complete"
     tier = TIER_DEEP
+    source = "~/.local/bin/hermes-shared-boot-context --gate-exit-code (authoritative BOOT STATUS line)"
+    failure = "exit code non-zero or the first BOOT STATUS line is not exactly 'BOOT STATUS: COMPLETE'"
+    evidence = "<status line or no_status_line>:rc=<n>"
 
     def check(self, ctx: Context) -> list[Finding]:
         command = ctx.config.get("boot_gate_command") or [
@@ -1344,6 +1394,9 @@ class CanonicalBootComplete(Invariant):
 class RuntimeCeilingsMatchDoctrine(Invariant):
     name = "runtime_ceilings_match_doctrine"
     tier = TIER_DEEP
+    source = "hermes config get <key> for expected_runtime_config (doctrine operations.md ceilings)"
+    failure = "a live runtime value differs from the doctrine value or cannot be read"
+    evidence = "value_mismatch:<live value>; detail expected"
 
     def check(self, ctx: Context) -> list[Finding]:
         expected = ctx.config.get("expected_runtime_config") or {}
@@ -1364,6 +1417,9 @@ class CounterpartHeartbeatFresh(Invariant):
     """The light and deep passes watch each other."""
 
     name = "controller_heartbeat_fresh"
+    source = "~/.hermes/state/system-health-controller/heartbeat-<other tier>.json finished_ts"
+    failure = "the other pass has not finished within 2 intervals + 120 s (or never ran after install)"
+    evidence = "counterpart_heartbeat_stale|counterpart_never_ran; detail limit_seconds"
     confirm_cycles = 1
 
     def __init__(self, tier: str) -> None:
@@ -1389,6 +1445,669 @@ class CounterpartHeartbeatFresh(Invariant):
         return []
 
 
+# ---------------------------------------------------------------------------
+# F1 detect-only invariants (Christopher, 2026-09-14): no recovery, no new
+# mutation authority. Each reads an existing authoritative surface through the
+# code that already owns it.
+# ---------------------------------------------------------------------------
+
+
+def _is_relabelled_subject(conn, task_id: str) -> bool:
+    """The ``subject_lane_relabelled`` shape: a subject, not a verifier."""
+    row = conn.execute(
+        "SELECT 1 FROM tasks t WHERE t.id = ? "
+        "AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.child_id = t.id) "
+        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = 'review_requested') "
+        "AND EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.kind = 'executor_lane_normalized')",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+class ReadyBacklogExplained(Invariant):
+    """Dispatcher consistency: spawnable ready work does not wait unexplained.
+
+    Unlike the gateway's "dispatcher stuck" telemetry, a card is only a fault
+    when nothing explains the wait: its respawn guard is clear and the global
+    concurrency cap has room.
+    """
+
+    name = "ready_backlog_explained"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = ("kanban.db tasks/task_events via kanban_diagnostics._rule_stranded_in_ready, "
+              "kanban_db.check_respawn_guard, count_running_tasks, resolve_max_in_progress, "
+              "profiles.profile_exists")
+    failure = ("a ready, unclaimed, assigned, not-disposed card has waited past "
+               "ready_stranded_threshold_seconds while its respawn guard is clear and capacity is "
+               "free (spawnable), or its assignee is not a real profile (unspawnable); 2 cycles")
+    evidence = "spawnable_ready_unclaimed | ready_assignee_not_spawnable; detail status"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        kb = _kb()
+        from hermes_cli import kanban_diagnostics as kd
+        from hermes_cli import profiles
+        threshold = int(ctx.config.get("ready_stranded_threshold_seconds", 1800))
+        now = int(ctx.now())
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
+                "AND assignee IS NOT NULL AND TRIM(assignee) <> '' "
+                f"AND {kb._not_irreversibly_disposed_sql()}"
+            ).fetchall()
+            if not rows:
+                return []
+            cap = kb.resolve_max_in_progress(kb.configured_max_in_progress())
+            capacity_free = cap is None or kb.count_running_tasks(conn) < cap
+            for row in rows:
+                events = conn.execute(
+                    "SELECT kind, created_at FROM task_events WHERE task_id = ? ORDER BY id",
+                    (row["id"],),
+                ).fetchall()
+                if not kd._rule_stranded_in_ready(
+                    row, events, [], now, {"stranded_threshold_seconds": threshold},
+                ):
+                    continue
+                if not profiles.profile_exists(row["assignee"]):
+                    out.append(Finding(self.name, row["id"], "ready_assignee_not_spawnable",
+                                       {"status": "ready"}))
+                    continue
+                if not capacity_free or kb.check_respawn_guard(conn, row["id"]) is not None:
+                    continue  # the wait is explained
+                out.append(Finding(self.name, row["id"], "spawnable_ready_unclaimed",
+                                   {"status": "ready"}))
+        return out
+
+
+class RunLeaseConsistency(Invariant):
+    """The reclaim passes are actually keeping claims, runs and executions consistent."""
+
+    name = "run_lease_consistency"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = ("kanban.db tasks (claim_expires, current_run_id), task_runs (ended_at), executions "
+              "(status, heartbeat_at, ended_at) — the state release_stale_claims, "
+              "reconcile_orphaned_running, detect_crashed_workers and exec_supervisor.reconcile maintain")
+    failure = ("a running card whose claim expired more than lease_grace_seconds ago, a running card "
+               "without an open current run, an open run whose card is not running on it, or a live "
+               "execution whose heartbeat is older than execution_heartbeat_stale_seconds; 2 cycles")
+    evidence = ("running_claim_expired_unreclaimed | running_without_open_run | open_run_detached:<run> | "
+                "execution_heartbeat_stale_unreconciled:<execution>")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        now = int(ctx.now())
+        grace = int(ctx.config.get("lease_grace_seconds", 300))
+        stale = int(ctx.config.get("execution_heartbeat_stale_seconds", 900))
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            for task in conn.execute(
+                "SELECT id, claim_expires, current_run_id FROM tasks WHERE status = 'running'"
+            ).fetchall():
+                if task["claim_expires"] is not None and now - int(task["claim_expires"]) > grace:
+                    out.append(Finding(self.name, task["id"], "running_claim_expired_unreclaimed", {}))
+                run = None
+                if task["current_run_id"] is not None:
+                    run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?",
+                                       (task["current_run_id"],)).fetchone()
+                if run is None or run["ended_at"] is not None:
+                    out.append(Finding(self.name, task["id"], "running_without_open_run", {}))
+            for run in conn.execute(
+                "SELECT r.id, r.task_id, t.status, t.current_run_id FROM task_runs r "
+                "JOIN tasks t ON t.id = r.task_id WHERE r.ended_at IS NULL"
+            ).fetchall():
+                if run["status"] != "running" or run["current_run_id"] != run["id"]:
+                    out.append(Finding(self.name, run["task_id"], f"open_run_detached:{run['id']}", {}))
+            for ex in conn.execute(
+                "SELECT id, task_id, heartbeat_at, started_at FROM executions "
+                "WHERE ended_at IS NULL AND status IN ('launching', 'running')"
+            ).fetchall():
+                beat = ex["heartbeat_at"] if ex["heartbeat_at"] is not None else ex["started_at"]
+                if beat is not None and now - int(beat) > stale:
+                    out.append(Finding(self.name, ex["task_id"] or ex["id"],
+                                       f"execution_heartbeat_stale_unreconciled:{ex['id']}",
+                                       {"execution_id": ex["id"]}))
+        return out
+
+
+#: Events the verdict return path writes on a subject for a finished verifier.
+_VERDICT_DELIVERY_KINDS = (
+    "verifier_verdict_returned", "verifier_verdict_skipped", "verifier_verdict_unattested",
+    "verifier_verdict_unreadable", "verification_blocker_returned", "verified_completion_deferred",
+)
+
+
+class VerdictReturnedToSubject(Invariant):
+    name = "verdict_returned_to_subject"
+    tier = TIER_LIGHT
+    settle_seconds = 180
+    source = ("kanban.db task_links/tasks + subject task_events of the return path "
+              "(_return_verifier_verdict_to_subjects kinds) and kanban_db._verifier_reported_verdict")
+    failure = ("a codex_verify child finished more than 180 s ago while its subject is still pending "
+               "verification and no return-path event on the subject names that verifier")
+    evidence = "verifier_done_verdict_undelivered:<verifier>; detail verifier_task, verdict"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        kb = _kb()
+        now = int(ctx.now())
+        marks = ",".join("?" for _ in _VERDICT_DELIVERY_KINDS)
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            rows = conn.execute(
+                "SELECT c.id AS child, c.completed_at, l.parent_id AS subject FROM task_links l "
+                "JOIN tasks c ON c.id = l.child_id JOIN tasks s ON s.id = l.parent_id "
+                "WHERE c.executor_lane = ? AND c.status = 'done' "
+                "AND s.verification_state = ? AND s.terminal_disposition IS NULL",
+                (kb.EXECUTOR_LANE_CODEX_VERIFY, kb.VERIFICATION_PENDING),
+            ).fetchall()
+            for row in rows:
+                if row["completed_at"] is not None and now - int(row["completed_at"]) < self.settle_seconds:
+                    continue
+                delivered = False
+                for ev in conn.execute(
+                    f"SELECT payload FROM task_events WHERE task_id = ? AND kind IN ({marks})",
+                    (row["subject"], *_VERDICT_DELIVERY_KINDS),
+                ):
+                    try:
+                        if json.loads(ev["payload"] or "{}").get("verifier_task") == row["child"]:
+                            delivered = True
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                if delivered:
+                    continue
+                verdict, _ = kb._verifier_reported_verdict(conn, row["child"])
+                out.append(Finding(self.name, row["subject"],
+                                   f"verifier_done_verdict_undelivered:{row['child']}",
+                                   {"verifier_task": row["child"], "verdict": verdict or "none"}))
+        return out
+
+
+class VerifierChildStalledInTodo(Invariant):
+    name = "verifier_child_stalled_in_todo"
+    tier = TIER_LIGHT
+    source = "kanban.db tasks/task_links (codex_verify children of pending subjects)"
+    failure = ("a codex_verify child of a subject pending verification has sat in todo longer than "
+               "verifier_todo_stall_seconds (the refused repair-leg PASS retry shape)")
+    evidence = "codex_verifier_child_stalled_in_todo; detail subject"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        kb = _kb()
+        now = int(ctx.now())
+        stall = int(ctx.config.get("verifier_todo_stall_seconds", 900))
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            for row in conn.execute(
+                "SELECT c.id, c.created_at, l.parent_id FROM tasks c "
+                "JOIN task_links l ON l.child_id = c.id JOIN tasks s ON s.id = l.parent_id "
+                "WHERE c.executor_lane = ? AND c.status = 'todo' AND c.terminal_disposition IS NULL "
+                "AND s.verification_state = ?",
+                (kb.EXECUTOR_LANE_CODEX_VERIFY, kb.VERIFICATION_PENDING),
+            ).fetchall():
+                if now - int(row["created_at"] or now) > stall:
+                    out.append(Finding(self.name, row["id"], "codex_verifier_child_stalled_in_todo",
+                                       {"subject": row["parent_id"]}))
+        return out
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError, OSError):
+        return False
+    return True
+
+
+class GatewayPlatformsConnected(Invariant):
+    """Telegram/report delivery path: the platforms alerts depend on are connected."""
+
+    name = "gateway_platforms_connected"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = "~/.hermes/gateway_state.json (gateway/status.py): pid, gateway_state, platforms.<name>.state/writer_pid"
+    failure = ("for each required_gateway_platforms entry: gateway not running or its pid dead, platform "
+               "missing, state not connected, or its writer is not the live gateway process; 2 cycles")
+    evidence = ("gateway_state_unreadable | gateway_not_running:<state> | gateway_pid_dead | platform_missing | "
+                "platform_state:<state> | platform_writer_not_gateway; subject = platform")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        required = ctx.config.get("required_gateway_platforms") or []
+        if not required:
+            return []
+        path = ctx.hermes_home / "gateway_state.json"
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return [Finding(self.name, "gateway", f"gateway_state_unreadable:{type(exc).__name__}", {})]
+        if doc.get("gateway_state") != "running":
+            return [Finding(self.name, "gateway", f"gateway_not_running:{doc.get('gateway_state')}", {})]
+        pid = doc.get("pid")
+        if not _pid_alive(pid):
+            return [Finding(self.name, "gateway", "gateway_pid_dead", {})]
+        platforms = doc.get("platforms") or {}
+        out: list[Finding] = []
+        for name in required:
+            entry = platforms.get(name)
+            if not isinstance(entry, dict):
+                out.append(Finding(self.name, name, "platform_missing", {}))
+            elif entry.get("state") != "connected":
+                out.append(Finding(self.name, name, f"platform_state:{entry.get('state')}", {}))
+            elif entry.get("writer_pid") != pid:
+                out.append(Finding(self.name, name, "platform_writer_not_gateway", {}))
+        return out
+
+
+def _statvfs(path: str):
+    return os.statvfs(path)
+
+
+def _meminfo() -> dict:
+    out = {}
+    with open("/proc/meminfo", encoding="utf-8") as fh:
+        for line in fh:
+            key, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts and parts[0].isdigit():
+                out[key.strip()] = int(parts[0])  # kB
+    return out
+
+
+def _loadavg5() -> float:
+    with open("/proc/loadavg", encoding="utf-8") as fh:
+        return float(fh.read().split()[1])
+
+
+class ResourceThresholds(Invariant):
+    """One place for the thresholds scattered across existing watchers.
+
+    Values mirror the existing ones (``shared/health-check.sh`` disk/memory 90 %
+    and load 2 x CPUs; the isolated-backend reaper's 1.5 GB MemAvailable and
+    90 % swap); inode usage is new — no watcher checked it.
+    """
+
+    name = "resource_thresholds"
+    tier = TIER_LIGHT
+    confirm_cycles = 2
+    source = "os.statvfs(paths), /proc/meminfo, /proc/loadavg, os.cpu_count(), <HERMES_HOME>/kanban.db-wal size"
+    failure = ("disk or inode use at/over its percentage, MemAvailable under its percentage or MiB floor, "
+               "swap use at/over its percentage, 5-minute load per CPU over its ratio, or the Kanban WAL "
+               "over its size; 2 cycles")
+    evidence = ("disk_used_over:<path> | inodes_used_over:<path> | memory_available_low | swap_used_over | "
+                "load_per_cpu_over | kanban_wal_oversized; detail measured value and threshold")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        cfg = ctx.config.get("resource_thresholds") or {}
+        if not cfg:
+            return []
+        out: list[Finding] = []
+        seen_devices: set = set()
+        for path in cfg.get("paths", ["/"]):
+            try:
+                device = os.stat(path).st_dev
+            except OSError:
+                out.append(Finding(self.name, path, "path_unreadable", {}))
+                continue
+            if device in seen_devices:
+                continue
+            seen_devices.add(device)
+            st = _statvfs(path)
+            used = st.f_blocks - st.f_bfree
+            if used + st.f_bavail:
+                pct = used * 100.0 / (used + st.f_bavail)
+                if pct >= float(cfg.get("disk_used_pct", 90)):
+                    out.append(Finding(self.name, path, f"disk_used_over:{path}",
+                                       {"used_pct": f"{pct:.1f}", "threshold": str(cfg.get("disk_used_pct", 90))}))
+            iused = st.f_files - st.f_ffree
+            if st.f_files and iused + st.f_favail:
+                ipct = iused * 100.0 / (iused + st.f_favail)
+                if ipct >= float(cfg.get("inode_used_pct", 90)):
+                    out.append(Finding(self.name, path, f"inodes_used_over:{path}",
+                                       {"used_pct": f"{ipct:.1f}", "threshold": str(cfg.get("inode_used_pct", 90))}))
+        mem = _meminfo()
+        total, available = mem.get("MemTotal"), mem.get("MemAvailable")
+        if total and available is not None:
+            avail_pct = available * 100.0 / total
+            if (avail_pct < float(cfg.get("mem_available_pct_min", 10))
+                    or available / 1024 < float(cfg.get("mem_available_mib_min", 1536))):
+                out.append(Finding(self.name, "memory", "memory_available_low",
+                                   {"available_mib": str(available // 1024), "available_pct": f"{avail_pct:.1f}"}))
+        swap_total, swap_free = mem.get("SwapTotal"), mem.get("SwapFree")
+        if swap_total:
+            swap_pct = (swap_total - (swap_free or 0)) * 100.0 / swap_total
+            if swap_pct >= float(cfg.get("swap_used_pct", 90)):
+                out.append(Finding(self.name, "swap", "swap_used_over", {"used_pct": f"{swap_pct:.1f}"}))
+        cpus = os.cpu_count() or 1
+        per_cpu = _loadavg5() / cpus
+        if per_cpu > float(cfg.get("load_per_cpu", 2.0)):
+            out.append(Finding(self.name, "load", "load_per_cpu_over", {"load_per_cpu": f"{per_cpu:.2f}"}))
+        wal = ctx.hermes_home / "kanban.db-wal"
+        limit = float(cfg.get("kanban_wal_mib", 512)) * 1024 * 1024
+        if wal.exists() and wal.stat().st_size > limit:
+            out.append(Finding(self.name, "kanban.db-wal", "kanban_wal_oversized",
+                               {"size_mib": str(wal.stat().st_size // (1024 * 1024))}))
+        return out
+
+
+class OwnershipAndLinkage(Invariant):
+    name = "ownership_and_linkage"
+    tier = TIER_DEEP
+    source = ("kanban_db.unowned_tasks, orphaned_repair_tasks + missing_repair_relations, "
+              "orphaned_verifier_tasks (existing read-only census functions)")
+    failure = ("a live (not done/archived) card without a resolvable owner, a live recovery card missing "
+               "its required repairs/umbrella relations, or a live verifier card without a subject "
+               "(relabelled subjects excluded; historical closed cards are history, not health)")
+    evidence = "unowned_live_card | repair_card_missing_relations:<relations> | live_verifier_without_subject"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        kb = _kb()
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            live = {r["id"] for r in conn.execute(
+                "SELECT id FROM tasks WHERE status NOT IN ('done', 'archived')")}
+            for tid in kb.unowned_tasks(conn):
+                out.append(Finding(self.name, tid, "unowned_live_card", {}))
+            for tid in kb.orphaned_repair_tasks(conn):
+                if tid in live:
+                    missing = ",".join(kb.missing_repair_relations(conn, tid))
+                    out.append(Finding(self.name, tid, f"repair_card_missing_relations:{missing}", {}))
+            for tid in kb.orphaned_verifier_tasks(conn):
+                if tid in live and not _is_relabelled_subject(conn, tid):
+                    out.append(Finding(self.name, tid, "live_verifier_without_subject", {}))
+        return out
+
+
+class TaskGraphIntegrity(Invariant):
+    name = "task_graph_integrity"
+    tier = TIER_DEEP
+    source = "kanban.db task_links, tasks (status, block_kind, terminal_disposition, executor_lane), task_relations"
+    failure = ("a dependency cycle; a link to a card that does not exist; a todo child waiting on a parent "
+               "automation has given up on (attempt budget exhausted, or abandoned but not closed); or a "
+               "live claude_recovery card linked to nothing it recovers")
+    evidence = ("link_cycle (subject = smallest id, detail members) | link_endpoint_missing | "
+                "waiting_on_given_up_parent:<parent> | recovery_card_unlinked")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        kb = _kb()
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            ids = {r["id"] for r in conn.execute("SELECT id FROM tasks")}
+            edges: dict[str, list[str]] = {}
+            for link in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+                parent, child = link["parent_id"], link["child_id"]
+                if parent not in ids or child not in ids:
+                    present = child if child in ids else parent
+                    out.append(Finding(self.name, present, "link_endpoint_missing", {}))
+                    continue
+                edges.setdefault(parent, []).append(child)
+            for members in _cycles(edges):
+                out.append(Finding(self.name, min(members), "link_cycle",
+                                   {"members": ",".join(sorted(members))}))
+            for row in conn.execute(
+                "SELECT l.child_id, p.id AS parent FROM task_links l "
+                "JOIN tasks c ON c.id = l.child_id JOIN tasks p ON p.id = l.parent_id "
+                "WHERE c.status = 'todo' AND ("
+                "  (p.status = 'blocked' AND p.block_kind = 'attempt_budget_exhausted') "
+                "  OR (p.terminal_disposition = ? AND p.status NOT IN ('done', 'archived')))",
+                (kb.DISPOSITION_ABANDONED,),
+            ).fetchall():
+                out.append(Finding(self.name, row["child_id"],
+                                   f"waiting_on_given_up_parent:{row['parent']}", {"parent": row["parent"]}))
+            for row in conn.execute(
+                "SELECT t.id FROM tasks t WHERE t.executor_lane = ? "
+                "AND t.status NOT IN ('done', 'archived') "
+                "AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.parent_id = t.id OR l.child_id = t.id) "
+                "AND NOT EXISTS (SELECT 1 FROM task_relations r WHERE r.from_task_id = t.id OR r.to_task_id = t.id)",
+                (kb.EXECUTOR_LANE_CLAUDE_RECOVERY,),
+            ).fetchall():
+                out.append(Finding(self.name, row["id"], "recovery_card_unlinked", {}))
+        return out
+
+
+def _cycles(edges: dict[str, list[str]]) -> list[frozenset]:
+    """Strongly connected components of size > 1 (or a self-loop), iteratively."""
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set = set()
+    stack: list[str] = []
+    found: list[frozenset] = []
+    counter = 0
+    nodes = set(edges) | {c for children in edges.values() for c in children}
+    for root in sorted(nodes):
+        if root in index:
+            continue
+        work = [(root, iter(edges.get(root, ())))]
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, children = work[-1]
+            advanced = False
+            for child in children:
+                if child not in index:
+                    index[child] = low[child] = counter
+                    counter += 1
+                    stack.append(child)
+                    on_stack.add(child)
+                    work.append((child, iter(edges.get(child, ()))))
+                    advanced = True
+                    break
+                if child in on_stack:
+                    low[node] = min(low[node], index[child])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                component = set()
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    component.add(member)
+                    if member == node:
+                        break
+                if len(component) > 1 or node in edges.get(node, ()):
+                    found.append(frozenset(component))
+    return found
+
+
+class ControlDefectRegressions(Invariant):
+    """Supervisory invariants for the control defects repaired on 2026-09-14.
+
+    Watches for recurrence after ``control_defect_watch_since`` (the deploy of
+    the repairs). The historical INC-2026-09-14-01 attachments predate it and
+    belong to the F2 company-isolation decision; they are not hidden, they are
+    simply not a regression of the repaired harvester.
+    """
+
+    name = "control_defect_regressions"
+    tier = TIER_DEEP
+    source = ("kanban.db gauntlet_stale_disposition/blocked/commented events + executions.ended_at "
+              "(rule: kanban_db INFRASTRUCTURE_AUTO_RELEASE_WINDOW_SECONDS, AUTOMATION_COMMENT_AUTHORS); "
+              "task_attachments by claude-lane (rule: recovery_lane._HARVEST_DENIED_SUFFIXES); "
+              "objective_attempt_budget_granted events (rule: kanban_db._automation_identity)")
+    failure = ("since control_defect_watch_since: stale supervision released an infrastructure park past "
+               "the retry window or after a non-automation comment; the claude lane attached a denied "
+               "log/database/bytecode/key file (unsafe); or, at any time, an attempt grant not made by a "
+               "named human_interactive operator (unsafe)")
+    evidence = ("stale_release_violated:<reason>:<execution> | harvested_denied_file:<attachment id> (unsafe) | "
+                "attempt_grant_by_automation:<event id> (unsafe)")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        kb = _kb()
+        from hermes_cli import recovery_lane
+        since = int(ctx.config.get("control_defect_watch_since") or 0)
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            for ev in conn.execute(
+                "SELECT id, task_id, payload, created_at FROM task_events "
+                "WHERE kind = 'gauntlet_stale_disposition' AND created_at >= ?", (since,),
+            ).fetchall():
+                try:
+                    payload = json.loads(ev["payload"] or "{}")
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("action") != "infrastructure_recovery_released":
+                    continue
+                execution = conn.execute("SELECT ended_at FROM executions WHERE id = ?",
+                                         (payload.get("execution_id"),)).fetchone()
+                if execution is None or execution["ended_at"] is None:
+                    continue
+                released_at = int(payload.get("detected_at") or ev["created_at"])
+                reason = None
+                if released_at - int(execution["ended_at"]) > kb.INFRASTRUCTURE_AUTO_RELEASE_WINDOW_SECONDS:
+                    reason = "retry_window_expired"
+                else:
+                    block = conn.execute(
+                        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'blocked' AND id < ? "
+                        "ORDER BY id DESC LIMIT 1", (ev["task_id"], ev["id"]),
+                    ).fetchone()
+                    for comment in conn.execute(
+                        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                        "AND id > ? AND id < ?", (ev["task_id"], block["id"] if block else 0, ev["id"]),
+                    ):
+                        try:
+                            author = str(json.loads(comment["payload"] or "{}").get("author") or "")
+                        except json.JSONDecodeError:
+                            author = ""
+                        if not (author.endswith("-lane") or author in kb.AUTOMATION_COMMENT_AUTHORS):
+                            reason = "owner_engaged"
+                            break
+                if reason:
+                    out.append(Finding(self.name, ev["task_id"],
+                                       f"stale_release_violated:{reason}:{payload.get('execution_id')}", {}))
+            for att in conn.execute(
+                "SELECT id, task_id, filename FROM task_attachments "
+                "WHERE uploaded_by = 'claude-lane' AND created_at >= ?", (since,),
+            ).fetchall():
+                name = str(att["filename"] or "")
+                if (name.endswith(recovery_lane._HARVEST_DENIED_SUFFIXES)
+                        or name.startswith(".env") or ".log." in name):
+                    out.append(Finding(self.name, att["task_id"], f"harvested_denied_file:{att['id']}",
+                                       {"attachment_id": str(att["id"])}, unsafe=True))
+            for ev in conn.execute(
+                "SELECT id, task_id, payload FROM task_events WHERE kind = ?",
+                (kb.OBJECTIVE_ATTEMPT_GRANT_EVENT,),
+            ).fetchall():
+                try:
+                    payload = json.loads(ev["payload"] or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                authorizer = str(payload.get("authorized_by") or "")
+                actor = str(payload.get("actor_id") or "")
+                if (payload.get("actor_kind") != "human_interactive" or not authorizer.strip()
+                        or not actor.strip() or kb._automation_identity(authorizer)
+                        or kb._automation_identity(actor)):
+                    out.append(Finding(self.name, ev["task_id"], f"attempt_grant_by_automation:{ev['id']}",
+                                       {}, unsafe=True))
+        return out
+
+
+class LifeWikiDailyNote(Invariant):
+    name = "life_wiki_daily_note"
+    tier = TIER_DEEP
+    source = ("the Life Wiki vault Logs/daily/<local date>.md (written by the 04:00 nightly reconciliation); "
+              "the life-wiki-daily-validation result is watched by critical_cron_jobs_healthy")
+    failure = "after cutoff_hour local time, today's daily note does not exist (or the vault is missing)"
+    evidence = "daily_note_missing_after_cutoff:<date> | vault_missing"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        cfg = ctx.config.get("life_wiki_daily_note") or {}
+        if not cfg:
+            return []
+        from zoneinfo import ZoneInfo
+        vault = Path(os.path.expanduser(cfg["vault"]))
+        if not vault.is_dir():
+            return [Finding(self.name, "life-wiki-daily-note", "vault_missing", {})]
+        local = _dt.datetime.fromtimestamp(ctx.now(), ZoneInfo(cfg.get("timezone", "America/Chicago")))
+        if local.hour < int(cfg.get("cutoff_hour", 6)):
+            return []
+        day = local.date().isoformat()
+        if not (vault / "Logs" / "daily" / f"{day}.md").is_file():
+            return [Finding(self.name, "life-wiki-daily-note", f"daily_note_missing_after_cutoff:{day}", {})]
+        return []
+
+
+class BackupResults(Invariant):
+    name = "backup_results"
+    tier = TIER_DEEP
+    source = ("~/.hermes/state/dr-backup-verify.json (dr-backup-verify.sh: verdict, ran_at — itself checks "
+              "the nuclear backup audit log) and the newest hermes-*.dump in the Postgres daily backup dir")
+    failure = ("DR verify verdict not OK, its result older than dr_max_age_seconds or unreadable; no Postgres "
+               "dump, the newest older than postgres_max_age_seconds, or smaller than postgres_min_bytes")
+    evidence = ("dr_state_unreadable | dr_verdict:<verdict> | dr_verify_stale | postgres_dump_missing | "
+                "postgres_dump_stale | postgres_dump_too_small")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        cfg = ctx.config.get("backup_results") or {}
+        if not cfg:
+            return []
+        now = ctx.now()
+        out: list[Finding] = []
+        state_path = Path(os.path.expanduser(cfg["dr_verify_state"]))
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            out.append(Finding(self.name, "dr-backup-verify", f"dr_state_unreadable:{type(exc).__name__}", {}))
+        else:
+            if state.get("verdict") != "OK":
+                out.append(Finding(self.name, "dr-backup-verify", f"dr_verdict:{state.get('verdict')}", {}))
+            ran = _parse_ts(str(state.get("ran_at") or "").replace("Z", "+00:00"))
+            if ran is None or now - ran > int(cfg.get("dr_max_age_seconds", 93600)):
+                out.append(Finding(self.name, "dr-backup-verify", "dr_verify_stale", {}))
+        dump_dir = Path(os.path.expanduser(cfg["postgres_dump_dir"]))
+        dumps = sorted(dump_dir.glob(cfg.get("postgres_dump_glob", "hermes-*.dump")),
+                       key=lambda p: p.stat().st_mtime) if dump_dir.is_dir() else []
+        if not dumps:
+            out.append(Finding(self.name, "postgres-daily", "postgres_dump_missing", {}))
+        else:
+            newest = dumps[-1].stat()
+            if now - newest.st_mtime > int(cfg.get("postgres_max_age_seconds", 93600)):
+                out.append(Finding(self.name, "postgres-daily", "postgres_dump_stale", {}))
+            if newest.st_size < int(cfg.get("postgres_min_bytes", 1048576)):
+                out.append(Finding(self.name, "postgres-daily", "postgres_dump_too_small", {}))
+        return out
+
+
+class EscalationCardsDispositioned(Invariant):
+    """Detection without an actionable disposition is itself a health failure."""
+
+    name = "escalation_cards_dispositioned"
+    tier = TIER_DEEP
+    source = "kanban.db tasks created by system-health-controller (idempotency_key health:*)"
+    failure = ("a controller escalation card is still unassigned in triage past "
+               "escalation_card_max_undispositioned_seconds (default 7 days, the doctrine triage hygiene threshold)")
+    evidence = "undispositioned_past_threshold; detail count, oldest card id"
+
+    def check(self, ctx: Context) -> list[Finding]:
+        limit = int(ctx.config.get("escalation_card_max_undispositioned_seconds", 604800))
+        cutoff = int(ctx.now()) - limit
+        with ctx.kanban() as conn:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'health:%' AND created_by = ? "
+                "AND status = 'triage' AND assignee IS NULL AND created_at < ? ORDER BY created_at",
+                (CONTROLLER_ID, cutoff),
+            ).fetchall()
+        if not rows:
+            return []
+        return [Finding(self.name, "health-escalation-cards", "undispositioned_past_threshold",
+                        {"count": str(len(rows)), "oldest": rows[0]["id"]})]
+
+
+#: F1 invariants are detection only: none defines a recovery.
+F1_DETECT_ONLY = (
+    ReadyBacklogExplained, RunLeaseConsistency, VerdictReturnedToSubject, VerifierChildStalledInTodo,
+    GatewayPlatformsConnected, ResourceThresholds, OwnershipAndLinkage, TaskGraphIntegrity,
+    ControlDefectRegressions, LifeWikiDailyNote, BackupResults, EscalationCardsDispositioned,
+)
+
+
 def default_invariants() -> list[Invariant]:
     return [
         VerifierRouteOpen(),
@@ -1398,12 +2117,24 @@ def default_invariants() -> list[Invariant]:
         GatewayHeartbeatFresh(),
         CriticalCronJobsHealthy(),
         CounterpartHeartbeatFresh(TIER_LIGHT),
+        ReadyBacklogExplained(),
+        RunLeaseConsistency(),
+        VerdictReturnedToSubject(),
+        VerifierChildStalledInTodo(),
+        GatewayPlatformsConnected(),
+        ResourceThresholds(),
         VerifierOfVerifier(),
         VerifiedClosureAttributable(),
         CriticalTimersActive(),
         CanonicalBootComplete(),
         RuntimeCeilingsMatchDoctrine(),
         CounterpartHeartbeatFresh(TIER_DEEP),
+        OwnershipAndLinkage(),
+        TaskGraphIntegrity(),
+        ControlDefectRegressions(),
+        LifeWikiDailyNote(),
+        BackupResults(),
+        EscalationCardsDispositioned(),
     ]
 
 
@@ -1496,7 +2227,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     status_p.add_argument("--config")
     status_p.add_argument("--state-dir")
     status_p.add_argument("--dry-run", action="store_true")
+    sub.add_parser("invariants", help="print every invariant's tier, source, failure condition and evidence")
     args = parser.parse_args(argv)
+    if args.command == "invariants":
+        print(json.dumps([
+            {"name": inv.name, "tier": inv.tier, "detect_only": type(inv).recover is Invariant.recover,
+             "source": inv.source, "failure": inv.failure, "evidence": inv.evidence}
+            for inv in default_invariants()
+        ], indent=2))
+        return 0
     ctx = build_context(args)
     if args.command == "status":
         state = StateStore(ctx.state_dir).load()

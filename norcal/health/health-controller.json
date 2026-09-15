@@ -80,5 +80,35 @@
     "kanban.dispatch_stale_timeout_seconds": "300",
     "kanban.gauntlet_stale_timeout_seconds": "300",
     "kanban.gauntlet_stale_realert_seconds": "86400"
-  }
+  },
+  "ready_stranded_threshold_seconds": 1800,
+  "lease_grace_seconds": 300,
+  "execution_heartbeat_stale_seconds": 900,
+  "verifier_todo_stall_seconds": 900,
+  "required_gateway_platforms": ["telegram", "api_server", "webhook"],
+  "resource_thresholds": {
+    "paths": ["/", "/home"],
+    "disk_used_pct": 90,
+    "inode_used_pct": 90,
+    "mem_available_pct_min": 10,
+    "mem_available_mib_min": 1536,
+    "swap_used_pct": 90,
+    "load_per_cpu": 2.0,
+    "kanban_wal_mib": 512
+  },
+  "control_defect_watch_since": 1789427640,
+  "life_wiki_daily_note": {
+    "vault": "/home/chris/services/life-wiki/vault",
+    "timezone": "America/Chicago",
+    "cutoff_hour": 6
+  },
+  "backup_results": {
+    "dr_verify_state": "~/.hermes/state/dr-backup-verify.json",
+    "dr_max_age_seconds": 93600,
+    "postgres_dump_dir": "/home/chris/backups/hermes-postgres-daily",
+    "postgres_dump_glob": "hermes-*.dump",
+    "postgres_max_age_seconds": 93600,
+    "postgres_min_bytes": 1048576
+  },
+  "escalation_card_max_undispositioned_seconds": 604800
 }
