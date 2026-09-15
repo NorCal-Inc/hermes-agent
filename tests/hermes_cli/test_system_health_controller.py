@@ -3204,10 +3204,18 @@ class TestF4PassBounds:
         ctx = _ctx(kanban_home)
         ctx.sleep = time.sleep
         checks = []
+
+        def slow_check():                                   # each check costs 0.2 s, like a slow systemctl call
+            checks.append(1)
+            time.sleep(0.2)
+            return "still_failing"
+
         started = time.monotonic()
-        problem = shc._poll_until(ctx, lambda: checks.append(1) or "still_failing", timeout=0.3, interval=0.05)
-        assert problem == "still_failing" and time.monotonic() - started < 1.0
-        assert 2 <= len(checks) <= 8
+        problem = shc._poll_until(ctx, slow_check, timeout=0.3, interval=0.05)
+        elapsed = time.monotonic() - started
+        # An iteration cap alone would run 7 checks (~1.4 s); the real deadline stops after the first check
+        # that ends past 0.3 s.
+        assert problem == "still_failing" and len(checks) <= 3 and elapsed < 0.8
 
     def test_one_recovery_mutation_per_pass(self, kanban_home):
         state = {"broken": {"x", "y"}}
