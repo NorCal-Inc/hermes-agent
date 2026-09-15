@@ -9394,22 +9394,93 @@ def _runtime_cap_ladder_step(
 #: smallest tested code change necessary so explicitly authorized per-card
 #: runtime caps can exceed that baseline."* ``execution.max_runtime_seconds``
 #: bounds every supervised execution; a card's own ``max_runtime_seconds`` may
-#: only exceed it when the cap was granted by the ladder or by a named human
-#: approval, both of which leave a ``runtime_cap_raised`` event.
+#: only exceed it when the ladder or a human approval granted that cap, both of
+#: which leave a ``runtime_cap_raised`` event.
+#:
+#: Threat model (Christopher, 2026-09-15): protection is against escalation
+#: through supported Hermes interfaces -- worker tools, CLI paths, board
+#: functions, execution/event APIs. A process already running as the same OS
+#: user can edit ``kanban.db``, source or approval records directly; closing
+#: that needs a separate trust boundary and is out of scope here.
 RUNTIME_CAP_APPROVAL_EVENT = "runtime_cap_raised"
 RUNTIME_CAP_APPROVAL_SOURCE_LADDER = "runtime_cap_ladder"
-RUNTIME_CAP_APPROVAL_ACTOR_KIND = "human_instructed"
+#: The one accepted format for a human approval. The 2026-09-07
+#: ``actor_kind="human_instructed"`` records are retired from authorization:
+#: their fields were self-asserted and any event writer could copy them
+#: (independent verification x_076804477eae5e31), and no open card relied on one.
+RUNTIME_CAP_APPROVAL_SOURCE_HUMAN = "human_approval"
+RUNTIME_CAP_APPROVAL_AUTHORIZATION_SOURCE = "kanban_db.approve_runtime_cap"
+
+
+class RuntimeCapApprovalRefused(PermissionError):
+    """A runtime-cap approval was refused; nothing was recorded."""
+
+
+def _valid_ladder_raise(
+    conn: sqlite3.Connection, task_id: str, event_id: int, payload: dict,
+    approved: Optional[int],
+) -> bool:
+    """Whether ``payload`` is a raise the ladder itself would have written here.
+
+    One rung up, within the card's ceiling, after
+    ``RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG`` ``timed_out`` events at the rung
+    it left, and from either the baseline rung or a cap the card already held
+    with approval -- so a card created at 600 cannot ladder itself to 900.
+    """
+    try:
+        previous = int(payload.get("previous"))
+        granted = int(payload.get("max_runtime_seconds"))
+    except (TypeError, ValueError):
+        return False
+    if previous not in RUNTIME_CAP_LADDER or granted not in RUNTIME_CAP_LADDER:
+        return False
+    if RUNTIME_CAP_LADDER.index(granted) != RUNTIME_CAP_LADDER.index(previous) + 1:
+        return False
+    if granted > _runtime_cap_ladder_ceiling(conn, task_id):
+        return False
+    if previous != RUNTIME_CAP_LADDER[0] and previous != approved:
+        return False
+    timeouts = 0
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'timed_out' AND id < ?",
+        (task_id, event_id),
+    ):
+        try:
+            limit = int(json.loads(row["payload"] or "{}").get("limit_seconds") or 0)
+        except (TypeError, ValueError):
+            continue
+        if limit == previous:
+            timeouts += 1
+    return timeouts >= RUNTIME_CAP_LADDER_TIMEOUTS_PER_RUNG
+
+
+def _valid_human_approval(payload: dict) -> bool:
+    """Whether ``payload`` is in the format only ``approve_runtime_cap`` writes."""
+    if payload.get("source") != RUNTIME_CAP_APPROVAL_SOURCE_HUMAN:
+        return False
+    if payload.get("authorization_source") != RUNTIME_CAP_APPROVAL_AUTHORIZATION_SOURCE:
+        return False
+    if payload.get("actor_kind") != ACTOR_KIND_HUMAN_INTERACTIVE:
+        return False
+    if not str(payload.get("reason") or "").strip():
+        return False
+    for key in ("approved_by", "actor_id"):
+        name = str(payload.get(key) or "").strip()
+        if not name or _automation_identity(name):
+            return False
+    return True
 
 
 def approved_runtime_cap(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     """The card's cap if it is an approved override, else ``None``.
 
-    Approved means the card's newest ``runtime_cap_raised`` event names exactly
-    the cap the card carries now, and that event came from the governed ladder
-    (at a rung this card may reach) or from a named human instruction. A cap
-    set any other way -- at creation, by a worker's ``kanban_create`` call, or
-    changed after its approval -- is not approved, so a card cannot raise
-    itself past the baseline by writing a bigger number.
+    Replays the card's ``runtime_cap_raised`` history in order. A valid ladder
+    step or a valid human approval sets the approved cap; any other record --
+    an unattributed raise, a retired-format or self-asserted "human" record, a
+    ladder record without its timeouts -- clears it. The card's current cap
+    counts only when it equals the approved cap, so a cap set at creation, by a
+    worker's ``kanban_create`` call, or changed after its approval is not
+    approved.
     """
     row = conn.execute(
         "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)
@@ -9417,29 +9488,53 @@ def approved_runtime_cap(conn: sqlite3.Connection, task_id: str) -> Optional[int
     if row is None or row["max_runtime_seconds"] is None:
         return None
     cap = int(row["max_runtime_seconds"])
-    event = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1",
+    approved: Optional[int] = None
+    for event in conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
         (task_id, RUNTIME_CAP_APPROVAL_EVENT),
-    ).fetchone()
-    if event is None:
-        return None
-    try:
-        payload = json.loads(event["payload"] or "{}")
-        granted = int(payload.get("max_runtime_seconds"))
-    except (TypeError, ValueError):
-        return None
-    if granted != cap:
-        return None
-    if payload.get("source") == RUNTIME_CAP_APPROVAL_SOURCE_LADDER:
-        if cap in RUNTIME_CAP_LADDER and cap <= _runtime_cap_ladder_ceiling(conn, task_id):
-            return cap
-        return None
-    if (
-        payload.get("actor_kind") == RUNTIME_CAP_APPROVAL_ACTOR_KIND
-        and str(payload.get("actor_id") or "").strip()
     ):
-        return cap
+        try:
+            payload = json.loads(event["payload"] or "{}")
+            granted = int(payload.get("max_runtime_seconds"))
+        except (TypeError, ValueError, AttributeError):
+            approved = None
+            continue
+        if granted <= 0:
+            approved = None
+        elif payload.get("source") == RUNTIME_CAP_APPROVAL_SOURCE_LADDER:
+            valid = _valid_ladder_raise(conn, task_id, int(event["id"]), payload, approved)
+            approved = granted if valid else None
+        elif _valid_human_approval(payload):
+            approved = granted
+        else:
+            approved = None
+    return cap if approved is not None and approved == cap else None
+
+
+def _running_worker_context(conn: sqlite3.Connection) -> Optional[str]:
+    """Why this caller is inside a dispatcher-spawned worker, or ``None``.
+
+    ``_governed_grant_context`` sees env markers and supervised executions. A
+    profile worker is not a supervised execution, and its terminal tool can drop
+    the env markers, so also refuse any descendant (or process-group member) of
+    a running card's worker process.
+    """
+    ancestry = set(_process_ancestry())
+    try:
+        own_pgid = os.getpgid(0)
+    except OSError:
+        own_pgid = None
+    for row in conn.execute(
+        "SELECT id, worker_pid FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ):
+        pid = int(row["worker_pid"])
+        if pid in ancestry:
+            return f"caller descends from running kanban worker for {row['id']}"
+        try:
+            if own_pgid is not None and os.getpgid(pid) == own_pgid:
+                return f"caller shares the process group of the worker for {row['id']}"
+        except OSError:
+            pass
     return None
 
 
@@ -9450,42 +9545,65 @@ def approve_runtime_cap(
     *,
     approved_by: str,
     reason: str,
-) -> int:
-    """Record a named human approval of a per-card runtime cap.
+    env: Optional[Mapping[str, str]] = None,
+    now: Optional[int] = None,
+) -> dict:
+    """Record one human operator's approval of a per-card runtime cap.
 
     The only path besides the ladder that lets a card run longer than
-    ``execution.max_runtime_seconds``. Not exposed to worker tools. Raises
-    ``ValueError`` without writing anything when the approver, reason or cap
-    is missing, or the card does not exist.
+    ``execution.max_runtime_seconds``. Fails closed, writing nothing: refused
+    inside any board run or supervised execution (env markers, process
+    ancestry, running worker processes), without explicit operator provenance
+    (``HERMES_ACTOR_KIND=human_interactive`` and a named ``HERMES_ACTOR_ID``),
+    for automation identities, and without an approver, reason or positive cap.
+    Mirrors ``grant_objective_attempts``. Not exposed to worker tools.
     """
+    environ: Mapping[str, str] = os.environ if env is None else env
     approved_by = str(approved_by or "").strip()
     reason = str(reason or "").strip()
-    if not approved_by:
-        raise ValueError("approve_runtime_cap requires approved_by")
-    if not reason:
-        raise ValueError("approve_runtime_cap requires reason")
-    seconds = int(seconds)
-    if seconds <= 0:
-        raise ValueError("approve_runtime_cap requires a positive cap")
+    if not approved_by or not reason:
+        raise RuntimeCapApprovalRefused("an approval requires approved_by and a reason")
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        raise RuntimeCapApprovalRefused("an approval requires a positive integer cap")
+    context = _governed_grant_context(conn, environ) or _running_worker_context(conn)
+    if context is not None:
+        raise RuntimeCapApprovalRefused(f"automation cannot approve a runtime cap: {context}")
+    declared = (environ.get(ENV_ACTOR_KIND) or "").strip()
+    actor_id = (environ.get(ENV_ACTOR_ID) or "").strip()
+    if declared != ACTOR_KIND_HUMAN_INTERACTIVE or not actor_id:
+        raise RuntimeCapApprovalRefused(
+            f"an approval requires explicit operator provenance: {ENV_ACTOR_KIND}="
+            f"{ACTOR_KIND_HUMAN_INTERACTIVE} and a named {ENV_ACTOR_ID}"
+        )
+    for name in (actor_id, approved_by):
+        if _automation_identity(name):
+            raise RuntimeCapApprovalRefused(
+                f"{name!r} is an automation identity and cannot approve a runtime cap"
+            )
+    now_ts = int(time.time()) if now is None else int(now)
     with write_txn(conn):
         row = conn.execute(
             "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if row is None:
-            raise ValueError(f"unknown task {task_id}")
+            raise RuntimeCapApprovalRefused(f"task {task_id} not found")
+        payload = {
+            "max_runtime_seconds": seconds,
+            "previous": row["max_runtime_seconds"],
+            "source": RUNTIME_CAP_APPROVAL_SOURCE_HUMAN,
+            "authorization_source": RUNTIME_CAP_APPROVAL_AUTHORIZATION_SOURCE,
+            "approved_by": approved_by,
+            "actor_kind": declared,
+            "actor_id": actor_id,
+            "reason": reason,
+            "approved_at": now_ts,
+        }
         conn.execute(
             "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ?",
             (seconds, task_id),
         )
-        _append_event(conn, task_id, RUNTIME_CAP_APPROVAL_EVENT, {
-            "max_runtime_seconds": seconds,
-            "previous": row["max_runtime_seconds"],
-            "actor_kind": RUNTIME_CAP_APPROVAL_ACTOR_KIND,
-            "actor_id": approved_by,
-            "reason": reason,
-            "source": "human_approval",
-        })
-    return seconds
+        _append_event(conn, task_id, RUNTIME_CAP_APPROVAL_EVENT, payload)
+    return payload
 
 
 def gauntlet_canonical_ref() -> str:
