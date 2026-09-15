@@ -2120,13 +2120,28 @@ class TestF3Contract:
         for name in ("subject_lane_relabelled", "verifier_child_deadlocked"):   # v1 verifier routing stays in-code
             assert name not in bound
 
-    def test_repository_config_declares_every_class_disabled(self):
+    #: Christopher Hubbard authorized life_wiki_retry alone on 2026-09-15 (t_b8d62378 note §29). Any other enablement, or any
+    #: change to this class's authorization scope, must be a new explicit authorization with a new pinned digest.
+    AUTHORIZED_CLASSES = {
+        "life_wiki_retry": ("Christopher Hubbard", "5199c8ebc5c1c4ae9c2a8f34b8efb224fd0b92f0b2904acb24f2f6aa6352c149"),
+    }
+
+    def test_repository_config_authorizes_only_the_governed_classes(self):
         config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
         names = {k for k in config["recovery_classes"] if k != "status"}
         assert names == {c.name for c in shc.default_recovery_classes()}
         for klass in shc.default_recovery_classes():
-            assert config["recovery_classes"][klass.name]["enabled"] is False
-            assert shc.recovery_authorization(config, klass) == (None, None)
+            spec = config["recovery_classes"][klass.name]
+            authorized, problem = shc.recovery_authorization(config, klass)
+            assert problem is None, (klass.name, problem)
+            if klass.name in self.AUTHORIZED_CLASSES:
+                authorizer, digest = self.AUTHORIZED_CLASSES[klass.name]
+                assert spec["enabled"] is True and spec["authorized_by"] == authorizer
+                assert spec["authorization_sha256"] == digest == shc.recovery_authorization_digest(klass.name, spec)
+                assert authorized is not None
+            else:
+                assert spec["enabled"] is False, klass.name
+                assert authorized is None, klass.name
 
     def test_invalid_authorization_runs_nothing_and_degrades(self, kanban_home):
         state = {"broken": {"x"}}

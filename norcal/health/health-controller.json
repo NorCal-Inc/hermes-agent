@@ -206,8 +206,9 @@
       "reconcile": ["claims", "detached_runs", "executions"]
     },
     "life_wiki_retry": {
-      "enabled": false,
-      "authorized_by": "",
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard",
+      "authorization_sha256": "5199c8ebc5c1c4ae9c2a8f34b8efb224fd0b92f0b2904acb24f2f6aa6352c149",
       "daily_note_job": "nightly-executive-continuity-reconciliation",
       "validation_jobs": ["life-wiki-daily-validation"],
       "settle_seconds": 3600,
