@@ -2818,6 +2818,7 @@ class TestLifeWikiRetryRecovery:
         _wiki_setup(kanban_home, vault)
         clock = Clock()
         clock.t = _chicago_ts(5)                               # before the note cutoff: only the job finding
+        (vault / "Logs" / "daily" / "2026-09-14.md").write_text("# day\n")   # the validation retry waits for the note
         fake = FakeCron(kanban_home, vault, clock)
         light = self._controller(kanban_home, tmp_path, fake, _wiki_config(vault), clock).run(shc.TIER_LIGHT)
         assert fake.triggered == ["life-wiki-daily-validation"] and len(light.recovered) == 1
@@ -3284,3 +3285,332 @@ class TestF4PassBounds:
             bound = self._bound(config, tier)
             assert int(value) >= bound * 1.1, (tier, int(value), bound)
             assert int(value) < 3600, tier                         # a hung pass ends before the next hourly trigger
+
+
+# -- governed re-entry: an existing not_recoverable escalation becomes recoverable ----------------------------------
+#
+# Christopher, 2026-09-15: an escalation raised while no recovery class was authorized gets exactly one bounded
+# re-evaluation per new authorization digest of the matching class. Refused preconditions leave it escalated and
+# unmutated; a cleared detector resolves normally; unsafe, security/isolation, company, frozen and any other
+# escalation reason are excluded.
+
+
+def _ledger(ctx):
+    path = ctx.state_dir / "ledger.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def _fp_record(ctx, invariant="toggle_detector", subject="x"):
+    return [r for r in shc.StateStore(ctx.state_dir).load()["fingerprints"].values()
+            if r["invariant"] == invariant and r["subject"] == subject][0]
+
+
+class OtherToggle(Toggle):
+    name = "other_detector"
+
+
+def _escalated_without_authorization(kanban_home, state, clock, alerts, detectors=None, config=None):
+    """The production shape: the condition escalated while no class was authorized."""
+    ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=config or _governed())
+    result = shc.Controller(ctx, detectors or [Toggle(state)], recoveries=[]).run(shc.TIER_LIGHT)
+    rec = _fp_record(ctx)
+    assert rec["status"] == shc.STATUS_ESCALATED and rec["escalation_reason"] == shc.ESCALATION_NOT_RECOVERABLE
+    return ctx, result
+
+
+def _authorized_run(kanban_home, state, klass, clock, alerts, *, detectors=None, config=None, **spec):
+    config = _authorize(config or _governed(), klass.name, **spec)
+    ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=config)
+    return shc.Controller(ctx, detectors or [Toggle(state)], recoveries=[klass]).run(shc.TIER_LIGHT), ctx, config
+
+
+class TestNewlyAuthorizedRecoveryReentry:
+    def test_existing_escalation_gets_one_recovery_when_its_class_is_newly_authorized(self, kanban_home):
+        # 1, 14, 15
+        state = {"broken": {"x"}, "other": {"y"}}
+        clock, alerts = Clock(), Alerts()
+        other = OtherToggle({"broken": state["other"]})
+        ctx0, _ = _escalated_without_authorization(kanban_home, state, clock, alerts, detectors=[Toggle(state), other])
+        before = _fp_record(ctx0)
+        other_before = _fp_record(ctx0, "other_detector", "y")
+        with kb.connect_closing() as conn:
+            cards_before = [r["id"] for r in _health_cards(conn)]
+        assert len(alerts.sent) == 1
+        clock.advance(300)
+        klass = FakeRecovery(state)
+        result, ctx, config = _authorized_run(kanban_home, state, klass, clock, alerts,
+                                              detectors=[Toggle(state), OtherToggle({"broken": state["other"]})])
+        assert klass.recoveries == ["x"] and len(result.recovered) == 1
+        rec = _fp_record(ctx)
+        assert rec["status"] == shc.STATUS_RESOLVED
+        assert rec["card_id"] == before["card_id"] and rec["first_seen"] == before["first_seen"]
+        (entry,) = rec["recovery_reentries"]
+        assert entry["recovery_class"] == "fake_recovery"
+        assert entry["authorization_sha256"] == config["recovery_classes"]["fake_recovery"]["authorization_sha256"]
+        assert entry["prior_escalation_reason"] == shc.ESCALATION_NOT_RECOVERABLE
+        assert entry["prior_escalated_at"] == before["escalated_at"] and entry["card_id"] == before["card_id"]
+        (prior,) = rec["prior_escalations"]
+        assert prior["escalation_reason"] == shc.ESCALATION_NOT_RECOVERABLE and prior["card_id"] == before["card_id"]
+        events = [e for e in _ledger(ctx) if e["event"] == "recovery_newly_authorized"]
+        assert len(events) == 1 and events[0]["outcome"] == "recovery_path"
+        other_after = _fp_record(ctx, "other_detector", "y")
+        for key in ("status", "escalation_reason", "escalated_at", "card_id", "attempts", "first_seen"):
+            assert other_after.get(key) == other_before.get(key), key
+        assert "recovery_reentries" not in other_after
+        with kb.connect_closing() as conn:
+            assert [r["id"] for r in _health_cards(conn)] == cards_before
+        assert len(alerts.sent) == 1
+
+    def test_unchanged_authorization_never_reevaluates_again(self, kanban_home):
+        # 2, 10
+        state = {"broken": {"x"}}
+        clock, alerts = Clock(), Alerts()
+        _escalated_without_authorization(kanban_home, state, clock, alerts)
+        klass = FakeRecovery(state, fixes=False)
+        config = _authorize(_governed(), klass.name)
+        for _ in range(8):
+            clock.advance(300)
+            ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=config)
+            shc.Controller(ctx, [Toggle(state)], recoveries=[klass]).run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x", "x"]                             # one bounded episode: first attempt + retry
+        rec = _fp_record(ctx)
+        assert rec["status"] == shc.STATUS_ESCALATED
+        assert rec["escalation_reason"] == shc.ESCALATION_BUDGET_EXHAUSTED
+        assert len(rec["recovery_reentries"]) == 1
+        assert len([e for e in _ledger(ctx) if e["event"] == "recovery_newly_authorized"]) == 1
+        assert len(alerts.sent) == 1                                      # existing card, alert not repeated
+        with kb.connect_closing() as conn:
+            assert len(_health_cards(conn)) == 1
+
+    def test_a_new_authorization_digest_gives_exactly_one_new_bounded_eligibility(self, kanban_home):
+        # 3
+        state = {"broken": {"x"}}
+        clock, alerts = Clock(), Alerts()
+        _escalated_without_authorization(kanban_home, state, clock, alerts)
+        klass = FakeRecovery(state, fixes=False)
+        for _ in range(5):
+            clock.advance(300)
+            _authorized_run(kanban_home, state, klass, clock, alerts)
+        assert klass.recoveries == ["x", "x"]
+        klass.fixes = True
+        for _ in range(4):                                                # authorization changed once, then stable
+            clock.advance(300)
+            _, ctx, _ = _authorized_run(kanban_home, state, klass, clock, alerts, max_files=3)
+        assert klass.recoveries == ["x", "x", "x"]
+        rec = _fp_record(ctx)
+        assert rec["status"] == shc.STATUS_RESOLVED
+        assert [e["authorization_sha256"] != "" for e in rec["recovery_reentries"]] == [True, True]
+        assert rec["recovery_reentries"][0]["authorization_sha256"] != rec["recovery_reentries"][1]["authorization_sha256"]
+        assert len(rec["prior_escalations"]) == 2
+
+    @pytest.mark.parametrize("variant", ["unsafe", "company_isolation", "company_route", "frozen"])
+    def test_excluded_findings_stay_escalated(self, kanban_home, variant):
+        # 4, 5, 6
+        subject = "t_frozen1" if variant == "frozen" else "x"
+        name = "company_isolation" if variant == "company_isolation" else "toggle_detector"
+
+        class Detector(shc.Invariant):
+            tier = shc.TIER_LIGHT
+            source = failure = evidence = "test"
+
+            def check(self, ctx):
+                return [shc.Finding(self.name, subject, "broken", {}, unsafe=variant == "unsafe",
+                                    route="company" if variant == "company_route" else "shared")]
+
+        Detector.name = name
+        holds = ([{"name": "freeze", "task_ids": ["t_frozen1"], "reason": "r", "authorized_by": "a", "release": "z"}]
+                 if variant == "frozen" else None)
+        clock, alerts = Clock(), Alerts()
+        ctx0 = _ctx(kanban_home, clock=clock, alerts=alerts, config=_governed(recovery_holds=holds))
+        shc.Controller(ctx0, [Detector()], recoveries=[]).run(shc.TIER_LIGHT)
+        before = _fp_record(ctx0, name, subject)
+        assert before["status"] == shc.STATUS_ESCALATED
+
+        class Bound(FakeRecovery):
+            binds = {name: ("broken",)}
+
+        klass = Bound({"broken": {subject}})
+        for _ in range(3):
+            clock.advance(300)
+            config = _authorize(_governed(recovery_holds=holds), klass.name)
+            ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=config)
+            shc.Controller(ctx, [Detector()], recoveries=[klass]).run(shc.TIER_LIGHT)
+        after = _fp_record(ctx, name, subject)
+        assert klass.gates == 0 and klass.recoveries == []
+        assert after["status"] == shc.STATUS_ESCALATED and after["escalation_reason"] == before["escalation_reason"]
+        assert "recovery_reentries" not in after
+        assert not [e for e in _ledger(ctx) if e["event"] == "recovery_newly_authorized"]
+
+    def test_escalations_for_other_reasons_are_never_reentered(self, kanban_home):
+        # 7: refused while authorized (an operator-decision refusal), then a new authorization digest
+        state = {"broken": {"x"}}
+        clock, alerts = Clock(), Alerts()
+        klass = FakeRecovery(state, gate=shc.Gate(shc.GATE_REFUSED, "job_paused_owner_decision"))
+        _authorized_run(kanban_home, state, klass, clock, alerts)
+        rec = _fp_record(_ctx(kanban_home))
+        assert rec["escalation_reason"] == "recovery_refused:job_paused_owner_decision"
+        gates = klass.gates
+        klass.gate_decision = None
+        for _ in range(3):
+            clock.advance(300)
+            _, ctx, _ = _authorized_run(kanban_home, state, klass, clock, alerts, max_files=9)
+        assert klass.gates == gates and klass.recoveries == []
+        assert _fp_record(ctx)["escalation_reason"] == "recovery_refused:job_paused_owner_decision"
+
+    def test_detector_already_cleared_resolves_without_recovery(self, kanban_home):
+        # 8
+        state = {"broken": {"x"}}
+        clock, alerts = Clock(), Alerts()
+        _escalated_without_authorization(kanban_home, state, clock, alerts)
+        state["broken"].clear()
+        clock.advance(300)
+        klass = FakeRecovery(state)
+        _, ctx, _ = _authorized_run(kanban_home, state, klass, clock, alerts)
+        rec = _fp_record(ctx)
+        assert klass.gates == 0 and klass.recoveries == []
+        assert rec["status"] == shc.STATUS_RESOLVED and "recovery_reentries" not in rec
+        assert any(e["event"] == "green" and e.get("via") == "condition_cleared" for e in _ledger(ctx))
+
+    def test_failed_preconditions_leave_the_escalation_unmutated(self, kanban_home):
+        # 9
+        state = {"broken": {"x"}}
+        clock, alerts = Clock(), Alerts()
+        ctx0, _ = _escalated_without_authorization(kanban_home, state, clock, alerts)
+        before = _fp_record(ctx0)
+        klass = FakeRecovery(state, gate=shc.Gate(shc.GATE_REFUSED, "job_missing"))
+        for _ in range(3):
+            clock.advance(300)
+            _, ctx, _ = _authorized_run(kanban_home, state, klass, clock, alerts)
+        rec = _fp_record(ctx)
+        assert klass.recoveries == [] and klass.gates == 1
+        for key in ("status", "escalation_reason", "escalated_at", "card_id", "attempts", "first_seen"):
+            assert rec.get(key) == before.get(key), key
+        (entry,) = rec["recovery_reentries"]
+        assert entry["gate"] == shc.GATE_REFUSED and entry["gate_reason"] == "job_missing"
+        assert [e["outcome"] for e in _ledger(ctx) if e["event"] == "recovery_newly_authorized"] == ["remained_escalated"]
+        assert len(alerts.sent) == 1
+        with kb.connect_closing() as conn:
+            assert len(_health_cards(conn)) == 1
+
+    def test_dry_run_never_reenters(self, kanban_home):
+        state = {"broken": {"x"}}
+        clock, alerts = Clock(), Alerts()
+        _escalated_without_authorization(kanban_home, state, clock, alerts)
+        klass = FakeRecovery(state)
+        config = _authorize(_governed(), klass.name)
+        ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=config, dry_run=True)
+        shc.Controller(ctx, [Toggle(state)], recoveries=[klass]).run(shc.TIER_LIGHT)
+        assert klass.gates == 0 and "recovery_reentries" not in _fp_record(_ctx(kanban_home))
+
+
+# -- life_wiki_retry: validation retry waits for today's note ---------------------------------------------------------
+
+
+class TestLifeWikiValidationWaitsForTheNote:
+    def _controller(self, kanban_home, fake, config, clock, alerts=None, invariants=None):
+        ctx = _ctx(kanban_home, clock=clock, alerts=alerts or Alerts(), config=config, run_command=fake.run_command)
+        ctx.cron_trigger = fake.trigger
+        return shc.Controller(ctx, invariants or [shc.LifeWikiDailyNote(), shc.CriticalCronJobsHealthy()]), ctx
+
+    def _validation_rec(self, ctx):
+        return _fp_record(ctx, "critical_cron_jobs_healthy", "life-wiki-daily-validation")
+
+    def test_validation_failure_with_the_note_missing_defers_without_spending_an_attempt(self, kanban_home, tmp_path):
+        # 11
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock)
+        controller, ctx = self._controller(kanban_home, fake, _wiki_config(vault), clock)
+        for _ in range(3):
+            controller.run(shc.TIER_LIGHT)
+            clock.advance(300)
+        assert "life-wiki-daily-validation" not in fake.triggered
+        rec = self._validation_rec(ctx)
+        assert rec["status"] == shc.STATUS_OPEN and int(rec.get("attempts") or 0) == 0
+        assert rec["deferral_reason"] == "awaiting_daily_note"
+        assert any(e["event"] == "recovery_gate" and e.get("reason") == "awaiting_daily_note" for e in _ledger(ctx))
+
+    @pytest.mark.parametrize("validator_rc,recovered", [(0, True), (2, False)])
+    def test_once_the_note_exists_the_validation_retry_proceeds_and_needs_validator_exit_zero(
+            self, kanban_home, tmp_path, validator_rc, recovered):
+        # 12
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock, validator_rc=validator_rc)
+        controller, ctx = self._controller(kanban_home, fake, _wiki_config(vault), clock)
+        controller.run(shc.TIER_LIGHT)
+        assert fake.triggered == []
+        (vault / "Logs" / "daily" / "2026-09-14.md").write_text("# day\n")
+        clock.advance(300)
+        result = controller.run(shc.TIER_LIGHT)
+        assert fake.triggered == ["life-wiki-daily-validation"]
+        assert (len(result.recovered) == 1) is recovered
+        if not recovered:
+            assert self._validation_rec(ctx)["last_postcondition"] == "validator_failed:rc=2"
+
+    def test_a_note_that_never_appears_escalates_validation_without_spending_its_retries(self, kanban_home, tmp_path):
+        # 13
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock, writes_note=False)
+        controller, ctx = self._controller(kanban_home, fake, _wiki_config(vault, settle=600), clock)
+        for i in range(30):                                               # 2.5 hours of 5-minute light passes
+            controller.run(shc.TIER_LIGHT)
+            if i % 12 == 0:
+                controller.run(shc.TIER_DEEP)
+            clock.advance(300)
+        assert "life-wiki-daily-validation" not in fake.triggered
+        assert fake.triggered.count("nightly-executive-continuity-reconciliation") <= 2
+        rec = self._validation_rec(ctx)
+        assert rec["status"] == shc.STATUS_ESCALATED
+        assert rec["escalation_reason"] == shc.ESCALATION_DEFERRED_TOO_LONG and int(rec.get("attempts") or 0) == 0
+
+    def test_paused_note_job_refuses_the_validation_retry_instead_of_deferring(self, kanban_home, tmp_path):
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault, job_state="paused", enabled=False)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock)
+        controller, ctx = self._controller(kanban_home, fake, _wiki_config(vault), clock,
+                                           invariants=[shc.CriticalCronJobsHealthy()])
+        controller.run(shc.TIER_LIGHT)
+        rec = self._validation_rec(ctx)
+        assert fake.triggered == [] and rec["status"] == shc.STATUS_ESCALATED
+        assert rec["escalation_reason"] == "recovery_refused:daily_note_job_paused_owner_decision"
+
+    def test_production_shape_escalations_become_one_ordered_recovery_when_authorized(self, kanban_home, tmp_path):
+        """2026-09-15 shape: note missing and both jobs failed while the class was disabled; then it is authorized."""
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock)
+        disabled = {k: v for k, v in _wiki_config(vault).items() if k != "recovery_classes"}
+        disabled["critical_cron_jobs"] = {"life-wiki-daily-validation": {},
+                                          "nightly-executive-continuity-reconciliation": {}}
+        controller, ctx = self._controller(kanban_home, fake, disabled, clock)
+        controller.run(shc.TIER_LIGHT)
+        controller.run(shc.TIER_DEEP)
+        state = shc.StateStore(ctx.state_dir).load()["fingerprints"].values()
+        assert {r["escalation_reason"] for r in state} == {shc.ESCALATION_NOT_RECOVERABLE}
+        cards = {r["card_id"] for r in state}
+        authorized = {**disabled, "recovery_classes": _wiki_config(vault)["recovery_classes"]}
+        clock.advance(300)
+        controller, ctx = self._controller(kanban_home, fake, authorized, clock)
+        controller.run(shc.TIER_LIGHT)                                    # validation first: must wait for the note
+        assert fake.triggered == []
+        controller.run(shc.TIER_DEEP)                                     # note path: existing job, then validator
+        assert fake.triggered == ["nightly-executive-continuity-reconciliation"]
+        clock.advance(300)
+        controller.run(shc.TIER_LIGHT)                                    # note exists: validation retry proceeds
+        assert fake.triggered == ["nightly-executive-continuity-reconciliation", "life-wiki-daily-validation"]
+        final = shc.StateStore(ctx.state_dir).load()["fingerprints"].values()
+        assert all(r["status"] == shc.STATUS_RESOLVED for r in final), [(r["invariant"], r["subject"], r["status"]) for r in final]
+        assert {r["card_id"] for r in final} == cards
+        assert all(len(r.get("recovery_reentries") or []) <= 1 for r in final)

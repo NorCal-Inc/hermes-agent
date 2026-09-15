@@ -741,6 +741,9 @@ class Controller:
         rec["observations"] = int(rec.get("observations", 0)) + 1
 
         if rec["status"] == STATUS_ESCALATED:
+            if (not self.ctx.dry_run and reason_override is None
+                    and self._reenter_newly_authorized(inv, finding, rec, state, result)):
+                return
             # Escalated exactly once. Only an undelivered alert is retried.
             self._deliver_alert(finding, rec)
             return
@@ -939,6 +942,70 @@ class Controller:
             carried.add(fp)
             self._process(inv, finding, state, result)
         return carried
+
+    def _reenter_newly_authorized(self, inv: Invariant, finding: Finding, rec: dict, state: dict,
+                                  result: PassResult) -> bool:
+        """Governed transition (Christopher, 2026-09-15): an escalation no class could act on meets a new authorization.
+
+        A fingerprint escalated ``not_recoverable`` -- no recovery class was authorized for it at the time -- gets
+        exactly ONE re-evaluation for each new authorization digest of the class that now binds it:
+
+        * the class gate is consulted once; REFUSED (or a raising gate) leaves the escalation exactly as it was and
+          only records the evaluation, so the same digest is never evaluated again;
+        * otherwise the fingerprint enters the normal bounded recovery path (fresh class budget, deferral and
+          recurrence bounds) with its card pointer, first_seen and observations kept and the previous escalation
+          appended to ``prior_escalations``; a failing episode escalates again on the existing card.
+
+        Never for unsafe, company-route, escalate-only (security, isolation, governance) or frozen findings -- the
+        caller passes no reason override and ``_recovery_for`` refuses the rest -- nor for a fingerprint whose
+        original escalation reason was anything other than ``not_recoverable``. A detector that has already cleared
+        never reaches here: ``_resolve_absent`` resolves it as ``condition_cleared``.
+        Returns True when the fingerprint was moved into the recovery path this pass.
+        """
+        origin = rec.get("origin_escalation_reason") or rec.get("escalation_reason")
+        if origin != ESCALATION_NOT_RECOVERABLE:
+            return False
+        reentries = list(rec.get("recovery_reentries") or [])
+        if finding.invariant in ESCALATE_ONLY_INVARIANTS:
+            return False
+        bound = self._recovery_for(inv, finding, None)      # refuses unsafe, company-route and frozen findings
+        if bound is None:
+            return False
+        klass, spec = bound
+        digest = str(spec.get("authorization_sha256") or recovery_authorization_digest(klass.name, spec))
+        if any(e.get("recovery_class") == klass.name and e.get("authorization_sha256") == digest for e in reentries):
+            return False
+        now = self.ctx.now()
+        try:
+            gate = klass.gate(self.ctx, finding, rec, spec)
+        except Exception as exc:
+            gate = Gate(GATE_REFUSED, f"gate_raised:{type(exc).__name__}")
+        entry = {
+            "at": _iso(now), "recovery_class": klass.name, "authorization_sha256": digest,
+            "authorized_by": spec.get("authorized_by"), "gate": gate.decision, "gate_reason": gate.reason,
+            "prior_status": rec.get("status"), "prior_escalation_reason": rec.get("escalation_reason"),
+            "prior_escalated_at": rec.get("escalated_at"), "prior_attempts": int(rec.get("attempts") or 0),
+            "card_id": rec.get("card_id"),
+        }
+        rec["recovery_reentries"] = reentries + [entry]
+        rec["origin_escalation_reason"] = origin
+        refused = gate.decision == GATE_REFUSED
+        self.store.record(now, "recovery_newly_authorized", fingerprint=finding.fingerprint,
+                          recovery_class=klass.name, authorization_sha256=digest, gate=gate.decision,
+                          reason=gate.reason, outcome="remained_escalated" if refused else "recovery_path")
+        if refused:
+            return False
+        rec.setdefault("prior_escalations", []).append({
+            key: rec.get(key) for key in ("escalation_reason", "escalated_at", "card_id", "card_error", "alert_delivered")
+        })
+        rec["status"] = STATUS_OPEN
+        rec["escalation_reason"] = None
+        rec["attempts"] = 0
+        for key in ("recovery_pending", "awaiting_postcondition_since", "deferred_since", "deferral_reason",
+                    "last_postcondition", "gate_detector_disagreements", "waiting_for_pass_budget"):
+            rec.pop(key, None)
+        self._recover_with_class(inv, klass, spec, finding, rec, state, result)
+        return True
 
     def _recover_with_class(self, inv: Invariant, klass: "RecoveryClass", spec: dict, finding: Finding,
                             rec: dict, state: dict, result: PassResult) -> None:
@@ -3281,7 +3348,9 @@ class LifeWikiRetryRecovery(RecoveryClass):
     authorization_boundary = ("the daily-note job and validation jobs named in the class spec only; never "
                               "life-wiki-github-sync (it commits every change); no alternative storage is written")
     validator = ("daily note: today's note exists and the deterministic validator command exits 0; validation job: "
-                 "last_run_at after the trigger and last_status ok (settle window before judging)")
+                 "last_run_at after the trigger, last_status ok, today's note exists and the validator exits 0 "
+                 "(settle window before judging). A validation retry is deferred while today's note is missing "
+                 "(bounded by max_deferral_seconds) and refused when the daily-note job is paused or missing")
     rollback = "none required: an extra run of an idempotent scheduled job; the job's own writes follow its normal path"
     escalation_only = "paused/disabled or missing job; job succeeded today without writing the note; validator still failing after retry"
 
@@ -3325,6 +3394,12 @@ class LifeWikiRetryRecovery(RecoveryClass):
         return finding.signature.split(":", 1)[1]
 
     @staticmethod
+    def _today(ctx) -> str:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(ctx.config["life_wiki_daily_note"].get("timezone", "America/Chicago"))
+        return _dt.datetime.fromtimestamp(ctx.now(), tz).date().isoformat()
+
+    @staticmethod
     def _note_path(ctx, date) -> Path:
         vault = Path(os.path.expanduser(ctx.config["life_wiki_daily_note"]["vault"]))
         return vault / "Logs" / "daily" / f"{date}.md"
@@ -3348,8 +3423,19 @@ class LifeWikiRetryRecovery(RecoveryClass):
             if (last is not None and job.get("last_status") == "ok" and not rec.get("recovery_pending")
                     and _dt.datetime.fromtimestamp(last, tz).date().isoformat() == date):
                 return Gate(GATE_REFUSED, "job_succeeded_without_note")
-        elif job.get("last_status") == "ok" and not int(job.get("failure_streak") or 0) and not rec.get("recovery_pending"):
-            return Gate(GATE_CLEARED, "job_ok")
+        else:
+            if job.get("last_status") == "ok" and not int(job.get("failure_streak") or 0) and not rec.get("recovery_pending"):
+                return Gate(GATE_CLEARED, "job_ok")
+            # A validation job validates today's note: rerunning it before the note exists only spends a retry.
+            # Wait for the note path (bounded by max_deferral_seconds -> recovery_deferred_too_long); if the
+            # note job itself cannot run, retrying validation is pointless -- refuse (owner decision).
+            note_job = self._job(ctx, spec["daily_note_job"])
+            if note_job is None:
+                return Gate(GATE_REFUSED, "daily_note_job_missing")
+            if not note_job.get("enabled", True) or note_job.get("state") == "paused":
+                return Gate(GATE_REFUSED, "daily_note_job_paused_owner_decision")
+            if not self._note_path(ctx, self._today(ctx)).is_file():
+                return Gate(GATE_DEFERRED, "awaiting_daily_note")
         if ctx.cron_trigger is None:
             return Gate(GATE_REFUSED, "no_trigger_mechanism")
         return Gate(GATE_PROCEED)
@@ -3374,7 +3460,10 @@ class LifeWikiRetryRecovery(RecoveryClass):
             return "job_not_rerun_yet"
         if job.get("last_status") != "ok":
             return f"job_status:{job.get('last_status')}"
-        return None
+        date = self._today(ctx)
+        argv = [os.path.expanduser(p.replace("{date}", date)) for p in spec["validator_command"]]
+        rc, _ = ctx.run_command(argv, int(spec.get("validator_timeout_seconds", 120)))
+        return None if rc == 0 else f"validator_failed:rc={rc}"
 
 
 _GIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
