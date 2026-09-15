@@ -3155,7 +3155,12 @@ class TestVaultDriftCoverage:
         _git(work, "add", "stale.md")
         _git(work, "commit", "-q", "-m", "stale")
         (work / "a.md").unlink()                                          # deletion: age unknown -> old
+        (work / "fresh-edit.md").write_text("fresh", encoding="utf-8")   # a fresh change must not mask it
         assert ("vault", "worktree_dirty") in _signatures(self._check(kanban_home, config))
+        (work / "fresh-edit.md").unlink()
+        _git(work, "checkout", "--", "a.md")
+        (work / "only-fresh.md").write_text("fresh", encoding="utf-8")
+        assert ("vault", "worktree_dirty") not in _signatures(self._check(kanban_home, config))
 
     def test_zero_grace_repositories_are_unchanged(self, kanban_home, tmp_path):
         _bare, work = _git_repo_pair(tmp_path, name="runtime")
