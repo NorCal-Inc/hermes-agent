@@ -6,5 +6,9 @@ OnFailure=system-health-controller-failure@%n.service
 Type=oneshot
 WorkingDirectory=/home/chris/.hermes/hermes-agent-next
 ExecStart=/home/chris/.hermes/hermes-agent-next/venv/bin/python /home/chris/.hermes/hermes-agent-next/norcal/health/system_health_controller.py run --tier light
-TimeoutStartSec=240
+# F4 (2026-09-15): finite worst-case bound, see norcal/health/README.md "Pass duration bounds".
+# Detection <= ~340 s (8 unit checks x 30 s, 8 loopback probes x 5 s, one batched alert 60 s) plus at most
+# ONE recovery per pass (max_recovery_mutations_per_pass=1; shared-service worst ~580 s incl. revalidation,
+# gateway worst ~450 s) = ~920 s; 1200 s leaves ~30% margin. Never infinity.
+TimeoutStartSec=1200
 Nice=10

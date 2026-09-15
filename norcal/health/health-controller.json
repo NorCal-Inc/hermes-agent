@@ -155,8 +155,9 @@
     "deploy_drift_state": "~/.hermes/state/deploy-drift-check.json",
     "deploy_drift_max_age_seconds": 25200,
     "watched_repositories": [
-      {"name": "hermes-agent-next", "path": "~/.hermes/hermes-agent-next", "upstream": "origin/main"},
-      {"name": "doctrine", "path": "~/.hermes/doctrine", "upstream": null}
+      {"name": "hermes-agent-next", "path": "~/.hermes/hermes-agent-next", "upstream": "origin/main", "change_grace_seconds": 0},
+      {"name": "doctrine", "path": "~/.hermes/doctrine", "upstream": null, "change_grace_seconds": 0},
+      {"name": "life-wiki-vault", "path": "/home/chris/services/life-wiki/vault", "upstream": "origin/main", "change_grace_seconds": 2700}
     ]
   },
   "company_isolation": {
@@ -173,6 +174,7 @@
       "ENT-009": {"tokens": ["african-heartbeat", "africanheartbeat", "african_heartbeat"], "lead_profiles": ["alana---african-heartbeat"]}
     }
   },
+  "max_recovery_mutations_per_pass": 1,
   "recovery_classes": {
     "status": "F3 built and tested only (Christopher, 2026-09-14). NOT authorized for live execution: enabling a class requires Christopher's explicit per-class authorization, authorized_by, enabled true and a re-pinned authorization_sha256 (recovery_authorization_digest). Escalate-only conditions have no class.",
     "gateway_restart": {
@@ -182,7 +184,7 @@
       "restart_command": ["/home/chris/.hermes/hermes-agent-next/venv/bin/python", "-m", "hermes_cli.main", "gateway", "restart"],
       "cooldown_seconds": 1800,
       "cooldown_marker": "~/.hermes/gateway_watchdog_last_restart",
-      "command_timeout_seconds": 300,
+      "command_timeout_seconds": 240,
       "postcondition_timeout_seconds": 120,
       "required_platforms": ["telegram", "api_server", "webhook"]
     },
@@ -217,7 +219,7 @@
       "repositories": {
         "life-wiki-vault": {"path": "/home/chris/services/life-wiki/vault", "remote": "origin", "branch": "main"}
       },
-      "note": "The vault is not in repository_drift.watched_repositories today, so this class would refuse to validate until it is watched with the same upstream (an F4 decision)."
+      "note": "F4: the vault is watched by repository_drift with the same upstream and a 2700 s change grace (three life-wiki-github-sync intervals), so this class validates; it stays disabled and never commits, resets or force-pushes."
     },
     "evidence_attachment": {
       "enabled": false,

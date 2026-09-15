@@ -96,6 +96,8 @@ _AGGREGATE_PRECEDENCE = (
     ("exception", AGGREGATE_GREEN_WITH_HOLDS),
 )
 
+PASS_SKIPPED_LOCK_BUSY = "SKIPPED_LOCK_BUSY"
+
 ROUTE_SHARED = "shared"
 ROUTE_COMPANY = "company"
 
@@ -514,12 +516,20 @@ class Controller:
         self.store = StateStore(ctx.state_dir)
         self._authorized: dict[str, tuple["RecoveryClass", dict]] = {}
         self._frozen: set = set()
+        self._pass_mutations = 0
 
     def run(self, tier: str) -> PassResult:
         if tier not in TIERS:
             raise ValueError(f"tier must be one of {TIERS}")
-        with self.store.lock():
-            return self._run_locked(tier)
+        try:
+            with self.store.lock(timeout_seconds=float(self.ctx.config.get("pass_lock_wait_seconds", 50))):
+                return self._run_locked(tier)
+        except TimeoutError:
+            # The other tier is still running (bounded by its TimeoutStartSec). Not a controller failure:
+            # no heartbeat is written, so a genuinely stuck pass still surfaces through the counterpart
+            # heartbeat invariant instead of an OnFailure alert every 5 minutes.
+            self.store.record(self.ctx.now(), "pass_skipped", tier=tier, reason="lock_busy")
+            return PassResult(tier, PASS_SKIPPED_LOCK_BUSY, 0, [], [], [], [], state_model=state_model(self.ctx.config))
 
     def _run_locked(self, tier: str) -> PassResult:
         now = self.ctx.now()
@@ -531,6 +541,7 @@ class Controller:
         self._alert_queue: list[tuple[Finding, dict]] = []
         holds = recovery_holds(self.ctx.config)
         self._frozen = {tid for hold in holds for tid in hold["task_ids"]}
+        self._pass_mutations = 0
         invalid_recoveries = self._authorize_recoveries()
         governed: dict = {}
         if model == STATE_MODEL_GOVERNED:
@@ -1005,6 +1016,15 @@ class Controller:
             self._escalate(finding, rec, f"{ESCALATION_RECOVERY_REFUSED}:{gate.reason}", result)
             return
 
+        budget = int(self.ctx.config.get("max_recovery_mutations_per_pass", 1))
+        if self._pass_mutations >= budget:
+            # One bounded recovery per pass keeps the pass duration (and TimeoutStartSec) bounded and
+            # prevents restart storms; the rest wait for the next pass without consuming budget.
+            rec["waiting_for_pass_budget"] = True
+            result.open.append(fp)
+            return
+        self._pass_mutations += 1
+        rec.pop("waiting_for_pass_budget", None)
         rec.pop("deferred_since", None)
         rec["attempts"] = int(rec.get("attempts") or 0) + 1
         try:
@@ -2612,9 +2632,41 @@ class RepositoryDrift(Invariant):
               "repos, used coarse) and git --no-optional-locks status / rev-list against the local upstream ref "
               "for watched_repositories (no fetch)")
     failure = ("deploy-drift verdict not CLEAN or older than deploy_drift_max_age_seconds; a watched shared "
-               "repository has uncommitted changes, commits not on its upstream, or is behind it")
+               "repository has uncommitted changes, commits not on its upstream, or is behind it — for a repository "
+               "with change_grace_seconds, only once the oldest change/commit is older than the grace (unknown age "
+               "counts as old)")
     evidence = ("deploy_drift_verdict:<v> | deploy_drift_stale | deploy_drift_unreadable | worktree_dirty | "
                 "unpushed_commits | behind_upstream | repo_unreadable (subject = repository name; counts in detail)")
+
+    @staticmethod
+    def _oldest_change_age(ctx: Context, path: str) -> Optional[float]:
+        """Age of the oldest uncommitted change, or ``None`` when any change's age is unknown."""
+        rc, raw = ctx.run_command(["git", "--no-optional-locks", "-C", path, "status", "--porcelain", "-z"], 30)
+        if rc != 0:
+            return None
+        tokens = raw.split("\0")
+        oldest: Optional[float] = None
+        index = 0
+        while index < len(tokens):
+            entry = tokens[index]
+            index += 1
+            if len(entry) < 4:
+                continue
+            status, rel = entry[:2], entry[3:]
+            if "R" in status or "C" in status:
+                index += 1                                  # the original path follows a rename/copy
+            try:
+                mtime = os.lstat(os.path.join(path, rel)).st_mtime
+            except OSError:
+                return None                                 # deleted or unreadable: age unknown
+            oldest = mtime if oldest is None else min(oldest, mtime)
+        return None if oldest is None else ctx.now() - oldest
+
+    @staticmethod
+    def _oldest_commit_age(ctx: Context, path: str, spec: str) -> Optional[float]:
+        rc, out = ctx.run_command(["git", "-C", path, "log", "--format=%ct", spec], 30)
+        stamps = [int(s) for s in out.split() if s.isdigit()] if rc == 0 else []
+        return ctx.now() - min(stamps) if stamps else None
 
     def check(self, ctx: Context) -> list[Finding]:
         out: list[Finding] = []
@@ -2638,16 +2690,21 @@ class RepositoryDrift(Invariant):
             if rc != 0:
                 out.append(Finding(self.name, repo["name"], "repo_unreadable", {}))
                 continue
+            grace = int(repo.get("change_grace_seconds") or 0)
             dirty = len([ln for ln in text.splitlines() if ln.strip()])
             if dirty:
-                out.append(Finding(self.name, repo["name"], "worktree_dirty", {"entries": str(dirty)}))
+                age = self._oldest_change_age(ctx, path) if grace else None
+                if not grace or age is None or age > grace:
+                    out.append(Finding(self.name, repo["name"], "worktree_dirty", {"entries": str(dirty)}))
             upstream = repo.get("upstream")
             if upstream:
                 for signature, spec in (("unpushed_commits", f"{upstream}..HEAD"),
                                         ("behind_upstream", f"HEAD..{upstream}")):
                     rc, count = ctx.run_command(["git", "-C", path, "rev-list", "--count", spec], 30)
                     if rc == 0 and count.strip().isdigit() and int(count.strip()) > 0:
-                        out.append(Finding(self.name, repo["name"], signature, {"commits": count.strip()}))
+                        age = self._oldest_commit_age(ctx, path, spec) if grace else None
+                        if not grace or age is None or age > grace:
+                            out.append(Finding(self.name, repo["name"], signature, {"commits": count.strip()}))
         return out
 
 
@@ -2790,15 +2847,20 @@ def _cooldown_mark(ctx: Context, key: str, ts: float) -> None:
 
 def _poll_until(ctx: Context, check: Callable[[], Optional[str]], timeout: float,
                 interval: float = 5.0) -> Optional[str]:
-    """Bounded polling by iteration count (never by the injectable clock)."""
+    """Bounded polling: an iteration cap AND a real monotonic deadline (never the injectable clock).
+
+    Worst case = ``timeout`` plus the duration of one final ``check`` (its own commands are bounded).
+    """
     rounds = max(1, int(timeout // interval)) + 1
+    deadline = time.monotonic() + max(float(timeout), 0.0)
     problem: Optional[str] = "not_checked"
     for index in range(rounds):
         problem = check()
         if problem is None:
             return None
-        if index < rounds - 1:
-            ctx.sleep(interval)
+        if index >= rounds - 1 or time.monotonic() >= deadline:
+            break
+        ctx.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     return problem
 
 
@@ -2912,7 +2974,24 @@ class GatewayRestartRecovery(RecoveryClass):
         _, enabled = ctx.run_command(["systemctl", "--user", "is-enabled", self.UNIT], 30)
         if enabled.strip() not in ("enabled", "enabled-runtime", "static", "linked"):
             return Gate(GATE_REFUSED, "gateway_unit_not_installed")
+        pid = _read_json(ctx.hermes_home / "gateway_state.json").get("pid")
+        if pid is not None and _pid_alive(pid):
+            # Only a provably wedged event loop takes the bounded restart path (~10 s escalation). An
+            # alive or unknown loop would take the graceful drain, which may wait for in-flight turns
+            # (agent.restart_after_turn_timeout, 1800 s live): refuse and escalate instead.
+            loop = self._loop_state(ctx, pid)
+            if loop != "wedged":
+                return Gate(GATE_REFUSED, f"gateway_process_alive_loop_{loop}")
         return Gate(GATE_PROCEED)
+
+    @staticmethod
+    def _loop_state(ctx, pid) -> str:
+        """``alive`` / ``wedged`` / ``unknown`` from the gateway's own loop-liveness probe."""
+        try:
+            from hermes_cli.gateway import probe_gateway_loop_liveness
+            return str(probe_gateway_loop_liveness(int(pid), home=ctx.hermes_home))
+        except Exception:
+            return "unknown"
 
     def recover(self, ctx, finding, spec):
         now = ctx.now()

@@ -2389,6 +2389,40 @@ def _gateway_config(tmp_path):
 
 
 class TestGatewayRestartRecovery:
+    @pytest.fixture(autouse=True)
+    def _wedged_loop(self, monkeypatch):
+        """The bounded restart path requires the gateway's own probe to report a wedged loop."""
+        self.loop_probes = []
+
+        def probe(ctx, pid):
+            self.loop_probes.append(pid)
+            return getattr(self, "loop_state", "wedged")
+
+        monkeypatch.setattr(shc.GatewayRestartRecovery, "_loop_state", staticmethod(probe))
+
+    @pytest.mark.parametrize("loop,decision", [("alive", "gateway_process_alive_loop_alive"),
+                                               ("unknown", "gateway_process_alive_loop_unknown")])
+    def test_a_live_gateway_whose_loop_is_not_wedged_is_never_restarted(self, kanban_home, tmp_path, loop, decision):
+        clock = Clock()
+        self.loop_state = loop
+        _write_gateway(kanban_home, clock, fresh=False)
+        systemd = FakeSystemd({"hermes-gateway.service": "active"})
+        results, _ = self._run(kanban_home, tmp_path, systemd, clock, 2)
+        assert systemd.mutations() == [] and results[-1].status == shc.AGGREGATE_ESCALATED
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "gateway_heartbeat_fresh"][0]
+        assert rec["escalation_reason"] == f"recovery_refused:{decision}"
+
+    def test_a_dead_gateway_process_restarts_without_consulting_the_loop_probe(self, kanban_home, tmp_path):
+        clock = Clock()
+        _write_gateway(kanban_home, clock, fresh=False, pid=_dead_pid())
+        config = _gateway_config(tmp_path)
+        gate = shc.GatewayRestartRecovery().gate(
+            _ctx(kanban_home, clock=clock, config=config, run_command=FakeSystemd({})),
+            shc.Finding("gateway_heartbeat_fresh", "gateway", "heartbeat_stale", {}), {},
+            config["recovery_classes"]["gateway_restart"])
+        assert gate.decision == shc.GATE_PROCEED and self.loop_probes == []
+
     def _run(self, kanban_home, tmp_path, systemd, clock, passes, config=None, before_pass=None):
         config = config or _gateway_config(tmp_path)
         ctx = _ctx(kanban_home, clock=clock, config={**config, "gateway_heartbeat_max_age_seconds": 180},
@@ -3072,3 +3106,168 @@ class TestEvidenceAttachmentRecovery:
         config = _evidence_config()
         spec = {**config["recovery_classes"]["evidence_attachment"], "patterns": [pattern]}
         assert shc.EvidenceAttachmentRecovery().validate_spec(spec, config).startswith("pattern_not_allowed")
+
+
+# ---------------------------------------------------------------------------
+# F4 preparation (Christopher, 2026-09-15): vault drift coverage, bounded pass
+# duration, one recovery per pass, lock contention. Not deployed.
+# ---------------------------------------------------------------------------
+
+
+def _commit_at(repo, name, ts):
+    (repo / name).write_text(name, encoding="utf-8")
+    _git(repo, "add", name)
+    env = {**os.environ, "GIT_COMMITTER_DATE": f"@{int(ts)} +0000", "GIT_AUTHOR_DATE": f"@{int(ts)} +0000"}
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(repo), "commit", "-q", "-m", name],
+                   check=True, capture_output=True, env=env)
+
+
+def _drift_config(tmp_path, repos):
+    state = tmp_path / "drift.json"
+    state.write_text(json.dumps({"verdict": "CLEAN", "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+    return {"repository_drift": {"deploy_drift_state": str(state), "watched_repositories": repos}}
+
+
+class TestVaultDriftCoverage:
+    def _check(self, kanban_home, config):
+        return shc.RepositoryDrift().check(_ctx(kanban_home, clock=time.time, config=config,
+                                                run_command=shc.run_command))
+
+    def test_fresh_changes_inside_the_grace_are_not_findings(self, kanban_home, tmp_path):
+        _bare, work = _git_repo_pair(tmp_path)
+        (work / "note.md").write_text("fresh agent write", encoding="utf-8")
+        _commit_at(work, "fresh-commit.md", time.time() - 60)
+        (work / "untracked.md").write_text("new", encoding="utf-8")
+        config = _drift_config(tmp_path, [{"name": "vault", "path": str(work), "upstream": "origin/main",
+                                           "change_grace_seconds": 2700}])
+        assert self._check(kanban_home, config) == []
+
+    def test_old_dirty_change_old_unpushed_commit_and_unknown_age_are_findings(self, kanban_home, tmp_path):
+        _bare, work = _git_repo_pair(tmp_path)
+        _commit_at(work, "old-commit.md", time.time() - 10_000)
+        stale = work / "stale.md"
+        stale.write_text("forgotten", encoding="utf-8")
+        os.utime(stale, (time.time() - 10_000, time.time() - 10_000))
+        config = _drift_config(tmp_path, [{"name": "vault", "path": str(work), "upstream": "origin/main",
+                                           "change_grace_seconds": 2700}])
+        assert _signatures(self._check(kanban_home, config)) == [("vault", "unpushed_commits"),
+                                                                 ("vault", "worktree_dirty")]
+        _git(work, "add", "stale.md")
+        _git(work, "commit", "-q", "-m", "stale")
+        (work / "a.md").unlink()                                          # deletion: age unknown -> old
+        assert ("vault", "worktree_dirty") in _signatures(self._check(kanban_home, config))
+
+    def test_zero_grace_repositories_are_unchanged(self, kanban_home, tmp_path):
+        _bare, work = _git_repo_pair(tmp_path, name="runtime")
+        (work / "note.md").write_text("fresh", encoding="utf-8")
+        _commit_at(work, "fresh.md", time.time() - 5)
+        config = _drift_config(tmp_path, [{"name": "hermes-agent-next", "path": str(work), "upstream": "origin/main",
+                                           "change_grace_seconds": 0}])
+        assert _signatures(self._check(kanban_home, config)) == [("hermes-agent-next", "unpushed_commits"),
+                                                                 ("hermes-agent-next", "worktree_dirty")]
+
+    def test_repository_config_watches_the_vault_and_the_sync_class_validates(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        watched = {r["name"]: r for r in config["repository_drift"]["watched_repositories"]}
+        assert watched["life-wiki-vault"]["change_grace_seconds"] == 2700
+        assert watched["life-wiki-vault"]["upstream"] == "origin/main"
+        assert watched["hermes-agent-next"]["change_grace_seconds"] == 0
+        assert watched["doctrine"]["change_grace_seconds"] == 0
+        spec = config["recovery_classes"]["vault_git_sync"]
+        assert spec["enabled"] is False and set(spec["repositories"]) == {"life-wiki-vault"}
+        assert shc.VaultSyncRecovery().validate_spec(spec, config) is None
+        assert shc.recovery_authorization(config, shc.VaultSyncRecovery()) == (None, None)
+
+    def test_grace_expired_unpushed_commit_is_synced_and_proven_on_the_isolated_remote(self, kanban_home, tmp_path):
+        bare, work = _git_repo_pair(tmp_path, name="vault")
+        _commit_at(work, "old.md", time.time() - 10_000)
+        head = subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        config = {**_governed(), **_drift_config(tmp_path, [{"name": "vault", "path": str(work),
+                                                             "upstream": "origin/main", "change_grace_seconds": 2700}])}
+        _authorize(config, "vault_git_sync", repositories={"vault": {"path": str(work), "remote": "origin",
+                                                                     "branch": "main"}})
+        calls = []
+
+        def recording(argv, timeout):
+            calls.append(list(argv))
+            return shc.run_command(argv, timeout)
+
+        ctx = _ctx(kanban_home, clock=time.time, config=config, run_command=recording)
+        result = shc.Controller(ctx, [shc.RepositoryDrift()]).run(shc.TIER_DEEP)
+        assert len(result.recovered) == 1 and _remote_head(bare) == head
+        assert not any(p in ("--force", "-f", "commit", "add", "reset") or p.startswith("+")
+                       for c in calls for p in c[4:])
+
+
+class TestF4PassBounds:
+    def test_polling_stops_at_the_real_deadline(self, kanban_home):
+        ctx = _ctx(kanban_home)
+        ctx.sleep = time.sleep
+        checks = []
+        started = time.monotonic()
+        problem = shc._poll_until(ctx, lambda: checks.append(1) or "still_failing", timeout=0.3, interval=0.05)
+        assert problem == "still_failing" and time.monotonic() - started < 1.0
+        assert 2 <= len(checks) <= 8
+
+    def test_one_recovery_mutation_per_pass(self, kanban_home):
+        state = {"broken": {"x", "y"}}
+        klass = FakeRecovery(state)
+        clock = Clock()
+        controller, ctx = _fake_controller(kanban_home, state, klass, clock=clock)
+        first = controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x"] and len(first.recovered) == 1
+        waiting = [r for r in shc.StateStore(ctx.state_dir).load()["fingerprints"].values()
+                   if r.get("subject") == "y"][0]
+        assert waiting["attempts"] == 0 and waiting["waiting_for_pass_budget"] is True
+        clock.advance(300)
+        second = controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x", "y"] and len(second.recovered) == 1
+
+    def test_a_busy_lock_skips_the_pass_without_failing_or_writing_a_heartbeat(self, kanban_home, tmp_path):
+        ctx = _ctx(kanban_home, config={"pass_lock_wait_seconds": 0.2})
+        store = shc.StateStore(ctx.state_dir)
+        with store.lock():
+            result = shc.Controller(ctx, [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        assert result.status == shc.PASS_SKIPPED_LOCK_BUSY
+        assert store.read_heartbeat("light") is None
+        assert '"reason": "lock_busy"' in store.ledger.read_text()
+
+    # Worst-case pass duration derived from the per-call timeouts in this module (seconds).
+    CALL = {"systemctl": 30, "http_probe": 5, "alert": 60, "boot_gate": 240, "config_get": 30, "git": 30,
+            "registry_check": 120, "crontab": 30, "sync_git": 60, "sync_fetch_push": 120, "validator": 120}
+
+    def _bound(self, config, tier):
+        c = self.CALL
+        units = len(config["shared_user_units"]) + len(config["shared_system_units"])
+        classes = config["recovery_classes"]
+        if tier == "light":
+            probes = len(config["company_health_probes"]["entities"]) + len(config["shared_health_endpoints"])
+            detection = units * c["systemctl"] + probes * c["http_probe"] + c["alert"]
+            gw = classes["gateway_restart"]
+            gateway = (c["systemctl"] + gw["command_timeout_seconds"] + gw["postcondition_timeout_seconds"]
+                       + 2 * c["systemctl"])
+            svc = classes["shared_service_restart"]
+            shared = (2 * c["systemctl"] + c["systemctl"] + 120 + svc["postcondition_timeout_seconds"]
+                      + 2 * (c["systemctl"] + c["http_probe"]) + units * c["systemctl"])
+            return detection + max(gateway, shared)
+        timers = len(config["critical_user_timers"])
+        repos = config["repository_drift"]["watched_repositories"]
+        drift = sum(3 * c["git"] + (3 * c["git"] if r.get("change_grace_seconds") else 0) for r in repos)
+        detection = ((1 + timers) * c["systemctl"] + c["boot_gate"]
+                     + len(config["expected_runtime_config"]) * c["config_get"]
+                     + (1 + timers + 1) * c["systemctl"] + c["crontab"] + drift + c["registry_check"] + c["alert"])
+        vault = (5 * c["sync_git"] + 2 * c["sync_fetch_push"] + 4 * c["sync_git"] + 3 * c["sync_git"] + drift)
+        wiki = c["validator"]
+        return detection + max(vault, wiki)
+
+    def test_unit_templates_carry_a_finite_timeout_covering_the_worst_case(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        assert config["max_recovery_mutations_per_pass"] == 1
+        for tier in ("light", "deep"):
+            text = (_CONTROLLER_PATH.parent / "systemd" / f"system-health-controller-{tier}.service").read_text()
+            (line,) = [ln for ln in text.splitlines() if ln.startswith("TimeoutStartSec=")]
+            value = line.split("=", 1)[1]
+            assert value.isdigit(), f"{tier} TimeoutStartSec must be a finite number of seconds, got {value!r}"
+            bound = self._bound(config, tier)
+            assert int(value) >= bound * 1.1, (tier, int(value), bound)
+            assert int(value) < 3600, tier                         # a hung pass ends before the next hourly trigger

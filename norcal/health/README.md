@@ -80,6 +80,25 @@ verifier-routing recovery keeps its in-code path. Escalate-only detectors are li
 `ESCALATE_ONLY_INVARIANTS`. Before enabling `gateway_restart` or `shared_service_restart` live, the light unit's
 `TimeoutStartSec=240` must be raised to cover a graceful gateway drain plus the postcondition poll.
 
+### Pass duration bounds (F4, 2026-09-15)
+
+Every external call the controller makes is bounded, and a pass performs at most
+`max_recovery_mutations_per_pass` (1) recovery mutation. Worst cases, derived from the per-call timeouts and
+the configured counts (pinned by `TestF4PassBounds`):
+
+| Tier | Detection worst case | Worst single recovery | Bound | `TimeoutStartSec` |
+|---|---|---|---|---|
+| light | 340 s — 8 shared units x 30 s, 8 loopback probes x 5 s, one batched alert 60 s | shared-service restart 580 s (gate 60, reset 30, restart 120, poll 60 + final check 35, revalidation of 8 unit checks 240, postcondition 35); gateway restart 450 s (gate 30, governed restart capped 240, poll 120, checks 60) | 920 s | 1200 |
+| deep | 1560 s — timers 300, boot gate 240, runtime config 120, watcher integrity 360, repository drift 360, registry check 120, alert 60 | vault sync 1320 s (gate 300, fetch/merge/push 540, remote proof 180, drift revalidation 360); Life Wiki validator 120 s | 2880 s | 3300 (< the hourly interval) |
+
+Measured reality is far below these bounds (idle graceful gateway restarts on 2026-09-14 took 29–31 s from stop
+to Telegram connected; a live light pass takes a few seconds). The gateway class only restarts a dead process or a
+loop the gateway's own probe reports **wedged**: an alive or unknown loop would take the graceful drain, which can
+wait `agent.restart_after_turn_timeout` (1800 s live) for in-flight turns, so it is refused and escalated instead.
+When a pass cannot take the controller lock within `pass_lock_wait_seconds` (the other tier is still running,
+bounded by its own timeout) it records `pass_skipped` and exits 0 without a heartbeat; a genuinely stuck pass
+surfaces through `controller_heartbeat_fresh_<tier>`.
+
 Escalation is exactly once per fingerprint: one `triage` card (unassigned, tenant-less,
 `idempotency_key=health:<invariant>:<fingerprint>`, system provenance, `defect:` authority) and one
 delivery-checked `hermes send` alert carrying identifiers and signatures only. A card that already
