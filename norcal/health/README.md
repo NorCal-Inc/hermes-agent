@@ -55,6 +55,31 @@ authorization change.
 files on a non-company card; the historical inventory) are `unsafe`: never covered by a governed exception,
 escalated at once. Filenames are never recorded — card ids and counts only.
 
+### F3 bounded recovery classes (Christopher, 2026-09-14) — built and tested, NOT authorized live
+
+`recovery_classes` in `health-controller.json` lists six classes, **all `enabled: false`**. A class runs only
+when `enabled: true`, `authorized_by` is set and `authorization_sha256` equals
+`recovery_authorization_digest(name, spec)` (scope, allowlists and bounds pinned); an enabled class that fails
+validation runs nothing and reports `recovery_class_authorization_valid` (DEGRADED). Print them with
+`venv/bin/python norcal/health/system_health_controller.py recoveries`.
+
+| Class | Detector condition | Mutation | Postcondition |
+|---|---|---|---|
+| `gateway_restart` | `gateway_heartbeat_fresh` stale/missing, 2 passes | shared watchdog cooldown marker, then `hermes gateway restart` | heartbeat fresh, unit active, required platforms connected by the live pid |
+| `shared_service_restart` | `shared_units_active` not_active, allowlisted shared user unit, 2 passes | `systemctl --user reset-failed` + `restart` | unit active + loopback health endpoint HEALTHY |
+| `lease_reconciliation` | `run_lease_consistency`, 2 passes | `reclaim_task` / `_reclaim_dangling_run` / `exec_supervisor._reconcile_one` | card/run/claim consistent, execution settled |
+| `life_wiki_retry` | missing daily note / failing validation job | schedule the existing cron job (`trigger_job`) | note exists + validator exits 0 / job reran ok |
+| `vault_git_sync` | `repository_drift` unpushed/behind on an allowlisted watched repo | fetch, `merge --ff-only`, `push` (never force) | `ls-remote` equals local HEAD, tree clean |
+| `evidence_attachment` | `verifier_route_open` evidence_missing | attach existing allowlisted files from the task-owned workspace | `subject_has_evidence` + dispatchable |
+
+Every class: gate re-reads live state (`proceed` / `cleared` / `deferred` / `refused`); refused → ESCALATED
+without mutation; at most 2 mutations per episode (first attempt + one retry); an unchanged recurrence inside
+the class window → ESCALATED (`recurred_after_recovery`); deferral bounded; a failed postcondition is never
+silently resolved when the detector goes quiet. Never for unsafe, company-route or frozen-card findings; v1
+verifier-routing recovery keeps its in-code path. Escalate-only detectors are listed in
+`ESCALATE_ONLY_INVARIANTS`. Before enabling `gateway_restart` or `shared_service_restart` live, the light unit's
+`TimeoutStartSec=240` must be raised to cover a graceful gateway drain plus the postcondition poll.
+
 Escalation is exactly once per fingerprint: one `triage` card (unassigned, tenant-less,
 `idempotency_key=health:<invariant>:<fingerprint>`, system provenance, `defect:` authority) and one
 delivery-checked `hermes send` alert carrying identifiers and signatures only. A card that already

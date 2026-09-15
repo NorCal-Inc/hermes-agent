@@ -172,5 +172,59 @@
       "ENT-008": {"tokens": ["nexora"], "lead_profiles": ["nexora_biotide_lead"]},
       "ENT-009": {"tokens": ["african-heartbeat", "africanheartbeat", "african_heartbeat"], "lead_profiles": ["alana---african-heartbeat"]}
     }
+  },
+  "recovery_classes": {
+    "status": "F3 built and tested only (Christopher, 2026-09-14). NOT authorized for live execution: enabling a class requires Christopher's explicit per-class authorization, authorized_by, enabled true and a re-pinned authorization_sha256 (recovery_authorization_digest). Escalate-only conditions have no class.",
+    "gateway_restart": {
+      "enabled": false,
+      "authorized_by": "",
+      "unit": "hermes-gateway.service",
+      "restart_command": ["/home/chris/.hermes/hermes-agent-next/venv/bin/python", "-m", "hermes_cli.main", "gateway", "restart"],
+      "cooldown_seconds": 1800,
+      "cooldown_marker": "~/.hermes/gateway_watchdog_last_restart",
+      "command_timeout_seconds": 300,
+      "postcondition_timeout_seconds": 120,
+      "required_platforms": ["telegram", "api_server", "webhook"]
+    },
+    "shared_service_restart": {
+      "enabled": false,
+      "authorized_by": "",
+      "cooldown_seconds": 600,
+      "postcondition_timeout_seconds": 60,
+      "services": {
+        "NorCal_Hermes.service": {"health_url": "http://127.0.0.1:5130/api/status"},
+        "life-wiki-api.service": {"health_url": "http://127.0.0.1:5100/api/healthz"},
+        "life-wiki-web.service": {"health_url": "http://127.0.0.1:5181/"},
+        "norcal-opsbridge.service": {"health_url": null}
+      }
+    },
+    "lease_reconciliation": {
+      "enabled": false,
+      "authorized_by": "",
+      "reconcile": ["claims", "detached_runs", "executions"]
+    },
+    "life_wiki_retry": {
+      "enabled": false,
+      "authorized_by": "",
+      "daily_note_job": "nightly-executive-continuity-reconciliation",
+      "validation_jobs": ["life-wiki-daily-validation"],
+      "settle_seconds": 3600,
+      "validator_command": ["/home/chris/.hermes/scripts/life-wiki-daily-validator.py", "--date", "{date}"]
+    },
+    "vault_git_sync": {
+      "enabled": false,
+      "authorized_by": "",
+      "repositories": {
+        "life-wiki-vault": {"path": "/home/chris/services/life-wiki/vault", "remote": "origin", "branch": "main"}
+      },
+      "note": "The vault is not in repository_drift.watched_repositories today, so this class would refuse to validate until it is watched with the same upstream (an F4 decision)."
+    },
+    "evidence_attachment": {
+      "enabled": false,
+      "authorized_by": "",
+      "max_files": 5,
+      "max_bytes": 1048576,
+      "patterns": ["*EVIDENCE*.md", "*evidence*.md", "*EVIDENCE*.json", "*evidence*.json", "*REGRESSION*.txt"]
+    }
   }
 }

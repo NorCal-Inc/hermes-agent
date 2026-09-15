@@ -112,7 +112,27 @@ ESCALATION_BUDGET_EXHAUSTED = "recovery_budget_exhausted"
 ESCALATION_UNSAFE = "unsafe"
 ESCALATION_FROZEN_UNCOVERED = "frozen_condition_not_covered"
 ESCALATION_EXCEPTION_INVALID = "governed_exception_invalid"
-_ESCALATED_CLASS_REASONS = (ESCALATION_BUDGET_EXHAUSTED, ESCALATION_UNSAFE)
+#: F3 recovery classes (Christopher, 2026-09-14): a gate refusal (unsafe or
+#: ambiguous live state), an unchanged recurrence soon after a recovery, and a
+#: recovery deferred past its bound all stop automatic mutation and await a decision.
+ESCALATION_RECOVERY_REFUSED = "recovery_refused"
+ESCALATION_RECURRED = "recurred_after_recovery"
+ESCALATION_DEFERRED_TOO_LONG = "recovery_deferred_too_long"
+ESCALATION_RECOVERY_AUTH_INVALID = "recovery_authorization_invalid"
+ESCALATION_POSTCONDITION_FAILED = "recovery_postcondition_failed"
+RECOVERY_VALIDITY_INVARIANT = "recovery_class_authorization_valid"
+_ESCALATED_CLASS_REASONS = (ESCALATION_BUDGET_EXHAUSTED, ESCALATION_UNSAFE, ESCALATION_RECURRED,
+                            ESCALATION_DEFERRED_TOO_LONG, ESCALATION_POSTCONDITION_FAILED)
+
+GATE_PROCEED = "proceed"
+GATE_CLEARED = "cleared"
+GATE_DEFERRED = "deferred"
+GATE_REFUSED = "refused"
+
+
+def _escalated_class_reason(reason: Optional[str]) -> bool:
+    reason = str(reason or "")
+    return reason in _ESCALATED_CLASS_REASONS or reason.startswith(ESCALATION_RECOVERY_REFUSED + ":")
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "health-controller.json"
 
@@ -203,6 +223,11 @@ class Context:
     create_card: Callable[["Context", Finding, dict, str], tuple[Optional[str], bool]]
     now: Callable[[], float] = time.time
     dry_run: bool = False
+    #: F3: bounded postcondition polling after a recovery (injected for tests).
+    sleep: Callable[[float], None] = time.sleep
+    #: F3: schedule an existing Hermes cron job by name on the next tick.
+    #: Returns ``(scheduled, detail)``; must refuse a paused or missing job.
+    cron_trigger: Optional[Callable[[str], tuple[bool, str]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -481,10 +506,14 @@ class _HoldEscalation(Invariant):
 
 
 class Controller:
-    def __init__(self, ctx: Context, invariants: Iterable[Invariant]) -> None:
+    def __init__(self, ctx: Context, invariants: Iterable[Invariant],
+                 recoveries: Optional[Iterable["RecoveryClass"]] = None) -> None:
         self.ctx = ctx
         self.invariants = list(invariants)
+        self.recoveries = list(default_recovery_classes() if recoveries is None else recoveries)
         self.store = StateStore(ctx.state_dir)
+        self._authorized: dict[str, tuple["RecoveryClass", dict]] = {}
+        self._frozen: set = set()
 
     def run(self, tier: str) -> PassResult:
         if tier not in TIERS:
@@ -501,6 +530,8 @@ class Controller:
         result = PassResult(tier, "GREEN", 0, [], [], [], [], state_model=model)
         self._alert_queue: list[tuple[Finding, dict]] = []
         holds = recovery_holds(self.ctx.config)
+        self._frozen = {tid for hold in holds for tid in hold["task_ids"]}
+        invalid_recoveries = self._authorize_recoveries()
         governed: dict = {}
         if model == STATE_MODEL_GOVERNED:
             governed = self._observe_governed(tier, holds, state, result, now)
@@ -517,8 +548,10 @@ class Controller:
                         held.setdefault(hold["name"], []).append(finding)
                         continue
                     self._process(inv, finding, state, result)
+                present |= self._carry_pending_recoveries(inv, present, state, result)
                 self._resolve_absent(inv, present, state, result)
             self._escalate_holds(tier, holds, held, state, result)
+        self._report_invalid_recoveries(tier, invalid_recoveries, state, result)
         self._flush_alerts()
         if model == STATE_MODEL_GOVERNED:
             result.status, result.classes = self._classify(tier, state, governed["valid_names"])
@@ -566,6 +599,7 @@ class Controller:
         valid, invalid, frozen = governed_exceptions(self.ctx.config, now)
         for hold in holds:
             frozen.update(hold["task_ids"])
+        self._frozen = set(frozen)
         by_condition = {c: entry for entry in valid for c in entry["conditions"]}
         matched: dict[str, list[Finding]] = {}
         for inv in [i for i in self.invariants if i.tier == tier]:
@@ -585,6 +619,7 @@ class Controller:
                                   state, result, reason_override=ESCALATION_FROZEN_UNCOVERED)
                 else:
                     self._process(inv, finding, state, result)
+            present |= self._carry_pending_recoveries(inv, present, state, result)
             self._resolve_absent(inv, present, state, result)
 
         validity = _GovernanceCarrier(EXCEPTION_VALIDITY_INVARIANT, tier)
@@ -648,7 +683,7 @@ class Controller:
                 name = str(rec.get("subject") or "").rsplit("@", 1)[0]
                 cls = "exception" if name in valid_names else "degraded"
             elif status == STATUS_ESCALATED:
-                cls = "escalated" if rec.get("escalation_reason") in _ESCALATED_CLASS_REASONS else "degraded"
+                cls = "escalated" if _escalated_class_reason(rec.get("escalation_reason")) else "degraded"
             elif status == STATUS_OPEN and int(rec.get("attempts") or 0) > 0:
                 cls = "recovery"
             else:
@@ -699,8 +734,17 @@ class Controller:
             self._deliver_alert(finding, rec)
             return
 
+        if finding.route == ROUTE_COMPANY and finding.recoverable:
+            # Company health is escalate-only: no shared recovery ever acts on it.
+            finding = dataclasses.replace(finding, recoverable=False)
+
         if self.ctx.dry_run:
             result.open.append(fp)
+            return
+
+        bound = self._recovery_for(inv, finding, reason_override)
+        if bound is not None:
+            self._recover_with_class(inv, bound[0], bound[1], finding, rec, state, result)
             return
 
         if finding.recoverable and rec["attempts"] < inv.max_attempts:
@@ -798,6 +842,216 @@ class Controller:
             self.store.record(self.ctx.now(), "alert", fingerprint=finding.fingerprint,
                               delivered=bool(delivered), attempt=rec["alert_attempts"],
                               batch_size=len(queue))
+
+    # -- F3 RECOVERY CLASSES --------------------------------------------------
+
+    def _authorize_recoveries(self) -> list[tuple[str, str]]:
+        """Resolve each recovery class's authorization for this pass."""
+        self._authorized = {}
+        invalid: list[tuple[str, str]] = []
+        for klass in self.recoveries:
+            spec, problem = recovery_authorization(self.ctx.config, klass)
+            if problem:
+                invalid.append((klass.name, problem))
+            elif spec is not None:
+                self._authorized[klass.name] = (klass, spec)
+        return invalid
+
+    def _report_invalid_recoveries(self, tier: str, invalid: list[tuple[str, str]],
+                                   state: dict, result: PassResult) -> None:
+        """An enabled class whose authorization does not validate never runs: DEGRADED."""
+        carrier = _GovernanceCarrier(RECOVERY_VALIDITY_INVARIANT, TIER_LIGHT)
+        if tier != TIER_LIGHT:
+            return
+        present: set[str] = set()
+        for name, problem in invalid:
+            finding = Finding(RECOVERY_VALIDITY_INVARIANT, name, f"invalid:{problem}", {"recovery_class": name})
+            present.add(finding.fingerprint)
+            result.findings += 1
+            self._process(carrier, finding, state, result, reason_override=ESCALATION_RECOVERY_AUTH_INVALID)
+        self._resolve_absent(carrier, present, state, result)
+
+    def _recovery_for(self, inv: Invariant, finding: Finding,
+                      reason_override: Optional[str]) -> Optional[tuple["RecoveryClass", dict]]:
+        """The authorized class bound to this exact condition, if any.
+
+        Never for: an invariant with its own in-code recovery (v1 verifier
+        routing is preserved unchanged), an unsafe finding, a company-route
+        finding, a finding forced unrecoverable (frozen card, unsafe, invalid
+        exception) or a finding on a frozen task.
+        """
+        if reason_override is not None or finding.unsafe or finding.route != ROUTE_SHARED:
+            return None
+        if finding.recoverable and type(inv).recover is not Invariant.recover:
+            return None  # v1 in-code recovery (verifier routing) keeps its own path
+        if _finding_ids(finding) & self._frozen:
+            return None
+        for klass, spec in self._authorized.values():
+            if klass.matches(finding, spec, self.ctx.config):
+                return klass, spec
+        return None
+
+    def _carry_pending_recoveries(self, inv: Invariant, present: set[str], state: dict,
+                                  result: PassResult) -> set[str]:
+        """Keep an unfinished recovery alive after its detector went quiet.
+
+        A recovery whose postcondition has not yet passed (a restarted service
+        whose health endpoint is still failing, a scheduled job still running)
+        must not be silently resolved because the detector stopped firing.
+        """
+        carried: set[str] = set()
+        if self.ctx.dry_run:
+            return carried
+        for fp, rec in list(state["fingerprints"].items()):
+            if fp in present or rec.get("invariant") != inv.name or rec.get("tier") != inv.tier:
+                continue
+            if (rec.get("status") == STATUS_ESCALATED and rec.get("recovery_class")
+                    and rec.get("last_postcondition")):
+                # An escalated recovery whose postcondition still fails stays
+                # escalated even though its detector went quiet.
+                bound = self._authorized.get(rec["recovery_class"])
+                finding = Finding(inv.name, rec["subject"], rec["signature"], dict(rec.get("detail") or {}))
+                try:
+                    still_failing = bound is None or bound[0].postcondition(self.ctx, finding, rec, bound[1]) is not None
+                except Exception:
+                    still_failing = True
+                if still_failing:
+                    carried.add(fp)
+                continue
+            if rec.get("status") != STATUS_OPEN or not rec.get("recovery_pending"):
+                continue
+            bound = self._authorized.get(rec.get("recovery_class") or "")
+            finding = Finding(inv.name, rec["subject"], rec["signature"], dict(rec.get("detail") or {}),
+                              recoverable=True)
+            if bound is None or _finding_ids(finding) & self._frozen:
+                continue  # class no longer authorized: let the condition resolve normally
+            carried.add(fp)
+            self._process(inv, finding, state, result)
+        return carried
+
+    def _recover_with_class(self, inv: Invariant, klass: "RecoveryClass", spec: dict, finding: Finding,
+                            rec: dict, state: dict, result: PassResult) -> None:
+        now = self.ctx.now()
+        fp = finding.fingerprint
+        rec["recovery_class"] = klass.name
+        rec["detail"] = dict(finding.detail)
+        history = state.setdefault("recovery_history", {})
+
+        if (int(rec.get("attempts") or 0) == 0 and not rec.get("deferred_since")
+                and not rec.get("recovery_pending")):
+            last = history.get(fp)
+            if last and now - float(last.get("recovered_ts", 0)) < klass.recurrence_window_seconds:
+                rec["recovery_pending"] = False
+                self._escalate(finding, rec, ESCALATION_RECURRED, result)
+                return
+            if rec["observations"] < max(1, klass.recover_after_cycles):
+                result.open.append(fp)
+                return
+
+        awaiting = rec.get("awaiting_postcondition_since")
+        if awaiting is not None:
+            post = self._validate(inv, klass, spec, finding, rec)
+            if post is None:
+                self._recovered(fp, rec, klass, history, result, via="postcondition_passed")
+                return
+            rec["last_postcondition"] = post
+            if now - float(awaiting) < klass.settle_seconds(spec):
+                result.open.append(fp)
+                return
+            rec["awaiting_postcondition_since"] = None
+
+        if int(rec.get("attempts") or 0) >= klass.max_attempts:
+            rec["recovery_pending"] = False
+            self._escalate(finding, rec, ESCALATION_BUDGET_EXHAUSTED, result)
+            return
+
+        try:
+            gate = klass.gate(self.ctx, finding, rec, spec)
+        except Exception as exc:
+            gate = Gate(GATE_REFUSED, f"gate_raised:{type(exc).__name__}")
+        self.store.record(now, "recovery_gate", fingerprint=fp, recovery_class=klass.name,
+                          decision=gate.decision, reason=gate.reason)
+        if gate.decision == GATE_CLEARED:
+            post = self._validate(inv, klass, spec, finding, rec)
+            if post is None:
+                rec["recovery_pending"] = False
+                rec["status"] = STATUS_RESOLVED
+                rec["resolved_at"] = _iso(now)
+                result.resolved.append(fp)
+                self.store.record(now, "green", fingerprint=fp, via="cleared_before_recovery")
+                return
+            if rec.get("recovery_pending"):
+                # Nothing left for this class to do, yet the postcondition fails.
+                rec["recovery_pending"] = False
+                self._escalate(finding, rec, ESCALATION_POSTCONDITION_FAILED, result)
+                return
+            rec["gate_detector_disagreements"] = int(rec.get("gate_detector_disagreements") or 0) + 1
+            if rec["gate_detector_disagreements"] >= 2:
+                self._escalate(finding, rec, f"{ESCALATION_RECOVERY_REFUSED}:gate_and_detector_disagree", result)
+                return
+            result.open.append(fp)
+            return
+        if gate.decision == GATE_DEFERRED:
+            rec.setdefault("deferred_since", now)
+            rec["deferral_reason"] = gate.reason
+            if now - float(rec["deferred_since"]) > klass.max_deferral_seconds:
+                rec["recovery_pending"] = False
+                self._escalate(finding, rec, ESCALATION_DEFERRED_TOO_LONG, result)
+                return
+            result.open.append(fp)
+            return
+        if gate.decision != GATE_PROCEED:
+            rec["recovery_pending"] = False
+            self._escalate(finding, rec, f"{ESCALATION_RECOVERY_REFUSED}:{gate.reason}", result)
+            return
+
+        rec.pop("deferred_since", None)
+        rec["attempts"] = int(rec.get("attempts") or 0) + 1
+        try:
+            outcome = klass.recover(self.ctx, finding, spec)
+        except Exception as exc:
+            outcome = RecoveryOutcome(False, "recover_raised", {"error": f"{type(exc).__name__}"})
+        rec["last_recovery"] = {"at": _iso(now), "action": outcome.action, "applied": outcome.applied,
+                                "detail": outcome.detail, "recovery_class": klass.name}
+        self.store.record(now, "recovery", fingerprint=fp, attempt=rec["attempts"], recovery_class=klass.name,
+                          action=outcome.action, applied=outcome.applied)
+        post = self._validate(inv, klass, spec, finding, rec)
+        if post is None:
+            self._recovered(fp, rec, klass, history, result, via="recovery")
+            return
+        rec["last_postcondition"] = post
+        rec["recovery_pending"] = True
+        if outcome.applied and klass.settle_seconds(spec) > 0:
+            rec["awaiting_postcondition_since"] = now
+            result.open.append(fp)
+            return
+        if rec["attempts"] >= klass.max_attempts:
+            rec["recovery_pending"] = False
+            self._escalate(finding, rec, ESCALATION_BUDGET_EXHAUSTED, result)
+            return
+        result.open.append(fp)
+
+    def _validate(self, inv: Invariant, klass: "RecoveryClass", spec: dict, finding: Finding,
+                  rec: dict) -> Optional[str]:
+        """REVALIDATE: the exact detector, then the class's own postcondition."""
+        if finding.fingerprint in {f.fingerprint for f in self._observe(inv)}:
+            return "detector_still_firing"
+        try:
+            return klass.postcondition(self.ctx, finding, rec, spec)
+        except Exception as exc:
+            return f"postcondition_raised:{type(exc).__name__}"
+
+    def _recovered(self, fp: str, rec: dict, klass: "RecoveryClass", history: dict,
+                   result: PassResult, *, via: str) -> None:
+        now = self.ctx.now()
+        rec["status"] = STATUS_RESOLVED
+        rec["resolved_at"] = _iso(now)
+        rec["recovery_pending"] = False
+        rec["awaiting_postcondition_since"] = None
+        rec["last_postcondition"] = None
+        history[fp] = {"recovered_ts": now, "recovery_class": klass.name, "attempts": rec.get("attempts")}
+        result.recovered.append(fp)
+        self.store.record(now, "green", fingerprint=fp, via=via, recovery_class=klass.name)
 
     # -- HOLD ----------------------------------------------------------------
 
@@ -2460,6 +2714,835 @@ class CompanyIsolation(Invariant):
 F2_DETECT_ONLY = (CompanyHealthEndpoints, SharedEndpointsHealthy, SharedUnitsActive, WatcherIntegrity,
                   RepositoryDrift, CompanyIsolation)
 
+# ---------------------------------------------------------------------------
+# F3 bounded recovery classes (Christopher, 2026-09-14): built and tested only.
+# Each class is separately authorized in ``recovery_classes`` (enabled +
+# authorized_by + pinned authorization_sha256), gates on re-read live state,
+# mutates through an existing governed mechanism, and is revalidated by the
+# exact detector plus its own postcondition. Everything not bound here stays
+# ESCALATE-only.
+# ---------------------------------------------------------------------------
+
+import fnmatch  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
+
+
+@dataclasses.dataclass(frozen=True)
+class Gate:
+    decision: str  # GATE_PROCEED | GATE_CLEARED | GATE_DEFERRED | GATE_REFUSED
+    reason: str = ""
+
+
+def recovery_authorization_digest(name: str, spec: dict) -> str:
+    """sha256 over a class's whole authorization scope (enabled, authorizer, allowlists, bounds)."""
+    scope = {k: v for k, v in spec.items() if k not in ("authorization_sha256", "status", "note")}
+    return hashlib.sha256(json.dumps({"recovery_class": name, **scope}, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def recovery_authorization(config: dict, klass: "RecoveryClass") -> tuple[Optional[dict], Optional[str]]:
+    """``(spec, None)`` when authorized, ``(None, None)`` when not enabled, ``(None, problem)`` when invalid."""
+    block = config.get("recovery_classes")
+    if block is None:
+        return None, None
+    if not isinstance(block, dict):
+        return None, "malformed_recovery_classes"
+    spec = block.get(klass.name)
+    if spec is None:
+        return None, None
+    if not isinstance(spec, dict):
+        return None, "malformed"
+    if spec.get("enabled") is not True:
+        return None, None
+    if not str(spec.get("authorized_by") or "").strip():
+        return None, "missing_authorized_by"
+    try:
+        problem = klass.validate_spec(spec, config)
+    except Exception as exc:
+        problem = f"validate_raised:{type(exc).__name__}"
+    if problem:
+        return None, problem
+    if spec.get("authorization_sha256") != recovery_authorization_digest(klass.name, spec):
+        return None, "authorization_digest_mismatch"
+    return spec, None
+
+
+def _cooldown_path(ctx: Context) -> Path:
+    return ctx.state_dir / "recovery-cooldowns.json"
+
+
+def _cooldown_last(ctx: Context, key: str) -> Optional[float]:
+    try:
+        return float(json.loads(_cooldown_path(ctx).read_text(encoding="utf-8")).get(key))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _cooldown_mark(ctx: Context, key: str, ts: float) -> None:
+    path = _cooldown_path(ctx)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data[key] = ts
+    _atomic_write_json(path, data)
+
+
+def _poll_until(ctx: Context, check: Callable[[], Optional[str]], timeout: float,
+                interval: float = 5.0) -> Optional[str]:
+    """Bounded polling by iteration count (never by the injectable clock)."""
+    rounds = max(1, int(timeout // interval)) + 1
+    problem: Optional[str] = "not_checked"
+    for index in range(rounds):
+        problem = check()
+        if problem is None:
+            return None
+        if index < rounds - 1:
+            ctx.sleep(interval)
+    return problem
+
+
+class RecoveryClass:
+    """One bounded, separately authorized recovery for exact detector conditions."""
+
+    name = ""
+    #: invariant name -> signature prefixes this class may act on.
+    binds: dict = {}
+    #: First attempt plus one bounded retry.
+    max_attempts = 2
+    #: The detector must have fired on this many consecutive passes first.
+    recover_after_cycles = 1
+    #: An unchanged recurrence inside this window escalates instead of looping.
+    recurrence_window_seconds = 3600
+    #: Deferral (cooldown, transition in progress) longer than this escalates.
+    max_deferral_seconds = 3600
+    trigger = ""
+    mutation = ""
+    authorization_boundary = ""
+    validator = ""
+    rollback = ""
+    escalation_only = ""
+
+    def settle_seconds(self, spec: dict) -> int:
+        return 0
+
+    def validate_spec(self, spec: dict, config: dict) -> Optional[str]:
+        return None
+
+    def matches(self, finding: Finding, spec: dict, config: dict) -> bool:
+        prefixes = self.binds.get(finding.invariant)
+        return bool(prefixes) and finding.signature.startswith(tuple(prefixes))
+
+    def gate(self, ctx: Context, finding: Finding, rec: dict, spec: dict) -> Gate:  # pragma: no cover
+        raise NotImplementedError
+
+    def recover(self, ctx: Context, finding: Finding, spec: dict) -> RecoveryOutcome:  # pragma: no cover
+        raise NotImplementedError
+
+    def postcondition(self, ctx: Context, finding: Finding, rec: dict, spec: dict) -> Optional[str]:
+        return None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+class GatewayRestartRecovery(RecoveryClass):
+    name = "gateway_restart"
+    UNIT = "hermes-gateway.service"
+    binds = {"gateway_heartbeat_fresh": ("heartbeat_stale", "heartbeat_missing")}
+    recover_after_cycles = 2
+    recurrence_window_seconds = 7200
+    max_deferral_seconds = 2700
+    trigger = ("gateway_heartbeat_fresh heartbeat_stale|heartbeat_missing on 2 consecutive light passes, "
+               "re-read live at the gate")
+    mutation = ("write the shared watchdog cooldown marker, then the existing governed restart "
+                "`hermes gateway restart` (graceful drain of the user unit)")
+    authorization_boundary = ("hermes-gateway.service only, user scope, the governed restart command exactly; cooldown "
+                              ">= the crontab watchdog's 1800 s and shared through its marker; deferred while a "
+                              "restart/lifecycle transition is in progress")
+    validator = ("gateway heartbeat fresh; hermes-gateway.service active; gateway_state.json running with a live pid "
+                 "that also wrote the heartbeat; every required messaging platform connected by that pid "
+                 "(polled up to postcondition_timeout_seconds)")
+    rollback = "none required: a restart is non-destructive; a failed postcondition escalates; disable with enabled:false"
+    escalation_only = "unit not installed; cooldown or transition outlasting max_deferral; recurrence within 2 h"
+
+    def validate_spec(self, spec, config):
+        if spec.get("unit") != self.UNIT:
+            return "unit_must_be_hermes_gateway"
+        command = spec.get("restart_command")
+        if not (isinstance(command, list) and all(isinstance(p, str) for p in command)
+                and command[-2:] == ["gateway", "restart"]):
+            return "restart_command_must_be_governed_gateway_restart"
+        if any(part in ("--system", "--force", "-f", "kill") for part in command):
+            return "restart_command_flag_not_allowed"
+        if int(spec.get("cooldown_seconds") or 0) < 1800:
+            return "cooldown_below_watchdog"
+        if not str(spec.get("cooldown_marker") or "").strip():
+            return "missing_cooldown_marker"
+        return None
+
+    def _heartbeat(self, ctx):
+        data = _read_json(ctx.hermes_home / "state" / "gateway.heartbeat")
+        return _parse_ts(data.get("updated_at")), data.get("pid")
+
+    def _stale(self, ctx) -> bool:
+        updated, _ = self._heartbeat(ctx)
+        return updated is None or ctx.now() - updated > int(ctx.config.get("gateway_heartbeat_max_age_seconds", 180))
+
+    def gate(self, ctx, finding, rec, spec):
+        if not self._stale(ctx):
+            return Gate(GATE_CLEARED, "heartbeat_fresh")
+        phase = _read_json(ctx.hermes_home / "state" / "gateway.lifecycle.json").get("phase")
+        if phase not in (None, "running"):
+            return Gate(GATE_DEFERRED, f"lifecycle_phase:{phase}")
+        if _read_json(ctx.hermes_home / "gateway_state.json").get("restart_requested"):
+            return Gate(GATE_DEFERRED, "restart_already_requested")
+        last = _cooldown_last(ctx, self.name) or 0.0
+        try:
+            last = max(last, float(Path(os.path.expanduser(spec["cooldown_marker"])).read_text().strip()))
+        except (OSError, ValueError):
+            pass
+        if last and ctx.now() - last < int(spec["cooldown_seconds"]):
+            return Gate(GATE_DEFERRED, "cooldown_active")
+        _, enabled = ctx.run_command(["systemctl", "--user", "is-enabled", self.UNIT], 30)
+        if enabled.strip() not in ("enabled", "enabled-runtime", "static", "linked"):
+            return Gate(GATE_REFUSED, "gateway_unit_not_installed")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        now = ctx.now()
+        _cooldown_mark(ctx, self.name, now)
+        marker = Path(os.path.expanduser(spec["cooldown_marker"]))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{int(now)}\n", encoding="utf-8")
+        rc, _ = ctx.run_command(list(spec["restart_command"]), int(spec.get("command_timeout_seconds", 300)))
+        _poll_until(ctx, lambda: self._post(ctx, spec), float(spec.get("postcondition_timeout_seconds", 120)))
+        return RecoveryOutcome(rc == 0, "governed_gateway_restart", {"exit_code": rc})
+
+    def _post(self, ctx, spec) -> Optional[str]:
+        if self._stale(ctx):
+            return "heartbeat_not_fresh"
+        _, active = ctx.run_command(["systemctl", "--user", "is-active", self.UNIT], 30)
+        if active.strip() != "active":
+            return f"unit_not_active:{active.strip() or 'unknown'}"
+        gstate = _read_json(ctx.hermes_home / "gateway_state.json")
+        pid = gstate.get("pid")
+        if gstate.get("gateway_state") != "running" or not _pid_alive(pid):
+            return "gateway_process_not_running"
+        _, beat_pid = self._heartbeat(ctx)
+        if beat_pid is not None and beat_pid != pid:
+            return "heartbeat_from_another_process"
+        for platform in spec.get("required_platforms") or ctx.config.get("required_gateway_platforms") or []:
+            entry = (gstate.get("platforms") or {}).get(platform) or {}
+            if entry.get("state") != "connected" or entry.get("writer_pid") != pid:
+                return f"platform_not_connected:{platform}"
+        return None
+
+    def postcondition(self, ctx, finding, rec, spec):
+        return self._post(ctx, spec)
+
+
+_TRANSITION_STATES = ("activating", "deactivating", "reloading", "refreshing")
+
+
+class SharedServiceRestartRecovery(RecoveryClass):
+    name = "shared_service_restart"
+    binds = {"shared_units_active": ("not_active:",)}
+    recover_after_cycles = 2
+    max_deferral_seconds = 1800
+    trigger = "shared_units_active not_active:<state> for an allowlisted shared user unit on 2 consecutive light passes"
+    mutation = "systemctl --user reset-failed <unit>; systemctl --user restart <unit>"
+    authorization_boundary = ("only units in recovery_classes.shared_service_restart.services that are also "
+                              "shared_user_units; never hermes-gateway (own class), never a system unit (privilege), "
+                              "never a company service; failed state, or inactive with a non-success Result")
+    validator = "unit active and its configured loopback health endpoint HEALTHY (polled up to postcondition_timeout_seconds)"
+    rollback = "none required: restarting a failed/crashed shared unit restores its prior state; failure escalates"
+    escalation_only = ("inactive after a clean stop (possibly deliberate); unexpected unit state; company or system "
+                       "services; transition or cooldown outlasting max_deferral")
+
+    def validate_spec(self, spec, config):
+        services = spec.get("services")
+        if not isinstance(services, dict) or not services:
+            return "no_services"
+        shared_user = set(config.get("shared_user_units") or [])
+        system_units = set(config.get("shared_system_units") or [])
+        probes = config.get("company_health_probes") or {}
+        company_units = {f"{e.get('service')}.service" for e in probes.get("entities", []) if isinstance(e, dict)}
+        tokens = [t for c in ((config.get("company_isolation") or {}).get("companies") or {}).values()
+                  for t in c.get("tokens", [])]
+        for unit, entry in services.items():
+            if unit == GatewayRestartRecovery.UNIT:
+                return "gateway_has_its_own_class"
+            if unit in company_units or any(tok in unit.lower() for tok in tokens):
+                return f"company_service_not_allowed:{unit}"
+            if unit in system_units or unit not in shared_user:
+                return f"not_a_shared_user_unit:{unit}"
+            url = (entry or {}).get("health_url")
+            if url:
+                parts = urlsplit(url)
+                if parts.scheme != "http" or parts.hostname not in _LOOPBACK_HOSTS:
+                    return f"health_url_not_loopback:{unit}"
+        if int(spec.get("cooldown_seconds") or 0) < 300:
+            return "cooldown_too_short"
+        return None
+
+    def matches(self, finding, spec, config):
+        return super().matches(finding, spec, config) and finding.subject in spec["services"]
+
+    def _state(self, ctx, unit) -> str:
+        _, out = ctx.run_command(["systemctl", "--user", "is-active", unit], 30)
+        return out.strip() or "unknown"
+
+    def gate(self, ctx, finding, rec, spec):
+        unit = finding.subject
+        state = self._state(ctx, unit)
+        if state == "active" and not rec.get("recovery_pending"):
+            return Gate(GATE_CLEARED, "active")
+        if state in _TRANSITION_STATES:
+            return Gate(GATE_DEFERRED, f"transition:{state}")
+        if state == "inactive":
+            _, outcome = ctx.run_command(["systemctl", "--user", "show", "-p", "Result", "--value", unit], 30)
+            if outcome.strip() in ("", "success"):
+                return Gate(GATE_REFUSED, "inactive_after_clean_stop")
+        elif state not in ("failed", "active"):
+            return Gate(GATE_REFUSED, f"unexpected_state:{state}")
+        last = _cooldown_last(ctx, f"{self.name}:{unit}")
+        if last and ctx.now() - last < int(spec["cooldown_seconds"]):
+            return Gate(GATE_DEFERRED, "cooldown_active")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        unit = finding.subject
+        _cooldown_mark(ctx, f"{self.name}:{unit}", ctx.now())
+        ctx.run_command(["systemctl", "--user", "reset-failed", unit], 30)
+        rc, _ = ctx.run_command(["systemctl", "--user", "restart", unit], 120)
+        _poll_until(ctx, lambda: self._post(ctx, unit, spec), float(spec.get("postcondition_timeout_seconds", 60)))
+        return RecoveryOutcome(rc == 0, "restart_shared_user_unit", {"unit": unit, "exit_code": rc})
+
+    def _post(self, ctx, unit, spec) -> Optional[str]:
+        state = self._state(ctx, unit)
+        if state != "active":
+            return f"unit_not_active:{state}"
+        url = (spec["services"].get(unit) or {}).get("health_url")
+        if url:
+            coarse, _status, _latency = _http_probe(url, float(spec.get("health_timeout_seconds", 5)))
+            if coarse != HEALTH_HEALTHY:
+                return f"health_endpoint:{coarse}"
+        return None
+
+    def postcondition(self, ctx, finding, rec, spec):
+        return self._post(ctx, finding.subject, spec)
+
+
+class LeaseReconciliationRecovery(RecoveryClass):
+    name = "lease_reconciliation"
+    KINDS = {
+        "claims": ("running_claim_expired_unreclaimed", "running_without_open_run"),
+        "detached_runs": ("open_run_detached:",),
+        "executions": ("execution_heartbeat_stale_unreconciled:",),
+    }
+    binds = {"run_lease_consistency": tuple(p for kind in KINDS.values() for p in kind)}
+    recover_after_cycles = 2
+    trigger = "run_lease_consistency finding on 2 consecutive light passes (the dispatcher's own reclaim passes did not act)"
+    mutation = ("claims: kanban_db.reclaim_task (governed reclaim, worker already dead); detached_runs: "
+                "kanban_db._reclaim_dangling_run for the card's own current run; executions: "
+                "exec_supervisor._reconcile_one for that one execution (process already gone)")
+    authorization_boundary = ("one card/run/execution at a time; never when the worker or executor process is alive, "
+                              "an execution heartbeat is fresh, or the claim belongs to another host; never for age alone")
+    validator = ("card running => unexpired claim and an open current run; card not running => no open current run; "
+                 "execution settled; plus the exact detector rerun")
+    rollback = ("reclaim returns the card to its source phase with full run/event history preserved; nothing is "
+                "deleted; the next dispatch resumes it")
+    escalation_only = "live worker/executor, fresh heartbeat, other-host claim, a detached run that is not the card's current run"
+
+    def validate_spec(self, spec, config):
+        kinds = spec.get("reconcile")
+        if not isinstance(kinds, list) or not kinds or any(k not in self.KINDS for k in kinds):
+            return "reconcile_must_list_claims_detached_runs_executions"
+        return None
+
+    def matches(self, finding, spec, config):
+        allowed = tuple(p for kind in spec["reconcile"] for p in self.KINDS[kind])
+        return finding.invariant == "run_lease_consistency" and finding.signature.startswith(allowed)
+
+    @staticmethod
+    def _live_execution(ctx, conn, task_id) -> Optional[str]:
+        from hermes_cli import exec_supervisor as es
+        stale = int(ctx.config.get("execution_heartbeat_stale_seconds", 900))
+        for row in conn.execute(
+            "SELECT id, pid, proc_key, heartbeat_at, started_at FROM executions "
+            "WHERE task_id = ? AND ended_at IS NULL AND status IN ('launching', 'running')", (task_id,),
+        ).fetchall():
+            beat = row["heartbeat_at"] if row["heartbeat_at"] is not None else row["started_at"]
+            if (beat is not None and ctx.now() - int(beat) <= stale) or es._still_alive(row["pid"], row["proc_key"]):
+                return row["id"]
+        return None
+
+    def gate(self, ctx, finding, rec, spec):
+        kb = _kb()
+        sig = finding.signature
+        now = ctx.now()
+        with ctx.kanban() as conn:
+            if sig.startswith("execution_heartbeat_stale_unreconciled:"):
+                from hermes_cli import exec_supervisor as es
+                row = conn.execute("SELECT status, ended_at, pid, proc_key, heartbeat_at, started_at FROM executions "
+                                   "WHERE id = ?", (finding.detail.get("execution_id"),)).fetchone()
+                if row is None or row["ended_at"] is not None or row["status"] not in ("launching", "running"):
+                    return Gate(GATE_CLEARED, "execution_settled")
+                beat = row["heartbeat_at"] if row["heartbeat_at"] is not None else row["started_at"]
+                if beat is not None and now - int(beat) <= int(ctx.config.get("execution_heartbeat_stale_seconds", 900)):
+                    return Gate(GATE_CLEARED, "heartbeat_fresh")
+                if es._still_alive(row["pid"], row["proc_key"]):
+                    return Gate(GATE_REFUSED, "live_process_stale_heartbeat")
+                return Gate(GATE_PROCEED)
+            task = conn.execute("SELECT status, claim_lock, claim_expires, worker_pid, current_run_id FROM tasks "
+                                "WHERE id = ?", (finding.subject,)).fetchone()
+            if task is None:
+                return Gate(GATE_REFUSED, "task_missing")
+            if sig.startswith("open_run_detached:"):
+                run_id = int(sig.split(":", 1)[1])
+                run = conn.execute("SELECT ended_at, worker_pid FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+                if run is None or run["ended_at"] is not None:
+                    return Gate(GATE_CLEARED, "run_ended")
+                if task["status"] == "running" and task["current_run_id"] == run_id:
+                    return Gate(GATE_CLEARED, "run_is_live_current_run")
+                if task["current_run_id"] != run_id:
+                    return Gate(GATE_REFUSED, "no_governed_mechanism_for_non_current_run")
+                if run["worker_pid"] and kb._pid_alive(run["worker_pid"]):
+                    return Gate(GATE_REFUSED, "run_worker_alive")
+            else:
+                if task["status"] != "running":
+                    return Gate(GATE_CLEARED, "not_running")
+                grace = int(ctx.config.get("lease_grace_seconds", 300))
+                if sig == "running_claim_expired_unreclaimed" and (
+                        task["claim_expires"] is None or now - int(task["claim_expires"]) <= grace):
+                    return Gate(GATE_CLEARED, "claim_not_expired")
+                if sig == "running_without_open_run" and task["current_run_id"] is not None:
+                    run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (task["current_run_id"],)).fetchone()
+                    if run is not None and run["ended_at"] is None:
+                        return Gate(GATE_CLEARED, "run_open")
+                lock = str(task["claim_lock"] or "")
+                host = lock.rsplit(":", 1)[0] if ":" in lock else ""
+                if host and host != kb._claimer_id().split(":", 1)[0]:
+                    return Gate(GATE_REFUSED, "claim_held_by_other_host")
+                if task["worker_pid"] and kb._pid_alive(task["worker_pid"]):
+                    return Gate(GATE_REFUSED, "worker_process_alive")
+            live = self._live_execution(ctx, conn, finding.subject)
+            if live:
+                return Gate(GATE_REFUSED, "live_execution")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        kb = _kb()
+        sig = finding.signature
+        with ctx.kanban() as conn:
+            if sig.startswith("execution_heartbeat_stale_unreconciled:"):
+                from hermes_cli import exec_supervisor as es
+                record = es.get_execution(conn, finding.detail.get("execution_id"))
+                if record is None:
+                    return RecoveryOutcome(False, "execution_missing")
+                result = es.ReconcileResult()
+                es._reconcile_one(conn, record, policy=es.load_policy(), now=int(ctx.now()), result=result)
+                return RecoveryOutcome(True, "reconcile_one_execution", {"execution_id": record.id})
+            if sig.startswith("open_run_detached:"):
+                status = conn.execute("SELECT status FROM tasks WHERE id = ?", (finding.subject,)).fetchone()["status"]
+                with kb.write_txn(conn):
+                    kb._reclaim_dangling_run(conn, finding.subject, statuses=(status,), now=int(ctx.now()),
+                                             note=f"{CONTROLLER_ID}: closed detached run (worker gone)")
+                return RecoveryOutcome(True, "close_dangling_current_run", {})
+            done = kb.reclaim_task(conn, finding.subject,
+                                   reason=f"{CONTROLLER_ID}: {sig}; worker and executor not alive")
+            return RecoveryOutcome(bool(done), "governed_reclaim", {})
+
+    def postcondition(self, ctx, finding, rec, spec):
+        sig = finding.signature
+        now = ctx.now()
+        with ctx.kanban() as conn:
+            if sig.startswith("execution_heartbeat_stale_unreconciled:"):
+                row = conn.execute("SELECT ended_at FROM executions WHERE id = ?",
+                                   (finding.detail.get("execution_id"),)).fetchone()
+                return None if row is None or row["ended_at"] is not None else "execution_not_settled"
+            task = conn.execute("SELECT status, claim_expires, current_run_id FROM tasks WHERE id = ?",
+                                (finding.subject,)).fetchone()
+            if task is None:
+                return "task_missing"
+            run = None
+            if task["current_run_id"] is not None:
+                run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (task["current_run_id"],)).fetchone()
+            run_open = run is not None and run["ended_at"] is None
+            if task["status"] == "running":
+                grace = int(ctx.config.get("lease_grace_seconds", 300))
+                if task["claim_expires"] is None or now - int(task["claim_expires"]) > grace or not run_open:
+                    return "running_card_still_inconsistent"
+            elif run_open:
+                return "open_current_run_on_non_running_card"
+            if sig.startswith("open_run_detached:"):
+                detached = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?",
+                                        (int(sig.split(":", 1)[1]),)).fetchone()
+                if detached is not None and detached["ended_at"] is None:
+                    return "detached_run_still_open"
+        return None
+
+
+class LifeWikiRetryRecovery(RecoveryClass):
+    name = "life_wiki_retry"
+    binds = {"life_wiki_daily_note": ("daily_note_missing_after_cutoff:",),
+             "critical_cron_jobs_healthy": ("last_status:", "failure_streak", "never_ran", "stale")}
+    recurrence_window_seconds = 86400
+    max_deferral_seconds = 7200
+    FORBIDDEN_JOBS = ("life-wiki-github-sync",)
+    trigger = ("life_wiki_daily_note daily_note_missing_after_cutoff, or critical_cron_jobs_healthy failure/staleness "
+               "of an allowlisted Wiki validation job")
+    mutation = "schedule the existing Hermes cron job once on its next tick (cron.jobs.trigger_job), never a paused job"
+    authorization_boundary = ("the daily-note job and validation jobs named in the class spec only; never "
+                              "life-wiki-github-sync (it commits every change); no alternative storage is written")
+    validator = ("daily note: today's note exists and the deterministic validator command exits 0; validation job: "
+                 "last_run_at after the trigger and last_status ok (settle window before judging)")
+    rollback = "none required: an extra run of an idempotent scheduled job; the job's own writes follow its normal path"
+    escalation_only = "paused/disabled or missing job; job succeeded today without writing the note; validator still failing after retry"
+
+    def settle_seconds(self, spec):
+        return int(spec.get("settle_seconds", 1800))
+
+    def validate_spec(self, spec, config):
+        jobs = [spec.get("daily_note_job")] + list(spec.get("validation_jobs") or [])
+        if not all(isinstance(j, str) and j.strip() for j in jobs):
+            return "jobs_must_be_named"
+        if any(j in self.FORBIDDEN_JOBS for j in jobs):
+            return "forbidden_job"
+        command = spec.get("validator_command")
+        if not (isinstance(command, list) and all(isinstance(p, str) for p in command)
+                and any("{date}" in p for p in command)):
+            return "validator_command_must_take_date"
+        if not (config.get("life_wiki_daily_note") or {}).get("vault"):
+            return "life_wiki_daily_note_not_configured"
+        return None
+
+    def matches(self, finding, spec, config):
+        if not super().matches(finding, spec, config):
+            return False
+        if finding.invariant == "critical_cron_jobs_healthy":
+            return finding.subject in (spec.get("validation_jobs") or [])
+        return True
+
+    @staticmethod
+    def _job(ctx, name) -> Optional[dict]:
+        doc = _read_json(ctx.hermes_home / "cron" / "jobs.json")
+        for job in doc.get("jobs", []) if isinstance(doc.get("jobs"), list) else []:
+            if isinstance(job, dict) and job.get("name") == name:
+                return job
+        return None
+
+    def _job_name(self, finding, spec) -> str:
+        return spec["daily_note_job"] if finding.invariant == "life_wiki_daily_note" else finding.subject
+
+    @staticmethod
+    def _note_date(finding) -> str:
+        return finding.signature.split(":", 1)[1]
+
+    @staticmethod
+    def _note_path(ctx, date) -> Path:
+        vault = Path(os.path.expanduser(ctx.config["life_wiki_daily_note"]["vault"]))
+        return vault / "Logs" / "daily" / f"{date}.md"
+
+    def gate(self, ctx, finding, rec, spec):
+        name = self._job_name(finding, spec)
+        job = self._job(ctx, name)
+        if job is None:
+            return Gate(GATE_REFUSED, "job_missing")
+        if not job.get("enabled", True) or job.get("state") == "paused":
+            return Gate(GATE_REFUSED, "job_paused_owner_decision")
+        if job.get("state") == "running":
+            return Gate(GATE_DEFERRED, "job_running")
+        if finding.invariant == "life_wiki_daily_note":
+            date = self._note_date(finding)
+            if self._note_path(ctx, date).is_file():
+                return Gate(GATE_CLEARED, "note_exists")
+            from zoneinfo import ZoneInfo
+            last = _parse_ts(job.get("last_run_at"))
+            tz = ZoneInfo(ctx.config["life_wiki_daily_note"].get("timezone", "America/Chicago"))
+            if (last is not None and job.get("last_status") == "ok" and not rec.get("recovery_pending")
+                    and _dt.datetime.fromtimestamp(last, tz).date().isoformat() == date):
+                return Gate(GATE_REFUSED, "job_succeeded_without_note")
+        elif job.get("last_status") == "ok" and not int(job.get("failure_streak") or 0) and not rec.get("recovery_pending"):
+            return Gate(GATE_CLEARED, "job_ok")
+        if ctx.cron_trigger is None:
+            return Gate(GATE_REFUSED, "no_trigger_mechanism")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        name = self._job_name(finding, spec)
+        ok, detail = ctx.cron_trigger(name)
+        return RecoveryOutcome(bool(ok), "trigger_existing_cron_job", {"job": name, "detail": str(detail)[:120]})
+
+    def postcondition(self, ctx, finding, rec, spec):
+        triggered = _parse_ts((rec.get("last_recovery") or {}).get("at"))
+        if finding.invariant == "life_wiki_daily_note":
+            date = self._note_date(finding)
+            if not self._note_path(ctx, date).is_file():
+                return "note_missing"
+            argv = [os.path.expanduser(p.replace("{date}", date)) for p in spec["validator_command"]]
+            rc, _ = ctx.run_command(argv, int(spec.get("validator_timeout_seconds", 120)))
+            return None if rc == 0 else f"validator_failed:rc={rc}"
+        job = self._job(ctx, finding.subject) or {}
+        last = _parse_ts(job.get("last_run_at"))
+        if last is None or (triggered is not None and last < triggered):
+            return "job_not_rerun_yet"
+        if job.get("last_status") != "ok":
+            return f"job_status:{job.get('last_status')}"
+        return None
+
+
+_GIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+
+class VaultSyncRecovery(RecoveryClass):
+    name = "vault_git_sync"
+    FORBIDDEN_REPOS = ("hermes-agent-next", "doctrine")
+    binds = {"repository_drift": ("unpushed_commits", "behind_upstream")}
+    trigger = "repository_drift unpushed_commits|behind_upstream on a repository allowlisted for automatic sync"
+    mutation = ("git fetch <remote> <branch>; git merge --ff-only <remote>/<branch> when behind; "
+                "git push <remote> HEAD:refs/heads/<branch> when ahead (never --force)")
+    authorization_boundary = ("only repositories in the class spec that are also watched by repository_drift with the "
+                              "same path and upstream; never hermes-agent-next or the doctrine repo; clean working tree, "
+                              "on the expected branch, no merge/rebase in progress, not diverged")
+    validator = "git ls-remote shows the remote branch at the local HEAD commit; working tree still clean"
+    rollback = ("fast-forward only: the prior commit stays in history; a pushed commit can be reverted forward by its "
+                "owner; nothing is committed, reset or force-pushed by the controller")
+    escalation_only = "dirty or provenance-unknown working tree, diverged history, wrong branch, operation in progress, forbidden repositories"
+
+    def validate_spec(self, spec, config):
+        repos = spec.get("repositories")
+        if not isinstance(repos, dict) or not repos:
+            return "no_repositories"
+        watched = {r.get("name"): r for r in ((config.get("repository_drift") or {}).get("watched_repositories") or [])
+                   if isinstance(r, dict)}
+        forbidden_paths = {os.path.realpath(os.path.expanduser(p))
+                           for p in ("~/.hermes/hermes-agent-next", "~/.hermes/doctrine")}
+        for name, entry in repos.items():
+            path = os.path.realpath(os.path.expanduser(str((entry or {}).get("path") or "")))
+            if name in self.FORBIDDEN_REPOS or os.path.basename(path) in self.FORBIDDEN_REPOS or path in forbidden_paths:
+                return f"repository_never_auto_synced:{name}"
+            remote, branch = entry.get("remote"), entry.get("branch")
+            if not (isinstance(remote, str) and _GIT_TOKEN_RE.match(remote)
+                    and isinstance(branch, str) and _GIT_TOKEN_RE.match(branch)):
+                return f"invalid_remote_or_branch:{name}"
+            spec_watch = watched.get(name)
+            if (spec_watch is None or os.path.realpath(os.path.expanduser(spec_watch.get("path") or "")) != path
+                    or spec_watch.get("upstream") != f"{remote}/{branch}"):
+                return f"not_watched_with_same_upstream:{name}"
+        return None
+
+    def matches(self, finding, spec, config):
+        return super().matches(finding, spec, config) and finding.subject in spec["repositories"]
+
+    @staticmethod
+    def _git(ctx, path, *args, timeout=60):
+        return ctx.run_command(["git", "--no-optional-locks", "-C", path, *args], timeout)
+
+    def _counts(self, ctx, path, upstream):
+        rc_a, ahead = self._git(ctx, path, "rev-list", "--count", f"{upstream}..HEAD")
+        rc_b, behind = self._git(ctx, path, "rev-list", "--count", f"HEAD..{upstream}")
+        if rc_a or rc_b or not ahead.strip().isdigit() or not behind.strip().isdigit():
+            return None
+        return int(ahead.strip()), int(behind.strip())
+
+    def gate(self, ctx, finding, rec, spec):
+        entry = spec["repositories"][finding.subject]
+        path = os.path.expanduser(entry["path"])
+        rc, status = self._git(ctx, path, "status", "--porcelain")
+        if rc != 0:
+            return Gate(GATE_REFUSED, "repo_unreadable")
+        if status.strip():
+            return Gate(GATE_REFUSED, "worktree_dirty_unknown_changes")
+        rc, git_dir = self._git(ctx, path, "rev-parse", "--absolute-git-dir")
+        if rc == 0 and any((Path(git_dir.strip()) / marker).exists() for marker in
+                           ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply")):
+            return Gate(GATE_REFUSED, "git_operation_in_progress")
+        rc, head = self._git(ctx, path, "rev-parse", "--abbrev-ref", "HEAD")
+        if rc != 0 or head.strip() != entry["branch"]:
+            return Gate(GATE_REFUSED, "not_on_expected_branch")
+        counts = self._counts(ctx, path, f"{entry['remote']}/{entry['branch']}")
+        if counts is None:
+            return Gate(GATE_REFUSED, "upstream_unreadable")
+        if counts[0] and counts[1]:
+            return Gate(GATE_REFUSED, "diverged")
+        if not counts[0] and not counts[1]:
+            return Gate(GATE_CLEARED, "in_sync")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        entry = spec["repositories"][finding.subject]
+        path, remote, branch = os.path.expanduser(entry["path"]), entry["remote"], entry["branch"]
+        rc, _ = self._git(ctx, path, "fetch", "--quiet", remote, branch, timeout=120)
+        if rc != 0:
+            return RecoveryOutcome(False, "fetch_failed", {"exit_code": rc})
+        counts = self._counts(ctx, path, f"{remote}/{branch}")
+        _, status = self._git(ctx, path, "status", "--porcelain")
+        if counts is None or (counts[0] and counts[1]) or status.strip():
+            return RecoveryOutcome(False, "unsafe_after_fetch", {})
+        merged = pushed = False
+        if counts[1]:
+            rc, _ = self._git(ctx, path, "merge", "--ff-only", f"{remote}/{branch}")
+            if rc != 0:
+                return RecoveryOutcome(False, "fast_forward_failed", {"exit_code": rc})
+            merged = True
+        if counts[0]:
+            rc, _ = self._git(ctx, path, "push", remote, f"HEAD:refs/heads/{branch}", timeout=120)
+            if rc != 0:
+                return RecoveryOutcome(False, "push_failed", {"exit_code": rc})
+            pushed = True
+        _, head = self._git(ctx, path, "rev-parse", "HEAD")
+        return RecoveryOutcome(True, "fast_forward_sync", {"merged": merged, "pushed": pushed,
+                                                          "expected_commit": head.strip()})
+
+    def postcondition(self, ctx, finding, rec, spec):
+        entry = spec["repositories"][finding.subject]
+        path = os.path.expanduser(entry["path"])
+        _, head = self._git(ctx, path, "rev-parse", "HEAD")
+        rc, remote = self._git(ctx, path, "ls-remote", entry["remote"], f"refs/heads/{entry['branch']}", timeout=60)
+        remote_sha = remote.split()[0] if rc == 0 and remote.strip() else ""
+        if not head.strip() or remote_sha != head.strip():
+            return "remote_does_not_contain_expected_commit"
+        _, status = self._git(ctx, path, "status", "--porcelain")
+        return "worktree_changed" if status.strip() else None
+
+
+_EVIDENCE_EXTENSIONS = (".md", ".json", ".txt", ".patch", ".diff")
+
+
+class EvidenceAttachmentRecovery(RecoveryClass):
+    name = "evidence_attachment"
+    binds = {"verifier_route_open": ("no_route:evidence_missing",)}
+    trigger = "verifier_route_open no_route:evidence_missing on a shared Gauntlet subject in review"
+    mutation = ("attach existing files matching the class patterns from the task's own workspace "
+                "(recovery_lane._task_owned_workspace + _harvestable) with kanban_db.store_attachment_bytes")
+    authorization_boundary = ("task-owned workspace only; allowlisted name patterns with .md/.json/.txt/.patch/.diff; "
+                              "never logs, databases, WAL, bytecode, keys, .env, caches, hidden or company-named files; "
+                              "never a company-lane card; size and count bounded; nothing is generated")
+    validator = "kanban_db.subject_has_evidence and _subject_evidence_is_dispatchable, plus the exact detector rerun"
+    rollback = "attachments are additive and idempotent (same name+content never re-attached); an owner can remove a row"
+    escalation_only = "no task-owned workspace; no eligible existing file; company-lane card; subject not pending review"
+
+    def validate_spec(self, spec, config):
+        patterns = spec.get("patterns")
+        if not isinstance(patterns, list) or not patterns:
+            return "no_patterns"
+        for pattern in patterns:
+            if (not isinstance(pattern, str) or "/" in pattern or ".." in pattern
+                    or not pattern.lower().endswith(_EVIDENCE_EXTENSIONS)):
+                return f"pattern_not_allowed:{pattern}"
+        if not 1 <= int(spec.get("max_files") or 0) <= 10:
+            return "max_files_out_of_range"
+        if not 1 <= int(spec.get("max_bytes") or 0) <= 5 * 1024 * 1024:
+            return "max_bytes_out_of_range"
+        return None
+
+    @staticmethod
+    def _company_tokens(config) -> list[str]:
+        return [t for c in ((config.get("company_isolation") or {}).get("companies") or {}).values()
+                for t in c.get("tokens", [])]
+
+    def _candidates(self, ctx, task, root: Path, spec) -> list[Path]:
+        from hermes_cli import recovery_lane
+        tokens = self._company_tokens(ctx.config)
+        out: list[Path] = []
+        for path in sorted(root.rglob("*")):
+            rel = path.relative_to(root)
+            if (path.is_symlink() or not path.is_file() or any(part.startswith(".") for part in rel.parts)
+                    or not any(fnmatch.fnmatchcase(path.name, p) for p in spec["patterns"])
+                    or not path.name.lower().endswith(_EVIDENCE_EXTENSIONS)
+                    or not recovery_lane._harvestable(path, root)
+                    or any(tok in path.name.lower() for tok in tokens)
+                    or path.stat().st_size > int(spec["max_bytes"]) or path.stat().st_size == 0):
+                continue
+            out.append(path)
+            if len(out) >= int(spec["max_files"]):
+                break
+        return out
+
+    def _task(self, ctx, conn, task_id):
+        from hermes_cli import recovery_lane
+        kb = _kb()
+        task = kb.get_task(conn, task_id)
+        root = recovery_lane._task_owned_workspace(task) if task is not None else None
+        return task, root
+
+    def gate(self, ctx, finding, rec, spec):
+        kb = _kb()
+        leads = {lead for c in ((ctx.config.get("company_isolation") or {}).get("companies") or {}).values()
+                 for lead in c.get("lead_profiles", [])}
+        with ctx.kanban() as conn:
+            task, root = self._task(ctx, conn, finding.subject)
+            if task is None:
+                return Gate(GATE_REFUSED, "task_missing")
+            if task.status != "review" or task.verification_state != kb.VERIFICATION_PENDING:
+                return Gate(GATE_CLEARED, "not_pending_review")
+            if kb.subject_has_evidence(conn, task.id):
+                return Gate(GATE_CLEARED, "evidence_present")
+            if task.tenant or task.assignee in leads:
+                return Gate(GATE_REFUSED, "company_lane_task")
+            if root is None:
+                return Gate(GATE_REFUSED, "no_task_owned_workspace")
+            if not self._candidates(ctx, task, root, spec):
+                return Gate(GATE_REFUSED, "no_eligible_source_evidence")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        kb = _kb()
+        stored = 0
+        with ctx.kanban() as conn:
+            task, root = self._task(ctx, conn, finding.subject)
+            if task is None or root is None:
+                return RecoveryOutcome(False, "workspace_unavailable")
+            existing = set()
+            for attachment in kb.list_attachments(conn, task.id):
+                try:
+                    existing.add((attachment.filename,
+                                  hashlib.sha256(Path(attachment.stored_path).read_bytes()).hexdigest()))
+                except (OSError, TypeError):
+                    continue
+            for path in self._candidates(ctx, task, root, spec):
+                data = path.read_bytes()
+                if (path.name, hashlib.sha256(data).hexdigest()) in existing:
+                    continue
+                kb.store_attachment_bytes(conn, task.id, path.name, data, uploaded_by=CONTROLLER_ID)
+                stored += 1
+        return RecoveryOutcome(stored > 0, "attach_task_owned_evidence", {"attached": stored})
+
+    def postcondition(self, ctx, finding, rec, spec):
+        kb = _kb()
+        with ctx.kanban() as conn:
+            if not kb.subject_has_evidence(conn, finding.subject):
+                return "evidence_absent"
+            if not kb._subject_evidence_is_dispatchable(conn, finding.subject):
+                return "evidence_not_dispatchable"
+        return None
+
+
+F3_RECOVERY_CLASSES = (GatewayRestartRecovery, SharedServiceRestartRecovery, LeaseReconciliationRecovery,
+                       LifeWikiRetryRecovery, VaultSyncRecovery, EvidenceAttachmentRecovery)
+
+#: Detectors no F3 class may ever act on (Christopher, 2026-09-14): escalate-only.
+ESCALATE_ONLY_INVARIANTS = (
+    "company_health_endpoints", "company_isolation", "control_defect_regressions", "watcher_integrity",
+    "verified_closure_attributable", "subject_review_regressed", "verifier_of_verifier", "canonical_boot_complete",
+    "runtime_ceilings_match_doctrine", "shared_endpoints_healthy", "resource_thresholds", "ownership_and_linkage",
+    "task_graph_integrity", "backup_results", "escalation_cards_dispositioned", "critical_timers_active",
+    "gateway_platforms_connected", "ready_backlog_explained", "verdict_returned_to_subject",
+    "verifier_child_stalled_in_todo", HOLD_INVARIANT, EXCEPTION_VALIDITY_INVARIANT,
+)
+
+
+def default_recovery_classes() -> list[RecoveryClass]:
+    return [cls() for cls in F3_RECOVERY_CLASSES]
+
+
 #: F1 invariants are detection only: none defines a recovery.
 F1_DETECT_ONLY = (
     ReadyBacklogExplained, RunLeaseConsistency, VerdictReturnedToSubject, VerifierChildStalledInTodo,
@@ -2561,6 +3644,26 @@ def kanban_repair_card(
         return card_id, True
 
 
+def make_cron_trigger() -> Callable[[str], tuple[bool, str]]:
+    """Schedule an existing Hermes cron job on the next scheduler tick.
+
+    ``cron.jobs.trigger_job`` also clears a pause, so a paused or disabled job is
+    refused here as well as at the recovery gate: a pause is an owner decision.
+    """
+    def trigger(name: str) -> tuple[bool, str]:
+        try:
+            from cron import jobs as cron_jobs
+        except Exception as exc:
+            return False, f"cron_unavailable:{type(exc).__name__}"
+        job = cron_jobs.resolve_job_ref(name)
+        if not job:
+            return False, "job_missing"
+        if not job.get("enabled", True) or job.get("state") == "paused":
+            return False, "job_paused_owner_decision"
+        return bool(cron_jobs.trigger_job(job["id"])), "scheduled_next_tick"
+    return trigger
+
+
 def build_context(args: argparse.Namespace) -> Context:
     kb = _kb()
     config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
@@ -2576,6 +3679,7 @@ def build_context(args: argparse.Namespace) -> Context:
         run_command=run_command,
         create_card=kanban_repair_card,
         dry_run=bool(args.dry_run),
+        cron_trigger=make_cron_trigger(),
     )
 
 
@@ -2594,7 +3698,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     status_p.add_argument("--state-dir")
     status_p.add_argument("--dry-run", action="store_true")
     sub.add_parser("invariants", help="print every invariant's tier, source, failure condition and evidence")
+    rec_p = sub.add_parser("recoveries", help="print every recovery class and its authorization state")
+    rec_p.add_argument("--config")
     args = parser.parse_args(argv)
+    if args.command == "recoveries":
+        config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        rows = []
+        for klass in default_recovery_classes():
+            spec, problem = recovery_authorization(config, klass)
+            rows.append({
+                "name": klass.name, "binds": {k: list(v) for k, v in klass.binds.items()},
+                "authorized": spec is not None, "authorization_problem": problem,
+                "max_attempts": klass.max_attempts, "recover_after_cycles": klass.recover_after_cycles,
+                "recurrence_window_seconds": klass.recurrence_window_seconds,
+                "trigger": klass.trigger, "mutation": klass.mutation,
+                "authorization_boundary": klass.authorization_boundary, "validator": klass.validator,
+                "rollback": klass.rollback, "escalation_only": klass.escalation_only,
+            })
+        print(json.dumps(rows, indent=2))
+        return 0
     if args.command == "invariants":
         print(json.dumps([
             {"name": inv.name, "tier": inv.tier, "detect_only": type(inv).recover is Invariant.recover,

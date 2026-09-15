@@ -2023,3 +2023,1052 @@ class TestCompanyIsolation:
                                                       run_command=lambda argv, t: (rc, "ENT-004 Orion secret routing")))
         assert [f.signature for f in findings] == ([signature] if signature else [])
         assert "Orion" not in json.dumps([f.detail for f in findings])
+
+
+# ---------------------------------------------------------------------------
+# F3 — bounded recovery classes (Christopher, 2026-09-14): build and test only.
+# Generic controller flow first (a fake class), then each class against its
+# real mechanism on an isolated board / git remote / HTTP server / fake systemd.
+# ---------------------------------------------------------------------------
+
+AUTHORIZER = "Christopher, 2026-09-14 (test)"
+
+
+def _authorize(config, name, **spec):
+    entry = {"enabled": True, "authorized_by": AUTHORIZER, **spec}
+    entry["authorization_sha256"] = shc.recovery_authorization_digest(name, entry)
+    config.setdefault("recovery_classes", {})[name] = entry
+    return config
+
+
+class Toggle(shc.Invariant):
+    """A detector over a mutable ``state`` dict."""
+
+    name = "toggle_detector"
+    tier = shc.TIER_LIGHT
+    source = failure = evidence = "test"
+
+    def __init__(self, state):
+        self.state = state
+        self.checks = 0
+
+    def check(self, ctx):
+        self.checks += 1
+        return [shc.Finding(self.name, s, "broken", {}) for s in sorted(self.state.get("broken", ()))]
+
+
+class FakeRecovery(shc.RecoveryClass):
+    name = "fake_recovery"
+    binds = {"toggle_detector": ("broken",)}
+    trigger = mutation = authorization_boundary = validator = rollback = escalation_only = "test"
+
+    def __init__(self, state, *, fixes=True, post=None, gate=None, after_cycles=1, settle=0, recurrence=3600,
+                 max_deferral=3600):
+        self.state = state
+        self.fixes = fixes
+        self.post = post or {}
+        self.gate_decision = gate
+        self.recover_after_cycles = after_cycles
+        self.recurrence_window_seconds = recurrence
+        self.max_deferral_seconds = max_deferral
+        self._settle = settle
+        self.recoveries = []
+        self.gates = 0
+
+    def settle_seconds(self, spec):
+        return self._settle
+
+    def gate(self, ctx, finding, rec, spec):
+        self.gates += 1
+        if self.gate_decision:
+            return self.gate_decision
+        if finding.subject not in self.state["broken"] and not rec.get("recovery_pending"):
+            return shc.Gate(shc.GATE_CLEARED)
+        return shc.Gate(shc.GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        self.recoveries.append(finding.subject)
+        if self.fixes:
+            self.state["broken"].discard(finding.subject)
+        return shc.RecoveryOutcome(True, "fake_fix")
+
+    def postcondition(self, ctx, finding, rec, spec):
+        return self.post.get("value")
+
+
+def _fake_controller(kanban_home, state, klass, *, clock=None, alerts=None, model=True):
+    config = _authorize(_governed() if model else {}, klass.name)
+    ctx = _ctx(kanban_home, clock=clock or Clock(), alerts=alerts or Alerts(), config=config)
+    return shc.Controller(ctx, [Toggle(state)], recoveries=[klass]), ctx
+
+
+class TestF3Contract:
+    def test_every_class_documents_its_boundary_and_is_bounded(self):
+        for klass in shc.default_recovery_classes():
+            for field in ("trigger", "mutation", "authorization_boundary", "validator", "rollback", "escalation_only"):
+                assert str(getattr(klass, field)).strip(), f"{klass.name} has no {field}"
+            assert klass.max_attempts == 2, klass.name        # the first attempt plus one bounded retry
+
+    def test_no_class_binds_an_escalate_only_condition(self):
+        for klass in shc.default_recovery_classes():
+            for invariant, prefixes in klass.binds.items():
+                assert invariant not in shc.ESCALATE_ONLY_INVARIANTS, (klass.name, invariant)
+                assert not any(p.startswith(("worktree_dirty", "deploy_drift", "repo_unreadable", "no_route:evidence_ready",
+                                             "paused_without_reason", "pause_expired", "script_missing", "job_missing"))
+                               for p in prefixes), (klass.name, prefixes)
+        bound = {inv for klass in shc.default_recovery_classes() for inv in klass.binds}
+        for name in ("subject_lane_relabelled", "verifier_child_deadlocked"):   # v1 verifier routing stays in-code
+            assert name not in bound
+
+    def test_repository_config_declares_every_class_disabled(self):
+        config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
+        names = {k for k in config["recovery_classes"] if k != "status"}
+        assert names == {c.name for c in shc.default_recovery_classes()}
+        for klass in shc.default_recovery_classes():
+            assert config["recovery_classes"][klass.name]["enabled"] is False
+            assert shc.recovery_authorization(config, klass) == (None, None)
+
+    def test_invalid_authorization_runs_nothing_and_degrades(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state)
+        config = _authorize(_governed(), klass.name)
+        config["recovery_classes"][klass.name]["authorized_by"] = "someone else"     # scope edited, digest stale
+        result = shc.Controller(_ctx(kanban_home, config=config), [Toggle(state)], recoveries=[klass]).run(shc.TIER_LIGHT)
+        assert klass.recoveries == [] and result.status == shc.AGGREGATE_DEGRADED
+        state_file = shc.StateStore(_ctx(kanban_home).state_dir).load()
+        assert any(r["invariant"] == shc.RECOVERY_VALIDITY_INVARIANT and r["signature"] ==
+                   "invalid:authorization_digest_mismatch" for r in state_file["fingerprints"].values())
+
+    @pytest.mark.parametrize("variant", ["company_route", "unsafe", "frozen"])
+    def test_company_unsafe_and_frozen_findings_are_never_recovered(self, kanban_home, variant):
+        class Detector(shc.Invariant):
+            name = "toggle_detector"
+            tier = shc.TIER_LIGHT
+            source = failure = evidence = "test"
+
+            def check(self, ctx):
+                return [shc.Finding(self.name, "t_frozen1" if variant == "frozen" else "x", "broken", {},
+                                    recoverable=True, unsafe=variant == "unsafe",
+                                    route="company" if variant == "company_route" else "shared")]
+
+        klass = FakeRecovery({"broken": {"x", "t_frozen1"}})
+        config = _authorize(_governed(), klass.name)
+        if variant == "frozen":
+            config["recovery_holds"] = [{"name": "freeze", "task_ids": ["t_frozen1"], "reason": "r",
+                                         "authorized_by": "a", "release": "z"}]
+        controller = shc.Controller(_ctx(kanban_home, config=config), [Detector()], recoveries=[klass])
+        controller.run(shc.TIER_LIGHT)
+        shc.Controller(_ctx(kanban_home, clock=lambda: time.time() + 7200, config=config), [Detector()],
+                       recoveries=[klass]).run(shc.TIER_LIGHT)
+        assert klass.recoveries == [] and klass.gates == 0
+
+    def test_v1_verifier_routing_keeps_its_in_code_path(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_evidence_after_handoff(conn)
+        config = _authorize(_governed(), "evidence_attachment", patterns=["*EVIDENCE*.md"], max_files=5, max_bytes=1024)
+        route = Counting(shc.VerifierRouteOpen())
+        result = shc.Controller(_ctx(kanban_home, config=config), [route]).run(shc.TIER_LIGHT)
+        assert route.recoveries == 1 and len(result.recovered) == 1
+        with kb.connect_closing() as conn:
+            assert kb._open_verifier_child(conn, tid) is not None
+
+
+class TestF3ControllerFlow:
+    def test_detector_first_then_after_cycles_then_recovered_and_idempotent(self, kanban_home):
+        state = {"broken": set()}
+        klass = FakeRecovery(state, after_cycles=2)
+        clock = Clock()
+        controller, ctx = _fake_controller(kanban_home, state, klass, clock=clock)
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_GREEN and klass.gates == 0   # no detection
+        state["broken"].add("x")
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_DEGRADED and klass.recoveries == []
+        clock.advance(300)
+        second = controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x"] and len(second.recovered) == 1 and second.status == shc.AGGREGATE_GREEN
+        for _ in range(3):
+            clock.advance(300)
+            assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_GREEN
+        assert klass.recoveries == ["x"]                                                  # idempotent: no repeat
+        (entry,) = shc.StateStore(ctx.state_dir).load()["recovery_history"].values()
+        assert entry["recovery_class"] == "fake_recovery" and entry["attempts"] == 1
+
+    def test_failing_recovery_is_bounded_to_two_attempts_and_escalates_once(self, kanban_home):
+        state = {"broken": {"x"}}
+        alerts = Alerts()
+        klass = FakeRecovery(state, fixes=False)
+        clock = Clock()
+        controller, ctx = _fake_controller(kanban_home, state, klass, clock=clock, alerts=alerts)
+        statuses = []
+        for _ in range(6):
+            statuses.append(controller.run(shc.TIER_LIGHT).status)
+            clock.advance(300)
+        assert klass.recoveries == ["x", "x"]
+        assert statuses[0] == shc.AGGREGATE_RECOVERY and statuses[-1] == shc.AGGREGATE_ESCALATED
+        assert len(alerts.sent) == 1
+        with kb.connect_closing() as conn:
+            assert len(_health_cards(conn)) == 1
+
+    def test_unchanged_recurrence_inside_the_window_escalates_without_mutation(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state)
+        clock = Clock()
+        controller, _ = _fake_controller(kanban_home, state, klass, clock=clock)
+        controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x"]
+        clock.advance(300)
+        state["broken"].add("x")
+        result = controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x"] and klass.gates == 1
+        assert result.status == shc.AGGREGATE_ESCALATED
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "toggle_detector"][0]
+        assert rec["escalation_reason"] == shc.ESCALATION_RECURRED
+
+    def test_recurrence_after_the_window_is_a_fresh_bounded_episode(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state, recurrence=600)
+        clock = Clock()
+        controller, _ = _fake_controller(kanban_home, state, klass, clock=clock)
+        controller.run(shc.TIER_LIGHT)
+        clock.advance(900)
+        state["broken"].add("x")
+        assert len(controller.run(shc.TIER_LIGHT).recovered) == 1 and klass.recoveries == ["x", "x"]
+
+    def test_refused_gate_escalates_without_mutation(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state, gate=shc.Gate(shc.GATE_REFUSED, "ambiguous_state"))
+        controller, _ = _fake_controller(kanban_home, state, klass)
+        result = controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == [] and result.status == shc.AGGREGATE_ESCALATED
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "toggle_detector"][0]
+        assert rec["escalation_reason"] == "recovery_refused:ambiguous_state"
+
+    def test_deferral_is_bounded(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state, gate=shc.Gate(shc.GATE_DEFERRED, "cooldown_active"), max_deferral=900)
+        clock = Clock()
+        controller, _ = _fake_controller(kanban_home, state, klass, clock=clock)
+        statuses = []
+        for _ in range(5):
+            statuses.append(controller.run(shc.TIER_LIGHT).status)
+            clock.advance(300)
+        assert klass.recoveries == []
+        assert statuses[:3] == [shc.AGGREGATE_DEGRADED] * 3 and statuses[-1] == shc.AGGREGATE_ESCALATED
+
+    def test_failed_postcondition_is_not_silently_resolved_when_the_detector_goes_quiet(self, kanban_home):
+        state = {"broken": {"x"}}
+        post = {"value": "health_endpoint:HTTP_5XX"}
+        klass = FakeRecovery(state, post=post)
+        clock = Clock()
+        controller, _ = _fake_controller(kanban_home, state, klass, clock=clock)
+        first = controller.run(shc.TIER_LIGHT)                  # detector quiet after fix, postcondition fails
+        assert first.recovered == [] and first.status == shc.AGGREGATE_RECOVERY
+        clock.advance(300)
+        second = controller.run(shc.TIER_LIGHT)                 # carried, retried once more, still failing
+        assert klass.recoveries == ["x", "x"] and second.status == shc.AGGREGATE_ESCALATED
+        post["value"] = None
+        clock.advance(300)
+        controller.run(shc.TIER_LIGHT)
+        assert klass.recoveries == ["x", "x"]
+
+    def test_settle_window_waits_without_a_second_mutation(self, kanban_home):
+        state = {"broken": {"x"}}
+        post = {"value": "job_not_rerun_yet"}
+        klass = FakeRecovery(state, fixes=False, post=post, settle=1800)
+        clock = Clock()
+        controller, _ = _fake_controller(kanban_home, state, klass, clock=clock)
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_RECOVERY
+        clock.advance(300)
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_RECOVERY and klass.recoveries == ["x"]
+        state["broken"].discard("x")
+        post["value"] = None
+        clock.advance(300)
+        assert len(controller.run(shc.TIER_LIGHT).recovered) == 1 and klass.recoveries == ["x"]
+
+    def test_settle_window_class_is_still_bounded_to_two_mutations(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state, fixes=False, post={"value": "job_not_rerun_yet"}, settle=600)
+        clock = Clock()
+        controller, _ = _fake_controller(kanban_home, state, klass, clock=clock)
+        statuses = []
+        for _ in range(12):
+            statuses.append(controller.run(shc.TIER_LIGHT).status)
+            clock.advance(300)
+        assert klass.recoveries == ["x", "x"] and statuses[-1] == shc.AGGREGATE_ESCALATED
+
+    def test_recovery_for_refuses_a_frozen_task_directly(self, kanban_home):
+        state = {"broken": set()}
+        klass = FakeRecovery(state)
+        config = _authorize(_governed(), klass.name)
+        config["recovery_holds"] = [{"name": "freeze", "task_ids": ["t_frozen1"], "reason": "r",
+                                     "authorized_by": "a", "release": "z"}]
+        controller = shc.Controller(_ctx(kanban_home, config=config), [Toggle(state)], recoveries=[klass])
+        controller.run(shc.TIER_LIGHT)
+        inv = Toggle(state)
+        assert controller._recovery_for(inv, shc.Finding("toggle_detector", "t_frozen1", "broken", {}), None) is None
+        assert controller._recovery_for(inv, shc.Finding("toggle_detector", "x", "broken", {"parent": "t_frozen1"}),
+                                        None) is None
+        assert controller._recovery_for(inv, shc.Finding("toggle_detector", "x", "broken", {}), None) is not None
+
+    def test_dry_run_never_gates_or_recovers(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state)
+        config = _authorize(_governed(), klass.name)
+        shc.Controller(_ctx(kanban_home, config=config, dry_run=True), [Toggle(state)],
+                       recoveries=[klass]).run(shc.TIER_LIGHT)
+        assert klass.gates == 0 and klass.recoveries == []
+
+    def test_unauthorized_class_leaves_the_detector_escalate_only(self, kanban_home):
+        state = {"broken": {"x"}}
+        klass = FakeRecovery(state)
+        result = shc.Controller(_ctx(kanban_home, config=_governed()), [Toggle(state)],
+                                recoveries=[klass]).run(shc.TIER_LIGHT)
+        assert klass.gates == 0 and len(result.escalated) == 1
+
+
+# -- class 1: gateway -----------------------------------------------------------
+
+
+class FakeSystemd:
+    def __init__(self, states, *, results=None, installed=("hermes-gateway.service",), on_restart=None):
+        self.states = dict(states)
+        self.results = dict(results or {})
+        self.installed = set(installed)
+        self.on_restart = on_restart
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, timeout):
+        self.calls.append(list(argv))
+        if argv[-2:] == ["gateway", "restart"]:
+            if self.on_restart:
+                self.on_restart("hermes-gateway.service")
+            return 0, ""
+        if argv[:2] == ["systemctl", "is-active"]:
+            state = self.states.get(argv[-1], "active")
+            return (0 if state == "active" else 3), state + "\n"
+        if argv[:2] == ["systemctl", "--user"]:
+            verb, unit = argv[2], argv[-1]
+            if verb == "is-active":
+                state = self.states.get(unit, "active")
+                return (0 if state == "active" else 3), state + "\n"
+            if verb == "is-enabled":
+                return (0, "enabled\n") if unit in self.installed else (1, "not-found\n")
+            if verb == "show":
+                return 0, self.results.get(unit, "success") + "\n"
+            if verb == "reset-failed":
+                return 0, ""
+            if verb == "restart":
+                if self.on_restart:
+                    self.on_restart(unit)
+                return 0, ""
+        return 1, ""
+
+    def mutations(self):
+        return [c for c in self.calls if c[-2:] == ["gateway", "restart"] or (len(c) > 2 and c[2] in ("restart", "reset-failed"))]
+
+
+def _write_gateway(home, clock, *, fresh=True, pid=None, platforms=("telegram", "api_server", "webhook")):
+    pid = os.getpid() if pid is None else pid
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    updated = clock() if fresh else clock() - 3600
+    (home / "state" / "gateway.heartbeat").write_text(json.dumps({"pid": pid, "updated_at": _iso(updated)}),
+                                                       encoding="utf-8")
+    (home / "state" / "gateway.lifecycle.json").write_text(json.dumps({"phase": "running", "pid": pid}),
+                                                            encoding="utf-8")
+    (home / "gateway_state.json").write_text(json.dumps({
+        "pid": pid, "gateway_state": "running", "restart_requested": False,
+        "platforms": {p: {"state": "connected", "writer_pid": pid} for p in platforms}}), encoding="utf-8")
+
+
+def _gateway_config(tmp_path):
+    return _authorize(_governed(), "gateway_restart", unit="hermes-gateway.service",
+                      restart_command=["python", "-m", "hermes_cli.main", "gateway", "restart"],
+                      cooldown_seconds=1800, cooldown_marker=str(tmp_path / "gateway_watchdog_last_restart"),
+                      postcondition_timeout_seconds=10, required_platforms=["telegram", "api_server", "webhook"])
+
+
+class TestGatewayRestartRecovery:
+    def _run(self, kanban_home, tmp_path, systemd, clock, passes, config=None, before_pass=None):
+        config = config or _gateway_config(tmp_path)
+        ctx = _ctx(kanban_home, clock=clock, config={**config, "gateway_heartbeat_max_age_seconds": 180},
+                   run_command=systemd)
+        ctx.sleep = lambda seconds: None
+        controller = shc.Controller(ctx, [shc.GatewayHeartbeatFresh()])
+        results = []
+        for _ in range(passes):
+            if before_pass:
+                before_pass()
+            results.append(controller.run(shc.TIER_LIGHT))
+            clock.advance(300)
+        return results, ctx
+
+    def test_proven_stale_gateway_is_restarted_once_and_revalidated(self, kanban_home, tmp_path):
+        clock = Clock()
+        _write_gateway(kanban_home, clock, fresh=False)
+        alive = {"restarted": False}
+
+        def restart(unit):
+            alive["restarted"] = True
+            _write_gateway(kanban_home, clock, fresh=True)
+
+        systemd = FakeSystemd({"hermes-gateway.service": "active"}, on_restart=restart)
+        refresh = lambda: alive["restarted"] and _write_gateway(kanban_home, clock, fresh=True)  # noqa: E731
+        results, ctx = self._run(kanban_home, tmp_path, systemd, clock, 4, before_pass=refresh)
+        assert systemd.mutations() == [["python", "-m", "hermes_cli.main", "gateway", "restart"]]
+        assert results[0].recovered == [] and len(results[1].recovered) == 1         # needs 2 cycles first
+        assert results[-1].status == shc.AGGREGATE_GREEN
+        assert int((tmp_path / "gateway_watchdog_last_restart").read_text()) > 0     # shared cooldown marker
+
+    def test_watchdog_cooldown_defers_then_bounded_deferral_escalates(self, kanban_home, tmp_path):
+        clock = Clock()
+        _write_gateway(kanban_home, clock, fresh=False)
+        (tmp_path / "gateway_watchdog_last_restart").write_text(f"{int(clock())}\n")
+        systemd = FakeSystemd({"hermes-gateway.service": "active"})
+        config = _gateway_config(tmp_path)
+        results, _ = self._run(kanban_home, tmp_path, systemd, clock, 3, config=config)
+        assert systemd.mutations() == [] and results[-1].status == shc.AGGREGATE_DEGRADED
+        klass = shc.GatewayRestartRecovery()
+        assert klass.max_deferral_seconds > int(config["recovery_classes"]["gateway_restart"]["cooldown_seconds"])
+
+    @pytest.mark.parametrize("setup,reason", [("draining", shc.GATE_DEFERRED), ("uninstalled", shc.GATE_REFUSED),
+                                              ("fresh", shc.GATE_CLEARED)])
+    def test_gate_decisions(self, kanban_home, tmp_path, setup, reason):
+        clock = Clock()
+        _write_gateway(kanban_home, clock, fresh=setup == "fresh")
+        if setup == "draining":
+            (kanban_home / "state" / "gateway.lifecycle.json").write_text(json.dumps({"phase": "draining"}))
+        systemd = FakeSystemd({"hermes-gateway.service": "active"},
+                              installed=() if setup == "uninstalled" else ("hermes-gateway.service",))
+        config = _gateway_config(tmp_path)
+        spec = config["recovery_classes"]["gateway_restart"]
+        ctx = _ctx(kanban_home, clock=clock, config=config, run_command=systemd)
+        gate = shc.GatewayRestartRecovery().gate(ctx, shc.Finding("gateway_heartbeat_fresh", "gateway",
+                                                                  "heartbeat_stale", {}), {}, spec)
+        assert gate.decision == reason and systemd.mutations() == []
+
+    def test_restart_that_does_not_restore_is_retried_once_after_cooldown_then_escalates(self, kanban_home, tmp_path):
+        clock = Clock()
+        _write_gateway(kanban_home, clock, fresh=False)
+        systemd = FakeSystemd({"hermes-gateway.service": "active"})          # restart never brings it back
+        alerts = Alerts()
+        config = _gateway_config(tmp_path)
+        ctx = _ctx(kanban_home, clock=clock, alerts=alerts, config=config, run_command=systemd)
+        ctx.sleep = lambda seconds: None
+        controller = shc.Controller(ctx, [shc.GatewayHeartbeatFresh()])
+        statuses = []
+        for _ in range(12):
+            statuses.append(controller.run(shc.TIER_LIGHT).status)
+            clock.advance(300)
+        assert len(systemd.mutations()) == 2 and statuses[-1] == shc.AGGREGATE_ESCALATED
+        assert len(alerts.sent) == 1
+
+    def test_heartbeat_back_but_messaging_disconnected_is_not_recovered(self, kanban_home, tmp_path):
+        clock = Clock()
+        _write_gateway(kanban_home, clock, fresh=False)
+
+        def restart(unit):
+            _write_gateway(kanban_home, clock, fresh=True, platforms=("api_server", "webhook"))
+
+        systemd = FakeSystemd({"hermes-gateway.service": "active"}, on_restart=restart)
+        results, _ = self._run(kanban_home, tmp_path, systemd, clock, 2)
+        assert len(systemd.mutations()) == 1
+        assert results[1].recovered == [] and results[1].status == shc.AGGREGATE_RECOVERY
+
+    @pytest.mark.parametrize("change,problem", [
+        ({"unit": "NorCal_Hermes.service"}, "unit_must_be_hermes_gateway"),
+        ({"restart_command": ["systemctl", "--user", "restart", "hermes-gateway.service"]},
+         "restart_command_must_be_governed_gateway_restart"),
+        ({"restart_command": ["python", "-m", "hermes_cli.main", "--system", "gateway", "restart"]},
+         "restart_command_flag_not_allowed"),
+        ({"cooldown_seconds": 600}, "cooldown_below_watchdog"),
+    ])
+    def test_authorization_boundary(self, tmp_path, change, problem):
+        spec = {**_gateway_config(tmp_path)["recovery_classes"]["gateway_restart"], **change}
+        assert shc.GatewayRestartRecovery().validate_spec(spec, {}) == problem
+
+
+# -- class 2: shared service restart ---------------------------------------------
+
+
+def _service_config(url=None, **overrides):
+    base = {"shared_user_units": ["life-wiki-api.service", "norcal-opsbridge.service", "erika-phone.service"],
+            "shared_system_units": ["caddy.service"],
+            "company_health_probes": {"entities": [{"entity_id": "ENT-004", "service": "orion-api"}]},
+            "company_isolation": {"companies": {"ENT-004": {"tokens": ["orion"]}}}}
+    services = overrides.pop("services", {"life-wiki-api.service": {"health_url": url}})
+    return _authorize({**_governed(), **base}, "shared_service_restart", services=services,
+                      cooldown_seconds=600, postcondition_timeout_seconds=5, **overrides)
+
+
+class TestSharedServiceRestartRecovery:
+    def _controller(self, kanban_home, config, systemd, clock, alerts=None):
+        ctx = _ctx(kanban_home, clock=clock, alerts=alerts or Alerts(), config=config, run_command=systemd)
+        ctx.sleep = lambda seconds: None
+        return shc.Controller(ctx, [shc.SharedUnitsActive()])
+
+    def test_failed_allowlisted_unit_is_restarted_and_its_endpoint_revalidated(self, kanban_home):
+        clock = Clock()
+        with _health_server(200) as (url, hits):
+            systemd = FakeSystemd({"life-wiki-api.service": "failed", "norcal-opsbridge.service": "active",
+                                   "erika-phone.service": "active"})
+            systemd.on_restart = lambda unit: systemd.states.__setitem__(unit, "active")
+            controller = self._controller(kanban_home, _service_config(url), systemd, clock)
+            first = controller.run(shc.TIER_LIGHT)
+            clock.advance(300)
+            second = controller.run(shc.TIER_LIGHT)
+            assert first.recovered == [] and len(second.recovered) == 1 and hits
+        assert systemd.mutations() == [["systemctl", "--user", "reset-failed", "life-wiki-api.service"],
+                                       ["systemctl", "--user", "restart", "life-wiki-api.service"]]
+        assert second.status == shc.AGGREGATE_GREEN
+
+    def test_clean_stop_is_refused_as_possibly_deliberate(self, kanban_home):
+        clock = Clock()
+        systemd = FakeSystemd({"life-wiki-api.service": "inactive", "norcal-opsbridge.service": "active",
+                               "erika-phone.service": "active"}, results={"life-wiki-api.service": "success"})
+        controller = self._controller(kanban_home, _service_config(), systemd, clock)
+        controller.run(shc.TIER_LIGHT)
+        clock.advance(300)
+        result = controller.run(shc.TIER_LIGHT)
+        assert systemd.mutations() == [] and result.status == shc.AGGREGATE_ESCALATED
+
+    def test_crashed_inactive_unit_is_restarted(self, kanban_home):
+        clock = Clock()
+        systemd = FakeSystemd({"life-wiki-api.service": "inactive", "norcal-opsbridge.service": "active",
+                               "erika-phone.service": "active"}, results={"life-wiki-api.service": "exit-code"})
+        systemd.on_restart = lambda unit: systemd.states.__setitem__(unit, "active")
+        controller = self._controller(kanban_home, _service_config(), systemd, clock)
+        controller.run(shc.TIER_LIGHT)
+        clock.advance(300)
+        assert len(controller.run(shc.TIER_LIGHT).recovered) == 1
+
+    def test_non_allowlisted_shared_unit_stays_escalate_only(self, kanban_home):
+        clock = Clock()
+        systemd = FakeSystemd({"life-wiki-api.service": "active", "norcal-opsbridge.service": "failed",
+                               "erika-phone.service": "active"})
+        controller = self._controller(kanban_home, _service_config(), systemd, clock)
+        controller.run(shc.TIER_LIGHT)
+        clock.advance(300)
+        result = controller.run(shc.TIER_LIGHT)
+        assert systemd.mutations() == [] and len(result.escalated) == 1
+
+    def test_unit_up_but_endpoint_down_retries_once_after_cooldown_then_escalates(self, kanban_home):
+        clock = Clock()
+        alerts = Alerts()
+        with _health_server(503) as (url, _):
+            systemd = FakeSystemd({"life-wiki-api.service": "failed", "norcal-opsbridge.service": "active",
+                                   "erika-phone.service": "active"})
+            systemd.on_restart = lambda unit: systemd.states.__setitem__(unit, "active")
+            controller = self._controller(kanban_home, _service_config(url), systemd, clock, alerts)
+            statuses = []
+            for _ in range(8):
+                statuses.append(controller.run(shc.TIER_LIGHT).status)
+                clock.advance(300)
+        restarts = [c for c in systemd.mutations() if c[2] == "restart"]
+        assert len(restarts) == 2 and statuses[-1] == shc.AGGREGATE_ESCALATED and len(alerts.sent) == 1
+        # the endpoint recovers on its own: the escalation then clears on the next pass
+        with _health_server(200) as (url2, _):
+            spec = _service_config(url2)
+            controller = self._controller(kanban_home, spec, systemd, clock, alerts)
+            clock.advance(300)
+            assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_GREEN
+        assert len([c for c in systemd.mutations() if c[2] == "restart"]) == 2
+
+    @pytest.mark.parametrize("services,problem", [
+        ({"orion-api.service": {}}, "company_service_not_allowed:orion-api.service"),
+        ({"caddy.service": {}}, "not_a_shared_user_unit:caddy.service"),
+        ({"hermes-gateway.service": {}}, "gateway_has_its_own_class"),
+        ({"life-wiki-api.service": {"health_url": "http://10.1.1.1/h"}}, "health_url_not_loopback:life-wiki-api.service"),
+    ])
+    def test_authorization_boundary(self, services, problem):
+        config = _service_config(services=services)
+        spec = config["recovery_classes"]["shared_service_restart"]
+        assert shc.SharedServiceRestartRecovery().validate_spec(spec, config) == problem
+
+    def test_transitioning_unit_is_deferred(self, kanban_home):
+        systemd = FakeSystemd({"life-wiki-api.service": "activating"})
+        config = _service_config()
+        gate = shc.SharedServiceRestartRecovery().gate(
+            _ctx(kanban_home, config=config, run_command=systemd),
+            shc.Finding("shared_units_active", "life-wiki-api.service", "not_active:activating", {}), {},
+            config["recovery_classes"]["shared_service_restart"])
+        assert gate.decision == shc.GATE_DEFERRED and systemd.mutations() == []
+
+
+# -- class 3: lease / dead execution reconciliation ---------------------------------
+
+
+def _dead_pid():
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+def _lease_config():
+    return _authorize({**_governed(), "lease_grace_seconds": 300, "execution_heartbeat_stale_seconds": 900},
+                      "lease_reconciliation", reconcile=["claims", "detached_runs", "executions"])
+
+
+class TestLeaseReconciliationRecovery:
+    def _expired(self, conn, *, pid, host=None, title="stuck"):
+        tid = kb.create_task(conn, title=title, assignee="worker")
+        kb.claim_task(conn, tid)
+        lock = f"{host or kb._claimer_id().split(':', 1)[0]}:{pid}"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ?, claim_lock = ?, worker_pid = ? WHERE id = ?",
+                         (int(time.time()) - 5000, lock, pid, tid))
+        return tid
+
+    def _run(self, kanban_home, passes=2):
+        clock = lambda: time.time()  # noqa: E731
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, config=_lease_config()), [shc.RunLeaseConsistency()])
+        return [controller.run(shc.TIER_LIGHT) for _ in range(passes)]
+
+    def test_expired_claim_of_a_dead_worker_is_reclaimed_and_revalidated(self, kanban_home):
+        with kb.connect_closing() as conn:
+            stuck = self._expired(conn, pid=_dead_pid())
+            healthy = kb.create_task(conn, title="healthy long run", assignee="worker")
+            kb.claim_task(conn, healthy)
+            before = _board_snapshot(conn, [healthy])
+        results = self._run(kanban_home)
+        assert results[0].recovered == [] and len(results[1].recovered) == 1
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, stuck)
+            assert task.status == "ready" and task.claim_lock is None
+            assert "reclaimed" in _kinds(conn, stuck)
+            assert _board_snapshot(conn, [healthy])["rows"] == before["rows"]    # old but live: untouched
+
+    @pytest.mark.parametrize("variant,reason", [("alive", "worker_process_alive"),
+                                                ("other_host", "claim_held_by_other_host")])
+    def test_live_worker_or_foreign_claim_is_refused_without_mutation(self, kanban_home, variant, reason):
+        with kb.connect_closing() as conn:
+            tid = self._expired(conn, pid=os.getpid() if variant == "alive" else _dead_pid(),
+                                host="some-other-host" if variant == "other_host" else None)
+            before = _board_snapshot(conn, [tid])
+        results = self._run(kanban_home)
+        assert results[-1].status == shc.AGGREGATE_ESCALATED
+        with kb.connect_closing() as conn:
+            assert _board_snapshot(conn, [tid])["rows"] == before["rows"]
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "run_lease_consistency"][0]
+        assert rec["escalation_reason"] == f"recovery_refused:{reason}"
+
+    def test_live_execution_with_fresh_heartbeat_is_never_touched(self, kanban_home):
+        from hermes_cli import exec_supervisor
+        with kb.connect_closing() as conn:
+            tid = self._expired(conn, pid=_dead_pid())
+            record = exec_supervisor.create_execution(conn, executor_type="claude", command_class="claude.headless",
+                                                      cwd="/tmp", task_id=tid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE executions SET status = 'running', heartbeat_at = ? WHERE id = ?",
+                             (int(time.time()), record.id))
+            before = _board_snapshot(conn, [tid])
+        self._run(kanban_home)
+        with kb.connect_closing() as conn:
+            assert _board_snapshot(conn, [tid])["rows"] == before["rows"]
+            assert conn.execute("SELECT ended_at FROM executions WHERE id = ?", (record.id,)).fetchone()[0] is None
+
+    def test_stale_execution_whose_process_is_gone_is_settled(self, kanban_home):
+        from hermes_cli import exec_supervisor
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="exec", assignee="worker")
+            record = exec_supervisor.create_execution(conn, executor_type="claude", command_class="claude.headless",
+                                                      cwd="/tmp", task_id=tid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE executions SET status = 'running', pid = ?, heartbeat_at = ? WHERE id = ?",
+                             (_dead_pid(), int(time.time()) - 5000, record.id))
+        results = self._run(kanban_home)
+        assert len(results[1].recovered) == 1
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT ended_at FROM executions WHERE id = ?", (record.id,)).fetchone()[0] is not None
+
+    def test_stale_heartbeat_but_live_process_is_refused(self, kanban_home):
+        from hermes_cli import exec_supervisor
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="exec", assignee="worker")
+            record = exec_supervisor.create_execution(conn, executor_type="claude", command_class="claude.headless",
+                                                      cwd="/tmp", task_id=tid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE executions SET status = 'running', pid = ?, proc_key = NULL, heartbeat_at = ? "
+                             "WHERE id = ?", (os.getpid(), int(time.time()) - 5000, record.id))
+        results = self._run(kanban_home)
+        assert results[-1].status == shc.AGGREGATE_ESCALATED
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT ended_at FROM executions WHERE id = ?", (record.id,)).fetchone()[0] is None
+
+    def test_detached_current_run_is_closed_but_a_non_current_one_is_refused(self, kanban_home):
+        with kb.connect_closing() as conn:
+            current = kb.create_task(conn, title="moved on", assignee="worker")
+            claimed = kb.claim_task(conn, current)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'blocked', worker_pid = NULL WHERE id = ?", (current,))
+                conn.execute("UPDATE task_runs SET worker_pid = NULL WHERE id = ?", (claimed.current_run_id,))
+        self._run(kanban_home)
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT ended_at FROM task_runs WHERE id = ?",
+                                (claimed.current_run_id,)).fetchone()[0] is not None
+            other = kb.create_task(conn, title="orphan run", assignee="worker")
+            orphan = kb.claim_task(conn, other)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'blocked', current_run_id = NULL, worker_pid = NULL WHERE id = ?",
+                             (other,))
+        results = self._run(kanban_home)
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT ended_at FROM task_runs WHERE id = ?",
+                                (orphan.current_run_id,)).fetchone()[0] is None
+        assert results[-1].status == shc.AGGREGATE_ESCALATED
+
+
+# -- class 4: Life Wiki retry ---------------------------------------------------------
+
+
+def _wiki_setup(home, vault, *, job_state="scheduled", enabled=True, last_status="error", last_run=None):
+    (vault / "Logs" / "daily").mkdir(parents=True, exist_ok=True)
+    _write_jobs(home, [
+        {"name": "nightly-executive-continuity-reconciliation", "enabled": enabled, "state": job_state,
+         "last_status": last_status, "last_run_at": last_run, "failure_streak": 1},
+        {"name": "life-wiki-daily-validation", "enabled": True, "state": "scheduled", "last_status": "error",
+         "last_run_at": last_run, "failure_streak": 1},
+    ])
+
+
+def _wiki_config(vault, settle=0):
+    config = {**_governed(), "life_wiki_daily_note": {"vault": str(vault), "timezone": "America/Chicago",
+                                                      "cutoff_hour": 6},
+              "critical_cron_jobs": {"life-wiki-daily-validation": {}}}
+    return _authorize(config, "life_wiki_retry", daily_note_job="nightly-executive-continuity-reconciliation",
+                      validation_jobs=["life-wiki-daily-validation"], settle_seconds=settle,
+                      validator_command=["validate", "--date", "{date}"])
+
+
+class FakeCron:
+    def __init__(self, home, vault, clock, *, writes_note=True, validator_rc=0):
+        self.home, self.vault, self.clock = home, vault, clock
+        self.writes_note = writes_note
+        self.validator_rc = validator_rc
+        self.triggered: list[str] = []
+
+    def trigger(self, name):
+        self.triggered.append(name)
+        doc = json.loads((self.home / "cron" / "jobs.json").read_text())
+        for job in doc["jobs"]:
+            if job["name"] == name:
+                job.update({"last_status": "ok", "failure_streak": 0, "last_run_at": _iso(self.clock() + 1)})
+        (self.home / "cron" / "jobs.json").write_text(json.dumps(doc))
+        if name.startswith("nightly") and self.writes_note:
+            (self.vault / "Logs" / "daily" / "2026-09-14.md").write_text("# day\n")
+        return True, "scheduled"
+
+    def run_command(self, argv, timeout):
+        return (self.validator_rc, "") if argv[0] == "validate" else (1, "")
+
+
+class TestLifeWikiRetryRecovery:
+    def _controller(self, kanban_home, tmp_path, fake, config, clock, alerts=None):
+        ctx = _ctx(kanban_home, clock=clock, alerts=alerts or Alerts(), config=config, run_command=fake.run_command)
+        ctx.cron_trigger = fake.trigger
+        return shc.Controller(ctx, [shc.LifeWikiDailyNote(), shc.CriticalCronJobsHealthy()])
+
+    def test_missing_note_triggers_the_existing_job_and_validator_passes(self, kanban_home, tmp_path):
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock)
+        deep = self._controller(kanban_home, tmp_path, fake, _wiki_config(vault), clock).run(shc.TIER_DEEP)
+        assert fake.triggered == ["nightly-executive-continuity-reconciliation"] and len(deep.recovered) == 1
+        assert (vault / "Logs" / "daily" / "2026-09-14.md").is_file()
+
+    def test_failed_validation_job_is_retried_through_the_scheduler(self, kanban_home, tmp_path):
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(5)                               # before the note cutoff: only the job finding
+        fake = FakeCron(kanban_home, vault, clock)
+        light = self._controller(kanban_home, tmp_path, fake, _wiki_config(vault), clock).run(shc.TIER_LIGHT)
+        assert fake.triggered == ["life-wiki-daily-validation"] and len(light.recovered) == 1
+
+    @pytest.mark.parametrize("variant,reason", [("paused", "job_paused_owner_decision"),
+                                                ("succeeded", "job_succeeded_without_note")])
+    def test_owner_paused_or_already_succeeded_job_is_refused(self, kanban_home, tmp_path, variant, reason):
+        vault = tmp_path / "vault"
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        if variant == "paused":
+            _wiki_setup(kanban_home, vault, job_state="paused", enabled=False)
+        else:
+            _wiki_setup(kanban_home, vault, last_status="ok", last_run=_iso(_chicago_ts(4)))
+        fake = FakeCron(kanban_home, vault, clock)
+        config = _wiki_config(vault)
+        config["critical_cron_jobs"] = {}
+        result = self._controller(kanban_home, tmp_path, fake, config, clock).run(shc.TIER_DEEP)
+        assert fake.triggered == [] and result.status == shc.AGGREGATE_ESCALATED
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "life_wiki_daily_note"][0]
+        assert rec["escalation_reason"] == f"recovery_refused:{reason}"
+
+    def test_validator_still_failing_is_bounded_and_escalates(self, kanban_home, tmp_path):
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock, validator_rc=2)
+        config = _wiki_config(vault)
+        config["critical_cron_jobs"] = {}
+        alerts = Alerts()
+        controller = self._controller(kanban_home, tmp_path, fake, config, clock, alerts)
+        statuses = []
+        for _ in range(4):
+            statuses.append(controller.run(shc.TIER_DEEP).status)
+            clock.advance(3600)
+            (vault / "Logs" / "daily" / "2026-09-14.md").unlink(missing_ok=True)
+        assert len(fake.triggered) == 2 and shc.AGGREGATE_ESCALATED in statuses and len(alerts.sent) == 1
+
+    def test_settle_window_waits_for_the_scheduled_run(self, kanban_home, tmp_path):
+        vault = tmp_path / "vault"
+        _wiki_setup(kanban_home, vault)
+        clock = Clock()
+        clock.t = _chicago_ts(7)
+        fake = FakeCron(kanban_home, vault, clock, writes_note=False)
+        config = _wiki_config(vault, settle=3600)
+        config["critical_cron_jobs"] = {}
+        controller = self._controller(kanban_home, tmp_path, fake, config, clock)
+        assert controller.run(shc.TIER_DEEP).status == shc.AGGREGATE_RECOVERY
+        clock.advance(1200)
+        (vault / "Logs" / "daily" / "2026-09-14.md").write_text("# day\n")
+        assert len(controller.run(shc.TIER_DEEP).recovered) == 1 and len(fake.triggered) == 1
+
+    def test_github_sync_job_can_never_be_authorized(self, tmp_path):
+        config = _wiki_config(tmp_path)
+        spec = {**config["recovery_classes"]["life_wiki_retry"], "validation_jobs": ["life-wiki-github-sync"]}
+        assert shc.LifeWikiRetryRecovery().validate_spec(spec, config) == "forbidden_job"
+
+
+# -- class 5: safe vault / git sync ----------------------------------------------------
+
+
+def _git_repo_pair(tmp_path, name="vault"):
+    bare = tmp_path / f"{name}-remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    work = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True, capture_output=True)
+    _git(work, "checkout", "-q", "-B", "main")
+    (work / "a.md").write_text("a", encoding="utf-8")
+    _git(work, "add", "a.md")
+    _git(work, "commit", "-q", "-m", "a")
+    _git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+    _git(work, "fetch", "-q", "origin")
+    return bare, work
+
+
+def _remote_head(bare):
+    return subprocess.run(["git", "--git-dir", str(bare), "rev-parse", "refs/heads/main"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _vault_config(tmp_path, work, name="vault"):
+    state = tmp_path / "drift.json"
+    state.write_text(json.dumps({"verdict": "CLEAN", "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+    config = {**_governed(), "repository_drift": {"deploy_drift_state": str(state), "watched_repositories": [
+        {"name": name, "path": str(work), "upstream": "origin/main"}]}}
+    return _authorize(config, "vault_git_sync", repositories={name: {"path": str(work), "remote": "origin",
+                                                                      "branch": "main"}})
+
+
+class TestVaultSyncRecovery:
+    FORBIDDEN_GIT = ("--force", "-f", "--force-with-lease", "reset", "commit", "add", "rebase", "clean", "stash")
+
+    def _run(self, kanban_home, config):
+        self.git_calls = []
+
+        def recording(argv, timeout):
+            self.git_calls.append(list(argv))
+            return shc.run_command(argv, timeout)
+
+        ctx = _ctx(kanban_home, clock=time.time, config=config, run_command=recording)
+        result = shc.Controller(ctx, [shc.RepositoryDrift()]).run(shc.TIER_DEEP)
+        for argv in self.git_calls:
+            assert not any(part in self.FORBIDDEN_GIT or part.startswith("+") for part in argv[4:]), argv
+        return result
+
+    def test_clean_unpushed_commit_is_pushed_and_verified_on_the_remote(self, kanban_home, tmp_path):
+        bare, work = _git_repo_pair(tmp_path)
+        (work / "b.md").write_text("b", encoding="utf-8")
+        _git(work, "add", "b.md")
+        _git(work, "commit", "-q", "-m", "b")
+        head = subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        other_bare, other = _git_repo_pair(tmp_path, name="unrelated")
+        (other / "c.md").write_text("c", encoding="utf-8")
+        _git(other, "add", "c.md")
+        _git(other, "commit", "-q", "-m", "c")
+        other_remote = _remote_head(other_bare)
+        result = self._run(kanban_home, _vault_config(tmp_path, work))
+        assert len(result.recovered) == 1 and _remote_head(bare) == head
+        assert _remote_head(other_bare) == other_remote                    # unrelated repo untouched
+        assert ["push", "origin", "HEAD:refs/heads/main"] in [c[4:] for c in self.git_calls]
+
+    def test_a_push_that_reports_success_without_reaching_the_remote_is_not_recovered(self, kanban_home, tmp_path):
+        bare, work = _git_repo_pair(tmp_path)
+        (work / "b.md").write_text("b", encoding="utf-8")
+        _git(work, "add", "b.md")
+        _git(work, "commit", "-q", "-m", "b")
+        remote_before = _remote_head(bare)
+
+        def silent_push(argv, timeout):
+            if argv[4:5] == ["push"]:
+                # claims success and moves the local tracking ref, but pushes nothing
+                _git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+                return 0, ""
+            return shc.run_command(argv, timeout)
+
+        ctx = _ctx(kanban_home, clock=time.time, config=_vault_config(tmp_path, work), run_command=silent_push)
+        result = shc.Controller(ctx, [shc.RepositoryDrift()]).run(shc.TIER_DEEP)
+        assert result.recovered == [] and _remote_head(bare) == remote_before
+        rec = [r for r in shc.StateStore(ctx.state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "repository_drift"][0]
+        assert rec["last_postcondition"] == "remote_does_not_contain_expected_commit"
+
+    def test_behind_is_fast_forwarded(self, kanban_home, tmp_path):
+        bare, work = _git_repo_pair(tmp_path)
+        peer = tmp_path / "peer"
+        subprocess.run(["git", "clone", "-q", str(bare), str(peer)], check=True, capture_output=True)
+        (peer / "p.md").write_text("p", encoding="utf-8")
+        _git(peer, "add", "p.md")
+        _git(peer, "commit", "-q", "-m", "p")
+        _git(peer, "push", "-q", "origin", "HEAD:refs/heads/main")
+        _git(work, "fetch", "-q", "origin")
+        result = self._run(kanban_home, _vault_config(tmp_path, work))
+        assert len(result.recovered) == 1 and (work / "p.md").is_file()
+
+    @pytest.mark.parametrize("variant,reason", [("dirty", "worktree_dirty_unknown_changes"), ("diverged", "diverged")])
+    def test_dirty_or_diverged_is_escalated_without_commit_or_push(self, kanban_home, tmp_path, variant, reason):
+        bare, work = _git_repo_pair(tmp_path)
+        (work / "b.md").write_text("b", encoding="utf-8")
+        _git(work, "add", "b.md")
+        _git(work, "commit", "-q", "-m", "b")
+        if variant == "dirty":
+            (work / "unknown.md").write_text("not attributed", encoding="utf-8")
+        else:
+            peer = tmp_path / "peer"
+            subprocess.run(["git", "clone", "-q", str(bare), str(peer)], check=True, capture_output=True)
+            (peer / "p.md").write_text("p", encoding="utf-8")
+            _git(peer, "add", "p.md")
+            _git(peer, "commit", "-q", "-m", "p")
+            _git(peer, "push", "-q", "origin", "HEAD:refs/heads/main")
+            _git(work, "fetch", "-q", "origin")
+        remote_before = _remote_head(bare)
+        log_before = subprocess.run(["git", "-C", str(work), "log", "--oneline"], capture_output=True, text=True).stdout
+        result = self._run(kanban_home, _vault_config(tmp_path, work))
+        assert _remote_head(bare) == remote_before and result.status == shc.AGGREGATE_ESCALATED
+        assert subprocess.run(["git", "-C", str(work), "log", "--oneline"], capture_output=True, text=True).stdout == log_before
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "repository_drift" and str(r.get("escalation_reason") or "").startswith("recovery")][0]
+        assert rec["escalation_reason"] == f"recovery_refused:{reason}"
+
+    @pytest.mark.parametrize("name,path_name,problem", [
+        ("hermes-agent-next", "hermes-agent-next", "repository_never_auto_synced:hermes-agent-next"),
+        ("docs", "doctrine", "repository_never_auto_synced:docs"),
+        ("unwatched", "unwatched", "not_watched_with_same_upstream:unwatched"),
+    ])
+    def test_authorization_boundary(self, tmp_path, name, path_name, problem):
+        config = _vault_config(tmp_path, tmp_path / "vault")
+        spec = {**config["recovery_classes"]["vault_git_sync"],
+                "repositories": {name: {"path": str(tmp_path / path_name), "remote": "origin", "branch": "main"}}}
+        assert shc.VaultSyncRecovery().validate_spec(spec, config) == problem
+
+
+
+# -- class 6: evidence attachment -------------------------------------------------------
+
+
+def _evidence_config(**overrides):
+    config = {**_governed(), "company_isolation": {"companies": {"ENT-004": {"tokens": ["orion"],
+                                                                               "lead_profiles": ["orion_lead"]}}}}
+    return _authorize(config, "evidence_attachment", patterns=["*EVIDENCE*.md", "*evidence*.json"], max_files=5,
+                      max_bytes=4096, **overrides)
+
+
+def _owned_workspace(conn, tid):
+    root = kb.workspaces_root() / tid
+    root.mkdir(parents=True, exist_ok=True)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? WHERE id = ?", (str(root), tid))
+    return root
+
+
+class TestEvidenceAttachmentRecovery:
+    def test_task_owned_evidence_is_attached_then_the_route_opens(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_without_evidence(conn)
+            root = _owned_workspace(conn, tid)
+            (root / "PHASE-EVIDENCE.md").write_text("# evidence\nchecked", encoding="utf-8")
+            (root / "agent.log").write_text("log", encoding="utf-8")
+        ctx = _ctx(kanban_home, config=_evidence_config())
+        controller = shc.Controller(ctx, [shc.VerifierRouteOpen()])
+        first = controller.run(shc.TIER_LIGHT)
+        assert len(first.recovered) == 1
+        with kb.connect_closing() as conn:
+            names = [a.filename for a in kb.list_attachments(conn, tid)]
+            assert names == ["PHASE-EVIDENCE.md"] and kb.subject_has_evidence(conn, tid)
+        second = controller.run(shc.TIER_LIGHT)                    # v1 routing now opens the verifier
+        assert len(second.recovered) == 1
+        with kb.connect_closing() as conn:
+            assert kb._open_verifier_child(conn, tid) is not None
+            assert [a.filename for a in kb.list_attachments(conn, tid)] == ["PHASE-EVIDENCE.md"]
+
+    def test_only_denied_or_company_files_is_refused_and_nothing_attached(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_without_evidence(conn)
+            root = _owned_workspace(conn, tid)
+            for name in ("agent.log", "kanban.db-wal", ".env", "key.pem", "orion-EVIDENCE.md", "notes.txt"):
+                (root / name).write_text("x", encoding="utf-8")
+            (root / "__pycache__").mkdir()
+            (root / "__pycache__" / "EVIDENCE.md").write_text("x", encoding="utf-8")
+            (root / ".hidden").mkdir()
+            (root / ".hidden" / "EVIDENCE.md").write_text("x", encoding="utf-8")
+        result = shc.Controller(_ctx(kanban_home, config=_evidence_config()), [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_ESCALATED
+        with kb.connect_closing() as conn:
+            assert kb.list_attachments(conn, tid) == []
+
+    @pytest.mark.parametrize("variant,reason", [("shared_home", "no_task_owned_workspace"),
+                                                ("company_lead", "company_lane_task")])
+    def test_shared_workspace_or_company_card_is_refused(self, kanban_home, variant, reason):
+        with kb.connect_closing() as conn:
+            tid = _subject_without_evidence(conn)
+            if variant == "shared_home":
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? WHERE id = ?",
+                                 (str(kanban_home), tid))
+                (kanban_home / "EVIDENCE.md").write_text("x", encoding="utf-8")
+            else:
+                (_owned_workspace(conn, tid) / "EVIDENCE.md").write_text("x", encoding="utf-8")
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET assignee = 'orion_lead' WHERE id = ?", (tid,))
+        shc.Controller(_ctx(kanban_home, config=_evidence_config()), [shc.VerifierRouteOpen()]).run(shc.TIER_LIGHT)
+        with kb.connect_closing() as conn:
+            assert kb.list_attachments(conn, tid) == []
+        rec = [r for r in shc.StateStore(_ctx(kanban_home).state_dir).load()["fingerprints"].values()
+               if r["invariant"] == "verifier_route_open"][0]
+        assert rec["escalation_reason"] == f"recovery_refused:{reason}"
+
+    def test_recover_is_idempotent_for_already_attached_content(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_without_evidence(conn)
+            root = _owned_workspace(conn, tid)
+            (root / "EVIDENCE.md").write_text("same", encoding="utf-8")
+        klass = shc.EvidenceAttachmentRecovery()
+        config = _evidence_config()
+        spec = config["recovery_classes"]["evidence_attachment"]
+        ctx = _ctx(kanban_home, config=config)
+        finding = shc.Finding("verifier_route_open", tid, "no_route:evidence_missing", {})
+        assert klass.recover(ctx, finding, spec).detail == {"attached": 1}
+        assert klass.recover(ctx, finding, spec).detail == {"attached": 0}
+        with kb.connect_closing() as conn:
+            assert len(kb.list_attachments(conn, tid)) == 1
+
+    @pytest.mark.parametrize("pattern", ["*.log", "*", "../*.md", "sub/EVIDENCE.md", "*.db-wal"])
+    def test_pattern_boundary(self, pattern):
+        config = _evidence_config()
+        spec = {**config["recovery_classes"]["evidence_attachment"], "patterns": [pattern]}
+        assert shc.EvidenceAttachmentRecovery().validate_spec(spec, config).startswith("pattern_not_allowed")
