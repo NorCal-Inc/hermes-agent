@@ -2857,6 +2857,7 @@ def _cmd_attempt_budget(args: argparse.Namespace) -> int:
             "effective_limit": kb.effective_objective_attempt_limit(conn, root),
             "grants": kb.objective_attempt_grants(conn, root),
             "granted_now": granted,
+            "failure_basis": kb._safe_objective_failure_basis(conn, root),
         }
     if args.json:
         print(json.dumps(report, indent=2))
@@ -2864,6 +2865,7 @@ def _cmd_attempt_budget(args: argparse.Namespace) -> int:
         print(f"objective {root}: {report['attempts']} attempts, effective limit "
               f"{report['effective_limit']} (base {report['base_limit']} + "
               f"{len(report['grants'])} grant(s))")
+        print(kb._describe_failure_basis(report["failure_basis"]))
         if granted:
             print(f"granted +{granted['added_attempts']} by {granted['authorized_by']}: "
                   f"{granted['prior_effective_limit']} -> {granted['new_effective_limit']}")
