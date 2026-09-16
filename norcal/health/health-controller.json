@@ -113,9 +113,6 @@
     "website-reboot-health.timer": {
       "max_age_seconds": 50400
     },
-    "gauntlet-progress-calibration.timer": {
-      "max_age_seconds": 14400
-    },
     "system-health-controller-light.timer": {
       "max_age_seconds": 900
     },
