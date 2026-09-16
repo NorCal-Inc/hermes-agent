@@ -12,7 +12,12 @@
       {
         "name": "phase3-hermes-cutover-freeze",
         "kind": "recovery_hold",
-        "task_ids": ["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"],
+        "task_ids": [
+          "t_3883034a",
+          "t_992e8161",
+          "t_4d21959c",
+          "t_15d87799"
+        ],
         "conditions": [
           "subject_lane_relabelled|t_3883034a|subject_on_codex_verify_lane:triage",
           "subject_review_regressed|t_3883034a|pending_subject_in_triage",
@@ -47,33 +52,76 @@
   "recovery_holds": [
     {
       "name": "phase3-hermes-cutover-freeze",
-      "task_ids": ["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"],
+      "task_ids": [
+        "t_3883034a",
+        "t_992e8161",
+        "t_4d21959c",
+        "t_15d87799"
+      ],
       "reason": "Official Hermes cutover (Phase 3 overlay extraction) is frozen; its cards are detected and escalated, never auto-repaired, released, reassigned, promoted or dispatched",
       "authorized_by": "Christopher, 2026-09-14 (t_b8d62378 Phase E, option A)",
       "release": "Delete this entry only when Christopher separately releases the Phase 3 freeze"
     }
   ],
   "critical_cron_jobs": {
-    "life-wiki-github-sync": {"max_age_seconds": 2700},
-    "nuclear_backup": {"max_age_seconds": 93600},
-    "nuclear-backup-drive-validation": {"max_age_seconds": 93600},
-    "dr-backup-verify": {"max_age_seconds": 93600},
-    "deploy-drift-watchdog": {"max_age_seconds": 25200},
-    "life-wiki-daily-validation": {"max_age_seconds": 93600},
-    "nightly-executive-continuity-reconciliation": {"max_age_seconds": 93600},
-    "gauntlet-progress-census": {"max_age_seconds": 900, "pause_max_age_seconds": 604800},
-    "executive-significant-change-watch": {"max_age_seconds": 900, "pause_max_age_seconds": 604800}
+    "life-wiki-github-sync": {
+      "max_age_seconds": 2700
+    },
+    "nuclear_backup": {
+      "max_age_seconds": 93600
+    },
+    "nuclear-backup-drive-validation": {
+      "max_age_seconds": 93600
+    },
+    "dr-backup-verify": {
+      "max_age_seconds": 93600
+    },
+    "deploy-drift-watchdog": {
+      "max_age_seconds": 25200
+    },
+    "life-wiki-daily-validation": {
+      "max_age_seconds": 93600
+    },
+    "nightly-executive-continuity-reconciliation": {
+      "max_age_seconds": 93600
+    },
+    "gauntlet-progress-census": {
+      "max_age_seconds": 900,
+      "pause_max_age_seconds": 604800
+    },
+    "executive-significant-change-watch": {
+      "max_age_seconds": 900,
+      "pause_max_age_seconds": 604800
+    }
   },
   "critical_user_timers": {
-    "hermes-ops-supervisor.timer": {"max_age_seconds": 600},
-    "hermes-skill-ledger-reconcile.timer": {"max_age_seconds": 1200},
-    "hermes-kanban-hygiene.timer": {"max_age_seconds": 93600},
-    "hermes-lesson-candidate-review.timer": {"max_age_seconds": 93600},
-    "hermes-postgres-backup.timer": {"max_age_seconds": 93600},
-    "website-reboot-health.timer": {"max_age_seconds": 50400},
-    "gauntlet-progress-calibration.timer": {"max_age_seconds": 14400},
-    "system-health-controller-light.timer": {"max_age_seconds": 900},
-    "system-health-controller-deep.timer": {"max_age_seconds": 7500}
+    "hermes-ops-supervisor.timer": {
+      "max_age_seconds": 600
+    },
+    "hermes-skill-ledger-reconcile.timer": {
+      "max_age_seconds": 1200
+    },
+    "hermes-kanban-hygiene.timer": {
+      "max_age_seconds": 93600
+    },
+    "hermes-lesson-candidate-review.timer": {
+      "max_age_seconds": 93600
+    },
+    "hermes-postgres-backup.timer": {
+      "max_age_seconds": 93600
+    },
+    "website-reboot-health.timer": {
+      "max_age_seconds": 50400
+    },
+    "gauntlet-progress-calibration.timer": {
+      "max_age_seconds": 14400
+    },
+    "system-health-controller-light.timer": {
+      "max_age_seconds": 900
+    },
+    "system-health-controller-deep.timer": {
+      "max_age_seconds": 7500
+    }
   },
   "expected_runtime_config": {
     "execution.max_runtime_seconds": "300",
@@ -85,9 +133,16 @@
   "lease_grace_seconds": 300,
   "execution_heartbeat_stale_seconds": 900,
   "verifier_todo_stall_seconds": 900,
-  "required_gateway_platforms": ["telegram", "api_server", "webhook"],
+  "required_gateway_platforms": [
+    "telegram",
+    "api_server",
+    "webhook"
+  ],
   "resource_thresholds": {
-    "paths": ["/", "/home"],
+    "paths": [
+      "/",
+      "/home"
+    ],
     "disk_used_pct": 90,
     "inode_used_pct": 90,
     "mem_available_pct_min": 10,
@@ -117,13 +172,36 @@
     "timeout_seconds": 5,
     "record_dir": "~/.hermes/state/system-health-controller/company-health",
     "entities": [
-      {"entity_id": "ENT-004", "name": "Orion Formation Services", "service": "orion-api", "url": "http://127.0.0.1:5160/api/healthz"},
-      {"entity_id": "ENT-003", "name": "Logos Covenant", "service": "logos-covenant-api", "url": "http://127.0.0.1:5150/api/healthz"},
-      {"entity_id": "ENT-007", "name": "The Glass Pepper", "service": "glass-pepper-api", "url": "http://127.0.0.1:5170/api/healthz"}
+      {
+        "entity_id": "ENT-004",
+        "name": "Orion Formation Services",
+        "service": "orion-api",
+        "url": "http://127.0.0.1:5160/api/healthz"
+      },
+      {
+        "entity_id": "ENT-003",
+        "name": "Logos Covenant",
+        "service": "logos-covenant-api",
+        "url": "http://127.0.0.1:5150/api/healthz"
+      },
+      {
+        "entity_id": "ENT-007",
+        "name": "The Glass Pepper",
+        "service": "glass-pepper-api",
+        "url": "http://127.0.0.1:5170/api/healthz"
+      }
     ],
     "excluded_entities": [
-      {"entity_id": "ENT-001", "name": "North Caledonia", "reason": "dormant/hidden (Christopher, 2026-09-14)"},
-      {"entity_id": "ENT-002", "name": "NCASS / LCASS (lcass-llc)", "reason": "dormant (Christopher, 2026-09-14)"}
+      {
+        "entity_id": "ENT-001",
+        "name": "North Caledonia",
+        "reason": "dormant/hidden (Christopher, 2026-09-14)"
+      },
+      {
+        "entity_id": "ENT-002",
+        "name": "NCASS / LCASS (lcass-llc)",
+        "reason": "dormant (Christopher, 2026-09-14)"
+      }
     ],
     "registry_inconsistency": "Logged for later registry reconciliation, not edited in F2: entity-registry.md has no status field and no LCASS row; doctrine-v2/scopes marks Logos dormant and NorCal (parent) active; Glass Pepper absent from the scope manifests.",
     "authorization_sha256": "da639ae541f456a616a1552227bf938133b1f22c14af350194cc103fb7c95519"
@@ -136,10 +214,22 @@
     "life-wiki-api": "http://127.0.0.1:5100/api/healthz",
     "life-wiki-web": "http://127.0.0.1:5181/"
   },
-  "shared_user_units": ["hermes-gateway.service", "NorCal_Hermes.service", "life-wiki-api.service", "life-wiki-web.service", "norcal-opsbridge.service", "erika-phone.service"],
-  "shared_system_units": ["caddy.service", "postgresql@16-main.service"],
-  "expected_user_unit_files": ["hermes-claude-workspace-runner.service", "hermes-gpt-workspace-runner.service"],
-  "crontab_watchers": ["hermes_gateway_watchdog.sh", "hermes_isolated_backend_reaper.sh"],
+  "shared_user_units": [
+    "hermes-gateway.service",
+    "NorCal_Hermes.service",
+    "life-wiki-api.service",
+    "life-wiki-web.service",
+    "norcal-opsbridge.service",
+    "erika-phone.service"
+  ],
+  "shared_system_units": [
+    "caddy.service"
+  ],
+  "expected_user_unit_files": [],
+  "crontab_watchers": [
+    "hermes_gateway_watchdog.sh",
+    "hermes_isolated_backend_reaper.sh"
+  ],
   "pinned_scripts": {
     "~/.hermes/scripts/life-wiki-github-sync.sh": "2cbacc4865f4596891954e4b4acf852d88da73b7e061dab39d6f9b060a48f0ee",
     "~/.hermes/scripts/nuclear_backup.sh": "2bc479f3101f68330a7bf65c55a29c31d7c5af1f8c7c72e5c30e7933acd7dfce",
@@ -155,23 +245,103 @@
     "deploy_drift_state": "~/.hermes/state/deploy-drift-check.json",
     "deploy_drift_max_age_seconds": 25200,
     "watched_repositories": [
-      {"name": "hermes-agent-next", "path": "~/.hermes/hermes-agent-next", "upstream": "origin/main", "change_grace_seconds": 0},
-      {"name": "doctrine", "path": "~/.hermes/doctrine", "upstream": null, "change_grace_seconds": 0},
-      {"name": "life-wiki-vault", "path": "/home/chris/services/life-wiki/vault", "upstream": "origin/main", "change_grace_seconds": 2700}
+      {
+        "name": "hermes-agent-next",
+        "path": "~/.hermes/hermes-agent-next",
+        "upstream": "origin/main",
+        "change_grace_seconds": 0
+      },
+      {
+        "name": "doctrine",
+        "path": "~/.hermes/doctrine",
+        "upstream": null,
+        "change_grace_seconds": 0
+      },
+      {
+        "name": "life-wiki-vault",
+        "path": "/home/chris/services/life-wiki/vault",
+        "upstream": "origin/main",
+        "change_grace_seconds": 2700
+      }
     ]
   },
   "company_isolation": {
-    "registry_check_command": ["~/.local/bin/entity-registry-check"],
+    "registry_check_command": [
+      "~/.local/bin/entity-registry-check"
+    ],
     "isolation_watch_since": 1789443912,
     "companies": {
-      "ENT-002": {"tokens": ["ncass", "lcass"], "lead_profiles": ["ncass_lead"]},
-      "ENT-003": {"tokens": ["logos"], "lead_profiles": ["logos_covenant_lead"]},
-      "ENT-004": {"tokens": ["orion"], "lead_profiles": ["orion_formation_services_lead"]},
-      "ENT-005": {"tokens": ["triptracker", "trip-tracker", "trip_tracker"], "lead_profiles": ["triptracker_lead"]},
-      "ENT-006": {"tokens": ["clhubbard"], "lead_profiles": ["clhubbard_lead"]},
-      "ENT-007": {"tokens": ["glass-pepper", "glass_pepper", "glasspepper"], "lead_profiles": ["the_glass_pepper_lead"]},
-      "ENT-008": {"tokens": ["nexora"], "lead_profiles": ["nexora_biotide_lead"]},
-      "ENT-009": {"tokens": ["african-heartbeat", "africanheartbeat", "african_heartbeat"], "lead_profiles": ["alana---african-heartbeat"]}
+      "ENT-002": {
+        "tokens": [
+          "ncass",
+          "lcass"
+        ],
+        "lead_profiles": [
+          "ncass_lead"
+        ]
+      },
+      "ENT-003": {
+        "tokens": [
+          "logos"
+        ],
+        "lead_profiles": [
+          "logos_covenant_lead"
+        ]
+      },
+      "ENT-004": {
+        "tokens": [
+          "orion"
+        ],
+        "lead_profiles": [
+          "orion_formation_services_lead"
+        ]
+      },
+      "ENT-005": {
+        "tokens": [
+          "triptracker",
+          "trip-tracker",
+          "trip_tracker"
+        ],
+        "lead_profiles": [
+          "triptracker_lead"
+        ]
+      },
+      "ENT-006": {
+        "tokens": [
+          "clhubbard"
+        ],
+        "lead_profiles": [
+          "clhubbard_lead"
+        ]
+      },
+      "ENT-007": {
+        "tokens": [
+          "glass-pepper",
+          "glass_pepper",
+          "glasspepper"
+        ],
+        "lead_profiles": [
+          "the_glass_pepper_lead"
+        ]
+      },
+      "ENT-008": {
+        "tokens": [
+          "nexora"
+        ],
+        "lead_profiles": [
+          "nexora_biotide_lead"
+        ]
+      },
+      "ENT-009": {
+        "tokens": [
+          "african-heartbeat",
+          "africanheartbeat",
+          "african_heartbeat"
+        ],
+        "lead_profiles": [
+          "alana---african-heartbeat"
+        ]
+      }
     }
   },
   "max_recovery_mutations_per_pass": 1,
@@ -181,12 +351,22 @@
       "enabled": false,
       "authorized_by": "",
       "unit": "hermes-gateway.service",
-      "restart_command": ["/home/chris/.hermes/hermes-agent-next/venv/bin/python", "-m", "hermes_cli.main", "gateway", "restart"],
+      "restart_command": [
+        "/home/chris/.hermes/hermes-agent-next/venv/bin/python",
+        "-m",
+        "hermes_cli.main",
+        "gateway",
+        "restart"
+      ],
       "cooldown_seconds": 1800,
       "cooldown_marker": "~/.hermes/gateway_watchdog_last_restart",
       "command_timeout_seconds": 240,
       "postcondition_timeout_seconds": 120,
-      "required_platforms": ["telegram", "api_server", "webhook"]
+      "required_platforms": [
+        "telegram",
+        "api_server",
+        "webhook"
+      ]
     },
     "shared_service_restart": {
       "enabled": false,
@@ -194,31 +374,53 @@
       "cooldown_seconds": 600,
       "postcondition_timeout_seconds": 60,
       "services": {
-        "NorCal_Hermes.service": {"health_url": "http://127.0.0.1:5130/api/status"},
-        "life-wiki-api.service": {"health_url": "http://127.0.0.1:5100/api/healthz"},
-        "life-wiki-web.service": {"health_url": "http://127.0.0.1:5181/"},
-        "norcal-opsbridge.service": {"health_url": null}
+        "NorCal_Hermes.service": {
+          "health_url": "http://127.0.0.1:5130/api/status"
+        },
+        "life-wiki-api.service": {
+          "health_url": "http://127.0.0.1:5100/api/healthz"
+        },
+        "life-wiki-web.service": {
+          "health_url": "http://127.0.0.1:5181/"
+        },
+        "norcal-opsbridge.service": {
+          "health_url": null
+        }
       }
     },
     "lease_reconciliation": {
       "enabled": false,
       "authorized_by": "",
-      "reconcile": ["claims", "detached_runs", "executions"]
+      "reconcile": [
+        "claims",
+        "detached_runs",
+        "executions"
+      ]
     },
     "life_wiki_retry": {
       "enabled": true,
       "authorized_by": "Christopher Hubbard",
       "authorization_sha256": "5199c8ebc5c1c4ae9c2a8f34b8efb224fd0b92f0b2904acb24f2f6aa6352c149",
       "daily_note_job": "nightly-executive-continuity-reconciliation",
-      "validation_jobs": ["life-wiki-daily-validation"],
+      "validation_jobs": [
+        "life-wiki-daily-validation"
+      ],
       "settle_seconds": 3600,
-      "validator_command": ["/home/chris/.hermes/scripts/life-wiki-daily-validator.py", "--date", "{date}"]
+      "validator_command": [
+        "/home/chris/.hermes/scripts/life-wiki-daily-validator.py",
+        "--date",
+        "{date}"
+      ]
     },
     "vault_git_sync": {
       "enabled": false,
       "authorized_by": "",
       "repositories": {
-        "life-wiki-vault": {"path": "/home/chris/services/life-wiki/vault", "remote": "origin", "branch": "main"}
+        "life-wiki-vault": {
+          "path": "/home/chris/services/life-wiki/vault",
+          "remote": "origin",
+          "branch": "main"
+        }
       },
       "note": "F4: the vault is watched by repository_drift with the same upstream and a 2700 s change grace (three life-wiki-github-sync intervals), so this class validates; it stays disabled and never commits, resets or force-pushes."
     },
@@ -227,7 +429,13 @@
       "authorized_by": "",
       "max_files": 5,
       "max_bytes": 1048576,
-      "patterns": ["*EVIDENCE*.md", "*evidence*.md", "*EVIDENCE*.json", "*evidence*.json", "*REGRESSION*.txt"]
+      "patterns": [
+        "*EVIDENCE*.md",
+        "*evidence*.md",
+        "*EVIDENCE*.json",
+        "*evidence*.json",
+        "*REGRESSION*.txt"
+      ]
     }
   }
 }
