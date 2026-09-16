@@ -9234,6 +9234,13 @@ def _governed_grant_context(conn: sqlite3.Connection, env: Mapping[str, str]) ->
         if (env.get(marker) or "").strip():
             return f"governed run marker {marker} is set"
     ancestry = set(_process_ancestry())
+    # In PID-namespaced/sandboxed runners, /proc ancestry may not expose the
+    # host-visible parent chain even though the immediate parent is recorded.
+    # Check the kernel's direct parent independently before relying on /proc.
+    try:
+        direct_parent = os.getppid()
+    except OSError:
+        direct_parent = None
     try:
         own_pgid = os.getpgid(0)
     except OSError:
@@ -9241,7 +9248,9 @@ def _governed_grant_context(conn: sqlite3.Connection, env: Mapping[str, str]) ->
     for row in conn.execute(
         "SELECT id, pid, pgid FROM executions WHERE ended_at IS NULL"
     ):
-        if row["pid"] is not None and int(row["pid"]) in ancestry:
+        if row["pid"] is not None and (
+            int(row["pid"]) in ancestry or int(row["pid"]) == direct_parent
+        ):
             return f"caller descends from live execution {row['id']}"
         if own_pgid is not None and row["pgid"] is not None and int(row["pgid"]) == own_pgid:
             return f"caller shares the process group of live execution {row['id']}"
@@ -9302,14 +9311,45 @@ def grant_objective_attempts(
             raise ObjectiveAttemptGrantRefused(
                 f"{name!r} is an automation identity and cannot authorize a grant"
             )
+    if actor_id.casefold() != "christopher" or authorized_by.casefold() != "christopher":
+        raise ObjectiveAttemptGrantRefused(
+            "attempt grants require explicit Christopher authorization"
+        )
     now_ts = int(time.time()) if now is None else int(now)
     with write_txn(conn):
         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
             raise ObjectiveAttemptGrantRefused(f"task {task_id} not found")
         root = _objective_lineage_root(conn, task_id)
         status = conn.execute("SELECT status FROM tasks WHERE id = ?", (root,)).fetchone()
-        if status is None or status["status"] in ("done", "archived", "failed", "cancelled"):
-            raise ObjectiveAttemptGrantRefused(f"objective {root} is not open")
+        if status is None:
+            raise ObjectiveAttemptGrantRefused(f"objective {root} not found")
+        if status["status"] in ("done", "archived", "failed", "cancelled"):
+            # A closed repaired objective is still immutable.  The one narrow
+            # continuation case is an explicitly governed, still-open repair
+            # card that was created as a descendant of that objective: the
+            # operator is extending the repair attempt, not reopening the
+            # repaired root.  Do not infer this from identity or prose; require
+            # the durable recovery cause, owner, both mandatory repair links,
+            # and the direct repairs relation that made this card a descendant.
+            subject = conn.execute(
+                "SELECT status, creation_cause, recovery_owner FROM tasks "
+                "WHERE id = ?", (task_id,)
+            ).fetchone()
+            is_open_repair = (
+                task_id != root
+                and subject is not None
+                and subject["status"] not in ("done", "archived", "failed", "cancelled")
+                and subject["creation_cause"] == CREATION_CAUSE_RECOVERY
+                and bool((subject["recovery_owner"] or "").strip())
+                and not missing_repair_relations(conn, task_id)
+                and conn.execute(
+                    "SELECT 1 FROM task_relations "
+                    "WHERE from_task_id = ? AND relation = ? LIMIT 1",
+                    (task_id, RELATION_REPAIRS),
+                ).fetchone() is not None
+            )
+            if not is_open_repair:
+                raise ObjectiveAttemptGrantRefused(f"objective {root} is not open")
         base = gauntlet_objective_attempt_limit()
         prior = effective_objective_attempt_limit(conn, root)
         payload = {

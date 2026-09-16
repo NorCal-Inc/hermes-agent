@@ -211,6 +211,12 @@ def test_grant_audit_event_is_complete_and_survives_completion(kanban_home):
         "authorized_by": "Christopher", "reason": REASON, "actor_kind": kb.ACTOR_KIND_HUMAN_INTERACTIVE,
         "actor_id": "christopher", "authorization_source": "hermes kanban attempt-budget --grant",
         "granted_at": 1_789_430_000,
+        # Fix #4 (t_c574be85): what the failures behind the grant amounted to.
+        "failure_basis": {
+            "basis": kb.FAILURE_BASIS_NONE, "failed_verdicts": 0, "superseded": 0,
+            "resolved": 0, "refailed": 0, "evidence_pending": 0, "open": 0, "repeated": 0,
+            "open_verifications": [], "evidence_pending_verifications": [], "fingerprints": [],
+        },
     }
 
 
@@ -264,3 +270,51 @@ def test_cli_grant_records_one_grant_and_refuses_inside_a_governed_run(kanban_ho
     assert len(json.loads(capsys.readouterr().out)["grants"]) == 1
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_closed_root_allows_only_human_grant_requested_by_open_governed_repair(kanban_home):
+    """A repair may finish its own handoff without reopening its closed subject."""
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="repaired objective", assignee="default")
+        umbrella = kb.create_task(conn, title="repair programme", assignee="default")
+        _spend(conn, root, kb.GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT)
+        assert kb.complete_task(conn, root, result="verified")
+        repair = kb.create_repair_task(
+            conn,
+            title="finish the durable repair handoff",
+            subject_id=root,
+            owner="erika",
+            umbrella_id=umbrella,
+            assignee="default",
+            gauntlet=True,
+        )
+
+        with pytest.raises(kb.ObjectiveAttemptGrantRefused, match="not open"):
+            _grant(conn, root)
+
+        payload = _grant(conn, repair)
+        assert payload["objective"] == root
+        assert payload["subject_requested"] == repair
+        assert payload["new_effective_limit"] == 9
+        assert kb.effective_objective_attempt_limit(conn, repair) == 9
+        assert kb.get_task(conn, root).status == "done"
+
+        with pytest.raises(kb.ObjectiveAttemptGrantRefused, match="automation"):
+            _grant(conn, repair, env={**OPERATOR, "HERMES_KANBAN_TASK": repair})
+        assert len(kb.objective_attempt_grants(conn, repair)) == 1
+
+
+def test_closed_root_repair_grant_requires_christopher_identity(kanban_home):
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="repaired objective", assignee="default")
+        umbrella = kb.create_task(conn, title="repair programme", assignee="default")
+        assert kb.complete_task(conn, root, result="verified")
+        repair = kb.create_repair_task(
+            conn, title="open repair", subject_id=root, owner="erika",
+            umbrella_id=umbrella, assignee="default", gauntlet=True,
+        )
+        non_christopher = {kb.ENV_ACTOR_KIND: kb.ACTOR_KIND_HUMAN_INTERACTIVE,
+                           kb.ENV_ACTOR_ID: "operator"}
+        with pytest.raises(kb.ObjectiveAttemptGrantRefused, match="Christopher"):
+            _grant(conn, repair, env=non_christopher, authorized_by="operator")
+        assert _grant_events(conn, repair) == 0
