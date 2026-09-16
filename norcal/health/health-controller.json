@@ -164,7 +164,7 @@
   },
   "escalation_card_max_undispositioned_seconds": 604800,
   "company_health_probes": {
-    "authorized_by": "Christopher, 2026-09-14, in session (F2 company health probe set: Orion Formation Services, Logos Covenant, The Glass Pepper only; this explicit authorization governs even where older manifests conflict)",
+    "authorized_by": "Christopher, 2026-09-16, in session (Glass Pepper current live scope is journal/reference only; health probe is the frontend root, not the retired API. Prior 2026-09-14 authorization remains for Orion and Logos.)",
     "boundaries": "Designated health endpoint only; unauthenticated loopback GET; record only entity/service id, timestamp, HTTP status code, latency/timeout result; never bodies, headers, cookies, auth material, logs, customer data, database output or diagnostic payloads; no shared Kanban card; coarse state only in shared findings",
     "timeout_seconds": 5,
     "record_dir": "~/.hermes/state/system-health-controller/company-health",
@@ -184,8 +184,8 @@
       {
         "entity_id": "ENT-007",
         "name": "The Glass Pepper",
-        "service": "glass-pepper-api",
-        "url": "http://127.0.0.1:5170/api/healthz"
+        "service": "glass-pepper-web",
+        "url": "http://127.0.0.1:5171/"
       }
     ],
     "excluded_entities": [
@@ -201,7 +201,7 @@
       }
     ],
     "registry_inconsistency": "Logged for later registry reconciliation, not edited in F2: entity-registry.md has no status field and no LCASS row; doctrine-v2/scopes marks Logos dormant and NorCal (parent) active; Glass Pepper absent from the scope manifests.",
-    "authorization_sha256": "da639ae541f456a616a1552227bf938133b1f22c14af350194cc103fb7c95519"
+    "authorization_sha256": "5372896b845dddab9735f0427527943985747cb83922436d47e5a3850daececf"
   },
   "shared_probe_timeout_seconds": 5,
   "shared_health_endpoints": {
