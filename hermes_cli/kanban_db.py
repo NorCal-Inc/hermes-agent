@@ -659,6 +659,12 @@ VALID_TASK_RELATIONS = {
 #: transaction that inserts the card. See :func:`create_repair_task`.
 REQUIRED_REPAIR_RELATIONS = (RELATION_REPAIRS, RELATION_UMBRELLA)
 
+# A repair may not enter execution merely because an administrative transition
+# put it back in ``ready``.  The repair must carry the durable validation-loop
+# recheck that supervises its lifecycle.  This uses the existing observation
+# timer mechanism; it does not create a second scheduler or verifier branch.
+VALIDATION_LOOP_TIMER_KIND = "validation_loop_recheck"
+
 # ---------------------------------------------------------------------------
 # OBSERVATION TIMERS — the 300-second recheck, mechanically
 # ---------------------------------------------------------------------------
@@ -5355,6 +5361,11 @@ def create_task(
         _resolve_gauntlet_default(title, body) if gauntlet is None
         else bool(gauntlet)
     )
+    # A governed repair is never an ordinary task, even when a caller reaches
+    # this kernel boundary directly with ``gauntlet=False``.  The validation
+    # loop is part of the repair contract, not an opt-in convention.
+    if declares_repair:
+        gauntlet_enforced = True
     if gauntlet is None and not gauntlet_enforced:
         # A governed parent's enforcement must carry down to its children:
         # otherwise a task created under a gauntlet-enforced parent (e.g. a
@@ -5778,6 +5789,14 @@ def create_task(
                             f"relation(s) {still_missing}; rolling back so no "
                             f"orphan card is created"
                         )
+                    # Arm the existing durable recheck before the transaction
+                    # can expose the repair as dispatchable.  This closes the
+                    # administrative bypass where a repair was unlinked,
+                    # promoted, and claimed without supervisory state.
+                    arm_observation_timer(
+                        conn, task_id, kind=VALIDATION_LOOP_TIMER_KIND,
+                        owner=recovery_owner, now=now,
+                    )
                 if executor_lane == EXECUTOR_LANE_CODEX_VERIFY:
                     # Read the linkage back from ``task_links``, in the same
                     # transaction that wrote it and before it can commit. The
@@ -7580,6 +7599,40 @@ def task_observation_timers(
     return [
         _observation_timer_from_row(r) for r in conn.execute(sql, params).fetchall()
     ]
+
+
+def validation_loop_entry_valid(conn: sqlite3.Connection, task_id: str) -> tuple[bool, str]:
+    """Check the durable admission state for a governed repair.
+
+    Administrative paths may legally change status, assignee, or dependency
+    edges, but none of those writes is a substitute for the validation loop.
+    The claim boundary calls this helper, so direct dispatcher/recovery paths
+    receive the same fail-closed decision as CLI/dashboard transitions.
+    """
+    repair = conn.execute(
+        "SELECT 1 FROM task_relations WHERE from_task_id = ? AND relation = ? LIMIT 1",
+        (task_id, RELATION_REPAIRS),
+    ).fetchone()
+    if repair is None:
+        return True, "not a governed repair"
+    row = conn.execute(
+        "SELECT gauntlet_enforced, terminal_disposition FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False, "task not found"
+    if not bool(row["gauntlet_enforced"] or gauntlet_enforcement_default()):
+        return False, "governed repair is not Gauntlet-enforced"
+    if row["terminal_disposition"] in IRREVERSIBLE_DISPOSITIONS:
+        return False, "repair has an irreversible terminal disposition"
+    timer = conn.execute(
+        "SELECT 1 FROM observation_timers WHERE task_id = ? AND kind = ? "
+        "AND state = ? LIMIT 1",
+        (task_id, VALIDATION_LOOP_TIMER_KIND, OBSERVATION_STATE_OBSERVING),
+    ).fetchone()
+    if timer is None:
+        return False, "validation-loop recheck timer is absent or closed"
+    return True, "validation-loop state valid"
 
 
 def due_observation_timers(
@@ -9823,6 +9876,12 @@ def claim_task(
         if repeated_error_ceiling_reached(conn, task_id)[0]:
             _block_repeated_error(conn, task_id)
             return None
+        loop_ok, loop_reason = validation_loop_entry_valid(conn, task_id)
+        if not loop_ok:
+            _append_event(conn, task_id, "execution_refused",
+                          {"reason": "validation_loop_missing", "detail": loop_reason,
+                           "source": "claim_task"})
+            return None
         # Structural invariant: never transition ready -> running while a
         # parent dependency is unsatisfied. This is the single enforcement
         # point regardless of which writer (create_task, link_tasks,
@@ -9970,6 +10029,12 @@ def claim_review_task(
         # and neither can quietly become an uncalled stage.
         if repeated_error_ceiling_reached(conn, task_id)[0]:
             _block_repeated_error(conn, task_id)
+            return None
+        loop_ok, loop_reason = validation_loop_entry_valid(conn, task_id)
+        if not loop_ok:
+            _append_event(conn, task_id, "execution_refused",
+                          {"reason": "validation_loop_missing", "detail": loop_reason,
+                           "source": "claim_review_task"})
             return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -17557,6 +17622,10 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    loop_ok, loop_reason = validation_loop_entry_valid(conn, task_id)
+    if not loop_ok:
+        return False, f"validation-loop admission refused: {loop_reason}"
+
     if not force:
         parents = conn.execute(
             "SELECT t.id, t.status, t.terminal_disposition FROM tasks t "
@@ -17754,6 +17823,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        loop_ok, loop_reason = validation_loop_entry_valid(conn, task_id)
+        if not loop_ok:
+            _append_event(conn, task_id, "execution_refused",
+                          {"reason": "validation_loop_missing", "detail": loop_reason,
+                           "source": "unblock_task"})
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
