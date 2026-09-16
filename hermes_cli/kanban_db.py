@@ -11512,23 +11512,45 @@ def _review_claim_conflict(
 def _open_verifier_child(
     conn: sqlite3.Connection, subject_id: str
 ) -> Optional[str]:
-    """Return an existing, still-live ``codex_verify`` child of ``subject_id``.
+    """Return a valid, still-live ``codex_verify`` child of ``subject_id``.
 
-    "Live" excludes ``done``/``archived`` children: a spent verifier card is
-    not a route to a verdict for the phase now open. Used to keep
-    :func:`_ensure_independent_verifier_child` idempotent — the architecture
-    already represents verifier work as a child, and a second one would put two
-    independent verdicts on the same phase.
+    A child is reusable only when its durable ``verifies`` relation names this
+    subject and the subject currently carries evidence the verifier dependency
+    gate accepts.  The dependency edge is intentionally *not* required here:
+    it may be removed before dispatch, while the durable relation remains the
+    verdict-return attribution.  This rejects historical blocked/orphaned or
+    otherwise unroutable cards instead of treating their mere task-link and
+    lane label as an idempotency key.
+
+    "Live" also excludes ``blocked``: a blocked verifier (circuit breaker,
+    ``INVALID_VERIFIER_LINKAGE``, operator hold) is not dispatchable, so even
+    with otherwise-valid linkage it is not a route to a verdict. It is left
+    untouched as history and ``request_review`` mints a fresh child instead.
     """
-    row = conn.execute(
+    if not _subject_evidence_is_dispatchable(conn, subject_id):
+        return None
+    rows = conn.execute(
         "SELECT c.id FROM task_links l "
         "JOIN tasks c ON c.id = l.child_id "
         "WHERE l.parent_id = ? AND c.executor_lane = ? "
-        "AND c.status NOT IN ('done', 'archived') "
-        "ORDER BY c.created_at ASC LIMIT 1",
-        (subject_id, EXECUTOR_LANE_CODEX_VERIFY),
-    ).fetchone()
-    return row["id"] if row is not None else None
+        "AND c.status NOT IN ('blocked', 'done', 'archived') "
+        "AND EXISTS ("
+        "  SELECT 1 FROM task_relations r "
+        "  WHERE r.from_task_id = c.id AND r.to_task_id = ?"
+        "    AND r.relation = ?"
+        ") "
+        "ORDER BY c.created_at ASC, c.id ASC",
+        (
+            subject_id,
+            EXECUTOR_LANE_CODEX_VERIFY,
+            subject_id,
+            RELATION_VERIFIES,
+        ),
+    ).fetchall()
+    for row in rows:
+        if not missing_verifier_linkage(conn, row["id"]):
+            return row["id"]
+    return None
 
 
 def _subject_evidence_is_dispatchable(

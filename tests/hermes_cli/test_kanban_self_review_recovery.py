@@ -1653,3 +1653,148 @@ class TestInstalledSelfReviewerIsNotSelected:
                 expected_run_id=claimed.current_run_id,
             ) is True
             assert kb._review_claim_conflict(conn, tid, "default") is None
+
+
+class TestVerifierChildReuseIntegrity:
+    def test_invalid_blocked_child_is_preserved_and_fresh_child_is_created(
+        self, kanban_home
+    ):
+        """A blocked child without durable attribution is never reused."""
+        with kb.connect_closing() as conn:
+            subject = _subject_awaiting_verification(conn)
+            # request_review opens the sanctioned child in the normal fixture;
+            # remove that setup route so the historical invalid child below is
+            # the only candidate visible to the reuse predicate.
+            existing = kb._open_verifier_child(conn, subject)
+            assert existing is not None
+            with kb.write_txn(conn):
+                conn.execute("DELETE FROM task_relations WHERE from_task_id = ?", (existing,))
+                conn.execute("DELETE FROM task_links WHERE child_id = ?", (existing,))
+                conn.execute("DELETE FROM tasks WHERE id = ?", (existing,))
+            invalid = kb.create_task(
+                conn,
+                title=f"Independent verification: {subject}",
+                body="historical invalid verifier",
+                assignee="atlas",
+                parents=[subject],
+                created_by="kanban:test-invalid-linkage",
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked' WHERE id = ?", (invalid,)
+                )
+                kb._append_event(
+                    conn, invalid, "INVALID_VERIFIER_LINKAGE",
+                    {"reason": "missing durable verifies relation"},
+                )
+
+            assert kb._open_verifier_child(conn, subject) is None
+            before = kb.get_task(conn, invalid)
+            fresh = kb._ensure_independent_verifier_child(
+                conn, subject, implementer="default"
+            )
+            assert fresh is not None and fresh != invalid
+            after = kb.get_task(conn, invalid)
+            assert after.status == before.status == "blocked"
+            assert _events(conn, invalid, "INVALID_VERIFIER_LINKAGE")
+            assert kb.verifier_subject_ids(conn, fresh) == [subject]
+            assert kb.missing_verifier_linkage(conn, fresh) == []
+
+    def test_valid_live_child_is_reused_idempotently(self, kanban_home):
+        with kb.connect_closing() as conn:
+            subject = _subject_awaiting_verification(conn)
+            first = kb._ensure_independent_verifier_child(
+                conn, subject, implementer="default"
+            )
+            assert first is not None
+            second = kb._ensure_independent_verifier_child(
+                conn, subject, implementer="default"
+            )
+            assert second == first
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_relations "
+                "WHERE from_task_id = ? AND relation = ?",
+                (first, kb.RELATION_VERIFIES),
+            ).fetchone()[0] == 1
+
+    def test_blocked_child_with_valid_linkage_is_not_reusable(self, kanban_home):
+        """Durable attribution alone does not make a blocked verifier live."""
+        with kb.connect_closing() as conn:
+            subject = _subject_awaiting_verification(conn)
+            child = kb._open_verifier_child(conn, subject)
+            assert child is not None
+            assert kb.missing_verifier_linkage(conn, child) == []
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked' WHERE id = ?", (child,)
+                )
+            assert kb.missing_verifier_linkage(conn, child) == []
+            assert kb._open_verifier_child(conn, subject) is None
+
+    def test_request_review_mints_replacement_for_blocked_child(
+        self, kanban_home
+    ):
+        """End to end through ``request_review``, not the internal helper.
+
+        A re-requested review whose only verifier child is blocked must mint a
+        fresh child with durable ``verifies`` attribution, leave the blocked
+        child exactly as it was, and then reuse the fresh live child on the
+        next re-request instead of minting a duplicate.
+        """
+
+        def re_request(tid, summary):
+            assert kb.reopen_review_task(conn, tid) is True
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            assert kb.request_review(
+                conn, tid, summary=summary,
+                expected_run_id=claimed.current_run_id,
+            ) is True
+
+        with kb.connect_closing() as conn:
+            subject = _subject_awaiting_verification(conn, assignee="erika")
+            invalid = kb._open_verifier_child(conn, subject)
+            assert invalid is not None
+            # A sanctioned (sticky) block, as the live invalid-linkage cards
+            # carry -- recompute_ready must not auto-recover it mid-test.
+            assert kb.block_task(
+                conn, invalid, reason="INVALID_VERIFIER_LINKAGE",
+            ) is True
+            assert kb.get_task(conn, invalid).status == "blocked"
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn, invalid, "INVALID_VERIFIER_LINKAGE",
+                    {"reason": "historical unroutable verifier"},
+                )
+            before = dict(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (invalid,)
+            ).fetchone())
+            events_before = _events(conn, invalid)
+            assert kb._open_verifier_child(conn, subject) is None
+
+            re_request(subject, "evidence repaired; resubmitted")
+
+            fresh = kb._open_verifier_child(conn, subject)
+            assert fresh is not None and fresh != invalid
+            assert kb.get_task(conn, fresh).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.verifier_subject_ids(conn, fresh) == [subject]
+            assert kb.missing_verifier_linkage(conn, fresh) == []
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_relations "
+                "WHERE from_task_id = ? AND to_task_id = ? AND relation = ?",
+                (fresh, subject, kb.RELATION_VERIFIES),
+            ).fetchone()[0] == 1
+            required = _events(conn, subject, "independent_verification_required")
+            assert required and required[-1][1]["verifier_task"] == fresh
+            # The blocked child is history: not mutated, not reinterpreted.
+            assert dict(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (invalid,)
+            ).fetchone()) == before
+            assert _events(conn, invalid) == events_before
+            assert len(_events(conn, subject, "independent_verifier_child_created")) == 2
+
+            # A genuinely live valid verifier is reused, not duplicated.
+            re_request(subject, "resubmitted again")
+            assert kb._open_verifier_child(conn, subject) == fresh
+            assert len(_events(conn, subject, "independent_verifier_child_created")) == 2
+            assert sorted(kb.child_ids(conn, subject)) == sorted([invalid, fresh])
