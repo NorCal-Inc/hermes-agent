@@ -274,7 +274,9 @@ class TestExtractionNeverBreaksTheVerdict:
 class TestExtractionDoesNotFireOnFailure:
     def test_failing_verdict_never_extracts(self, kanban_home):
         """An unverified finding must not become canon. The gate would refuse
-        it anyway; not calling at all is the cheaper guarantee."""
+        it anyway; not calling at all is the cheaper guarantee. (A FAIL does
+        record a non-binding candidate -- see
+        TestFailureRecordsNonBindingCandidate -- but never via this path.)"""
         with kb.connect_closing() as conn:
             tid = _pending(conn)
             ok, _ = kb.record_verification(
@@ -293,6 +295,185 @@ class TestExtractionDoesNotFireOnFailure:
             kinds = [k for k, _ in _events(conn, tid)]
             assert not any(k.startswith("lesson_") for k in kinds), kinds
             assert kb.list_lessons(conn) == []
+
+
+def _lesson_rows(conn, tid=None):
+    sql = "SELECT * FROM task_lessons"
+    params = ()
+    if tid is not None:
+        sql += " WHERE source_task_id = ?"
+        params = (tid,)
+    return conn.execute(sql + " ORDER BY id", params).fetchall()
+
+
+class TestFailureRecordsNonBindingCandidate:
+    """Fix #2: a durable FAIL verdict must leave learning material behind.
+
+    Before this, only PASS reached extraction, so every failed verdict on the
+    board produced zero ``task_lessons`` rows. The row a FAIL writes is always
+    a candidate: it is observation, not canon, and binds nothing until an
+    operator approves it.
+    """
+
+    @pytest.mark.parametrize("route_on_failure", [True, False])
+    def test_fail_writes_one_candidate_row(self, kanban_home, route_on_failure):
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+            assert len(_lesson_rows(conn)) == 0
+            ok, detail = kb.record_verification(
+                conn,
+                tid,
+                passed=False,
+                verifier="reviewer",
+                reason="3 tests fail in test_widget.py",
+                route_on_failure=route_on_failure,
+                evidence={"command": "pytest -q", "exit_code": 1},
+            )
+            assert ok is True, detail
+
+            rows = _lesson_rows(conn)
+            assert len(rows) == 1
+            row = rows[0]
+            assert row["source_task_id"] == tid
+            assert row["state"] == kb.LESSON_STATE_CANDIDATE
+            assert row["active"] == 0
+            assert row["tenant"] == "acme"
+            assert row["scope"] == kb.LESSON_SCOPE_TENANT
+            assert row["created_by"] == "reviewer"
+            assert "3 tests fail in test_widget.py" in row["lesson"]
+            assert tid in row["lesson"]
+
+            prov = json.loads(row["evidence"])
+            assert prov["origin"] == "verification_failed"
+            assert prov["source_task_id"] == tid
+            assert prov["verifier"] == "reviewer"
+            assert prov["reason"] == "3 tests fail in test_widget.py"
+            assert prov["verifier_evidence"]["exit_code"] == 1
+            failed = conn.execute(
+                "SELECT id FROM task_verifications WHERE task_id = ? "
+                "AND kind = 'verdict' AND state = ? ORDER BY id DESC LIMIT 1",
+                (tid, kb.VERIFICATION_FAILED),
+            ).fetchone()
+            assert row["verification_id"] == failed["id"]
+            assert prov["verification_id"] == failed["id"]
+
+            recorded = _events(conn, tid, "failure_lesson_candidate_recorded")
+            assert len(recorded) == 1
+            assert recorded[0][1]["lesson_id"] == row["id"]
+
+    def test_candidate_binds_nothing_until_approved(self, kanban_home):
+        with kb.connect_closing() as conn:
+            src = _pending(conn, tenant="acme")
+            ok, _ = kb.record_verification(
+                conn, src, passed=False, verifier="reviewer",
+                reason="migration left column nullable",
+                route_on_failure=False,
+            )
+            assert ok is True
+            # A later task in the same tenant/assignee that the row's 'all'
+            # selector would otherwise reach.
+            receiver = kb.create_task(
+                conn, title="next", assignee="default", tenant="acme"
+            )
+            assert kb.list_lessons(conn) == []
+            assert kb.lessons_for_task(conn, receiver) == []
+
+            (row,) = _lesson_rows(conn, src)
+            assert kb.approve_lesson(conn, row["id"], approver="christopher") is True
+            bound = kb.lessons_for_task(conn, receiver)
+            assert [lesson["id"] for lesson in bound] == [row["id"]]
+
+    def test_verifier_offered_lesson_is_kept_but_not_promoted(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+            ok, _ = kb.record_verification(
+                conn, tid, passed=False, verifier="reviewer",
+                reason="port check lied", route_on_failure=False,
+                evidence={
+                    kb.LESSON_EVIDENCE_KEY: LESSON,
+                    kb.LESSON_APPLICABILITY_EVIDENCE_KEY: "assignee:default",
+                },
+            )
+            assert ok is True
+            (row,) = _lesson_rows(conn, tid)
+            # Narrow and tenanted -- the PASS path would auto-activate this.
+            # A FAIL must not.
+            assert row["active"] == 0
+            assert row["state"] == kb.LESSON_STATE_CANDIDATE
+            assert row["applicability"] == "assignee:default"
+            assert LESSON in row["lesson"]
+
+    def test_invalid_selector_falls_back_to_all(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+            kb.record_verification(
+                conn, tid, passed=False, verifier="reviewer", reason="nope",
+                route_on_failure=False,
+                evidence={kb.LESSON_APPLICABILITY_EVIDENCE_KEY: "bogus:selector"},
+            )
+            (row,) = _lesson_rows(conn, tid)
+            assert row["applicability"] == kb.LESSON_SELECTOR_ALL
+
+    def test_refused_fail_verdict_writes_nothing(self, kanban_home):
+        """Only a DURABLE failure produces a row -- a refused verdict does not."""
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+            ok, _ = kb.record_verification(
+                conn, tid, passed=False, verifier="reviewer", reason=None,
+            )
+            assert ok is False
+            assert _lesson_rows(conn) == []
+
+    def test_extraction_failure_does_not_unwind_the_fail_verdict(
+        self, kanban_home, monkeypatch
+    ):
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+
+            def _boom(*a, **kw):
+                raise RuntimeError("provenance exploded")
+
+            monkeypatch.setattr(kb, "_latest_verdict_row", _boom)
+            ok, detail = kb.record_verification(
+                conn, tid, passed=False, verifier="reviewer",
+                reason="broken", route_on_failure=False,
+            )
+            assert (ok, detail) == (True, kb.VERIFICATION_FAILED)
+            assert _lesson_rows(conn) == []
+            assert _events(conn, tid, "failure_lesson_extraction_error")
+            head = conn.execute(
+                "SELECT verification_state FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            assert head["verification_state"] == kb.VERIFICATION_FAILED
+
+    def test_pass_writes_no_failure_candidate(self, kanban_home):
+        """The PASS branch is untouched: same single row, no failure event."""
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+            ok, _ = kb.record_verification(
+                conn, tid, passed=True, verifier="reviewer",
+                evidence={
+                    kb.LESSON_EVIDENCE_KEY: LESSON,
+                    kb.LESSON_APPLICABILITY_EVIDENCE_KEY: "assignee:default",
+                },
+            )
+            assert ok is True
+            rows = _lesson_rows(conn, tid)
+            assert len(rows) == 1
+            assert rows[0]["active"] == 1
+            assert rows[0]["state"] == kb.LESSON_STATE_ACTIVE
+            assert json.loads(rows[0]["evidence"]).get("origin") is None
+            assert not _events(conn, tid, "failure_lesson_candidate_recorded")
+            assert not _events(conn, tid, "failure_lesson_extraction_error")
+
+    def test_pass_without_lesson_still_writes_nothing(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _pending(conn, tenant="acme")
+            ok, _ = kb.record_verification(
+                conn, tid, passed=True, verifier="reviewer", evidence=None,
+            )
+            assert ok is True
+            assert _lesson_rows(conn) == []
 
 
 class TestVerifierLessonDeclaration:

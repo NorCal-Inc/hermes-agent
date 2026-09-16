@@ -15803,6 +15803,148 @@ def _extract_lesson_on_verify(
     return row
 
 
+def _extract_lesson_on_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verifier: Optional[str],
+    reason: Optional[str],
+    evidence: Optional[dict],
+    run_id: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Record a failed verdict as a non-binding candidate lesson.
+
+    The failure-side counterpart of :func:`_extract_lesson_on_verify`. That
+    path fires only on PASS, so every failed verdict -- 119 of them on the live
+    board when this was added -- produced no learning material at all.
+
+    It cannot reuse :func:`extract_lesson`: :func:`lesson_source_state` refuses
+    a FAILED head by design, and that gate must not be loosened. So the row is
+    written directly, and is ALWAYS ``state='candidate'``, ``active=0`` --
+    never run through :func:`lesson_promotion_eligibility`, because a failed
+    attempt stays an observation, never canonical learning. It binds nothing
+    (:func:`lessons_for_task` reads ``active = 1`` only) until an operator runs
+    :func:`approve_lesson` on it. No ``error_signature`` is set: the reasons
+    automated verifiers write are near-identical boilerplate, and exact
+    signature matching would make every such row "match" every other.
+
+    Same contract as the PASS path: runs after the verdict has committed, in
+    its own transaction, and **never raises**.
+    """
+    payload = evidence if isinstance(evidence, dict) else {}
+    reason_text = str(redact_review_value(reason or "")).strip()
+    offered = str(
+        redact_review_value(payload.get(LESSON_EVIDENCE_KEY) or "")
+    ).strip()
+    selector = LESSON_SELECTOR_ALL
+    raw_selector = str(payload.get(LESSON_APPLICABILITY_EVIDENCE_KEY) or "").strip()
+    if raw_selector:
+        try:
+            selector = normalize_lesson_applicability(raw_selector)
+        except LessonPromotionError:
+            selector = LESSON_SELECTOR_ALL
+
+    text = (
+        f"Verification FAILED for task {task_id}"
+        f" (verifier {verifier or 'unknown'}): {reason_text or 'no reason recorded'}"
+    )
+    if offered:
+        text += f"\nVerifier-offered lesson: {offered}"
+    if len(text) > LESSON_MAX_CHARS:
+        text = text[: LESSON_MAX_CHARS - 3].rstrip() + "..."
+
+    try:
+        with write_txn(conn):
+            task = conn.execute(
+                "SELECT tenant, status, verification_state FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                return None
+            verdict = _latest_verdict_row(conn, task_id)
+            tenant = task["tenant"] or None
+            scope = LESSON_SCOPE_TENANT if tenant else LESSON_SCOPE_GLOBAL
+            verification_id = (
+                int(verdict["id"])
+                if verdict is not None and verdict["state"] == VERIFICATION_FAILED
+                else None
+            )
+            provenance: dict[str, Any] = {
+                "origin": "verification_failed",
+                "source_task_id": task_id,
+                "source_status": task["status"],
+                "verification_state": task["verification_state"],
+                "verification_id": verification_id,
+                "failed_at": verdict["created_at"] if verdict is not None else None,
+                "verifier": verifier,
+                "reason": reason_text or None,
+            }
+            if payload:
+                provenance["verifier_evidence"] = redact_review_value(payload)
+            now = int(time.time())
+            cur = conn.execute(
+                """
+                INSERT INTO task_lessons
+                    (source_task_id, tenant, scope, applicability, lesson,
+                     evidence, verification_id, created_by, created_at,
+                     active, state, review_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    task_id,
+                    tenant,
+                    scope,
+                    selector,
+                    text,
+                    json.dumps(provenance, ensure_ascii=False, sort_keys=True),
+                    verification_id,
+                    verifier,
+                    now,
+                    LESSON_STATE_CANDIDATE,
+                    now + LESSON_DEFAULT_REVIEW_DAYS * 86400,
+                ),
+            )
+            lesson_id = int(cur.lastrowid)
+            _append_event(
+                conn,
+                task_id,
+                "failure_lesson_candidate_recorded",
+                {
+                    "lesson_id": lesson_id,
+                    "state": LESSON_STATE_CANDIDATE,
+                    "scope": scope,
+                    "tenant": tenant,
+                    "applicability": selector,
+                    "verifier": verifier,
+                    "verification_id": verification_id,
+                    "source": "record_verification",
+                },
+                run_id=run_id,
+            )
+            row = conn.execute(
+                "SELECT * FROM task_lessons WHERE id = ?", (lesson_id,)
+            ).fetchone()
+        return _lesson_row_to_dict(row)
+    except Exception as exc:
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "failure_lesson_extraction_error",
+                    {
+                        "verifier": verifier,
+                        "source": "record_verification",
+                        "error": type(exc).__name__,
+                        "detail": str(exc)[:400],
+                    },
+                    run_id=run_id,
+                )
+        except Exception:
+            pass
+        return None
+
+
 def record_verification(
     conn: sqlite3.Connection,
     task_id: str,
@@ -16113,6 +16255,16 @@ def record_verification(
             run_id=phase_run_id,
         )
         return True, VERIFICATION_VERIFIED
+    # The failing verdict is committed above too. Record it as a non-binding
+    # candidate before routing, so both route_on_failure outcomes produce one.
+    _extract_lesson_on_failure(
+        conn,
+        task_id,
+        verifier=verifier,
+        reason=reason_text,
+        evidence=evidence,
+        run_id=phase_run_id,
+    )
     if not route_on_failure:
         # Verdict is durable; the task stays in review and stays non-complete.
         return True, VERIFICATION_FAILED
