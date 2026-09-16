@@ -5381,6 +5381,19 @@ def create_task(
     # Claude before any Hermes agent/tool loop is built.
     assignee, executor_lane, _ = _normalize_shorthand_lane(assignee, executor_lane)
 
+    # An explicit in-body verification requirement is binding, not advisory.
+    # Additive to the classifier above and not overridable by gauntlet=False:
+    # the body is the author's own statement of the contract. Verifier cards
+    # are exempt -- their bodies describe the requirement they fulfil.
+    explicit_verification_required = False
+    if (
+        not gauntlet_enforced
+        and executor_lane != EXECUTOR_LANE_CODEX_VERIFY
+        and explicit_verification_requirement(title, body)
+    ):
+        gauntlet_enforced = True
+        explicit_verification_required = True
+
     if executor_lane is not None and executor_lane not in VALID_EXECUTOR_LANES:
         raise ValueError(
             f"executor_lane must be one of {sorted(VALID_EXECUTOR_LANES)} or None, "
@@ -5815,6 +5828,10 @@ def create_task(
                         # and the one an audit reads.
                         **provenance.as_dict(),
                         "recovery_owner": recovery_owner,
+                        **(
+                            {"gauntlet_source": "explicit_body_requirement"}
+                            if explicit_verification_required else {}
+                        ),
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -6469,6 +6486,104 @@ def gauntlet_default_for_subject(
     if _GAUNTLET_INVESTIGATION_RE.search(blob):
         return False
     return None
+
+
+#: The phrasing this project standardises on for "this card may not close on
+#: its executor's word". Write one of these, verbatim, into a task body when
+#: independent verification is mandatory; ``explicit_verification_requirement``
+#: recognises them (and structural variants of them) and the kernel enforces
+#: them -- at creation by stamping ``gauntlet_enforced``, at completion by
+#: refusing ``done``. Prose that merely *asks* for review is not enough to be
+#: reliable; these are the sentences that are.
+#:
+#: t_eed363cc is why: its body and its own closing comment both said an
+#: independent codex_verify PASS was still owed, nothing read either, and the
+#: card closed on self-report. ("root cause" in that kind of body even made the
+#: subject classifier return False.)
+CANONICAL_VERIFICATION_REQUIREMENT_PHRASES = (
+    "Independent verification required before closing.",
+    "Independent codex_verify PASS required before this closes.",
+    "Gauntlet PASS required before closing.",
+    # The executor-side admission, in a run summary or result:
+    "Still needs independent verification.",
+)
+
+#: Something only an independent party can supply.
+_VERIFICATION_REQ_SUBJECT_RE = re.compile(
+    r"\b(?:"
+    r"independent(?:ly)?[ _-]+(?:codex[ _-]?verif\w*|verif\w*|review\w*"
+    r"|pass|verdict|sign[ _-]?off|check\w*)"
+    r"|gauntlet[ _-]+(?:pass|verif\w*|verdict|sign[ _-]?off)"
+    r"|codex[ _-]?verify[ _-]+(?:pass|verdict|sign[ _-]?off)"
+    r")",
+    re.I,
+)
+#: ...stated as owed.
+_VERIFICATION_REQ_DEMAND_RE = re.compile(
+    r"\b(?:required|requires?|mandatory|must|needs?|needed|owed|owes"
+    r"|before\s+(?:it|this|the\s+(?:card|task|work))?\s*"
+    r"(?:closes|closing|close|closure|is\s+closed|done|completes|completion))\b",
+    re.I,
+)
+#: ...or stated as still outstanding (the executor's own admission).
+_VERIFICATION_REQ_PENDING_RE = re.compile(
+    r"\b(?:still|pending|outstanding|awaiting|awaits|not\s+yet|yet\s+to"
+    r"|unverified)\b",
+    re.I,
+)
+#: Explicit negations: "no independent verification required", "independent
+#: review is not required", "does not require an independent verdict".
+_VERIFICATION_REQ_NEGATION_RE = re.compile(
+    r"\b(?:not|no\s+longer|never)\s+(?:be\s+)?(?:required|needed|mandatory|necessary)\b"
+    r"|\b(?:does|do|did)(?:\s+not|n't)\s+(?:require|need)\b"
+    r"|\boptional\b",
+    re.I,
+)
+_VERIFICATION_REQ_PRECEDING_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never)\s+(?:(?:an?|any|further|additional|separate|more)\s+){0,2}$",
+    re.I,
+)
+#: A requirement reported as already met is not an outstanding one.
+_VERIFICATION_REQ_SATISFIED_RE = re.compile(
+    r"\b(?:was|were|has\s+been|have\s+been|already|now)\s+(?:been\s+)?"
+    r"(?:satisfied|obtained|received|recorded|granted|completed|passed|returned|met)\b",
+    re.I,
+)
+
+
+def explicit_verification_requirement(*texts: Optional[str]) -> bool:
+    """True when the text states that independent verification is owed.
+
+    Judged per clause, so a requirement in one sentence is not cancelled by an
+    unrelated "not required" in another. A clause counts when it names an
+    independent verification (see ``_VERIFICATION_REQ_SUBJECT_RE``) and either
+    demands it or reports it outstanding, unless it is explicitly negated or
+    reported satisfied. "still"/"pending"/"not yet" beat both exceptions: an
+    admission that the work is unverified is never read as its opposite.
+
+    Deliberately biased toward matching. A false positive costs one verifier
+    run; a false negative is t_eed363cc.
+    """
+    blob = "\n".join(t for t in texts if t)
+    if not blob:
+        return False
+    for clause in re.split(r"[.;!?\n]+", blob):
+        subject = _VERIFICATION_REQ_SUBJECT_RE.search(clause)
+        if subject is None:
+            continue
+        pending = bool(_VERIFICATION_REQ_PENDING_RE.search(clause))
+        if not pending and not _VERIFICATION_REQ_DEMAND_RE.search(clause):
+            continue
+        if not pending and (
+            _VERIFICATION_REQ_NEGATION_RE.search(clause)
+            or _VERIFICATION_REQ_PRECEDING_NEGATION_RE.search(
+                clause[: subject.start()]
+            )
+            or _VERIFICATION_REQ_SATISFIED_RE.search(clause)
+        ):
+            continue
+        return True
+    return False
 
 
 class ControlPlaneAdmissionError(RuntimeError):
@@ -13678,6 +13793,55 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    # Gate: the executor's own admission. A completion whose summary/result
+    # says independent verification is still owed is refused whatever the
+    # task's enforcement flag says, and the task is escalated to
+    # gauntlet_enforced so the refusal holds on every later attempt too. The
+    # VerificationRequiredError is what every executor wrapper already turns
+    # into request_review, so the card lands in review, never done.
+    # Not applied to a reviewer run's approval, a verifier card's report, or a
+    # task already carrying a VERIFIED verdict: there the phrase describes
+    # someone else's work or a requirement already met.
+    if explicit_verification_requirement(summary, result):
+        arow = conn.execute(
+            "SELECT status, executor_lane, gauntlet_enforced, verification_state "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            arow is not None
+            and arow["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            and arow["verification_state"] != VERIFICATION_VERIFIED
+            and _review_run_verification(conn, task_id)[0] is None
+        ):
+            with write_txn(conn):
+                if not arow["gauntlet_enforced"]:
+                    conn.execute(
+                        "UPDATE tasks SET gauntlet_enforced = 1 WHERE id = ?",
+                        (task_id,),
+                    )
+                _append_event(
+                    conn, task_id, "completion_blocked_self_reported_unverified",
+                    {
+                        "status": arow["status"],
+                        "verification_state": arow["verification_state"],
+                        "gauntlet_escalated": not arow["gauntlet_enforced"],
+                        # First non-blank line of either field: the admission
+                        # may sit only in result behind a blank summary.
+                        "summary_preview": next(
+                            (
+                                line.strip()[:200]
+                                for line in f"{summary or ''}\n{result or ''}".splitlines()
+                                if line.strip()
+                            ),
+                            None,
+                        ),
+                    },
+                )
+            raise VerificationRequiredError(
+                task_id, arow["status"], arow["verification_state"]
+            )
 
     # Gate: the Gauntlet chain. A gauntlet-enforced task reaches 'done' only
     # from a VERIFIED verdict, so a bare running -> done completion claim by
