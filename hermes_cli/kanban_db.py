@@ -9326,6 +9326,9 @@ def grant_objective_attempts(
             "actor_id": actor_id,
             "authorization_source": "hermes kanban attempt-budget --grant",
             "granted_at": now_ts,
+            # What the failures behind this grant amounted to when it was made,
+            # so a later grant can be read against whether anything changed.
+            "failure_basis": _safe_objective_failure_basis(conn, root),
         }
         _append_event(conn, root, OBJECTIVE_ATTEMPT_GRANT_EVENT, payload)
     return payload
@@ -9344,6 +9347,283 @@ def _objective_attempt_ceiling_reached(conn: sqlite3.Connection, task_id: str) -
     limit = effective_objective_attempt_limit(conn, root)
     attempts = gauntlet_objective_attempts(conn, root)
     return attempts >= limit, attempts, limit, root
+
+
+# ---------------------------------------------------------------------------
+# Failure fingerprints for the attempt ceiling (2026-09-16, t_c574be85)
+# ---------------------------------------------------------------------------
+#
+# The ceiling counts capacity. It could not say whether the runs that spent it
+# were still failing the same way or had since been answered, so an operator
+# deciding a grant saw "6/6" for both. Two live cases: ``t_318800fe`` was
+# granted 6 -> 9 -> 12 with nothing checking whether its failure had changed,
+# and ``t_fe66575d`` (zero runs of its own) was blocked by a budget spent a week
+# earlier, before the corrected evidence it was created to check existed.
+#
+# Nothing here changes admission: the ceiling blocks exactly as before. It only
+# classifies the failed verdicts behind the exhaustion, so the block reason
+# (and every grant) records which of the two situations the operator is in.
+#
+# The fingerprint is derived from the append-only ``task_verifications`` ledger
+# plus the failing verifier's own report, so it needs no schema migration and
+# no backfill writes. Verdict ``reason`` strings from the codex_verify return
+# path are boilerplate ("independent verifier t_x returned FAIL"), so the
+# failing criteria are read from the verifier's result instead, and the
+# boilerplate is used only when no criteria can be parsed.
+
+FAILURE_BASIS_REPEATED = "REPEATED_FAILURE_UNRESOLVED"
+FAILURE_BASIS_UNRESOLVED = "FAILURE_UNRESOLVED"
+FAILURE_BASIS_EVIDENCE_UNVERIFIED = "CORRECTED_EVIDENCE_UNVERIFIED"
+FAILURE_BASIS_RESOLVED = "FAILURES_RESOLVED"
+FAILURE_BASIS_NONE = "NO_FAILED_VERDICTS"
+FAILURE_BASIS_UNAVAILABLE = "FAILURE_BASIS_UNAVAILABLE"
+
+#: Two failing criteria are the same criterion when their significant terms
+#: overlap at least this much (Jaccard). Verifiers restate a criterion in
+#: slightly different words between runs ("produces" / "yields").
+_FAILURE_CRITERION_MATCH = 0.6
+
+_FAILING_CRITERION_RE = re.compile(
+    r"[:\-—]\s*(FAIL|FAILED|BLOCKED|INSUFFICIENT)\b"
+)
+
+
+def failure_fingerprint(text: Optional[str]) -> dict[str, Any]:
+    """Failing criteria and a stable fingerprint for one failed verdict's report.
+
+    A failing criterion is a bullet line whose label is followed by a
+    ``FAIL``/``BLOCKED``/``INSUFFICIENT`` marker, e.g.
+    ``- **Live-status predicate:** **FAIL.** ...``. Summary lines such as
+    ``VERDICT: FAIL`` are not bullets and are ignored. When no criterion
+    parses, the whole text is the single criterion. Terms are normalised with
+    :func:`_error_signature_terms`, so ids, paths and counts do not make a
+    recurrence look novel.
+    """
+    criteria: list[dict[str, Any]] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line.startswith(("-", "*", "•")):
+            continue
+        line = line.lstrip("-*• ").replace("*", "").replace("`", "")
+        match = _FAILING_CRITERION_RE.search(line)
+        if match is None:
+            continue
+        label = line[: match.start()].strip(" :-—.") or line[match.end():].strip(" :-—.")
+        terms = sorted(_error_signature_terms(label))
+        if terms and all(c["terms"] != terms for c in criteria):
+            criteria.append({"label": label[:160], "terms": terms})
+    source = "criteria"
+    if not criteria:
+        terms = sorted(_error_signature_terms(text or ""))
+        source = "text"
+        if terms:
+            criteria.append({"label": (text or "").strip()[:160], "terms": terms})
+    digest = hashlib.sha256(
+        "\n".join(" ".join(c["terms"]) for c in sorted(criteria, key=lambda c: c["terms"]))
+        .encode("utf-8")
+    ).hexdigest()[:16] if criteria else ""
+    return {"fingerprint": digest, "criteria": criteria, "source": source}
+
+
+def _failed_verdict_report(conn: sqlite3.Connection, verdict: sqlite3.Row) -> str:
+    """The failing verifier's own report for a failed verdict row, else its reason."""
+    verifier_task = None
+    try:
+        verifier_task = (json.loads(verdict["evidence"] or "{}") or {}).get("verifier_task")
+    except (TypeError, ValueError, AttributeError):
+        verifier_task = None
+    if not verifier_task and str(verdict["verifier"] or "").startswith(
+        f"{EXECUTOR_LANE_CODEX_VERIFY}:"
+    ):
+        verifier_task = str(verdict["verifier"]).split(":", 1)[1]
+    if verifier_task:
+        row = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (str(verifier_task),)
+        ).fetchone()
+        if row is not None and (row["result"] or "").strip():
+            return str(row["result"])
+        run = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
+            "AND summary != '' ORDER BY id DESC LIMIT 1",
+            (str(verifier_task),),
+        ).fetchone()
+        if run is not None:
+            return str(run["summary"])
+    return str(verdict["reason"] or "")
+
+
+def _criteria_match(a: list, b: list) -> bool:
+    sa, sb = set(a), set(b)
+    union = sa | sb
+    return bool(union) and len(sa & sb) / len(union) >= _FAILURE_CRITERION_MATCH
+
+
+def objective_failure_ledger(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    """Every failed verdict in ``task_id``'s objective lineage, oldest first.
+
+    Each entry's ``status`` is decided by the next verdict on the same subject:
+
+    * ``resolved``         -- the next judging verdict was VERIFIED;
+    * ``refailed``         -- the next judging verdict failed again (that later
+                              failure carries the current state);
+    * ``evidence_pending`` -- evidence was handed off again (a later
+                              ``pending`` row) and no verifier has judged it;
+    * ``open``             -- nothing has happened on the subject since.
+
+    ``repeats`` lists earlier failed verdicts in the lineage that failed on a
+    matching criterion, with the matching labels.
+    """
+    root = _objective_lineage_root(conn, task_id)
+    members = sorted(_objective_lineage_members(conn, root))
+    rows: list[sqlite3.Row] = []
+    for i in range(0, len(members), _LINEAGE_SQL_CHUNK):
+        batch = members[i:i + _LINEAGE_SQL_CHUNK]
+        marks = ",".join("?" * len(batch))
+        rows.extend(conn.execute(
+            f"SELECT id, task_id, state, verifier, evidence, reason, created_at "
+            f"FROM task_verifications WHERE task_id IN ({marks}) AND kind = 'verdict' "
+            f"ORDER BY id",
+            tuple(batch),
+        ).fetchall())
+    rows.sort(key=lambda r: int(r["id"]))
+    ledger: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        if row["state"] != VERIFICATION_FAILED:
+            continue
+        status = "open"
+        for later in rows[idx + 1:]:
+            if later["task_id"] != row["task_id"]:
+                continue
+            if later["state"] == VERIFICATION_VERIFIED:
+                status = "resolved"
+                break
+            if later["state"] == VERIFICATION_FAILED:
+                status = "refailed"
+                break
+            if later["state"] == VERIFICATION_PENDING:
+                status = "evidence_pending"
+        fp = failure_fingerprint(_failed_verdict_report(conn, row))
+        repeats: list[dict[str, Any]] = []
+        for earlier in ledger:
+            labels = [
+                c["label"] for c in fp["criteria"]
+                if any(_criteria_match(c["terms"], e["terms"]) for e in earlier["criteria"])
+            ]
+            if labels:
+                repeats.append({"verification_id": earlier["verification_id"], "criteria": labels})
+        ledger.append({
+            "verification_id": int(row["id"]),
+            "subject": str(row["task_id"]),
+            "verifier": row["verifier"],
+            "failed_at": int(row["created_at"]),
+            "status": status,
+            "fingerprint": fp["fingerprint"],
+            "fingerprint_source": fp["source"],
+            "criteria": fp["criteria"],
+            "repeats": repeats,
+        })
+    return ledger
+
+
+def objective_failure_basis(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """What the failed verdicts behind this objective's budget currently amount to.
+
+    Ordered most-conservative first: any still-open failure outranks corrected
+    evidence elsewhere in the lineage, and an open failure that repeats an
+    earlier one outranks both. Informational only -- it never admits a claim.
+    """
+    ledger = objective_failure_ledger(conn, task_id)
+    current = [e for e in ledger if e["status"] != "refailed"]
+    counts = {
+        s: sum(1 for e in ledger if e["status"] == s)
+        for s in ("resolved", "refailed", "evidence_pending", "open")
+    }
+    repeated = [e for e in ledger if e["repeats"]]
+    open_ = [e for e in current if e["status"] == "open"]
+    pending = [e for e in current if e["status"] == "evidence_pending"]
+    if not ledger:
+        basis = FAILURE_BASIS_NONE
+    elif any(e["repeats"] for e in open_):
+        basis = FAILURE_BASIS_REPEATED
+    elif open_:
+        basis = FAILURE_BASIS_UNRESOLVED
+    elif pending:
+        basis = FAILURE_BASIS_EVIDENCE_UNVERIFIED
+    else:
+        basis = FAILURE_BASIS_RESOLVED
+    return {
+        "basis": basis,
+        "failed_verdicts": len(ledger),
+        "superseded": counts["resolved"] + counts["refailed"] + counts["evidence_pending"],
+        **counts,
+        "repeated": len(repeated),
+        "open_verifications": [e["verification_id"] for e in open_],
+        "evidence_pending_verifications": [e["verification_id"] for e in pending],
+        "fingerprints": [
+            {k: e[k] for k in ("verification_id", "subject", "status", "fingerprint",
+                               "fingerprint_source")}
+            | {"criteria": [c["label"] for c in e["criteria"]],
+               "repeats": [r["verification_id"] for r in e["repeats"]]}
+            for e in ledger
+        ],
+    }
+
+
+def _safe_objective_failure_basis(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """:func:`objective_failure_basis` for the claim/grant paths, which must not raise."""
+    try:
+        return objective_failure_basis(conn, task_id)
+    except Exception as exc:
+        return {"basis": FAILURE_BASIS_UNAVAILABLE, "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def _describe_failure_basis(summary: dict[str, Any]) -> str:
+    """One operator-facing sentence distinguishing why the budget is exhausted."""
+    basis = summary.get("basis")
+    m = summary.get("failed_verdicts", 0)
+
+    def _where(ids: list) -> str:
+        subjects = {f["verification_id"]: f["subject"] for f in summary.get("fingerprints", [])}
+        return ", ".join(f"verification {i} on {subjects.get(i, '?')}" for i in ids)
+
+    if basis == FAILURE_BASIS_REPEATED:
+        return (
+            f"Failure basis: {basis} -- the unresolved failed verdict(s) "
+            f"({_where(summary['open_verifications'])}) repeat failing criteria from "
+            f"earlier verdicts in this lineage, and no new evidence has been handed "
+            f"off since. More attempts would repeat a known failure; change the "
+            f"approach before granting."
+        )
+    if basis == FAILURE_BASIS_UNRESOLVED:
+        return (
+            f"Failure basis: {basis} -- {len(summary['open_verifications'])} of {m} "
+            f"failed verdict(s) are still unresolved with no new evidence handed off "
+            f"since ({_where(summary['open_verifications'])}); {summary['resolved']} "
+            f"were resolved by a later VERIFIED verdict."
+        )
+    if basis == FAILURE_BASIS_EVIDENCE_UNVERIFIED:
+        return (
+            f"Failure basis: {basis} -- all {m} failed verdict(s) consuming this budget "
+            f"have since been superseded ({summary['resolved']} resolved by a later "
+            f"VERIFIED verdict, {summary['refailed']} by a later verdict, "
+            f"{summary['evidence_pending']} by new evidence handed off after the "
+            f"failure that no verifier has judged yet: failed "
+            f"{_where(summary['evidence_pending_verifications'])}); "
+            f"{summary['repeated']} of them repeated earlier failing criteria. The "
+            f"exhaustion was spent before that evidence existed -- an operator may "
+            f"grant on that basis rather than on raw exhaustion."
+        )
+    if basis == FAILURE_BASIS_RESOLVED:
+        return (
+            f"Failure basis: {basis} -- all {m} failed verdict(s) were resolved by a "
+            f"later VERIFIED verdict; the exhaustion is capacity, not an open failure."
+        )
+    if basis == FAILURE_BASIS_NONE:
+        return (
+            f"Failure basis: {basis} -- no failed verdict spent this budget, so there "
+            f"is no failure fingerprint to compare."
+        )
+    return f"Failure basis: {FAILURE_BASIS_UNAVAILABLE} -- could not be computed."
 
 
 def _in_flight_verifier_for_subject(
@@ -9401,11 +9681,13 @@ def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> 
     reached, attempts, limit, root = _objective_attempt_ceiling_reached(conn, task_id)
     if not reached:
         return
+    # Classifies the exhaustion; it never changes whether the ceiling blocks.
+    failure_basis = _safe_objective_failure_basis(conn, root)
     reason = (
         f"ATTEMPT_BUDGET_EXHAUSTED: {attempts} total runs against objective "
         f"lineage {root} (limit {limit}). This is NOT a failure verdict -- "
         f"automation has spent its budget on this objective and continuing "
-        f"requires an operator decision."
+        f"requires an operator decision. {_describe_failure_basis(failure_basis)}"
     )
     for tid in dict.fromkeys((root, task_id)):
         row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
@@ -9432,6 +9714,7 @@ def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> 
         )
         _append_event(conn, tid, "objective_attempt_ceiling_reached", {
             "objective": root, "attempts": attempts, "limit": limit,
+            "failure_basis": failure_basis,
         })
         _append_event(conn, tid, "blocked", {
             "reason": reason,
@@ -16132,6 +16415,14 @@ def _extract_lesson_on_failure(
             }
             if payload:
                 provenance["verifier_evidence"] = redact_review_value(payload)
+            if verification_id is not None:
+                # The same fingerprint objective_failure_ledger derives for the
+                # attempt ceiling, snapshotted at the moment of failure.
+                fp = failure_fingerprint(_failed_verdict_report(conn, verdict))
+                provenance["failure_fingerprint"] = fp["fingerprint"]
+                provenance["failing_criteria"] = redact_review_value(
+                    [c["label"] for c in fp["criteria"]]
+                )
             now = int(time.time())
             cur = conn.execute(
                 """
