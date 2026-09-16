@@ -1757,9 +1757,11 @@ class RuntimeCeilingsMatchDoctrine(Invariant):
     def check(self, ctx: Context) -> list[Finding]:
         expected = ctx.config.get("expected_runtime_config") or {}
         out: list[Finding] = []
+        runtime_python = ctx.hermes_home / "hermes-agent-next" / "venv" / "bin" / "python"
+        python_exe = str(runtime_python) if runtime_python.exists() else sys.executable
         for key, want in expected.items():
             rc, text = ctx.run_command(
-                [sys.executable, "-m", "hermes_cli.main", "config", "get", key], 30,
+                [python_exe, "-m", "hermes_cli.main", "config", "get", key], 30,
             )
             value = next((ln.strip() for ln in reversed(text.splitlines())
                           if ln.strip() and "1Password" not in ln), "")
