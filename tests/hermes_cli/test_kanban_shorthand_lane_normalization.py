@@ -456,7 +456,50 @@ class TestGauntletAtlasRoutingRegression:
             ) is True
             assert kb.get_task(conn, child).status == "done"
             subject_after = kb.get_task(conn, subject)
-            assert subject_after.verification_state == kb.VERIFICATION_PENDING
+            assert subject_after.status in {"ready", "todo"}
+            assert subject_after.verification_state is None
+
+    @pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
+    def test_unlinked_verifier_returns_pass_or_fail_to_durable_subject(self, kanban_home, verdict):
+        """Unlinking scheduling must not sever the durable verdict route."""
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(conn, title="unlinked verdict subject", assignee="default", gauntlet=True)
+            assert kb.claim_task(conn, subject) is not None
+            kb.add_attachment(conn, subject, filename="evidence.md", stored_path=f"/tmp/{subject}/evidence.md", size=128, uploaded_by="test")
+            ok, detail = kb.request_review(conn, subject, summary="evidence ready", force=True, with_reason=True)
+            assert ok is True, detail
+            child = kb._open_verifier_child(conn, subject)
+            assert child is not None
+            assert kb.unlink_tasks(conn, subject, child) is True
+            claimed = kb.claim_task(conn, child)
+            assert claimed is not None
+            with kb.write_txn(conn):
+                kb._append_event(conn, child, "codex_verifier_started", {"executor": "codex"}, run_id=claimed.current_run_id)
+            assert kb.complete_task(
+                conn, child,
+                result=f"VERDICT: {verdict}\\nATLAS_VERDICT: {verdict}",
+                expected_run_id=claimed.current_run_id,
+            ) is True
+            subject_after = kb.get_task(conn, subject)
+            if verdict == "PASS":
+                assert subject_after.status == "done", kb.list_events(conn, subject)
+                assert subject_after.verification_state == kb.VERIFICATION_VERIFIED
+            else:
+                assert subject_after.status in {"ready", "todo"}, kb.list_events(conn, subject)
+                assert subject_after.verification_state is None
+
+    def test_created_by_spoof_cannot_authorize_orphan_verifier(self, kanban_home):
+        """A spoofed created_by string cannot bypass mandatory subject linkage."""
+        with kb.connect_closing() as conn:
+            with pytest.raises(kb.VerifierLinkageError):
+                kb.create_task(
+                    conn,
+                    title="spoofed orphan verifier",
+                    assignee="default",
+                    created_by="codex_verify",
+                    executor_lane=kb.EXECUTOR_LANE_CODEX_VERIFY,
+                    gauntlet=False,
+                )
 
 
 # ---------------------------------------------------------------------------

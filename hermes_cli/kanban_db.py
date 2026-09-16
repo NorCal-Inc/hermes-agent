@@ -6804,7 +6804,19 @@ def verifier_subject_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     function keeps the guard, the watchdog and
     :func:`_return_verifier_verdict_to_subjects` anchored to one definition.
     """
-    return parent_ids(conn, task_id)
+    # The dependency edge is a scheduling mechanism and may be removed before
+    # the verifier is dispatched.  The durable ``verifies`` relation is the
+    # governance attribution and must remain the source of truth for verdict
+    # return.  Keep the live edge as a compatibility fallback for legacy rows
+    # created before the relation ledger existed, and deduplicate deterministically.
+    subject_ids = set(parent_ids(conn, task_id))
+    rows = conn.execute(
+        "SELECT to_task_id FROM task_relations "
+        "WHERE from_task_id = ? AND relation = ?",
+        (task_id, RELATION_VERIFIES),
+    ).fetchall()
+    subject_ids.update(row["to_task_id"] for row in rows)
+    return sorted(subject_ids)
 
 
 def missing_verifier_linkage(
@@ -11688,7 +11700,13 @@ def _resolve_lane_verifier_identity(
             f"{identity!r} does not resolve to a completed codex_verify task "
             f"whose completing run was executed by the codex_verify lane"
         )
-    if subject_id in parent_ids(conn, ref):
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ? "
+        "UNION ALL SELECT 1 FROM task_relations "
+        "WHERE from_task_id = ? AND to_task_id = ? AND relation = ? LIMIT 1",
+        (subject_id, ref, ref, subject_id, RELATION_VERIFIES),
+    ).fetchone()
+    if linked is not None:
         return None
     if _historical_orphan_subject_candidate(conn, ref) == subject_id:
         return None
@@ -12756,18 +12774,7 @@ def _return_verifier_verdict_to_subjects(
         ).fetchone()
         if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
             return
-        subjects = parent_ids(conn, verifier_task_id)
-        if not subjects:
-            # The dependency edge is removed before dispatch. Preserve verdict
-            # delivery through the append-only governance relation created while
-            # that edge was present; without this fallback the verifier could
-            # complete but its subject would remain pending forever.
-            relation_rows = conn.execute(
-                "SELECT to_task_id FROM task_relations "
-                "WHERE from_task_id = ? AND relation = ?",
-                (verifier_task_id, RELATION_VERIFIES),
-            ).fetchall()
-            subjects = [row["to_task_id"] for row in relation_rows]
+        subjects = verifier_subject_ids(conn, verifier_task_id)
         if not subjects:
             return
         verdict = _parse_verifier_verdict(summary, result)
