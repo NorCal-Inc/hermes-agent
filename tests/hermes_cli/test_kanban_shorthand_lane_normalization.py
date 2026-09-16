@@ -419,6 +419,45 @@ class TestGauntletAtlasRoutingRegression:
                 raise AssertionError("orphan codex_verify card bypassed completion gate")
             assert kb.get_task(conn, tid).status != "done"
 
+    def test_unlinked_request_review_verifier_uses_durable_relation(self, kanban_home):
+        """The verifier exemption survives unlink without weakening orphan checks."""
+        with kb.connect_closing() as conn:
+            subject = kb.create_task(
+                conn, title="subject", assignee="default", gauntlet=True,
+            )
+            assert kb.claim_task(conn, subject) is not None
+            kb.add_attachment(
+                conn, subject, filename="evidence.md",
+                stored_path=f"/tmp/{subject}/evidence.md", size=128,
+                uploaded_by="test",
+            )
+            ok, detail = kb.request_review(
+                conn, subject, summary="evidence ready", force=True, with_reason=True,
+            )
+            assert ok is True, detail
+            child = kb._open_verifier_child(conn, subject)
+            assert child is not None
+            assert kb.task_relations(
+                conn, child, relation=kb.RELATION_VERIFIES,
+            )[0]["to_task_id"] == subject
+            assert kb.unlink_tasks(conn, subject, child) is True
+            assert kb.gauntlet_required(conn, child) is False
+            claimed_child = kb.claim_task(conn, child)
+            assert claimed_child is not None
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn, child, "codex_verifier_started", {"executor": "codex"},
+                    run_id=claimed_child.current_run_id,
+                )
+            assert kb.complete_task(
+                conn, child,
+                result="VERDICT: FAIL\nATLAS_VERDICT: FAIL",
+                expected_run_id=claimed_child.current_run_id,
+            ) is True
+            assert kb.get_task(conn, child).status == "done"
+            subject_after = kb.get_task(conn, subject)
+            assert subject_after.verification_state == kb.VERIFICATION_PENDING
+
 
 # ---------------------------------------------------------------------------
 # assign_task honors the Gauntlet-subject carve-out too (2026-09-14)

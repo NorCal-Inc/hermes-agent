@@ -10677,21 +10677,24 @@ def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
     if row is None:
         return False
     if row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
-        # A codex_verify card is exempt from recursive verifier-of-verifier
-        # gating ONLY when it is actually linked to a subject.  A Gauntlet
-        # subject that was accidentally relabelled into the verifier lane
-        # must not inherit this exemption and complete on its own FAIL report.
-        # This is the mechanical backstop for the t_a0e4c47b failure.
+        # The dependency edge is deliberately removed before dispatch so the
+        # subject's completion state cannot gate its verifier.  The exemption
+        # therefore keys on the append-only governance relation created while
+        # the dependency still existed, not on the current task_links graph.
+        # An arbitrary/relabelled or orphan codex card cannot mint this relation
+        # because add_task_relation(RELATION_VERIFIES) requires the live edge.
+        verified_subject = conn.execute(
+            "SELECT 1 FROM task_relations "
+            "WHERE from_task_id = ? AND relation = ? LIMIT 1",
+            (task_id, RELATION_VERIFIES),
+        ).fetchone()
         linked_subject = conn.execute(
             "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,)
         ).fetchone()
-        if linked_subject is not None:
+        if verified_subject is not None or linked_subject is not None:
             return False
-        # An unlinked verifier-labelled card has no subject to receive its
-        # verdict.  It is therefore not a verifier artifact at all; keep the
-        # normal completion gate even when the card's own Gauntlet flag is
-        # false.  This closes the orphan escape hatch independently of the
-        # board-wide/per-card enforcement setting.
+        # No durable subject attribution means this is not a verifier artifact;
+        # preserve the orphan guard regardless of the board-wide flag.
         return True
     if row["gauntlet_enforced"]:
         return True
@@ -11896,6 +11899,18 @@ def _ensure_independent_verifier_child(
                 {"error": str(exc)[:500], "lane": EXECUTOR_LANE_CODEX_VERIFY},
             )
         return None
+    try:
+        add_task_relation(
+            conn, child_id, subject_id, RELATION_VERIFIES,
+            created_by="kanban:request_review",
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        with write_txn(conn):
+            _append_event(
+                conn, subject_id, "independent_verifier_relation_failed",
+                {"verifier_task": child_id, "error": str(exc)[:500]},
+            )
+        return None
     with write_txn(conn):
         _append_event(
             conn, subject_id, "independent_verifier_child_created",
@@ -12217,6 +12232,17 @@ def _return_verifier_verdict_to_subjects(
         if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
             return
         subjects = parent_ids(conn, verifier_task_id)
+        if not subjects:
+            # The dependency edge is removed before dispatch. Preserve verdict
+            # delivery through the append-only governance relation created while
+            # that edge was present; without this fallback the verifier could
+            # complete but its subject would remain pending forever.
+            relation_rows = conn.execute(
+                "SELECT to_task_id FROM task_relations "
+                "WHERE from_task_id = ? AND relation = ?",
+                (verifier_task_id, RELATION_VERIFIES),
+            ).fetchall()
+            subjects = [row["to_task_id"] for row in relation_rows]
         if not subjects:
             return
         verdict = _parse_verifier_verdict(summary, result)
