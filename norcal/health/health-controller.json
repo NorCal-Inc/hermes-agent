@@ -231,7 +231,7 @@
     "~/.hermes/scripts/life-wiki-github-sync.sh": "2cbacc4865f4596891954e4b4acf852d88da73b7e061dab39d6f9b060a48f0ee",
     "~/.hermes/scripts/nuclear_backup.sh": "2bc479f3101f68330a7bf65c55a29c31d7c5af1f8c7c72e5c30e7933acd7dfce",
     "~/.hermes/scripts/dr-backup-verify.sh": "a4d3cee1ea4676b067a37b8d19501ff5c0312048dae02b63be393b516ce31007",
-    "~/.hermes/scripts/deploy-drift-check.sh": "e7e472608020ef173c14904b01e8ce2c9532206c4ec9b6e2cba002e500490b1f",
+    "~/.hermes/scripts/deploy-drift-check.sh": "83bac14fc206bec8efad3b32a268b23040f117a1af26a96f92df8e55dda964fb",
     "~/.hermes/scripts/life-wiki-nightly-validate.sh": "83356d5c9f1f46a2042e4f69cd3c42f7b7da30dd05027ee0f27ecce23fd18b2b",
     "~/.hermes/scripts/gauntlet-progress-census-delayed.sh": "eb43ee839cb50f7e3e19e57e389fbfd951ae4244a8544360968c33ba791c8f2b",
     "~/.hermes/scripts/executive-significant-change-watch.py": "6603f24ca71ad6e4239e27dfaf54d05c23d9b41f1ed9bc55762fd614591f8959",

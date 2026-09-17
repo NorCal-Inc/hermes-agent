@@ -1960,6 +1960,37 @@ class TestRepositoryDrift:
         assert shc.RepositoryDrift().check(_ctx(kanban_home, clock=time.time, config=config,
                                                 run_command=shc.run_command)) == []
 
+    def test_unverified_verdict_is_distinct_from_drift_and_not_silently_healthy(self, kanban_home, tmp_path):
+        """Health finding t_a9ef4620 / fingerprint 7350d7ecd2f30810: deploy-drift-check.sh
+        now writes verdict UNVERIFIED (not DRIFT) when a git inspection failure -- e.g.
+        dubious ownership -- prevented it from confirming sync state. This must still
+        surface as a finding (fail-closed, never treated as healthy) but with a distinct
+        signature/fingerprint from a confirmed DRIFT verdict, so the two are never
+        conflated by anything consuming the heartbeat."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        state = tmp_path / "drift.json"
+        state.write_text(json.dumps({"verdict": "UNVERIFIED",
+                                     "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}),
+                         encoding="utf-8")
+        config = {"repository_drift": {"deploy_drift_state": str(state),
+                                       "watched_repositories": [{"name": "r", "path": str(repo), "upstream": None}]}}
+        findings = shc.RepositoryDrift().check(_ctx(kanban_home, clock=time.time, config=config,
+                                                     run_command=shc.run_command))
+        assert _signatures(findings) == [("deploy-drift-check", "deploy_drift_verdict:UNVERIFIED")]
+        unverified_fp = findings[0].fingerprint
+        drift_state = tmp_path / "drift-confirmed.json"
+        drift_state.write_text(json.dumps({"verdict": "DRIFT",
+                                           "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}),
+                               encoding="utf-8")
+        drift_config = {"repository_drift": {"deploy_drift_state": str(drift_state),
+                                             "watched_repositories": [{"name": "r", "path": str(repo),
+                                                                       "upstream": None}]}}
+        drift_findings = shc.RepositoryDrift().check(_ctx(kanban_home, clock=time.time, config=drift_config,
+                                                           run_command=shc.run_command))
+        assert drift_findings[0].fingerprint != unverified_fp
+
 
 ISOLATION_COMPANIES = {
     "ENT-003": {"tokens": ["logos"], "lead_profiles": ["logos_covenant_lead"]},
