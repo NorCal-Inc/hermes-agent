@@ -9,6 +9,11 @@ No LLM; silent when GREEN.
 - `system_health_controller.py` — controller, invariants, CLI (`run --tier light|deep [--dry-run] [--json]`, `status`).
 - `health-controller.json` — watched jobs/timers, doctrine runtime ceilings, `alert_target` (the Hermes Telegram "Alerts" group, the `TELEGRAM_ALERTS_CHAT_ID` channel the gateway watchdog and post-update health check already use; if that id changes, update both).
 - `systemd/` — user unit templates: light pass every 5 min, deep pass hourly, `OnFailure=` alert. Installed as user units (Phase E Gate 6, 2026-09-14).
+- `scripts/` — canonical source for standalone watcher scripts the `repository_drift` and `watcher_integrity`
+  invariants depend on (`deploy-drift-check.sh` + `deploy-drift-check-selftest.sh`, fingerprint 7350d7ecd2f30810,
+  kanban `t_a9ef4620`/`t_9891fa93`). Deployed by copying to `~/.hermes/scripts/`, pinned there by sha256 in
+  `pinned_scripts` in `health-controller.json` — keep both in sync when the script changes: edit here, redeploy the
+  copy, then update the pin to the new file's sha256.
 
 ## v1 scope (Christopher, 2026-09-14)
 
