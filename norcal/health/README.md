@@ -60,12 +60,9 @@ authorization change.
 files on a non-company card; the historical inventory) are `unsafe`: never covered by a governed exception,
 escalated at once. Filenames are never recorded — card ids and counts only.
 
-### F3 bounded recovery classes (Christopher, 2026-09-14) — built and tested, NOT authorized live
+### F3 bounded recovery classes — LIVE AUTHORIZED (Christopher, 2026-09-19)
 
-`recovery_classes` in `health-controller.json` lists six classes, **all `enabled: false`**. A class runs only
-when `enabled: true`, `authorized_by` is set and `authorization_sha256` equals
-`recovery_authorization_digest(name, spec)` (scope, allowlists and bounds pinned); an enabled class that fails
-validation runs nothing and reports `recovery_class_authorization_valid` (DEGRADED). Print them with
+`recovery_classes` in `health-controller.json` lists six bounded classes. Christopher authorized them live on 2026-09-19 under their existing allowlists, bounds and postconditions. Each class runs only when `enabled: true`, `authorized_by` is set and `authorization_sha256` equals `recovery_authorization_digest(name, spec)`; invalid authorization runs nothing and reports `recovery_class_authorization_valid` (DEGRADED). Recovery is attempted before escalation. Controller-created health cards automatically archive through the governed `overtaken_by_events` path after the underlying detector is verified clear. Telegram escalation is reserved for unresolved, refused, unsafe, or out-of-authority conditions. Print them with
 `venv/bin/python norcal/health/system_health_controller.py recoveries`.
 
 | Class | Detector condition | Mutation | Postcondition |

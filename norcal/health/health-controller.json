@@ -343,10 +343,10 @@
   },
   "max_recovery_mutations_per_pass": 1,
   "recovery_classes": {
-    "status": "F3 built and tested only (Christopher, 2026-09-14). NOT authorized for live execution: enabling a class requires Christopher's explicit per-class authorization, authorized_by, enabled true and a re-pinned authorization_sha256 (recovery_authorization_digest). Escalate-only conditions have no class.",
+    "status": "LIVE AUTHORIZED 2026-09-19: bounded recovery first; verified-clear controller cards auto-archive; Telegram only after unresolved/refused/out-of-bound conditions.",
     "gateway_restart": {
-      "enabled": false,
-      "authorized_by": "",
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard, 2026-09-19, in session: attempt bounded automatic resolution first; alert Telegram only when unresolved/refused/outside authorization",
       "unit": "hermes-gateway.service",
       "restart_command": [
         "/home/chris/.hermes/hermes-agent-next/venv/bin/python",
@@ -363,11 +363,12 @@
         "telegram",
         "api_server",
         "webhook"
-      ]
+      ],
+      "authorization_sha256": "5e0b5982fd19767a3f86c5304700d31cc4301b9baddcfa4d5d227958b4422f87"
     },
     "shared_service_restart": {
-      "enabled": false,
-      "authorized_by": "",
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard, 2026-09-19, in session: attempt bounded automatic resolution first; alert Telegram only when unresolved/refused/outside authorization",
       "cooldown_seconds": 600,
       "postcondition_timeout_seconds": 60,
       "services": {
@@ -383,21 +384,22 @@
         "norcal-opsbridge.service": {
           "health_url": null
         }
-      }
+      },
+      "authorization_sha256": "6006b2faa79265e01691e098acbbb5ee5c3d79f7e23416fd8c45d009f8ee2e3b"
     },
     "lease_reconciliation": {
-      "enabled": false,
-      "authorized_by": "",
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard, 2026-09-19, in session: attempt bounded automatic resolution first; alert Telegram only when unresolved/refused/outside authorization",
       "reconcile": [
         "claims",
         "detached_runs",
         "executions"
-      ]
+      ],
+      "authorization_sha256": "b690695e9b5f73b8e5efd03595f9b094f032d98ae32c10959ffd32371eabd5ac"
     },
     "life_wiki_retry": {
       "enabled": true,
-      "authorized_by": "Christopher Hubbard",
-      "authorization_sha256": "5199c8ebc5c1c4ae9c2a8f34b8efb224fd0b92f0b2904acb24f2f6aa6352c149",
+      "authorized_by": "Christopher Hubbard, 2026-09-19, in session: attempt bounded automatic resolution first; alert Telegram only when unresolved/refused/outside authorization",
       "daily_note_job": "nightly-executive-continuity-reconciliation",
       "validation_jobs": [
         "life-wiki-daily-validation"
@@ -407,11 +409,12 @@
         "/home/chris/.hermes/scripts/life-wiki-daily-validator.py",
         "--date",
         "{date}"
-      ]
+      ],
+      "authorization_sha256": "33df1dca244ab40bf7429d810f7d64495ada8b373d02bb516b9be03c06ac0e51"
     },
     "vault_git_sync": {
-      "enabled": false,
-      "authorized_by": "",
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard, 2026-09-19, in session: attempt bounded automatic resolution first; alert Telegram only when unresolved/refused/outside authorization",
       "repositories": {
         "life-wiki-vault": {
           "path": "/home/chris/services/life-wiki/vault",
@@ -419,11 +422,12 @@
           "branch": "main"
         }
       },
-      "note": "F4: the vault is watched by repository_drift with the same upstream and a 2700 s change grace (three life-wiki-github-sync intervals), so this class validates; it stays disabled and never commits, resets or force-pushes."
+      "note": "F4: the vault is watched by repository_drift with the same upstream and a 2700 s change grace (three life-wiki-github-sync intervals), so this class validates; it stays disabled and never commits, resets or force-pushes.",
+      "authorization_sha256": "24e62acdd1ccf69afe6b8ff692720cdeed2b3a8bf9af7eac284e98bae0b50db6"
     },
     "evidence_attachment": {
-      "enabled": false,
-      "authorized_by": "",
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard, 2026-09-19, in session: attempt bounded automatic resolution first; alert Telegram only when unresolved/refused/outside authorization",
       "max_files": 5,
       "max_bytes": 1048576,
       "patterns": [
@@ -432,7 +436,8 @@
         "*EVIDENCE*.json",
         "*evidence*.json",
         "*REGRESSION*.txt"
-      ]
+      ],
+      "authorization_sha256": "06e14413232f4ed8aecf21c904638decb3ceed51047a2133c433ec8c163d4d33"
     }
   }
 }

@@ -1139,6 +1139,7 @@ class Controller:
         history[fp] = {"recovered_ts": now, "recovery_class": klass.name, "attempts": rec.get("attempts")}
         result.recovered.append(fp)
         self.store.record(now, "green", fingerprint=fp, via=via, recovery_class=klass.name)
+        self._archive_resolved_health_card(fp, rec, via=via)
 
     # -- HOLD ----------------------------------------------------------------
 
@@ -1188,6 +1189,42 @@ class Controller:
             self._process(carrier, aggregate, state, result)
         self._resolve_absent(carrier, present, state, result)
 
+    def _archive_resolved_health_card(self, fp: str, rec: dict, *, via: str) -> None:
+        """Archive this controller's triage card after the underlying condition is verified clear.
+
+        This never claims task execution.  It uses the governed overtaken-by-events
+        disposition, preserving the original card, events and evidence while keeping the
+        operational board free of already-resolved controller findings.
+        """
+        card_id = rec.get("card_id")
+        if not card_id or rec.get("route") == ROUTE_COMPANY:
+            return
+        kb = _kb()
+        try:
+            with self.ctx.kanban() as conn:
+                row = conn.execute(
+                    "SELECT created_by, idempotency_key, status FROM tasks WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                if row is None or row["status"] == "archived":
+                    return
+                expected_prefix = f"health:{rec.get('invariant')}:"
+                if row["created_by"] != CONTROLLER_ID or not str(row["idempotency_key"] or "").startswith(expected_prefix):
+                    self.store.record(self.ctx.now(), "card_archive_refused", fingerprint=fp,
+                                      card_id=card_id, reason="not_controller_owned")
+                    return
+                ok, refusal = kb.reconcile_overtaken_by_events(
+                    conn, card_id, actor=CONTROLLER_ID,
+                    reason="Health-controller condition verified clear; no further operator action is required.",
+                    evidence=f"fingerprint={fp}; resolution={via}; controller state revalidated the detector as clear",
+                    superseded_by=[fp],
+                )
+                self.store.record(self.ctx.now(), "card_archived" if ok else "card_archive_refused",
+                                  fingerprint=fp, card_id=card_id, reason=refusal or via)
+        except Exception as exc:
+            self.store.record(self.ctx.now(), "card_archive_error", fingerprint=fp,
+                              card_id=card_id, error=f"{type(exc).__name__}: {str(exc)[:200]}")
+
     def _resolve_absent(self, inv: Invariant, present: set[str], state: dict, result: PassResult) -> None:
         now = self.ctx.now()
         for fp, rec in state["fingerprints"].items():
@@ -1200,6 +1237,7 @@ class Controller:
                 rec["resolved_at"] = _iso(now)
                 result.resolved.append(fp)
                 self.store.record(now, "green", fingerprint=fp, via="condition_cleared")
+                self._archive_resolved_health_card(fp, rec, via="condition_cleared")
 
 
 def alert_text(finding: Finding, rec: dict) -> tuple[str, str]:
