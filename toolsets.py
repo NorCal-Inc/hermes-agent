@@ -91,6 +91,28 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
 ]
 
+# The permanent narrow waist: the only tools that must ALWAYS stay in the
+# model-facing schema and may never be deferred into the Tool Search catalog.
+#
+# This is deliberately NOT the same list as _HERMES_CORE_TOOLS above. That list
+# is what a platform bundle GRANTS; this list is what stays VISIBLE. Collapsing
+# the two removes ~50 tools from every platform bundle instead of deferring
+# them, so they stop being discoverable at all (measured 2026-09-20:
+# tool_search for write_file/patch/kanban_complete/todo under hermes-cli
+# returned total_available=0). Progressive discovery needs a small visible core
+# AND a reachable catalog behind it -- granting less is capability loss, not
+# discovery.
+_HERMES_NEVER_DEFER = [
+    "terminal", "read_file", "write_file", "patch", "search_files",
+    "todo", "memory", "browser_navigate", "web_search", "session_search",
+    "clarify", "execute_code", "delegate_task",
+    # NOTE: "send_message" appears in tests/tools/test_tool_search.py's
+    # never-defer list but is not a real tool -- no toolset grants it and the
+    # registry has no entry, so that assertion passes vacuously. It is
+    # deliberately NOT included here; adding it would make every platform fail
+    # the waist-is-granted check below for a name that does not exist.
+]
+
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
 # constrained to avoid local file/system execution by prompt injection.

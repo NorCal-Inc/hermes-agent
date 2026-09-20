@@ -229,6 +229,22 @@ def _run_async(coro):
 
 discover_builtin_tools()
 
+# Apply the declarative governance tags once, immediately after registration and
+# before any schema or catalog can be exposed. Governance lives in one
+# reviewable file (~/.hermes/tool-registry/registry.yaml) rather than spread
+# across ~100 register() call sites. Best-effort by design: a missing or
+# malformed declaration leaves every tool at its registered default and never
+# fails a boot. Verified by ~/.hermes/tool-registry/compound.py
+# reconcile_registry, which reports any drift between the two.
+_governance_applied = registry.apply_governance_declarations()
+if _governance_applied.get("error"):
+    logger.debug("governance declarations not applied: %s",
+                 _governance_applied["error"])
+else:
+    logger.debug("governance declarations applied to %d/%d tools",
+                 _governance_applied.get("applied", 0),
+                 _governance_applied.get("declared", 0))
+
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
 # internally uses a blocking future.result(timeout=120) wait, and the
@@ -368,6 +384,7 @@ def get_tool_definitions(
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
                 registry._generation,
+                registry.governance_fingerprint(),
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),

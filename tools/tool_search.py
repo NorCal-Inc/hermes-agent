@@ -7,8 +7,9 @@ tools array by three bridge tools — ``tool_search``, ``tool_describe``,
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+* Waist tools defined in ``toolsets._HERMES_NEVER_DEFER`` are *never* deferred.
+  Always-load means always-load. No exceptions. (This is the narrow visible
+  waist, not ``_HERMES_CORE_TOOLS``, which is what a platform bundle grants.)
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -191,12 +192,16 @@ def load_config() -> ToolSearchConfig:
 def _core_tool_names() -> frozenset[str]:
     """Return the set of tool names that must NEVER be deferred.
 
+    This is the narrow permanent waist (``_HERMES_NEVER_DEFER``), NOT the
+    platform bundle list (``_HERMES_CORE_TOOLS``) -- the two are different
+    concepts and conflating them strips capability instead of deferring it.
+
     Imported lazily because ``toolsets`` imports from ``tools.registry``
     and we don't want a hard cycle.
     """
     try:
-        from toolsets import _HERMES_CORE_TOOLS
-        return frozenset(_HERMES_CORE_TOOLS)
+        from toolsets import _HERMES_NEVER_DEFER
+        return frozenset(_HERMES_NEVER_DEFER)
     except Exception:
         return frozenset()
 
@@ -205,7 +210,7 @@ def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
+    OR it is not in ``_HERMES_NEVER_DEFER``. Waist tools are never deferred
     even when their toolset is technically plugin-provided (this protects
     against accidental shadowing).
     """

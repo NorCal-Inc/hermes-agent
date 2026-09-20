@@ -616,3 +616,78 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+class TestGovernedCompanyDiscovery:
+    """Company-scoped tools are partitioned before Tool Search sees them."""
+
+    @staticmethod
+    def _register(name, entity_scope, allowed_roles=("*",)):
+        from tools.registry import registry
+
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True, "tool": name}),
+            schema=_td(name, f"Governed operation for {entity_scope}.")["function"],
+            toolset="mcp-governed-company-test",
+            entity_scope=entity_scope,
+            allowed_roles=allowed_roles,
+            category="operations",
+            access_mode="read",
+            approval_requirement="none",
+        )
+
+    def test_company_lane_search_does_not_reveal_other_lane(self, monkeypatch):
+        import model_tools
+
+        self._register("governed_orion_health", "orion")
+        self._register("governed_triptracker_health", "triptracker")
+
+        monkeypatch.setenv("HERMES_ENTITY_SCOPE", "orion")
+        monkeypatch.setenv("HERMES_ROLE_SCOPE", "*")
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "governed health", "limit": 10},
+            enabled_toolsets=["mcp-governed-company-test"],
+        ))
+        rendered = json.dumps(result)
+        assert result["total_available"] == 1
+        assert "governed_orion_health" in rendered
+        assert "governed_triptracker_health" not in rendered
+
+        monkeypatch.setenv("HERMES_ENTITY_SCOPE", "triptracker")
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "governed health", "limit": 10},
+            enabled_toolsets=["mcp-governed-company-test"],
+        ))
+        rendered = json.dumps(result)
+        assert result["total_available"] == 1
+        assert "governed_triptracker_health" in rendered
+        assert "governed_orion_health" not in rendered
+
+    def test_role_scope_filters_before_schema_exposure(self, monkeypatch):
+        import model_tools
+
+        self._register("governed_orion_sales_only", "orion", allowed_roles=("sales",))
+        monkeypatch.setenv("HERMES_ENTITY_SCOPE", "orion")
+        monkeypatch.setenv("HERMES_ROLE_SCOPE", "ops")
+        defs = model_tools.get_tool_definitions(
+            enabled_toolsets=["mcp-governed-company-test"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        assert "governed_orion_sales_only" not in {
+            td["function"]["name"] for td in defs
+        }
+
+    def test_direct_cross_lane_probe_matches_unknown_tool(self, monkeypatch):
+        from tools.registry import registry
+
+        self._register("governed_orion_private_probe", "orion")
+        monkeypatch.setenv("HERMES_ENTITY_SCOPE", "triptracker")
+        hidden = json.loads(registry.dispatch("governed_orion_private_probe", {}))
+        missing = json.loads(registry.dispatch("governed_no_such_tool", {}))
+        assert hidden["error"] == missing["error"].replace(
+            "governed_no_such_tool", "governed_orion_private_probe"
+        )

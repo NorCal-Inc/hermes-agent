@@ -217,6 +217,14 @@ class TestToolsetConsistency:
         # Sanity: the shared core must be non-trivial (i.e. we didn't
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
+        # Progressive discovery keeps a narrow permanent waist SEPARATE from
+        # the bundle list: the waist is what stays visible, the bundle is what
+        # is granted. Every waist tool must still be granted by every platform,
+        # or it is not "never deferred", it is absent.
+        waist = set(toolsets_mod._HERMES_NEVER_DEFER)
+        assert 5 <= len(waist) <= 16, waist
+        for name, ts in zip(platforms, tool_sets):
+            assert waist.issubset(ts), f"{name} is missing waist tools: {waist - ts}"
 
 
 class TestPluginToolsets:

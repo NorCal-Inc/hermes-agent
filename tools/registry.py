@@ -19,6 +19,8 @@ import functools
 import importlib
 import json
 import logging
+import pathlib
+import os
 import sys
 import threading
 import time
@@ -208,11 +210,15 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "entity_scope", "allowed_roles", "category", "access_mode",
+        "approval_requirement",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 entity_scope="shared", allowed_roles=None, category=None,
+                 access_mode="mixed", approval_requirement="runtime"):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +237,16 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.entity_scope = str(entity_scope or "shared").strip().lower()
+        roles = allowed_roles or ("*",)
+        if isinstance(roles, str):
+            roles = (roles,)
+        self.allowed_roles = frozenset(
+            str(role).strip().lower() for role in roles if str(role).strip()
+        ) or frozenset({"*"})
+        self.category = str(category or toolset or "other").strip().lower()
+        self.access_mode = str(access_mode or "mixed").strip().lower()
+        self.approval_requirement = str(approval_requirement or "runtime").strip().lower()
 
 
 class _PluginOverridePolicy:
@@ -749,6 +765,11 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        entity_scope: str = "shared",
+        allowed_roles=None,
+        category: Optional[str] = None,
+        access_mode: str = "mixed",
+        approval_requirement: str = "runtime",
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -844,6 +865,11 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                entity_scope=entity_scope,
+                allowed_roles=allowed_roles,
+                category=category,
+                access_mode=access_mode,
+                approval_requirement=approval_requirement,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1015,6 +1041,118 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def current_governance_context() -> tuple[str, frozenset[str]]:
+        """Return active company lane and role set for tool exposure."""
+        entity = str(os.environ.get("HERMES_ENTITY_SCOPE") or "shared").strip().lower()
+        raw_roles = str(os.environ.get("HERMES_ROLE_SCOPE") or "*")
+        roles = frozenset(
+            role.strip().lower() for role in raw_roles.split(",") if role.strip()
+        )
+        return entity or "shared", roles or frozenset({"*"})
+
+    @staticmethod
+    def _entry_permitted(entry: "ToolEntry", entity: str, roles: frozenset[str]) -> bool:
+        """Apply company and role visibility before any schema/catalog exposure."""
+        if entry.entity_scope != "shared" and entry.entity_scope != entity:
+            return False
+        if (
+            "*" not in entry.allowed_roles
+            and "*" not in roles
+            and not (entry.allowed_roles & roles)
+        ):
+            return False
+        return True
+
+    def get_governance_metadata(self, name: str) -> Optional[dict]:
+        """Return metadata only when the active lane is permitted to know it."""
+        entry = self.get_entry(name)
+        if entry is None:
+            return None
+        entity, roles = self.current_governance_context()
+        if not self._entry_permitted(entry, entity, roles):
+            return None
+        return {
+            "entity_scope": entry.entity_scope,
+            "roles": sorted(entry.allowed_roles),
+            "category": entry.category,
+            "access_mode": entry.access_mode,
+            "approval_requirement": entry.approval_requirement,
+        }
+
+    # Declarative governance source. Tags live in ONE place -- a reviewable
+    # file -- and the runtime reads them from there, so a governance decision
+    # is not spread across ~100 register() call sites where it cannot be
+    # audited as a set. Absent file = every tool keeps its registered default;
+    # this never fails a boot.
+    GOVERNANCE_DECLARATIONS = "/home/chris/.hermes/tool-registry/registry.yaml"
+
+    def apply_governance_declarations(self, path: Optional[str] = None) -> dict:
+        """Apply declared governance tags to already-registered tools.
+
+        Called once after tool registration. Before this existed the
+        declarative registry was decorative: every one of the 104 registered
+        tools carried the register()-time defaults (entity_scope=shared,
+        roles={*}, approval_requirement=runtime) regardless of what governance
+        declared, so `kanban_create` was declared operator-approved and
+        role-restricted while the runtime exposed it to every role with
+        approval deferred. Found 2026-09-20 by
+        `~/.hermes/tool-registry/compound.py reconcile_registry` on its first
+        run against live state.
+
+        Returns a summary; never raises. A malformed or missing declaration
+        leaves the runtime exactly as registered rather than failing closed on
+        a file that is not part of the boot contract.
+        """
+        src = pathlib.Path(path or self.GOVERNANCE_DECLARATIONS)
+        summary = {"source": str(src), "applied": 0, "declared": 0,
+                   "not_registered": 0, "error": None}
+        try:
+            if not src.is_file():
+                summary["error"] = "declaration file absent"
+                return summary
+            # Reuse the declarative registry's own minimal parser rather than
+            # taking a PyYAML dependency on the boot path.
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "_tool_registry_resolver", str(src.parent / "resolver.py"))
+            if spec is None or spec.loader is None:
+                summary["error"] = "resolver unavailable"
+                return summary
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            declared = mod.load()["tools"]
+        except Exception as exc:  # noqa: BLE001
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            return summary
+
+        summary["declared"] = len(declared)
+        with self._lock:
+            for name, d in declared.items():
+                entry = self._tools.get(name)
+                if entry is None:
+                    summary["not_registered"] += 1
+                    continue
+                roles = d.get("roles") or ["*"]
+                if isinstance(roles, str):
+                    roles = [roles]
+                entry.allowed_roles = frozenset(str(r) for r in roles)
+                entry.entity_scope = str(
+                    d.get("companies", "shared")).strip().lower()
+                if d.get("category"):
+                    entry.category = str(d["category"])
+                if d.get("access"):
+                    entry.access_mode = str(d["access"]).strip().lower()
+                if d.get("approval"):
+                    entry.approval_requirement = str(
+                        d["approval"]).strip().lower()
+                summary["applied"] += 1
+        return summary
+
+    def governance_fingerprint(self) -> tuple[str, tuple[str, ...]]:
+        entity, roles = self.current_governance_context()
+        return entity, tuple(sorted(roles))
+
     def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
@@ -1032,9 +1170,10 @@ class ToolRegistry:
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
+        entity, roles = self.current_governance_context()
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
-            if not entry:
+            if not entry or not self._entry_permitted(entry, entity, roles):
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
@@ -1116,7 +1255,8 @@ class ToolRegistry:
           for consistent error format.
         """
         entry = self.get_entry(name, scope=scope)
-        if not entry:
+        entity, roles = self.current_governance_context()
+        if not entry or not self._entry_permitted(entry, entity, roles):
             return tool_error(f"Unknown tool: {name}")
         try:
             if entry.is_async:
