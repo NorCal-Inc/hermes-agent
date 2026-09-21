@@ -5,11 +5,10 @@ Purpose:
 - Never auto-approve global/unbounded candidates.
 - Separate legacy unverified mistake-log imports from verified candidates.
 - Produce a durable daily report.
-- Create at most one bounded Erika review card per UTC day when VERIFIED
-  candidates require operator review.
+- Do not manufacture Kanban work merely because review candidates exist.
 """
 from __future__ import annotations
-import argparse, datetime as dt, json, os, sqlite3, subprocess, sys
+import argparse, datetime as dt, json, sqlite3
 from pathlib import Path
 
 DEFAULT_DB = Path.home()/'.hermes/kanban/kanban.db'
@@ -28,35 +27,6 @@ def load_candidates(db: Path):
     c=sqlite3.connect(db); c.row_factory=sqlite3.Row
     rows=list(c.execute("SELECT * FROM task_lessons WHERE state='candidate' AND active=0 ORDER BY id ASC"))
     c.close(); return rows
-
-def review_body(rows):
-    lines=[
-      'Verified lesson candidates require operator review. No candidate has been auto-approved.',
-      '', 'Review each candidate against its recorded verification provenance. Approve only if its broad/global interpretation is intended to bind future work.', ''
-    ]
-    for r in rows[:10]:
-        text=' '.join(str(r['lesson'] or '').split())
-        if len(text)>500: text=text[:497]+'...'
-        lines.append(f"- Lesson {r['id']} | source {r['source_task_id']} | verification {r['verification_id']} | applicability {r['applicability']} | {text}")
-    if len(rows)>10:
-        lines.append(f"- {len(rows)-10} additional verified candidates remain queued for a later bounded review batch.")
-    lines += ['', 'Acceptance: review is explicit; no global/all lesson is activated without named operator approval; provenance remains intact.']
-    return '\n'.join(lines)
-
-def create_review_task(rows, day):
-    if not rows: return None
-    cmd=[
-      str(Path.home()/'.hermes/hermes-agent-next/venv/bin/python'), '-m','hermes_cli.main','kanban','create',
-      'Review verified lesson candidates', '--body', review_body(rows), '--assignee','erika','--triage',
-      '--max-runtime','300', '--created-by','lesson-candidate-review',
-      '--idempotency-key',f'lesson-candidate-review:{day}', '--json'
-    ]
-    env=os.environ.copy(); env['HOME']=str(Path.home()); env['HERMES_HOME']=str(Path.home()/'.hermes')
-    p=subprocess.run(cmd, env=env, cwd=str(Path.home()/'.hermes/hermes-agent-next'), text=True, capture_output=True, timeout=45)
-    if p.returncode:
-        raise RuntimeError((p.stderr or p.stdout).strip())
-    try: return json.loads(p.stdout)
-    except Exception: return {'raw':p.stdout.strip()}
 
 def main():
     ap=argparse.ArgumentParser()
@@ -89,8 +59,6 @@ def main():
       'auto_approved':0, 'review_task':None,
       'verified_candidate_ids':[int(r['id']) for r in buckets['verified_review_required'][:10]],
     }
-    if buckets['verified_review_required'] and not args.dry_run:
-        report['review_task']=create_review_task(buckets['verified_review_required'], day)
     args.report_dir.mkdir(parents=True, exist_ok=True)
     latest=args.report_dir/'latest.json'; dated=args.report_dir/f'{day}.json'
     payload=json.dumps(report,indent=2,sort_keys=True)+'\n'
