@@ -1030,19 +1030,17 @@ class TestMigration:
 
 
 # ---------------------------------------------------------------------------
-# Governed-parent inheritance (t_f2d639a3 defect #2)
+# Gauntlet scope
 #
-# ``create_task`` used to stamp ``gauntlet_enforced`` from the board-wide
-# default only — a child spawned under a gauntlet-enforced parent (the
-# ordinary "governance decision -> implementation task" shape used
-# throughout this board) silently lost enforcement whenever the board
-# default was off, letting exactly the kind of work governance exists for
-# skip verification. Real-world instance: t_7311348b (gauntlet_enforced=1)
-# spawned t_500a3503 (gauntlet_enforced=0).
+# Independent verification belongs to the task that actually carries the
+# risk. A governed parent does not automatically turn every ordinary child
+# into another verifier chain. Children still opt in explicitly, inherit the
+# board-wide default when enabled, or auto-govern when their own subject is
+# high-risk.
 # ---------------------------------------------------------------------------
 
 class TestGauntletInheritance:
-    def test_child_of_governed_parent_inherits_enforcement(self, kanban_home):
+    def test_child_of_governed_parent_does_not_inherit_enforcement(self, kanban_home):
         with kb.connect_closing() as conn:
             parent = kb.create_task(
                 conn, title="governance decision", assignee="default",
@@ -1052,12 +1050,9 @@ class TestGauntletInheritance:
                 conn, title="implementation", assignee="default",
                 parents=[parent],
             )
-            assert kb.get_task(conn, child).gauntlet_enforced is True
+            assert kb.get_task(conn, child).gauntlet_enforced is False
 
-    def test_child_cannot_complete_without_verification(self, kanban_home):
-        """The actual acceptance bar: a governed child must not be able to
-        take the running -> done shortcut just because it inherited
-        enforcement rather than being created with gauntlet=True directly."""
+    def test_ordinary_child_can_complete_after_parent_is_done(self, kanban_home):
         with kb.connect_closing() as conn:
             parent = kb.create_task(
                 conn, title="governance decision", assignee="default",
@@ -1077,16 +1072,10 @@ class TestGauntletInheritance:
             )
             claimed = kb.claim_task(conn, child)
             assert claimed is not None and claimed.status == "running"
-            with pytest.raises(kb.VerificationRequiredError):
-                kb.complete_task(conn, child, summary="done, trust me")
-            assert kb.get_task(conn, child).status == "running"
+            assert kb.complete_task(conn, child, summary="deterministic proof passed") is True
+            assert kb.get_task(conn, child).status == "done"
 
-    def test_explicit_gauntlet_false_is_the_doctrine_exception_and_wins(
-        self, kanban_home
-    ):
-        """An explicit ``gauntlet=False`` from the caller is the only
-        sanctioned exception — it must still override parent inheritance,
-        exactly like it already overrides the board-wide default."""
+    def test_explicit_gauntlet_false_remains_ungoverned(self, kanban_home):
         with kb.connect_closing() as conn:
             parent = kb.create_task(
                 conn, title="governance decision", assignee="default",

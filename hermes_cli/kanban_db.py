@@ -5366,26 +5366,6 @@ def create_task(
     # loop is part of the repair contract, not an opt-in convention.
     if declares_repair:
         gauntlet_enforced = True
-    if gauntlet is None and not gauntlet_enforced:
-        # A governed parent's enforcement must carry down to its children:
-        # otherwise a task created under a gauntlet-enforced parent (e.g. a
-        # governance decision spawning an implementation task) silently
-        # loses enforcement the moment the board-wide default is off, and
-        # can complete without verification even though the work it does
-        # is exactly what the parent required governance for. Only an
-        # explicit gauntlet=False from the caller (a real doctrine
-        # exception) or the parent itself being unenforced skips this.
-        for _parent_id in parents:
-            if not _parent_id:
-                continue
-            _parent_row = conn.execute(
-                "SELECT gauntlet_enforced FROM tasks WHERE id = ?",
-                (_parent_id,),
-            ).fetchone()
-            if _parent_row is not None and _parent_row["gauntlet_enforced"]:
-                gauntlet_enforced = True
-                break
-
     # Simple operator/Erika shorthand: assignee="claude" means the direct
     # Claude executor lane, not a Hermes profile named "claude". Persist the
     # spawnable default profile as the dispatcher carrier; cli.py exits into
@@ -6459,23 +6439,22 @@ CONTROL_PLANE_AUTHORITY_PREFIXES = (
 )
 
 
-#: Work that MUTATES something that costs money, exposure or trust if wrong.
-#: Independent verification earns its cost here.
+#: High-risk mutations where an independent verifier earns its cost. Ordinary
+#: deploy/publish/customer-facing work is intentionally absent: deterministic
+#: task-local proof is enough unless the author explicitly requests independent
+#: verification. Keep this list to security, authority, isolation, destructive
+#: data, financial/legal, and boot/control-plane boundaries.
 _GAUNTLET_MUTATION_RE = re.compile(
     r"\b("
-    r"deploy|roll[ _-]?out|ship|publish|go[ _-]?live|cut[ _-]?over"
-    r"|production[ _-]?(change|push|fix|config)"
-    # Bare "migration" over-matched: "pre-migration" (a test fixture) and
-    # "entity-migration PLAN (read-only, no writes)". A qualifier is required
-    # so the phrase names an actual data change.
-    r"|(schema|data|database|db)[ _-]?migrat(e|ion)"
+    r"(schema|data|database|db)[ _-]?migrat(e|ion)"
     r"|schema[ _-]?change|backfill|data[ _-]?deletion|purge"
-    r"|payment|invoice|stripe|billing|refund|payroll|tax[ _-]?filing"
+    r"|payment|refund|payroll|tax[ _-]?filing"
     r"|credential|secret|token[ _-]?rotation|key[ _-]?rotation|access[ _-]?control"
     r"|permission[ _-]?change|firewall|port[ _-]?binding"
-    r"|polic(y|ies)[ _-]?change|legal[ _-]?filing|compliance[ _-]?change"
-    r"|customer[ _-]?facing|client[ _-]?facing|deliverable"
+    r"|legal[ _-]?filing|compliance[ _-]?change"
     r"|cross[ _-]?(company|entity)"
+    r"|company[ _-]?isolation|data[ _-]?isolation"
+    r"|control[ _-]?plane"
     r"|boot[ _-]?(gate|record|context|checkpoint|consumer|surface)"
     r"|shared[ _-]?boot"
     r")\b",

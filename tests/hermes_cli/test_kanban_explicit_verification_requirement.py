@@ -221,14 +221,18 @@ def test_verified_task_may_mention_the_requirement(kanban_home):
 # (c) no regression
 # ---------------------------------------------------------------------------
 
-def test_keyword_classification_unchanged(kanban_home):
+def test_keyword_classification_uses_risk_not_generic_mutation(kanban_home):
     with kb.connect_closing() as conn:
         deploy = kb.create_task(conn, title="deploy the API", assignee="default")
+        credential = kb.create_task(
+            conn, title="rotate the API credential", assignee="default",
+        )
         investigate = kb.create_task(
             conn, title="investigate slow queries", assignee="default",
         )
         plain = kb.create_task(conn, title="rename a variable", assignee="default")
-        assert _enforced(conn, deploy)
+        assert not _enforced(conn, deploy)
+        assert _enforced(conn, credential)
         assert not _enforced(conn, investigate)
         assert not _enforced(conn, plain)
         for tid in (deploy, investigate, plain):

@@ -289,24 +289,30 @@ class TestSecondGenerationControlPlane:
 
 
 class TestSelectiveGauntletEnforcement:
-    """#2 -- govern deliverables, not investigations. Classified on MUTATION.
+    """Independent verification is reserved for high-risk mutations.
 
-    The topic-vs-mutation distinction is the load-bearing one. A topic list is
-    gameable: an agent avoiding verification labels its card an
-    "investigation". Keying on what the work DOES closes that.
+    Ordinary deploy/publish/customer-facing work uses task-local deterministic
+    proof unless the author explicitly requests independent verification.
     """
 
     @pytest.mark.parametrize("title", [
-        "Deploy the Orion pricing page to production",
         "Rotate the Stripe billing credential",
         "Schema migration for the customer table",
-        "Update the refund policy change for LCASS",
-        "Cross-entity governance change for company routing",
-        "Ship the customer-facing onboarding deliverable",
+        "Issue a customer refund",
+        "Cross-entity data migration for company routing",
+        "Change the production firewall port binding",
         "Update shared boot consumer checkpoint pin",
     ])
-    def test_mutating_work_is_governed(self, title):
+    def test_high_risk_mutating_work_is_governed(self, title):
         assert kb.gauntlet_default_for_subject(title) is True
+
+    @pytest.mark.parametrize("title", [
+        "Deploy the Orion pricing page to production",
+        "Publish the customer-facing onboarding page",
+        "Ship the onboarding deliverable",
+    ])
+    def test_ordinary_mutation_falls_through_to_board_policy(self, title):
+        assert kb.gauntlet_default_for_subject(title) is None
 
     @pytest.mark.parametrize("title", [
         "Investigate Hermes host-memory watchdog missed resolution trigger",
@@ -319,10 +325,9 @@ class TestSelectiveGauntletEnforcement:
     def test_investigation_is_not_governed(self, title):
         assert kb.gauntlet_default_for_subject(title) is False
 
-    def test_mutation_beats_investigation_when_both_present(self):
-        """A root-cause discovery that patches production IS a production change."""
+    def test_high_risk_mutation_beats_investigation_when_both_present(self):
         assert kb.gauntlet_default_for_subject(
-            "Investigate the billing bug and deploy the fix to production"
+            "Investigate the credential leak and rotate the credential"
         ) is True
 
     def test_undecidable_subject_falls_through_to_board_config(self, monkeypatch):
@@ -332,14 +337,14 @@ class TestSelectiveGauntletEnforcement:
         monkeypatch.setattr(kb, "gauntlet_enforcement_default", lambda: False)
         assert kb._resolve_gauntlet_default("Tidy the notes") is False
 
-    def test_classification_overrides_a_permissive_board_default(
+    def test_high_risk_classification_overrides_a_permissive_board_default(
         self, kanban_home, monkeypatch
     ):
-        """Board says off; a deployment is still governed."""
+        """Board says off; a credential rotation is still governed."""
         monkeypatch.setattr(kb, "gauntlet_enforcement_default", lambda: False)
         with kb.connect_closing() as conn:
             tid = kb.create_task(
-                conn, title="Deploy the Orion pricing page to production",
+                conn, title="Rotate the Orion production credential",
                 assignee="default", provenance=_human(),
             )
             assert conn.execute(
