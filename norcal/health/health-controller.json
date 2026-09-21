@@ -96,9 +96,6 @@
     }
   },
   "critical_user_timers": {
-    "hermes-kanban-hygiene.timer": {
-      "max_age_seconds": 93600
-    },
     "hermes-postgres-backup.timer": {
       "max_age_seconds": 93600
     },
