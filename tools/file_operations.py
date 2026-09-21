@@ -2117,10 +2117,48 @@ class ShellFileOperations(FileOperations):
                     "UTF-8. The file was NOT created or modified."
                 )
             )
+        # Kanban workers register the inverse before the external mutation.
+        # The helper is a no-op outside a task-scoped local workspace. If a
+        # governed write cannot durably register its inverse, fail closed rather
+        # than create another unknown side effect for recovery to guess about.
+        _effect_token = None
+        try:
+            from hermes_cli.execution_effects import prepare_workspace_text_effect
+            _effect_token = prepare_workspace_text_effect(path, content)
+        except Exception as exc:
+            return WriteResult(
+                error=(
+                    f"Refusing to write '{path}': reversible execution effect "
+                    f"could not be recorded ({type(exc).__name__}: {exc}). "
+                    "The file was NOT modified."
+                )
+            )
+
         write_result = self._atomic_write(path, content)
 
         if write_result.exit_code != 0:
+            try:
+                from hermes_cli.execution_effects import cancel_workspace_effect
+                cancel_workspace_effect(_effect_token)
+            except Exception:
+                pass
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+
+        try:
+            from hermes_cli.execution_effects import mark_workspace_effect_applied
+            mark_workspace_effect_applied(_effect_token)
+        except Exception as exc:
+            # The mutation did occur, but the PREPARED ledger row already holds
+            # its before/after states and inverse. Surface the bookkeeping
+            # failure so this run cannot report a clean success; crash/reclaim
+            # reconciliation can still compare-and-reverse it safely.
+            return WriteResult(
+                error=(
+                    f"File write completed but execution-effect acknowledgement "
+                    f"failed ({type(exc).__name__}: {exc}). Recovery metadata "
+                    "was prepared before the write."
+                )
+            )
 
         # Bytes written — computed from the exact bytes we just wrote (len
         # matches wc -c) instead of spawning a ``wc -c`` subprocess. The
