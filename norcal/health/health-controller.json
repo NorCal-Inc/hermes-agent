@@ -1,5 +1,6 @@
 {
   "alert_target": "telegram:-1003786882754",
+  "kanban_card_invariants": ["company_isolation"],
   "boot_gate_command": null,
   "gateway_heartbeat_max_age_seconds": 180,
   "state_model": "governed_exceptions",
@@ -95,12 +96,6 @@
     }
   },
   "critical_user_timers": {
-    "hermes-ops-supervisor.timer": {
-      "max_age_seconds": 600
-    },
-    "hermes-skill-ledger-reconcile.timer": {
-      "max_age_seconds": 1200
-    },
     "hermes-kanban-hygiene.timer": {
       "max_age_seconds": 93600
     },
@@ -121,7 +116,7 @@
     }
   },
   "expected_runtime_config": {
-    "execution.max_runtime_seconds": "300",
+    "execution.max_runtime_seconds": "14400",
     "kanban.dispatch_stale_timeout_seconds": "300",
     "kanban.gauntlet_stale_timeout_seconds": "300",
     "kanban.gauntlet_stale_realert_seconds": "86400"

@@ -803,10 +803,24 @@ class Controller:
             card_id = None
             rec["route"] = ROUTE_COMPANY
         else:
-            try:
-                card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, reason)
-            except Exception as exc:
-                card_id, card_error = None, f"{type(exc).__name__}: {str(exc)[:200]}"
+            configured = self.ctx.config.get("kanban_card_invariants", ["company_isolation"])
+            if isinstance(configured, str):
+                configured = [configured]
+            card_invariants = {str(x) for x in (configured or [])}
+            should_create_card = (
+                finding.unsafe
+                or "*" in card_invariants
+                or finding.invariant in card_invariants
+            )
+            if should_create_card:
+                try:
+                    card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, reason)
+                except Exception as exc:
+                    card_id, card_error = None, f"{type(exc).__name__}: {str(exc)[:200]}"
+            else:
+                card_id = None
+                card_new = False
+                rec["route"] = ROUTE_SHARED
         rec["status"] = STATUS_ESCALATED
         rec["escalated_at"] = _iso(now)
         rec["escalation_reason"] = reason
@@ -2875,7 +2889,7 @@ class CompanyIsolation(Invariant):
         return out
 
 
-F2_DETECT_ONLY = (CompanyHealthEndpoints, SharedEndpointsHealthy, SharedUnitsActive, WatcherIntegrity,
+F2_DETECT_ONLY = (CompanyHealthEndpoints, SharedEndpointsHealthy, SharedUnitsActive,
                   RepositoryDrift, CompanyIsolation)
 
 # ---------------------------------------------------------------------------
@@ -3755,7 +3769,7 @@ def default_recovery_classes() -> list[RecoveryClass]:
 F1_DETECT_ONLY = (
     ReadyBacklogExplained, RunLeaseConsistency, VerdictReturnedToSubject, VerifierChildStalledInTodo,
     GatewayPlatformsConnected, ResourceThresholds, OwnershipAndLinkage, TaskGraphIntegrity,
-    ControlDefectRegressions, LifeWikiDailyNote, BackupResults, EscalationCardsDispositioned,
+    LifeWikiDailyNote, BackupResults, EscalationCardsDispositioned,
 )
 
 

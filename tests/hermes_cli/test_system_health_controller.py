@@ -77,10 +77,12 @@ class Alerts:
 
 
 def _ctx(home: Path, *, clock=None, alerts=None, config=None, run_command=None, dry_run=False):
+    test_config = {"kanban_card_invariants": ["*"]}
+    test_config.update(config or {})
     return shc.Context(
         state_dir=home / "state" / "system-health-controller",
         hermes_home=home,
-        config=config or {},
+        config=test_config,
         kanban=kb.connect_closing,
         send_alert=alerts if alerts is not None else Alerts(),
         run_command=run_command or (lambda argv, timeout: (0, "")),
