@@ -245,7 +245,9 @@ def redact_session_data(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_session_markdown(
-    session: dict[str, Any], output_dir: Path | str, *, fmt: str = "md", force: bool = False
+    session: dict[str, Any], output_dir: Path | str, *, fmt: str = "md", force: bool = False,
+    effect_conn=None, effect_task_id: str | None = None, effect_run_id: int | None = None,
+    _fault_after_prepare: bool = False, _fault_after_mutation: bool = False,
 ) -> Path:
     """Write a Markdown/QMD export file and return its path.
 
@@ -256,7 +258,22 @@ def write_session_markdown(
     path = out_dir / safe_session_filename(session, fmt=fmt)
     if path.exists() and not force:
         raise FileExistsError(str(path))
-    path.write_text(render_session_markdown(session, fmt=fmt), encoding="utf-8")
+    rendered = render_session_markdown(session, fmt=fmt)
+    if effect_conn is not None:
+        if not effect_task_id:
+            raise ValueError("effect_task_id is required when effect_conn is supplied")
+        from hermes_cli.execution_effects import write_text_with_effect
+        write_text_with_effect(
+            effect_conn,
+            task_id=effect_task_id,
+            run_id=effect_run_id,
+            path=path,
+            text=rendered,
+            fault_after_prepare=_fault_after_prepare,
+            fault_after_mutation=_fault_after_mutation,
+        )
+    else:
+        path.write_text(rendered, encoding="utf-8")
     return path
 
 

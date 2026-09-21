@@ -188,3 +188,46 @@ def effect_states(conn: sqlite3.Connection, *, task_id: str, run_id: int | None)
         (task_id, run_id),
     ).fetchall()
     return [str(row[0]) for row in rows]
+
+
+def write_text_with_effect(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int | None,
+    path: Path | str,
+    text: str,
+    fault_after_prepare: bool = False,
+    fault_after_mutation: bool = False,
+) -> int:
+    """Write a UTF-8 text file with a durable inverse registered first.
+
+    The two fault flags are test-only injection points. They model worker death
+    immediately after the durable prepare and immediately after the external
+    mutation, before ``mark_applied``. Production callers leave both false.
+    """
+    target = Path(path)
+    before = _observed_file_state(target)
+    after = {"exists": True, "text": text}
+    effect_id = prepare_effect(
+        conn,
+        task_id=task_id,
+        run_id=run_id,
+        effect_type="text_file_write",
+        resource=str(target),
+        before_state=before,
+        after_state=after,
+        inverse_action="restore_text_file",
+        inverse_payload={
+            "existed": bool(before.get("exists")),
+            "text": before.get("text", ""),
+        },
+    )
+    if fault_after_prepare:
+        raise RuntimeError("fault injection after effect prepare")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    if fault_after_mutation:
+        raise RuntimeError("fault injection after external mutation")
+    mark_applied(conn, effect_id)
+    return effect_id

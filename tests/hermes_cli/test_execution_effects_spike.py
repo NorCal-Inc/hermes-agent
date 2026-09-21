@@ -1,4 +1,5 @@
 import sqlite3
+import pytest
 from pathlib import Path
 
 from hermes_cli.execution_effects import (
@@ -145,3 +146,114 @@ def test_recovery_refuses_to_overwrite_unattributed_later_change(tmp_path):
     assert rollback_uncommitted(replacement, task_id="t6", run_id=5) == []
     assert resource.read_text(encoding="utf-8") == "someone-else"
     assert effect_states(replacement, task_id="t6", run_id=5) == ["conflict"]
+
+
+def test_existing_session_export_path_rolls_back_worker_death(tmp_path):
+    from hermes_cli.session_export_md import write_session_markdown
+
+    db = tmp_path / "effects.db"
+    conn = sqlite3.connect(db)
+    ensure_effect_schema(conn)
+    session = {
+        "id": "spike-session",
+        "title": "Reversible export spike",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    with pytest.raises(RuntimeError, match="after external mutation"):
+        write_session_markdown(
+            session,
+            tmp_path / "exports",
+            effect_conn=conn,
+            effect_task_id="t-spike",
+            effect_run_id=77,
+            _fault_after_mutation=True,
+        )
+
+    exported = next((tmp_path / "exports").glob("*.md"))
+    assert exported.exists()
+    assert effect_states(conn, task_id="t-spike", run_id=77) == ["prepared"]
+
+    replacement = sqlite3.connect(db)
+    assert rollback_uncommitted(replacement, task_id="t-spike", run_id=77)
+    assert not exported.exists()
+    assert effect_states(replacement, task_id="t-spike", run_id=77) == ["reverted"]
+
+
+def test_existing_session_export_commit_survives_recovery(tmp_path):
+    from hermes_cli.session_export_md import write_session_markdown
+
+    db = tmp_path / "effects.db"
+    conn = sqlite3.connect(db)
+    ensure_effect_schema(conn)
+    session = {
+        "id": "spike-session-commit",
+        "title": "Committed export spike",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    exported = write_session_markdown(
+        session,
+        tmp_path / "exports",
+        effect_conn=conn,
+        effect_task_id="t-commit",
+        effect_run_id=88,
+    )
+    assert exported.exists()
+    assert commit_run(conn, task_id="t-commit", run_id=88) == 1
+
+    replacement = sqlite3.connect(db)
+    assert rollback_uncommitted(replacement, task_id="t-commit", run_id=88) == []
+    assert exported.exists()
+    assert effect_states(replacement, task_id="t-commit", run_id=88) == ["committed"]
+
+
+def test_real_process_death_after_existing_export_mutation_recovers(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    db = tmp_path / "effects.db"
+    export_dir = tmp_path / "exports"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        """
+import os, sqlite3, sys
+from hermes_cli.execution_effects import ensure_effect_schema
+from hermes_cli.session_export_md import write_session_markdown
+
+db, out = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db)
+ensure_effect_schema(conn)
+session = {
+    'id': 'real-death-session',
+    'title': 'Real process death',
+    'messages': [{'role': 'user', 'content': 'hello'}],
+}
+try:
+    write_session_markdown(
+        session, out,
+        effect_conn=conn,
+        effect_task_id='t-real-death',
+        effect_run_id=99,
+        _fault_after_mutation=True,
+    )
+except RuntimeError:
+    os._exit(91)
+""",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    proc = subprocess.run(
+        [sys.executable, str(worker), str(db), str(export_dir)],
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 91
+    exported = next(export_dir.glob("*.md"))
+    assert exported.exists()
+
+    replacement = sqlite3.connect(db)
+    assert rollback_uncommitted(replacement, task_id="t-real-death", run_id=99)
+    assert not exported.exists()
+    assert effect_states(replacement, task_id="t-real-death", run_id=99) == ["reverted"]
