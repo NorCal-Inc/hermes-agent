@@ -2724,6 +2724,34 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+
+-- Durable ownership ledger for reversible external side effects. Effects are
+-- routed by the EXISTING task-run lifecycle; this is not a second scheduler.
+CREATE TABLE IF NOT EXISTS execution_effects (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id               TEXT NOT NULL,
+    run_id                INTEGER,
+    origin_run_id         INTEGER,
+    effect_type           TEXT NOT NULL,
+    resource              TEXT NOT NULL,
+    before_state          TEXT,
+    after_state           TEXT,
+    inverse_action        TEXT NOT NULL,
+    inverse_payload       TEXT,
+    state                 TEXT NOT NULL DEFAULT 'prepared',
+    hold_reason           TEXT,
+    created_at            INTEGER NOT NULL,
+    applied_at            INTEGER,
+    held_at               INTEGER,
+    rollback_requested_at INTEGER,
+    reverted_at           INTEGER,
+    conflict_at           INTEGER,
+    committed_at          INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_execution_effects_run
+    ON execution_effects(task_id, run_id, state, id);
+CREATE INDEX IF NOT EXISTS idx_execution_effects_state
+    ON execution_effects(state, task_id, id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 
@@ -4523,6 +4551,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+
+    # execution_effects existed briefly as an isolated spike before it joined
+    # SCHEMA_SQL. Migrate that early shape only during normal DB initialization,
+    # while the connection is open and already inside the schema-init lock.
+    from hermes_cli.execution_effects import ensure_effect_schema
+    ensure_effect_schema(conn, commit=False)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -8278,15 +8312,19 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    effect_policy: Optional[str] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
     ``outcome`` is the semantic result (completed / blocked / crashed /
     timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
     run-row status (usually just ``outcome``, but callers can pass it
-    explicitly). Returns the closed run_id or ``None`` if no active run
-    existed (e.g. a CLI user calling ``hermes kanban complete`` on a
-    task that was never claimed).
+    explicitly). ``effect_policy`` is normally inferred from that existing
+    outcome: success/review handoff commits effects, provider waits hold them,
+    and ownership-loss outcomes request rollback. Dependency waits pass
+    ``effect_policy='hold'`` explicitly because their run outcome remains the
+    legacy value ``blocked``. Returns the closed run_id or ``None`` if no active
+    run existed.
     """
     now = int(time.time())
     row = conn.execute(
@@ -8320,6 +8358,27 @@ def _end_run(
             run_id,
         ),
     )
+    # Route durable external side effects through the SAME lifecycle decision
+    # that just closed the run. This only changes ledger state here; actual
+    # rollback I/O is reconciled after the write transaction commits.
+    if effect_policy is None:
+        if outcome in {"completed", "review_requested"}:
+            effect_policy = "commit"
+        elif outcome == "rate_limited":
+            effect_policy = "hold"
+        else:
+            effect_policy = "rollback"
+    try:
+        from hermes_cli.execution_effects import route_run_effects
+        route_run_effects(
+            conn, task_id=task_id, run_id=run_id, policy=effect_policy,
+            reason=outcome, commit=False,
+        )
+    except sqlite3.OperationalError as exc:
+        # A pre-migration/third-party DB without the ledger must not make the
+        # legacy lifecycle unusable. connect() creates the table on normal boards.
+        if "execution_effects" not in str(exc):
+            raise
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
@@ -8382,6 +8441,60 @@ def _synthesize_ended_run(
         ),
     )
     return int(cur.lastrowid or 0)
+
+
+def reconcile_execution_effect_rollbacks(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Revert ownership-lost side effects and surface conflicts as existing blocks.
+
+    This is an actuator inside the ordinary dispatcher tick, not a watchdog or
+    repair-card generator. A conflict means current state no longer matches
+    either side of the recorded mutation, so Hermes refuses to overwrite it and
+    moves the existing task to the existing ``blocked/needs_input`` lane.
+    """
+    try:
+        from hermes_cli.execution_effects import reconcile_pending_rollbacks
+        reverted, conflicts = reconcile_pending_rollbacks(conn, commit=True)
+    except sqlite3.OperationalError as exc:
+        if "execution_effects" in str(exc):
+            return 0, 0
+        raise
+    if not conflicts:
+        return len(reverted), 0
+
+    placeholders = ",".join("?" for _ in conflicts)
+    rows = conn.execute(
+        f"SELECT id, task_id, resource FROM execution_effects WHERE id IN ({placeholders})",
+        tuple(int(x) for x in conflicts),
+    ).fetchall()
+    by_task: dict[str, list[str]] = {}
+    for row in rows:
+        by_task.setdefault(str(row["task_id"]), []).append(str(row["resource"]))
+    with write_txn(conn):
+        for tid, resources in by_task.items():
+            current = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            if current is None or current["status"] in ("done", "archived"):
+                continue
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=?",
+                (tid,),
+            )
+            conflict_payload = {
+                "reason": "reversible execution effect conflicts with current state",
+                "kind": "needs_input",
+                "resources": resources[:20],
+                "count": len(resources),
+                "status": "blocked",
+                "block_kind": "needs_input",
+            }
+            _append_event(conn, tid, "execution_effect_conflict", conflict_payload)
+            # Reuse the existing sticky-block contract so recompute_ready cannot
+            # silently release an unresolved ownership conflict next tick.
+            _append_event(conn, tid, "blocked", conflict_payload)
+    return len(reverted), len(conflicts)
 
 
 # ---------------------------------------------------------------------------
@@ -10189,6 +10302,20 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # A rollback that has not reconciled yet is unresolved ownership. Never
+        # start a replacement beside it. Conflict is also fail-closed: the
+        # dispatcher routes that task to needs_input during reconciliation.
+        try:
+            from hermes_cli.execution_effects import unresolved_effect_count
+            if unresolved_effect_count(conn, task_id=task_id):
+                _append_event(
+                    conn, task_id, "execution_refused",
+                    {"reason": "unresolved_execution_effects"},
+                )
+                return None
+        except sqlite3.OperationalError as exc:
+            if "execution_effects" not in str(exc):
+                raise
         # Universal safety control -- deliberately NOT gated on
         # ``_gauntlet_objective_scoped``. Every task gets brakes.
         reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
@@ -10306,6 +10433,20 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        try:
+            from hermes_cli.execution_effects import adopt_held_effects
+            adopted_effects = adopt_held_effects(
+                conn, task_id=task_id, new_run_id=int(run_id), commit=False
+            )
+            if adopted_effects:
+                _append_event(
+                    conn, task_id, "execution_effects_adopted",
+                    {"run_id": int(run_id), "count": int(adopted_effects)},
+                    run_id=int(run_id),
+                )
+        except sqlite3.OperationalError as exc:
+            if "execution_effects" not in str(exc):
+                raise
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
@@ -10344,6 +10485,17 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        try:
+            from hermes_cli.execution_effects import unresolved_effect_count
+            if unresolved_effect_count(conn, task_id=task_id):
+                _append_event(
+                    conn, task_id, "execution_refused",
+                    {"reason": "unresolved_execution_effects", "source": "claim_review_task"},
+                )
+                return None
+        except sqlite3.OperationalError as exc:
+            if "execution_effects" not in str(exc):
+                raise
         # Universal safety control -- see claim_task.
         reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
         if reached:
@@ -15458,7 +15610,7 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=reason, effect_policy="hold",
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -19538,6 +19690,11 @@ class DispatchResult:
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
+    effects_reverted: int = 0
+    """Durable side effects safely reversed after run ownership was lost."""
+    effect_conflicts: int = 0
+    """Side effects not reversed because current state no longer matched the
+    recorded mutation. Their existing tasks are routed to needs_input."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
@@ -22127,6 +22284,12 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Ownership-loss paths above only mark effects rollback_pending while their
+    # DB transaction is open. Reconcile them now, before any ready task can be
+    # promoted/claimed again. No repair card and no restart are involved.
+    result.effects_reverted, result.effect_conflicts = (
+        reconcile_execution_effect_rollbacks(conn)
+    )
     # Replay-safe Gauntlet actuator: a PASS persisted before a gateway restart
     # must still reach DONE without another model/human completion relay.
     finalize_stranded_verified_reviews(conn)
