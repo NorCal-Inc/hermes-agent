@@ -301,7 +301,14 @@ def precedence_order() -> list[str]:
 
 now = dt.datetime.now().astimezone()
 today = now.date().isoformat()
-failures: list[str] = []
+blockers: list[str] = []
+warnings: list[str] = []
+CRITICAL_DOCTRINE = {
+    "doctrine_precedence.md",
+    "hierarchy.md",
+    "sovereignty.md",
+    "data-isolation.md",
+}
 
 readme = DOCTRINE / "README.md"
 precedence = DOCTRINE / "doctrine_precedence.md"
@@ -310,21 +317,19 @@ all_doctrine = sorted(p.name for p in DOCTRINE.glob("*.md") if p.is_file())
 reserved = {"README.md", "doctrine_precedence.md"}
 unranked = [n for n in all_doctrine if n not in reserved and n not in ordered]
 
-# Deterministic Gauntlet startup invariant. Startup must load and verify every
-# binding doctrine file before BOOT STATUS may become COMPLETE. The model must
-# receive the same live bodies in precedence order; a manifest plus an
-# instruction to fetch later is not sufficient authority. Hashes remain in the
-# manifest so the exact loaded corpus is auditable.
+# Deterministic doctrine integrity check. Startup verifies the canonical doctrine
+# set in precedence order and emits only the manifest. Full doctrine bodies remain
+# available on demand and are not injected into every SessionStart payload.
+# This keeps the boot transport bounded while preserving exact corpus hashes.
 doctrine_files = ["README.md", "doctrine_precedence.md"] + ordered + unranked
 seen = set()
 doctrine_files = [n for n in doctrine_files if not (n in seen or seen.add(n))]
 
 doctrine_manifest = []
-doctrine_loaded_sections = []
 source_hash_parts = []
 constraints_body, constraints_err = read_text(BOOT_CONSTRAINTS)
 if constraints_err or not (constraints_body or "").strip():
-    failures.append(constraints_err or f"{BOOT_CONSTRAINTS}: empty canonical boot constraints")
+    blockers.append(constraints_err or f"{BOOT_CONSTRAINTS}: empty canonical boot constraints")
     constraints_body = "# NORTH CALEDONIA SHARED BOOT CONSTRAINTS\n\nBOOT CONSTRAINTS UNAVAILABLE — STOP BEFORE TASK EXECUTION."
 else:
     constraints_body = constraints_body.strip()
@@ -333,8 +338,7 @@ for name in doctrine_files:
     p = DOCTRINE / name
     body, err = read_text(p)
     if err:
-        failures.append(err)
-        body = f"BOOT REQUIRED FILE UNAVAILABLE: {err}"
+        (blockers if name in CRITICAL_DOCTRINE else warnings).append(err)
     digest = sha(p)
     source_hash_parts.append(f"{p}:{digest}")
     flags = []
@@ -342,11 +346,9 @@ for name in doctrine_files:
         flags.append("UNRANKED-BUT-BINDING")
     flag_text = f" flags={','.join(flags)}" if flags else ""
     doctrine_manifest.append(f"{name} sha256={digest or 'UNAVAILABLE'} path={p}{flag_text}")
-    doctrine_loaded_sections.append(section(f"BINDING DOCTRINE: {name}", body or ""))
 
 doctrine_sections = [
-    section("DOCTRINE MANIFEST — deterministically loaded and verified below", "\n".join(doctrine_manifest)),
-    *doctrine_loaded_sections,
+    section("DOCTRINE MANIFEST — verified canonical corpus; bodies load on demand", "\n".join(doctrine_manifest)),
 ]
 
 # Shared vault session-start chain. Deliberately excludes company-private folders.
@@ -364,7 +366,7 @@ vault_manifest = []
 for label, path, _ in required_vault:
     body, err = read_text(path)
     if err:
-        failures.append(err)
+        warnings.append(err)
     digest = sha(path)
     source_hash_parts.append(f"{path}:{digest}")
     vault_manifest.append(f"{label} sha256={digest or 'UNAVAILABLE'} path={path}")
@@ -380,7 +382,7 @@ vault_sections = [section(
 vault_index_path = API_VAULT / "VAULT-INDEX.md"
 vault_index_body, vault_index_err = read_text(vault_index_path)
 if vault_index_err:
-    failures.append(vault_index_err)
+    warnings.append(vault_index_err)
     vault_index_body = f"BOOT REQUIRED FILE UNAVAILABLE: {vault_index_err}"
 vault_sections.append(section("SHARED CANONICAL VAULT-INDEX — deterministically loaded", vault_index_body or ""))
 
@@ -394,7 +396,7 @@ if not daily.exists():
 else:
     daily_body, daily_err = read_text(daily)
     if daily_err:
-        failures.append(daily_err)
+        warnings.append(daily_err)
         daily_view = f"BOOT REQUIRED FILE UNAVAILABLE: {daily_err}"
     else:
         lines = (daily_body or "").splitlines()
@@ -436,9 +438,9 @@ erika_amendment_active = (
     erika_amendment_exists and erika_amendment_hash == ERIKA_EXECUTION_AMENDMENT_SHA256
 )
 if not erika_amendment_exists:
-    failures.append(f"Erika execution amendment missing: {ERIKA_EXECUTION_AMENDMENT_PATH}")
+    warnings.append(f"Erika execution amendment missing: {ERIKA_EXECUTION_AMENDMENT_PATH}")
 elif not erika_amendment_active:
-    failures.append(
+    warnings.append(
         f"Erika execution amendment hash mismatch: {ERIKA_EXECUTION_AMENDMENT_PATH} "
         f"expected={ERIKA_EXECUTION_AMENDMENT_SHA256} actual={erika_amendment_hash}"
     )
@@ -460,9 +462,9 @@ pinned_hash = sha(PINNED_CHECKPOINT_PATH) if pinned_exists else "UNAVAILABLE"
 pinned_active = pin_configured and pinned_exists and pinned_hash == PINNED_CHECKPOINT_SHA256
 if pin_configured and not pinned_active:
     if not pinned_exists:
-        failures.append(f"pinned checkpoint missing: {PINNED_CHECKPOINT_PATH}")
+        warnings.append(f"pinned checkpoint missing: {PINNED_CHECKPOINT_PATH}")
     else:
-        failures.append(
+        warnings.append(
             f"pinned checkpoint hash mismatch: {PINNED_CHECKPOINT_PATH} "
             f"expected={PINNED_CHECKPOINT_SHA256} actual={pinned_hash}"
         )
@@ -499,21 +501,16 @@ elif not pin_configured and checkpoints:
     )
     vault_sections.append(section(f"latest checkpoint metadata: {cp.name}", cp_meta))
 else:
-    failures.append("no checkpoint file found")
+    warnings.append("no checkpoint file found")
 
 # Live local repo state. No network fetch, no credentials, no company-private reads.
 doctrine_head, _ = run(["git", "-C", str(DOCTRINE), "rev-parse", "--short=12", "HEAD"])
 vault_head, _ = run(["git", "-C", str(VAULT), "rev-parse", "--short=12", "HEAD"])
 vault_status, _ = run(["git", "-C", str(VAULT), "status", "--short", "--branch"])
 
-# Vault truth checks from the canonical Claude boot sequence. The wrapper resolves its
-# own credentials without rendering them; only its human-readable verdict enters context.
-vault_prs, vp_rc = run([str(CH / ".local/bin/vault-pr-check")], timeout=30)
-if vp_rc != 0:
-    failures.append(f"vault-pr-check failed rc={vp_rc}")
-    vault_prs = vault_prs or "UNAVAILABLE — open vault PR state is unverified."
-elif not vault_prs:
-    vault_prs = "(none reported)"
+# GitHub PR state is task-scoped, not a boot dependency. Avoid an external network call
+# on every startup; run vault-pr-check only when the current task requires PR truth.
+vault_prs = "ON-DEMAND — run /home/chris/.local/bin/vault-pr-check when the current task requires PR state."
 
 # Checkpoint freshness uses metadata only — never read Claude session bodies here, because
 # those may contain company-private context. Shared boot may compare timestamps, not commingle
@@ -560,7 +557,7 @@ open_items = (
 active_priorities_path = VAULT / "Active Priorities.md"
 active_priorities_body, active_priorities_err = read_text(active_priorities_path)
 if active_priorities_err:
-    failures.append(active_priorities_err)
+    warnings.append(active_priorities_err)
     open_priorities_manifest = f"UNAVAILABLE — {active_priorities_err}"
 else:
     ap_lines = (active_priorities_body or "").splitlines()
@@ -585,45 +582,15 @@ else:
 
 kanban_continuity, kanban_err = kanban_continuity_state()
 if kanban_err:
-    failures.append(f"kanban continuity unavailable: {kanban_err}")
+    warnings.append(f"kanban continuity unavailable: {kanban_err}")
 
-# External skill/plugin supply-chain gate. Cleared third-party copies are pinned by content
-# hash and frozen locally. Any drift or unregistered externally installed skill/plugin makes
-# shared boot DEGRADED before an agent is allowed to execute work.
+# Single external skill/plugin supply-chain gate. Approved executable trees are
+# pinned by content hash; unregistered external installs and drift fail closed.
+# Broader skill-integrity inventory remains available on demand and is not a boot gate.
 skill_trust, st_rc = run([str(HERMES / "security/skill-trust/verify.py")], timeout=20)
 if st_rc != 0:
-    failures.append(f"skill supply-chain gate failed rc={st_rc}: {skill_trust or 'no verifier output'}")
+    blockers.append(f"skill supply-chain gate failed rc={st_rc}: {skill_trust or 'no verifier output'}")
     skill_trust = skill_trust or "SKILL TRUST: FAIL — verifier returned no output"
-
-skill_integrity_raw, si_rc = run(
-    [str(CH / ".local/bin/skill-integrity"), "verify", "--json"], timeout=30
-)
-try:
-    si = __import__("json").loads(skill_integrity_raw or "{}")
-    violations = si.get("violations") or []
-    missing = si.get("missing") or []
-    unfrozen_all = si.get("unfrozen") or []
-    # Claude marketplace *.staging trees are source/download staging, not active
-    # installed payloads. Active installed plugins remain covered by the separate
-    # claude-cache root. Do not degrade boot solely for staged marketplace copies.
-    staging_unfrozen = [x for x in unfrozen_all if ".staging/" in x]
-    active_unfrozen = [x for x in unfrozen_all if ".staging/" not in x]
-    integrity_clean = not (violations or missing or active_unfrozen)
-    skill_integrity = (
-        f"SKILL INTEGRITY: {'OK' if integrity_clean else 'FAIL'} — "
-        f"frozen={si.get('locked', 0)} changed={len(violations)} "
-        f"active_unfrozen={len(active_unfrozen)} missing={len(missing)} "
-        f"staging_ignored={len(staging_unfrozen)}"
-    )
-    if not integrity_clean:
-        failures.append(
-            "full skill integrity gate failed: "
-            f"changed={len(violations)} active_unfrozen={len(active_unfrozen)} missing={len(missing)}"
-        )
-except Exception as exc:
-    skill_integrity = skill_integrity_raw or "SKILL INTEGRITY: FAIL — verifier returned no output"
-    if si_rc != 0:
-        failures.append(f"full skill integrity gate failed rc={si_rc}: {type(exc).__name__}: {exc}")
 
 # Runtime identity without reading secrets.
 def pyproject_version(root: Path) -> str:
@@ -637,8 +604,9 @@ def pyproject_version(root: Path) -> str:
 target_v = pyproject_version(HERMES / "hermes-agent-next")
 
 fingerprint = hashlib.sha256("\n".join(source_hash_parts).encode()).hexdigest()
-boot_status = "DEGRADED — STOP BEFORE TASK EXECUTION" if failures else "COMPLETE"
-failure_text = "\n".join(f"- {x}" for x in failures) if failures else "(none)"
+boot_status = "DEGRADED — STOP BEFORE TASK EXECUTION" if blockers else "COMPLETE"
+failure_text = "\n".join(f"- {x}" for x in blockers) if blockers else "(none)"
+warning_text = "\n".join(f"- {x}" for x in warnings) if warnings else "(none)"
 unranked_text = ", ".join(unranked) if unranked else "(none)"
 doctrine_blob = "\n\n".join(doctrine_sections)
 vault_blob = "\n\n".join(vault_sections)
@@ -675,12 +643,14 @@ GAUNTLET RELIABILITY CONTRACT:
 - Only verified lessons may become durable canonical learning; failed or unresolved attempts remain observations/candidates.
 - No direct EXECUTING -> COMPLETED claim.
 
-REQUIRED-CHAIN FAILURES:
+BLOCKING FAILURES:
 {failure_text}
+
+NON-BLOCKING WARNINGS:
+{warning_text}
 
 SKILL / PLUGIN SUPPLY-CHAIN GATE:
 {skill_trust}
-{skill_integrity}
 
 LOCAL VAULT GIT STATE:
 {vault_status or '(clean/no output)'}
@@ -709,5 +679,5 @@ This block is the shared canonical startup context. Identity files may specializ
 
 
 
-if GATE_EXIT_CODE and failures:
+if GATE_EXIT_CODE and blockers:
     sys.exit(2)

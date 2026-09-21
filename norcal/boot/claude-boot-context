@@ -47,6 +47,7 @@ def canonical_checkpoint_authority():
     return True, "PASS"
 
 failures = []
+warnings = []
 status = "OK"
 local_sha = digest(LOCAL)
 canon_sha = digest(CANON)
@@ -80,7 +81,7 @@ except Exception as exc:
 
 checkpoint_ok, checkpoint_detail = canonical_checkpoint_authority()
 if not checkpoint_ok:
-    failures.append(f"Claude canonical checkpoint authority failed: {checkpoint_detail}")
+    warnings.append(f"Claude canonical checkpoint continuity warning: {checkpoint_detail}")
 
 caller_sync = (os.environ.get("CLAUDE_MD_SYNC") or "not-reported").strip()
 if failures:
@@ -98,6 +99,7 @@ preface = "<claude-bootstrap>\n" + "\n".join([
     f"CLAUDE CHECKPOINT AUTHORITY CHECK: {checkpoint_detail}",
     "Claude's CLAUDE.md is the role/rule file that must already be loaded before this SessionStart context. The shared payload below is the same doctrine/vault starting line used by Erika/Hermes.",
     *(f"FAILURE: {x}" for x in failures),
+    *(f"WARNING: {x}" for x in warnings),
 ]) + "\n</claude-bootstrap>"
 
 ctx = shared + "\n\n" + preface

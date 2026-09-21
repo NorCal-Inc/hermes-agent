@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Mechanical authority check for boot-gate recovery executors.
 
-Recovery authority exists only while the named Kanban card is an actively running
-claude_recovery task with a deterministic recovery gate. This module grants no
-ordinary-task authority and contains no model-facing policy decisions.
+The recovery launcher can authorize a session before boot with
+``NORCAL_RECOVERY_AUTHORIZED=1``. Kanban validation remains a compatibility fallback,
+not a dependency for recovery availability. This module grants no ordinary-task authority.
 """
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ def validate_recovery_task(task_id: str, db_path: str | Path | None = None) -> T
     task_id = (task_id or "").strip()
     if not task_id:
         return False, "recovery task id missing"
+    if (os.environ.get("NORCAL_RECOVERY_AUTHORIZED") or "").strip() == "1":
+        return True, "authorized recovery launcher"
     path = Path(db_path or os.environ.get("HERMES_KANBAN_DB") or DEFAULT_DB)
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)

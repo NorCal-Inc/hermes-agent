@@ -78,17 +78,10 @@ def startup_directive(complete: bool, failure: str = "") -> str:
             "<norcal-session-startup>\n"
             "FRESH SESSION STARTUP — MANDATORY AND NOT OPERATOR-TRIGGERED.\n"
             "SHARED BOOT GATE: COMPLETE\n"
-            "The canonical boot generator already ran for this session and every required "
-            "gate above has been evaluated. Its verbatim output precedes this block.\n"
-            "Before answering, routing, delegating, or acting on any Kanban task in this "
-            "session, execute the canonical five-step startup protocol against that payload: "
-            "(1) confirm boot state, boot time, doctrine version, source fingerprint, runtime "
-            "version, and required-chain failures; (2) apply the injected doctrine set in "
-            "precedence order; (3) load the shared vault continuity and CURRENT KANBAN "
-            "CONTINUITY as the first source of truth for current-task state; (4) read the gate "
-            "results already included above rather than repeating them; (5) surface the state.\n"
-            "Do not wait to be told to boot. Do not re-run the generator; its output is "
-            "already present.\n"
+            "The canonical boot generator already ran for this session. Its output precedes "
+            "this block. Confirm the boot state, surface any warnings, and use the compact "
+            "continuity already present. Do not re-run boot checks or preload doctrine bodies; "
+            "open specific doctrine or vault bodies only when the authorized task requires them.\n"
             "</norcal-session-startup>"
         )
     return (
@@ -99,12 +92,11 @@ def startup_directive(complete: bool, failure: str = "") -> str:
         "Ordinary task execution is blocked. Do not act on, claim, advance, verify, or "
         "complete any Kanban task, and do not execute the operator's original request "
         "through the failed gate. Do not ask whether to repair it.\n"
-        "Park the original request and use the Jarvis recovery override: create exactly one "
-        'recovery task with assignee="default", executor_lane="claude_recovery", and '
-        f'recovery_gate_cmd="{RECOVERY_GATE_CMD}", with the original request as its '
-        "dependent continuation. Do not diagnose the gate first and do not poll.\n"
-        "Ordinary execution resumes only once a fresh session reports SHARED BOOT GATE: "
-        "COMPLETE.\n"
+        "Use exactly one bounded recovery session for the named blocking failure. If Kanban "
+        "is available, the existing claude_recovery lane may launch it; launcher authorization "
+        "is independent of Kanban availability. Do not create verifier chains or additional "
+        "boot gates. Ordinary execution resumes only after a fresh session reports SHARED "
+        "BOOT GATE: COMPLETE.\n"
         "</norcal-session-startup>"
     )
 

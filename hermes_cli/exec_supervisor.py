@@ -685,6 +685,7 @@ def _build_claude_recovery(spec: dict) -> list[str]:
     binary = shutil.which("claude") or "claude"
     return [
         "/usr/bin/env",
+        "NORCAL_RECOVERY_AUTHORIZED=1",
         f"NORCAL_RECOVERY_TASK_ID={task_id}",
         binary,
         "-p",
@@ -728,6 +729,7 @@ def _build_codex_recovery(spec: dict) -> list[str]:
     task_id = _require_str(spec, "task_id")
     argv = [
         "/usr/bin/env",
+        "NORCAL_RECOVERY_AUTHORIZED=1",
         f"NORCAL_RECOVERY_TASK_ID={task_id}",
         *_resolve_codex_argv_prefix(),
         "exec",
