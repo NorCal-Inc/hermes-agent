@@ -156,15 +156,9 @@ class TestAssignTaskNormalizes:
             assert assigned[-1]["requested"] == "atlas"
             assert assigned[-1]["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY
 
-    def test_non_shorthand_assignment_leaves_lane_untouched(self, kanban_home):
-        """Only a shorthand token writes executor_lane. Nothing else does."""
+    def test_non_shorthand_assignment_clears_stale_lane(self, kanban_home):
+        """A real profile assignment owns execution and clears a stale lane."""
         with kb.connect_closing() as conn:
-            # The subject parent is mandatory: "atlas" resolves to
-            # ``codex_verify``, and a verifier card with no subject is refused
-            # by the mandatory-linkage guard (criterion A) because its verdict
-            # could be returned to nobody. Lane normalization is what is under
-            # test here, so the fixture satisfies the linkage rule rather than
-            # the rule being relaxed to admit an orphan verifier.
             subject = kb.create_task(conn, title="subject under review")
             tid = kb.create_task(
                 conn, title="verify", assignee="atlas", parents=(subject,),
@@ -172,14 +166,10 @@ class TestAssignTaskNormalizes:
             assert kb.get_task(conn, tid).executor_lane == (
                 kb.EXECUTOR_LANE_CODEX_VERIFY
             )
-            # Reassigning to a real profile must not silently clear the lane —
-            # clearing it is a separate decision with its own semantics, and
-            # inventing one here would change dispatch for existing rows.
             assert kb.assign_task(conn, tid, "default") is True
             task = kb.get_task(conn, tid)
             assert task.assignee == "default"
-            assert task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
-            assert _events(conn, tid, "executor_lane_normalized") == []
+            assert task.executor_lane is None
 
     def test_lane_change_on_same_carrier_resets_the_failure_streak(
         self, kanban_home
@@ -557,3 +547,22 @@ class TestAssignTaskPreservesGauntletSubjects:
             child = kb._open_verifier_child(conn, tid)
             assert child is not None
             assert kb.get_task(conn, child).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+
+def test_erika_assignment_clears_stale_claude_lane(kanban_home, monkeypatch):
+    """Erika reassignment must not normalize back to default/claude."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(
+        profiles, "profile_exists",
+        lambda name: name in {"default", "erika"},
+    )
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="stale claude lane", assignee="claude")
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "default"
+        assert task.executor_lane == kb.EXECUTOR_LANE_CLAUDE
+
+        assert kb.assign_task(conn, tid, "erika") is True
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "erika"
+        assert task.executor_lane is None

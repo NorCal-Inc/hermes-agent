@@ -6090,8 +6090,19 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 conn, task_id, row["assignee"],
             ) or ""
         else:
-            lane_sql = ", executor_lane = ?" if from_token is not None else ""
-            lane_params: tuple[Any, ...] = (lane,) if from_token is not None else ()
+            # Explicit assignment to a real Hermes profile is authoritative
+            # ownership of execution. A stale direct executor lane must not
+            # survive that reassignment, otherwise the dispatcher can rewrite
+            # the card back onto default/claude or default/codex_verify.
+            # Only the legacy shorthand tokens (claude/atlas) explicitly set
+            # a direct executor lane.
+            if from_token is None:
+                lane = None
+                lane_sql = ", executor_lane = NULL"
+                lane_params: tuple[Any, ...] = ()
+            else:
+                lane_sql = ", executor_lane = ?"
+                lane_params = (lane,)
             # Compare the whole executor identity, not just the profile string: a
             # task already on assignee='default' that is being moved onto the
             # codex_verify lane IS a reassignment, and must not inherit the
