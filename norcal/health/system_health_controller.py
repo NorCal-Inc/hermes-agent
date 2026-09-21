@@ -2864,12 +2864,16 @@ class CompanyIsolation(Invariant):
         lead_to_company = {lead: cid for cid, spec in companies.items() for lead in spec.get("lead_profiles", [])}
         watch_since = int(cfg.get("isolation_watch_since") or 0)
         counts: dict[str, int] = {}
-        historical: dict[str, int] = {}
         with ctx.kanban() as conn:
             for row in conn.execute(
                 "SELECT a.task_id, a.filename, a.created_at, t.assignee FROM task_attachments a "
                 "JOIN tasks t ON t.id = a.task_id"
             ).fetchall():
+                # The watch starts at an explicit cutover. Older attachments are
+                # preserved history, not a live incident that should re-escalate
+                # on every deep pass.
+                if int(row["created_at"] or 0) < watch_since:
+                    continue
                 name = str(row["filename"] or "").lower()
                 owner = lead_to_company.get(row["assignee"] or "")
                 foreign = [cid for cid, spec in companies.items() if cid != owner
@@ -2878,14 +2882,9 @@ class CompanyIsolation(Invariant):
                                               or name.startswith(".env") or ".log." in name))
                 if not foreign and not runtime:
                     continue
-                bucket = counts if int(row["created_at"] or 0) >= watch_since else historical
-                bucket[row["task_id"]] = bucket.get(row["task_id"], 0) + 1
+                counts[row["task_id"]] = counts.get(row["task_id"], 0) + 1
         for task_id, n in sorted(counts.items()):
             out.append(Finding(self.name, task_id, "boundary_attachments_on_card", {"count": str(n)}, unsafe=True))
-        if historical:
-            ids = sorted(historical)
-            out.append(Finding(self.name, "attachment-boundary-inventory", "historical_boundary_attachment_inventory",
-                               {"cards": str(len(ids)), "card_ids": ",".join(ids)[:1500]}, unsafe=True))
         return out
 
 

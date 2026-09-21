@@ -2029,24 +2029,16 @@ class TestCompanyIsolation:
         blob = json.dumps([(f.subject, f.signature, f.detail) for f in findings]).lower()
         assert "orion" not in blob and "logos" not in blob and ".log" not in blob
 
-    def test_history_is_one_unsafe_inventory_finding_and_is_never_excepted(self, kanban_home):
+    def test_pre_watch_history_is_preserved_but_not_a_live_isolation_finding(self, kanban_home):
         with kb.connect_closing() as conn:
-            orion_card, shared_card = self._board(conn)
-        alerts = Alerts()
-        condition = "company_isolation|attachment-boundary-inventory|historical_boundary_attachment_inventory"
-        config = {**self._config(int(time.time()) + 3600),
-                  **_governed(_exception("would-hide", "preserved_condition", [condition]))}
-        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=config,
-                                     run_command=lambda argv, t: (0, "")),
-                                [shc.CompanyIsolation()]).run(shc.TIER_DEEP)
-        assert result.status == shc.AGGREGATE_ESCALATED and result.held == []
-        state = shc.StateStore(_ctx(kanban_home).state_dir).load()
-        (rec,) = [r for r in state["fingerprints"].values() if r["invariant"] == "company_isolation"]
-        assert rec["subject"] == "attachment-boundary-inventory" and rec["escalation_reason"] == "unsafe"
+            self._board(conn)
+        config = self._config(int(time.time()) + 3600)
+        findings = shc.CompanyIsolation().check(
+            _ctx(kanban_home, config=config, run_command=lambda argv, t: (0, ""))
+        )
+        assert findings == []
         with kb.connect_closing() as conn:
-            (card,) = [c for c in _health_cards(conn) if "company_isolation" in c["title"]]
-        assert orion_card in card["body"] and shared_card in card["body"]
-        assert "orion-api" not in card["body"].lower() and "orion-api" not in alerts.sent[0][1].lower()
+            assert _health_cards(conn) == []
 
     @pytest.mark.parametrize("rc,signature", [(1, "registry_runtime_drift"), (2, "registry_check_incomplete"),
                                               (127, "registry_check_failed:rc=127"), (0, None)])
