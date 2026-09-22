@@ -76,16 +76,30 @@ The commit narrows a gate — `scrub_secrets=is_multiplex_active()` becomes
 `is_multiplex_active() or _is_routed_home(profile_home)` — inside upstream's
 `hermes_cli/kanban_db_dispatch.py`.
 
-None of that machinery exists here. This fork's `_default_spawn`
-(`hermes_cli/kanban_db.py:23396`) predates the whole mechanism: at the
-merge-base upstream's `_default_spawn` was also a bare `env = dict(os.environ)`,
-and `build_subprocess_env` / `strip_launch_profile_env` / `_is_routed_home` /
-`_worker_profile_scope` / `served_profile_child_env` all arrived upstream
-afterwards. There is no gate here to narrow, because there is no scrub.
+The **gate** does not exist here. This fork's `_default_spawn`
+(`hermes_cli/kanban_db.py:23423`) builds a bare `env = dict(os.environ)` and
+applies no scrub at all, so there is no `scrub_secrets=` argument to narrow.
+`strip_launch_profile_env`, `_is_routed_home`, `_worker_profile_scope` and
+`served_profile_child_env` are all absent (0 definitions, verified by grep).
 
-Implementing the scrub chain would be a feature port of a month of upstream
-evolution into the live NorCal kanban dispatcher, not a fix cherry-pick — see
-**Finding A** below, raised for a governed decision rather than executed here.
+**Correction (made on re-verification; an earlier revision of this file was
+wrong here).** That earlier revision listed `build_subprocess_env` among the
+primitives that "arrived upstream afterwards". It did not: **this fork has
+`build_subprocess_env` with a working `scrub_secrets=True` default** at
+`tools/environments/local.py:674`, over the long-standing
+`_sanitize_subprocess_env` (provider blocklist + `_is_hermes_internal_secret`
+patterns + `HERMES_HOME`/HOME propagation), plus `hermes_subprocess_env`. It is
+already used on the CLI spawn path (`cli.py:11941`). So the remedy for
+**Finding A** is routing one existing call site through an existing factory —
+*not* a month-long feature port, which is how the earlier wording read. The
+reviewer should weigh Finding A knowing the fix is cheap.
+
+The verdict is unchanged, and for the reason below rather than the corrected
+one: upstream's commit narrows a gate this fork does not have, so there is
+nothing to cherry-pick. Adding a scrub to the live dispatcher changes what
+every kanban worker on this host can see — a `data-isolation.md` /
+`sovereignty.md` decision, not an executor's. See **Finding A**, raised for a
+governed decision rather than executed here.
 
 ### 3. `8863b36fd6` — cron: stale-code yield reads as an outage in `cron status` — **REJECTED (precondition absent)**
 
@@ -285,10 +299,21 @@ built from one identical environment, differing only in `HERMES_HOME`.
 
 This is the exposure `bc0a42fd96` and its predecessors close upstream. It is a
 `data-isolation.md` / `sovereignty.md` question (do company lanes share the
-dispatcher's process credentials?) before it is a code question, and the fix —
-adopting `build_subprocess_env(scrub_secrets=…)` on the spawn path — would
-change what every kanban worker on this host can see. Recommend a governed
-decision; do not let an executor make it silently.
+dispatcher's process credentials?) before it is a code question, and the fix
+would change what every kanban worker on this host can see. Recommend a
+governed decision; do not let an executor make it silently.
+
+**The fix is cheap and already in-tree** — this is the one thing to carry into
+that decision. `tools/environments/local.py:674` already provides
+`build_subprocess_env(base=…, scrub_secrets=True)`, wrapping the established
+`_sanitize_subprocess_env` scrub list and the `HERMES_HOME`/HOME propagation
+contract, and `cli.py:11941` already spawns through it. Routing `_default_spawn`
+through the same factory is a small, single-site change. What needs deciding is
+not feasibility but **policy**: whether a kanban worker for company lane X
+should keep seeing the launch gateway's provider keys and Hermes-internal
+secrets. The scrub list is also not lane-aware — it removes known-secret
+patterns, not "another company's credentials" — so a governed answer may want
+more than the default.
 
 *No claim is made here about which specific credentials are in that environment
 — the mechanism was read, the values were not.*
