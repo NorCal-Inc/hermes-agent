@@ -15558,12 +15558,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         one company isolation requires — the only thing lost is an
         observability hook for a profile whose home no longer exists.
 
+        "Unresolvable" has to mean *no usable home*, not merely "the lookup
+        raised". ``get_profile_dir`` is pure path arithmetic — it validates the
+        name and joins it onto the profiles root, and returns a ``Path`` for a
+        profile that was deleted or renamed after startup without raising. So
+        existence is checked here, and again per event: the factory runs once
+        at adapter install (and reconnect), and the home can go away while the
+        adapter is up — which is the case named above.
+
         Upstream: 4aa9baf139
         """
         from hermes_cli.profiles import get_profile_dir
 
         try:
-            profile_home = get_profile_dir(profile_name)
+            profile_home = Path(get_profile_dir(profile_name))
+            if not profile_home.is_dir():
+                raise FileNotFoundError(
+                    f"profile home {str(profile_home)!r} is not an existing directory")
         except Exception:
             profile_home = None
             logger.warning(
@@ -15571,12 +15582,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "DROPPED rather than authorized against the launch profile's "
                 "allowlist", profile_name, exc_info=True)
 
+        reported_vanished = False
+
         async def _handler(event, source):
+            nonlocal reported_vanished
             if getattr(source, "profile", None) is None:
                 source.profile = profile_name
             if profile_home is None:
                 logger.debug(
                     "Dropping platform event for unresolvable profile '%s'", profile_name)
+                return None
+            if not profile_home.is_dir():
+                # Resolved at install time, gone now. Scoping to a home that no
+                # longer exists installs an EMPTY secret scope and points
+                # HERMES_HOME at nothing, so drop rather than dispatch.
+                if not reported_vanished:
+                    reported_vanished = True
+                    logger.warning(
+                        "Profile home for '%s' disappeared while its adapter was "
+                        "running; platform events are DROPPED", profile_name)
+                else:
+                    logger.debug(
+                        "Dropping platform event for vanished profile '%s'", profile_name)
                 return None
             with _profile_runtime_scope(profile_home):
                 return await self._handle_gateway_platform_event(event, source)
