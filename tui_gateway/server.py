@@ -9875,6 +9875,12 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         summary = str(payload.get("summary") or "").strip()
         handoff = f"\n{summary[:200]}" if summary else ""
         return f"👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+    if kind == "verification_failed":
+        reason = str(payload.get("reason") or "").strip()
+        verifier = str(payload.get("verifier") or "").strip()
+        verifier_text = f" by {verifier}" if verifier else ""
+        suffix = f"\n{reason[:200]}" if reason else ""
+        return f"❌ {board_tag}{tag}Kanban {task_id} verification failed{verifier_text}{suffix}"
     if kind == "block_loop_detected":
         reason = str(payload.get("reason") or "").strip()
         recurrences = payload.get("recurrences")

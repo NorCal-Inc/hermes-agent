@@ -191,6 +191,42 @@ class TestCollectKanbanNotifications:
 
         assert any("linked task" in text and dep in text and "gave up" in text for text in texts)
 
+    def test_verification_failed_notifies_origin_session(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid, claimer="worker:1")
+            assert claimed is not None
+            assert kb.request_review(
+                conn, tid, summary="implementation ready", reviewer="reviewer",
+                expected_run_id=claimed.current_run_id,
+            )
+        finally:
+            conn.close()
+
+        # Consume the review transition first.
+        first = _collect_kanban_notifications(_session())
+        assert any("ready for review" in text for text in first)
+
+        conn = kb.connect()
+        try:
+            ok, detail = kb.record_verification(
+                conn, tid, passed=False, verifier="reviewer",
+                reason="regression suite failed",
+                evidence={"command": "pytest -q", "exit_code": 1},
+            )
+            assert ok is True
+            assert detail in {"rework", kb.VERIFICATION_FAILED}
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert tid in texts[0]
+        assert "verification failed" in texts[0].lower()
+        assert "regression suite failed" in texts[0]
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]

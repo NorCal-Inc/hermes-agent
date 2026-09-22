@@ -450,6 +450,26 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'implementation ready for review' })
   })
 
+  it('verification_failed notifies with verifier reason', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'verification_failed', {
+        verifier: 'codex_verify:t_v',
+        reason: 'regression suite failed'
+      })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'error',
+      title: 'Verification failed',
+      message: expect.stringContaining('regression suite failed')
+    })
+    expect(lastNotify().message).toContain('codex_verify:t_v')
+  })
+
   it('linked_task_gave_up notifies the owner about the failed linked task', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)

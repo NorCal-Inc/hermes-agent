@@ -214,7 +214,8 @@ def test_child_task_inherits_parent_chat_type(kanban_home):
 def test_notification_event_taxonomy_is_kernel_owned():
     assert kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(kb.KANBAN_NOTIFY_EVENT_KINDS)
     assert {
-        "review_requested", "linked_task_gave_up", "block_loop_detected"
+        "review_requested", "linked_task_gave_up", "block_loop_detected",
+        "verification_failed",
     }.issubset(kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS)
     assert {"status", "archived", "unblocked"}.isdisjoint(
         kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
@@ -486,6 +487,84 @@ async def test_notifier_notify_plus_wake_wakes_on_block_loop_detected(kanban_hom
     assert tid in wake_text
     assert "missing capability" in wake_text
     assert "triage" in wake_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_verification_failed(kanban_home):
+    """An independent verifier FAIL is significant even when rework auto-routes."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="verify me", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake",
+        )
+        claimed = kb.claim_task(conn, tid, claimer="worker1:1")
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="implementation ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        # Consume the review handoff so this notifier pass can only be driven
+        # by the later independent-verification failure.
+        _old, _new, first_events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="",
+            kinds=kb.KANBAN_NOTIFY_EVENT_KINDS,
+        )
+        assert any(ev.kind == "review_requested" for ev in first_events)
+        ok, detail = kb.record_verification(
+            conn,
+            tid,
+            passed=False,
+            verifier="reviewer",
+            reason="regression suite failed",
+            evidence={"command": "pytest -q", "exit_code": 1},
+        )
+        assert ok is True
+        assert detail in {"rework", kb.VERIFICATION_FAILED}
+        assert any(ev.kind == "verification_failed" for ev in kb.list_events(conn, tid))
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    wake_mock.assert_awaited_once()
+    wake_text = wake_mock.await_args.kwargs["text"]
+    assert tid in wake_text
+    assert "regression suite failed" in wake_text
+    assert "verification" in wake_text.lower()
 
 
 @pytest.mark.asyncio

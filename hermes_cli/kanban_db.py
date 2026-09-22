@@ -109,11 +109,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 KANBAN_NOTIFY_EVENT_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "block_loop_detected",
-    "review_requested", "linked_task_gave_up",
+    "review_requested", "linked_task_gave_up", "verification_failed",
 )
 KANBAN_ACTIVE_WAKE_EVENT_KINDS = frozenset({
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "block_loop_detected", "review_requested", "linked_task_gave_up",
+    "verification_failed",
 })
 assert KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(KANBAN_NOTIFY_EVENT_KINDS)
 

@@ -191,6 +191,7 @@ type KanbanMessages = {
     blockedTitle: string
     blockLoopTitle: string
     gaveUpTitle: string
+    verificationFailedTitle: string
     crashedTitle: string
     timedOutTitle: string
     openKanban: string
@@ -393,6 +394,7 @@ export const en: KanbanMessages = {
     blockedTitle: 'Task blocked — needs your input',
     blockLoopTitle: 'Task routed to triage — needs a decision',
     gaveUpTitle: 'Task gave up',
+    verificationFailedTitle: 'Verification failed',
     crashedTitle: 'Worker crashed — will retry',
     timedOutTitle: 'Task timed out — will retry',
     openKanban: 'Open Kanban',
@@ -594,6 +596,7 @@ const ja: KanbanMessages = {
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
     blockLoopTitle: 'タスクをトリアージへ移動 — 判断が必要です',
     gaveUpTitle: 'タスクを断念しました',
+    verificationFailedTitle: '検証に失敗しました',
     crashedTitle: 'ワーカーがクラッシュ — 再試行します',
     timedOutTitle: 'タスクがタイムアウト — 再試行します',
     openKanban: 'かんばんを開く',
@@ -792,6 +795,7 @@ const zh: KanbanMessages = {
     blockedTitle: '任务受阻 — 需要你的输入',
     blockLoopTitle: '任务已转入分类 — 需要人工决定',
     gaveUpTitle: '任务已放弃',
+    verificationFailedTitle: '验证失败',
     crashedTitle: '工作单元崩溃 — 将重试',
     timedOutTitle: '任务超时 — 将重试',
     openKanban: '打开看板',
@@ -990,6 +994,7 @@ const zhHant: KanbanMessages = {
     blockedTitle: '任務受阻 — 需要你的輸入',
     blockLoopTitle: '任務已轉入分類 — 需要人工決定',
     gaveUpTitle: '任務已放棄',
+    verificationFailedTitle: '驗證失敗',
     crashedTitle: '工作單元當機 — 將重試',
     timedOutTitle: '任務逾時 — 將重試',
     openKanban: '開啟看板',

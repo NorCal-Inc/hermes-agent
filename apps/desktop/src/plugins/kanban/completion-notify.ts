@@ -53,6 +53,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
   ['linked_task_gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'warning' }],
   ['review_requested', { titleKey: 'col.review.label', toast: 'warning' }],
+  ['verification_failed', { titleKey: 'notify.verificationFailedTitle', toast: 'error' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
 
@@ -132,6 +133,14 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
 
   if (kind === 'gave_up') {
     return trimmed(payload?.error)
+  }
+
+  if (kind === 'verification_failed') {
+    const verifier = trimmed(payload?.verifier)
+    const reason = trimmed(payload?.reason)
+    const verifierText = verifier ? ` by ${verifier}` : ''
+    const reasonText = reason ? `: ${reason}` : ''
+    return `Verification failed${verifierText}${reasonText}`
   }
 
   if (kind === 'linked_task_gave_up') {

@@ -638,6 +638,22 @@ class GatewayKanbanWatchersMixin:
                                 f"⚠ {board_tag}{tag}Kanban {sub['task_id']}: linked "
                                 f"task {other_id} ({relation}) gave up{err}"
                             )
+                        elif kind == "verification_failed":
+                            reason_text = ""
+                            verifier = ""
+                            if ev.payload:
+                                reason_text = str(ev.payload.get("reason") or "").strip()[:200]
+                                verifier = str(ev.payload.get("verifier") or "").strip()
+                            verifier_text = f" by {verifier}" if verifier else ""
+                            wake_handoff = (
+                                f"Independent verification failed{verifier_text}"
+                                + (f": {reason_text}" if reason_text else "")
+                            )
+                            msg = (
+                                f"❌ {board_tag}{tag}Kanban {sub['task_id']} verification FAILED"
+                                f"{verifier_text}"
+                                + (f"\n{reason_text}" if reason_text else "")
+                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -858,6 +874,7 @@ class GatewayKanbanWatchersMixin:
                             if "review_requested" in _wake_kinds: _parts.append("ready for review")
                             if "linked_task_gave_up" in _wake_kinds: _parts.append("linked task gave up; needs attention")
                             if "block_loop_detected" in _wake_kinds: _parts.append("routed to triage; needs a human decision")
+                            if "verification_failed" in _wake_kinds: _parts.append("verification failed; repair required")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
