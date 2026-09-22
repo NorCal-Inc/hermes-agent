@@ -275,6 +275,69 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_review_requested(kanban_home):
+    """A review handoff is a phase transition, not a passive FYI.
+
+    Active subscriptions must wake the origin session so the already-authorized
+    review phase can continue without waiting for a human to notice the text ping.
+    """
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review wake", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake",
+        )
+        claimed = kb.claim_task(conn, tid, claimer="worker1:1")
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="implementation ready",
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    wake_mock.assert_awaited_once()
+    wake_text = wake_mock.await_args.kwargs["text"]
+    assert tid in wake_text
+    assert "implementation ready" in wake_text
+
+
+@pytest.mark.asyncio
 async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_home):
     """Plain/default notify must remain passive even when the task carries a
     creator session_id. This guards against the older unconditional wake path

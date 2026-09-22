@@ -602,10 +602,15 @@ class GatewayKanbanWatchersMixin:
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
-                            # first-class review lane. Wake the origin thread.
+                            # first-class review lane. Wake the origin thread
+                            # and carry the implementer's handoff into that
+                            # synthetic turn so the next authorized phase can
+                            # continue without rediscovery.
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                review_summary = str(ev.payload["summary"])
+                                handoff = f"\n{review_summary[:200]}"
+                                wake_handoff = review_summary[:200]
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
@@ -803,7 +808,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -840,6 +845,7 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review_requested" in _wake_kinds: _parts.append("ready for review")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
