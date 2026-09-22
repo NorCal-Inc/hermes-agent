@@ -211,6 +211,16 @@ def test_child_task_inherits_parent_chat_type(kanban_home):
     assert subs[0]["user_id_alt"] == "alt-u1"
 
 
+def test_notification_event_taxonomy_is_kernel_owned():
+    assert kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(kb.KANBAN_NOTIFY_EVENT_KINDS)
+    assert {
+        "review_requested", "linked_task_gave_up", "block_loop_detected"
+    }.issubset(kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS)
+    assert {"status", "archived", "unblocked"}.isdisjoint(
+        kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
+    )
+
+
 @pytest.mark.asyncio
 async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     """notify+wake delivers the passive message AND wakes the agent; a plain

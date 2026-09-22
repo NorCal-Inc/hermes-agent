@@ -9727,14 +9727,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-# Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
-# the cursor advances past them and they can't wedge a later completed/blocked
-# event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked", "block_loop_detected",
-    "review_requested", "linked_task_gave_up",
-)
+# UI formatting is local, but event classification comes from kanban_db inside
+# the poller so gateway and TUI cannot silently diverge again.
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
@@ -9977,7 +9971,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                     platform=sub["platform"],
                     chat_id=sub["chat_id"],
                     thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
+                    kinds=_kb.KANBAN_NOTIFY_EVENT_KINDS,
                 )
                 if not events:
                     continue

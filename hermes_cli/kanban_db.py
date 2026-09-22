@@ -103,6 +103,20 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Canonical subscription event taxonomy. Keep this in the Kanban kernel so
+# every Python delivery surface claims the same rows and applies the same
+# active-wake policy. UI formatting remains surface-specific.
+KANBAN_NOTIFY_EVENT_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "status", "archived", "unblocked", "block_loop_detected",
+    "review_requested", "linked_task_gave_up",
+)
+KANBAN_ACTIVE_WAKE_EVENT_KINDS = frozenset({
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "block_loop_detected", "review_requested", "linked_task_gave_up",
+})
+assert KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(KANBAN_NOTIFY_EVENT_KINDS)
+
 # ---------------------------------------------------------------------------
 # Gauntlet verification lifecycle
 # ---------------------------------------------------------------------------

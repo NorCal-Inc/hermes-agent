@@ -211,13 +211,9 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        # ``review_requested`` wakes the origin subscriber like a block does,
-        # but is not a block (see kanban_db.request_review); the task is not
-        # archived, so the subscription stays alive and later review
-        # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "linked_task_gave_up")
+        # The kernel owns event classification so gateway and TUI cannot drift
+        # into different notification/wake semantics. Formatting remains local.
+        TERMINAL_KINDS = _kb.KANBAN_NOTIFY_EVENT_KINDS
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -822,7 +818,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "linked_task_gave_up", "block_loop_detected")
+                        _WAKE_KINDS = _kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
