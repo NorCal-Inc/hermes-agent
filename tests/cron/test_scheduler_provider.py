@@ -594,6 +594,12 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     scoped via use_cron_store, so secondary-profile jobs actually fire
     instead of languishing in an unticked store."""
     from cron.scheduler_provider import InProcessCronScheduler
+    from agent import secret_scope
+
+    # Multi-profile cron ownership is gated on the profile-isolation machinery
+    # being explicitly enabled (see test_multiplex_cron_ownership_guard.py);
+    # a multiplex gateway sets this at startup from gateway.multiplex_profiles.
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
 
     # Set up two profile directories.
     p1 = tmp_path / "default"

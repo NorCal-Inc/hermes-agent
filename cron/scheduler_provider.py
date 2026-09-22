@@ -488,6 +488,101 @@ def scheduler_for_profile_mode(
     return InProcessCronScheduler()
 
 
+# ── Fail-closed gate on multi-profile cron ownership ─────────────────────
+# Ticking several profiles' cron stores from ONE process means that process
+# executes work on behalf of every one of those profiles. That is only safe
+# while the host/profile isolation machinery is explicitly enabled AND valid:
+#
+#   * ``agent.secret_scope.is_multiplex_active()`` is the process-global flag
+#     the gateway sets from ``gateway.multiplex_profiles``. It is what makes
+#     ``get_secret()`` RAISE on an unscoped credential read instead of falling
+#     back to ``os.environ``. With the flag off, os.environ still holds the
+#     LAUNCH profile's values, so every ticked profile's jobs would silently
+#     resolve the launch profile's credentials — a cross-profile leak with no
+#     error and no log line.
+#   * the per-profile scoping seams (``set_hermes_home_override`` /
+#     ``reset_hermes_home_override`` / ``use_cron_store``) must be importable;
+#     they are what scope each tick's home, store, lock and heartbeat.
+#   * the profile set itself must be well formed: every home has to resolve to
+#     a real directory, and two entries must not resolve to the SAME store (a
+#     shared store means one profile's ticker fires another's jobs and their
+#     heartbeats/ownership markers overwrite each other).
+#
+# When any of that does not hold we do NOT take multi-profile ownership. The
+# ticker falls back to the single-profile path it has always run, so
+# non-multiplex behaviour is bit-for-bit unchanged and no profile's jobs are
+# ever executed under another profile's credentials.
+
+
+class MultiplexCronIsolationError(RuntimeError):
+    """Multi-profile cron ownership was requested without valid isolation.
+
+    Raised by the multiplex ticker itself so a direct call cannot bypass the
+    gate. ``InProcessCronScheduler.start()`` checks first and degrades to the
+    single-profile ticker rather than letting this reach the cron thread.
+    """
+
+
+def _profile_home_of(entry: Any) -> Any:
+    """Return the home path from a ``(name, home)`` entry or a bare home."""
+    return entry[1] if isinstance(entry, tuple) else entry
+
+
+def multiplex_cron_isolation_error(profile_homes) -> str | None:
+    """Return why multi-profile cron ownership must not activate, else None.
+
+    Fail closed: any condition we cannot positively verify is a refusal.
+    """
+    from pathlib import Path
+
+    if not profile_homes:
+        return "no served profile homes were resolved"
+
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except Exception as exc:  # pragma: no cover - import-time breakage
+        return f"the secret-scope isolation module is unavailable ({exc})"
+
+    if not is_multiplex_active():
+        return (
+            "multiplexing is not enabled for this process "
+            "(agent.secret_scope.is_multiplex_active() is False), so an "
+            "unscoped credential read would fall back to the launch "
+            "profile's os.environ instead of failing closed"
+        )
+
+    try:
+        from hermes_constants import (  # noqa: F401
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+        from cron.jobs import use_cron_store  # noqa: F401
+    except Exception as exc:
+        return f"the per-profile cron scoping seams are unavailable ({exc})"
+
+    seen: dict[str, Any] = {}
+    for entry in profile_homes:
+        home = _profile_home_of(entry)
+        if not home:
+            return "a served profile entry carries no home path"
+        try:
+            resolved = Path(home).resolve()
+        except Exception as exc:
+            return f"profile home {home!r} does not resolve ({exc})"
+        if not resolved.is_dir():
+            return f"profile home {resolved} is not an existing directory"
+        key = str(resolved)
+        if key in seen:
+            return (
+                f"profile homes {seen[key]!r} and {_profile_home_of(entry)!r} "
+                f"resolve to the same store ({resolved}); per-profile cron "
+                f"ownership would not be isolated"
+            )
+        seen[key] = home
+
+    return None
+
+
 class InProcessCronScheduler(CronScheduler):
     """Default provider: the historical in-process 60s ticker.
 
@@ -530,16 +625,30 @@ class InProcessCronScheduler(CronScheduler):
         # only the process-global HERMES_HOME (the default profile) is ticked.
         # Heartbeats and recovery are also scoped per profile so `hermes cron
         # status` reflects liveness for every profile independently.
+        #
+        # Multi-profile ownership is gated fail-closed: unless the host/profile
+        # isolation machinery is explicitly enabled and valid we keep the
+        # single-profile ticker below, which is exactly the pre-multiplex
+        # behaviour.
         if profile_homes:
-            self._start_multiplex(
-                stop_event,
-                profile_homes=profile_homes,
-                adapters=adapters,
-                loop=loop,
-                interval=interval,
-                can_dispatch=can_dispatch,
+            refusal = multiplex_cron_isolation_error(profile_homes)
+            if refusal is None:
+                self._start_multiplex(
+                    stop_event,
+                    profile_homes=profile_homes,
+                    adapters=adapters,
+                    loop=loop,
+                    interval=interval,
+                    can_dispatch=can_dispatch,
+                )
+                return
+            logger.error(
+                "Refusing multi-profile cron ownership: %s. Ticking only the "
+                "launch profile's cron store; the %d requested profile store(s) "
+                "will NOT be ticked until this is fixed.",
+                refusal,
+                len(profile_homes),
             )
-            return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
         recovered = self.recover_interrupted()
@@ -629,6 +738,17 @@ class InProcessCronScheduler(CronScheduler):
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
         logger = logging.getLogger("cron.scheduler_provider")
+
+        # Re-check the fail-closed gate here, not only in start(): this method
+        # is the seam that actually takes ownership of another profile's cron
+        # store, and a direct call must not be able to bypass the enablement
+        # requirement.
+        refusal = multiplex_cron_isolation_error(profile_homes)
+        if refusal is not None:
+            raise MultiplexCronIsolationError(
+                f"multi-profile cron ownership refused: {refusal}"
+            )
+
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
             len(profile_homes),
