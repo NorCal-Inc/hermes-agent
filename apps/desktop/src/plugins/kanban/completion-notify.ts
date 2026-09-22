@@ -146,22 +146,33 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const reason = trimmed(payload?.reason)
     const verifierText = verifier ? ` by ${verifier}` : ''
     const reasonText = reason ? `: ${reason}` : ''
+
     return `Verification failed${verifierText}${reasonText}`
   }
 
-  if (['verifier_verdict_unattested', 'verification_blocker_returned', 'verifier_verdict_unreadable', 'verified_completion_deferred'].includes(kind)) {
+  if (
+    [
+      'verifier_verdict_unattested',
+      'verification_blocker_returned',
+      'verifier_verdict_unreadable',
+      'verified_completion_deferred'
+    ].includes(kind)
+  ) {
     const verifierTask = trimmed(payload?.verifier_task)
     const verdict = trimmed(payload?.verdict)
     const reason = trimmed(payload?.reason) || trimmed(payload?.detail)
+
     const labels: Record<string, string> = {
       verifier_verdict_unattested: 'Verifier verdict was not attested',
       verification_blocker_returned: 'Verifier returned BLOCKER',
       verifier_verdict_unreadable: 'Verifier returned no machine-readable verdict',
       verified_completion_deferred: 'Verified task could not complete'
     }
+
     const verifierText = verifierTask ? ` from ${verifierTask}` : ''
     const verdictText = verdict ? ` (${verdict})` : ''
     const reasonText = reason ? `: ${reason}` : ''
+
     return `${labels[kind] ?? 'Verification needs attention'}${verifierText}${verdictText}${reasonText}`
   }
 
@@ -170,6 +181,7 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const reason = trimmed(payload?.reason)
     const verifierText = verifierTask ? ` from ${verifierTask}` : ''
     const reasonText = reason ? `: ${reason}` : ''
+
     return `Verifier PASS refused${verifierText} — acceptance proof missing${reasonText}`
   }
 
@@ -183,6 +195,7 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const attemptsText = attempts ? ` after ${attempts} attempts` : ''
     const kindText = failureKind ? ` (${failureKind})` : ''
     const errorText = error ? `: ${error}` : ''
+
     return `Notification delivery failed for ${route}${attemptsText}${kindText}${errorText}`
   }
 
@@ -192,6 +205,7 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const error = trimmed(payload?.error)
     const relationText = relation ? ` (${relation})` : ''
     const errorText = error ? `: ${error}` : ''
+
     return linkedTask ? `Linked task ${linkedTask}${relationText} gave up${errorText}` : error
   }
 
