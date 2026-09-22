@@ -228,12 +228,46 @@ authorization gate falls back to `os.getenv` when no scope is installed, so
 Dropping is the fail-closed reading; the only thing lost is an observability
 hook for a profile whose home no longer exists.
 
+**Repair after failed verification — commit `b09a62bb80`.** Two independent
+verifications (`t_49b0a2c6`, `t_51624b71`) returned FAIL on the same defect in
+`bc12fc7048`, and both were right: the check rejected only `get_profile_dir()`
+*raising*, and `get_profile_dir()` does not raise for the case the docstring
+names. It is pure path arithmetic — `hermes_cli/profiles.py:374` normalizes the
+name and joins it onto the profiles root — so a profile deleted or renamed
+after startup resolved cleanly to a **nonexistent** `Path`, which the handler
+then treated as a good home: `_profile_runtime_scope()` pointed `HERMES_HOME`
+at nothing, installed an empty secret scope, and the event was dispatched
+rather than dropped.
+
+Fixed in two places, because the factory runs **once** per adapter install and
+`profiles_to_serve()` only yields directories that exist at startup — so the
+realistic failure is a home vanishing while the adapter is up, not one missing
+at install:
+
+* factory time — a resolved home that is not a directory takes the same
+  warned, drop-everything path as a raise;
+* per event — the cached home is re-checked before entering the scope; warns
+  once, then drops quietly.
+
+The verifiers' second finding — that the regression was synthetic (it
+manufactured a `FileNotFoundError` that real code never raises) — is also
+fixed. Two new tests use the **real** `get_profile_dir()` against a temp
+`HERMES_HOME`: one for a name with no directory behind it, one for a home
+removed between two events. Both assert `_profile_runtime_scope` is never
+entered, not merely that dispatch was skipped. The synthetic-raise case is
+kept as well, since an invalid name genuinely does raise.
+
+`test_secondary_handler_stamps_profile_before_dispatch` stubbed a
+`/profiles/work` path that does not exist and would now take the drop path; it
+creates the directory instead, so it still tests stamping.
+
 ---
 
 ## Findings raised, NOT fixed (outside this card's mutation scope)
 
 Per the Task-Scope Gate, an observed defect is not self-authorization to fix it.
-Both of these are recorded for a governed decision by Erika / Christopher.
+All three are recorded for a governed decision by Erika / Christopher.
+(Finding C was added during the post-verification repair.)
 
 ### Finding A — a kanban worker is built from the dispatcher's entire environment
 
@@ -274,6 +308,44 @@ rather than ported because the change rewrites live cron globals and ~12 test
 setups to fix something that cannot fire on this configuration — and would be
 speculative infrastructure until multiplexing is enabled. If multiplexing is
 ever turned on, this should be ported in the same change.
+
+### Finding C — the *message* handler has the same unresolvable-home defect, and fails OPEN
+
+Found while repairing `_make_profile_platform_event_handler`; raised, not
+fixed, because the safe behaviour is a governance call rather than a
+mechanical one.
+
+`gateway/run.py::_make_profile_message_handler` (line 15480) resolves a named
+secondary profile's home with the identical un-checked call —
+`get_profile_dir(profile_name)` inside a bare `try`, `None` on raise, no
+existence check — and then, when it has no home:
+
+```python
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_message(event)
+            return await self._handle_message(event)   # ← unscoped
+```
+
+It runs the message path **unscoped**, which is the behaviour
+`bc12fc7048` removed from the event path: `_handle_message` authorizes before
+the agent-turn scope is installed, so profile B's inbound traffic is admitted
+or denied by the LAUNCH profile's allowlist and allow-all flag. This is the
+same defect on the more consequential path — real inbound messages, not
+observer events — and it is silent (no warning at all).
+
+Not fixed here for two reasons. (1) Scope: the card authorizes adapting the
+seven upstream commits, and the event-path instance is the one under
+verification; a defect observed is not self-authorization. (2) The remedy is a
+real product decision — dropping a lane's *messages* when its home vanishes is
+visible to users in a way dropping an observer event is not, and the third
+option the tree already uses elsewhere is a documented fallback:
+`_resolve_profile_home_for_source` (line 27956) checks `profile_exists(name)`
+and falls back to `get_hermes_home()` **with a warning**. Three defensible
+behaviours, one choice, and it belongs to Erika / Christopher.
+
+Recommendation: at minimum make it loud (it is currently silent), and align it
+with whichever of drop / documented-fallback is chosen for the event path.
 
 ---
 
@@ -327,6 +399,29 @@ confirmed by running that file in a throwaway worktree detached at the base
 commit `c4d6605e29`, where it fails identically (1 failed, 7 passed). It is a
 NorCal toolset-customization drift unrelated to this card's scope, and is left
 untouched and reported rather than fixed here.
+
+### Re-run after the verification repair (`b09a62bb80`)
+
+The repair touches `gateway/run.py` and one gateway test file, so the whole
+`tests/gateway/` tree was re-run rather than a subset:
+
+* `tests/gateway/` — **651 files, 5872 passed, 1 failed, 35 skipped (244.9s)**.
+  The one failure is the same pre-existing
+  `test_reasoning_command.py::…::test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets`
+  (`assert 'web' in {'executive'}`), re-confirmed on this run at the base
+  commit `c4d6605e29` in a throwaway worktree: **7 passed, 1 failed**, the same
+  test. Not caused by this branch; NorCal toolset drift, left untouched.
+* `tests/gateway/test_gateway_platform_event_hook.py` alone — 37 passed.
+* `tests/agent/` — **403 files, 4818 passed, 0 failed, 27 skipped (161.2s)**.
+  Run as a directory (it contains the tier-1 scope-migration file the earlier
+  subset named individually); green.
+
+Both new tests were run against the pre-repair commit `fa20d3b1c5` (that exact
+tree, with only the new test file copied in): **2 failed, 35 passed**.
+`test_missing_profile_home_drops_the_event_under_real_resolution` and
+`test_profile_home_deleted_after_install_drops_the_event` both fail with the
+handler having dispatched (`assert <AsyncMock …> is None`) — i.e. the missing
+home was scoped and the event delivered.
 
 ### Each new test was run against the pre-fix code to confirm it fails there
 
