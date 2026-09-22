@@ -602,7 +602,7 @@ class TestProfileScopedPlatformEventHandler:
         resolver.assert_called_once_with(source)
         dispatch.assert_awaited_once_with({"event_type": "reaction"}, source)
 
-    def test_secondary_handler_stamps_profile_before_dispatch(self, monkeypatch):
+    def test_secondary_handler_stamps_profile_before_dispatch(self, monkeypatch, tmp_path):
         runner = object.__new__(GatewayRunner)
         captured = {}
 
@@ -611,8 +611,10 @@ class TestProfileScopedPlatformEventHandler:
             captured["profile"] = source.profile
 
         runner._handle_gateway_platform_event = dispatch
+        work_home = tmp_path / "profiles" / "work"
+        work_home.mkdir(parents=True)
         monkeypatch.setattr(
-            "hermes_cli.profiles.get_profile_dir", lambda name: Path("/profiles/work"),
+            "hermes_cli.profiles.get_profile_dir", lambda name: work_home,
         )
         handler = runner._make_profile_platform_event_handler("work")
         source = _adapter()._source_from_reaction_for_auth(
@@ -624,6 +626,97 @@ class TestProfileScopedPlatformEventHandler:
                 handler({"platform": "telegram", "event_type": "reaction", "payload": {}}, source))
 
         assert captured["profile"] == "work"
+
+    def test_missing_profile_home_drops_the_event_under_real_resolution(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """The real ``get_profile_dir`` does not raise for a deleted profile.
+
+        It is pure path arithmetic: validate the name, join it onto the
+        profiles root, return a ``Path`` that may not exist. So a handler that
+        only rejects an *exception* still scopes a vanished lane's events to a
+        home that isn't there. No mock of ``get_profile_dir`` here — the real
+        function resolves a name with no directory behind it.
+
+        Upstream: 4aa9baf139
+        """
+        from hermes_cli.profiles import get_profile_dir
+
+        root = tmp_path / ".hermes"
+        (root / "profiles").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        # Premise check: real resolution succeeds and yields a path that is not
+        # there. If this ever starts raising, the test below proves nothing.
+        resolved = get_profile_dir("vanishedlane")
+        assert not resolved.exists(), "fixture must model a profile with no directory"
+
+        runner = object.__new__(GatewayRunner)
+        dispatch = AsyncMock()
+        runner._handle_gateway_platform_event = dispatch
+
+        with caplog.at_level("WARNING", logger="gateway.run"):
+            handler = runner._make_profile_platform_event_handler("vanishedlane")
+        assert any("does not resolve" in r.message for r in caplog.records), (
+            "a profile home that does not exist must be reported, not silently used")
+
+        source = _adapter()._source_from_reaction_for_auth(
+            _auth_reaction_update(user_id=777)
+        )
+        with patch("gateway.run._profile_runtime_scope") as scope:
+            result = asyncio.run(handler(
+                {"platform": "telegram", "event_type": "reaction", "payload": {}}, source))
+
+        assert result is None
+        assert not scope.called, "a nonexistent home must never be entered as a scope"
+        dispatch.assert_not_awaited()
+
+    def test_profile_home_deleted_after_install_drops_the_event(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """The factory runs once at adapter install; the home can go away later.
+
+        ``profiles_to_serve`` only yields directories that exist at startup, so
+        the realistic failure is a profile removed or renamed while its adapter
+        is up. Re-check per event, or the closure keeps dispatching against a
+        stale path.
+        """
+        from hermes_cli.profiles import get_profile_dir
+
+        root = tmp_path / ".hermes"
+        home = root / "profiles" / "worklane"
+        home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert get_profile_dir("worklane") == home
+
+        runner = object.__new__(GatewayRunner)
+        dispatch = AsyncMock()
+        runner._handle_gateway_platform_event = dispatch
+        handler = runner._make_profile_platform_event_handler("worklane")
+
+        source = _adapter()._source_from_reaction_for_auth(
+            _auth_reaction_update(user_id=777)
+        )
+        event = {"platform": "telegram", "event_type": "reaction", "payload": {}}
+
+        # Still installed: the event is scoped and dispatched as normal.
+        with patch("gateway.run._profile_runtime_scope",
+                   side_effect=lambda _home: nullcontext()):
+            asyncio.run(handler(event, source))
+        dispatch.assert_awaited_once()
+
+        home.rmdir()
+        with caplog.at_level("WARNING", logger="gateway.run"):
+            with patch("gateway.run._profile_runtime_scope") as scope:
+                result = asyncio.run(handler(event, source))
+
+        assert result is None
+        scope.assert_not_called()
+        dispatch.assert_awaited_once()  # still just the pre-deletion dispatch
+        assert any("disappeared" in r.message for r in caplog.records), (
+            "a profile home vanishing mid-run must be reported once")
 
     def test_unresolvable_profile_home_drops_the_event(self, monkeypatch, caplog):
         """A NAMED profile whose home is gone must not be authorized as the launch profile.
