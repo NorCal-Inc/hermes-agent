@@ -2679,6 +2679,106 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
+# Where a diverged fork's Nous-upstream delta gets reviewed. This is an
+# out-of-band intelligence review (read the upstream commits, decide what is
+# relevant, port it deliberately) — NOT something ``hermes update`` installs.
+UPSTREAM_REVIEW_TOOL = "scripts/ops/upstream-intelligence-watch.py"
+
+
+def _upstream_review_state(
+    git_cmd: list[str],
+    cwd: Path,
+    branch: str,
+    depth_args: list[str],
+) -> Optional[dict]:
+    """Nous-upstream divergence for a fork, as review material — not a backlog.
+
+    ``hermes update`` installs from **origin**. Upstream only ever reaches the
+    working tree through ``_sync_with_upstream_if_needed``, which refuses to
+    touch anything once the fork carries commits of its own ("Skipping upstream
+    sync to preserve your changes"). So for a deliberately-diverged fork the
+    upstream delta is reading material, not an update queue.
+
+    Returns ``None`` when there is nothing useful to say (no upstream remote,
+    fetch/count failure, or no divergence). Otherwise a dict:
+
+    ``behind``      commits on ``upstream/<branch>`` not reachable from HEAD
+    ``fork_only``   commits on ``origin/<branch>`` not on ``upstream/<branch>``
+    ``actionable``  True iff ``hermes update`` would really fast-forward from
+                    upstream — i.e. the fork carries no commits of its own,
+                    the one case where the upstream delta IS a backlog.
+
+    Every failure degrades to ``None``. An unreachable or deleted upstream must
+    never fail ``hermes update --check``; the origin-relative answer above it
+    is the one the user acts on.
+    """
+    if not _has_upstream_remote(git_cmd, cwd):
+        return None
+
+    fetch = subprocess.run(
+        git_cmd + ["fetch"] + depth_args + ["upstream", branch, "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if fetch.returncode != 0:
+        return None
+
+    def _count(rev_range: str) -> Optional[int]:
+        result = subprocess.run(
+            git_cmd + ["rev-list", rev_range, "--count"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            return int(result.stdout.strip())
+        except ValueError:
+            return None
+
+    behind = _count(f"HEAD..upstream/{branch}")
+    fork_only = _count(f"upstream/{branch}..origin/{branch}")
+    if behind is None or fork_only is None or behind == 0:
+        return None
+
+    return {
+        "behind": behind,
+        "fork_only": fork_only,
+        "actionable": fork_only == 0,
+    }
+
+
+def _format_upstream_review_lines(review: dict, branch: str) -> list[str]:
+    """Render the upstream state so it can never read as a staleness count.
+
+    The word "behind" is reserved for the origin-relative figure printed above
+    these lines; a diverged fork's upstream delta is labelled as review volume
+    and pointed at the intelligence-watch tooling instead.
+    """
+    count = review["behind"]
+    commits_word = "commit" if count == 1 else "commits"
+    if review["actionable"]:
+        # No fork-local commits: the apply path really would fast-forward from
+        # upstream, so this one IS pending work. Say so plainly.
+        return [
+            f"ℹ Nous upstream: {count} {commits_word} on upstream/{branch}; this "
+            "fork carries no local commits,",
+            "  so 'hermes update' will fast-forward them in after pulling origin.",
+        ]
+    fork_word = "commit" if review["fork_only"] == 1 else "commits"
+    return [
+        f"ℹ Nous upstream (review only, NOT an update backlog): {count} "
+        f"{commits_word} on upstream/{branch}",
+        f"  available for relevance review. This fork carries {review['fork_only']} "
+        f"{fork_word} of its own and",
+        "  deliberately does not track Nous commit-for-commit, so 'hermes update' "
+        "will not install these.",
+        f"  Review path: {UPSTREAM_REVIEW_TOOL} (upstream intelligence watch).",
+    ]
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -2728,12 +2828,20 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     for lock_path in cleared:
         print(f"  (removed stale git lock: {lock_path})")
 
-    # Fetch only the branch we compare against; prefer upstream as the canonical
-    # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
-    # thousands of auto-generated branches, so scope the fetch to <branch>.
-    # Note: upstream/<branch> may not exist for non-main branches (a fork's
-    # bb/gui has no upstream counterpart), so when the caller picks a
-    # non-default branch we skip the upstream probe and use origin directly.
+    # Fetch only the branch we compare against. A bare `git fetch <remote>`
+    # pulls every ref, and this repo has thousands of auto-generated branches,
+    # so scope the fetch to <branch>.
+    #
+    # ORIGIN IS THE COMPARE REF, ALWAYS. This path used to prefer
+    # `upstream/<branch>` whenever an `upstream` remote existed, which made the
+    # reported "commits behind" figure measure the fork-vs-Nous divergence
+    # rather than anything `hermes update` would install. On a fork that
+    # deliberately diverges (NorCal's production checkout measured 16,140
+    # commits from upstream/main and 0 from origin/main on 2026-09-21) that
+    # reads as a catastrophic update backlog on a fully-current install. The
+    # apply path pulls `origin/<branch>`, so origin is the honest answer here.
+    # The upstream delta is still surfaced below — as labelled review material,
+    # via `_upstream_review_state`, never as a behind-count.
     # Installer checkouts are shallow (`git clone --depth 1`). A plain
     # `git fetch` would unshallow the repo (dragging in the whole history —
     # the exact cost the shallow clone avoided) and the rev-list count below
@@ -2750,54 +2858,14 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
 
-    if branch == "main":
-        # Probe locally (~6 ms) whether an 'upstream' remote exists at all
-        # before spending a network fetch on it. Non-fork installs have no
-        # 'upstream' remote, and the old flow burned a failed network attempt
-        # (~0.3-1 s) on every --check before falling back to origin.
-        has_upstream_remote = (
-            subprocess.run(
-                git_cmd + ["remote", "get-url", "upstream"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).returncode
-            == 0
-        )
-        fetch_result = None
-        if has_upstream_remote:
-            print("→ Fetching from upstream...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["upstream", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-        if fetch_result is not None and fetch_result.returncode == 0:
-            upstream_exists = True
-            compare_branch = f"upstream/{branch}"
-        else:
-            # No upstream remote, or the upstream fetch failed — use origin.
-            print("→ Fetching from origin...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["origin", branch],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            upstream_exists = False
-            compare_branch = f"origin/{branch}"
-    else:
-        # Non-default branch: compare against origin/<branch> directly.
-        print("→ Fetching from origin...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        upstream_exists = False
-        compare_branch = f"origin/{branch}"
+    print("→ Fetching from origin...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch"] + depth_args + ["origin", branch],
+        cwd=_m().PROJECT_ROOT,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    compare_branch = f"origin/{branch}"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -2874,6 +2942,18 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         from hermes_cli.config import recommended_update_command
 
         print(f"  Run '{recommended_update_command()}' to install.")
+
+    # Secondary, clearly-labelled line: how far this fork sits from Nous
+    # upstream. Printed AFTER the actionable verdict and never using the word
+    # "behind", so the two can't be read as one number. Gated the same way the
+    # apply path gates its upstream sync (fork origin + main branch).
+    if branch == "main" and _is_fork(_get_origin_url(git_cmd, _m().PROJECT_ROOT)):
+        review = _upstream_review_state(
+            git_cmd, _m().PROJECT_ROOT, branch, depth_args
+        )
+        if review is not None:
+            for line in _format_upstream_review_lines(review, branch):
+                print(line)
 
 def _ensure_fhs_path_guard() -> None:
     """Ensure /usr/local/bin is on PATH for RHEL-family root non-login shells.
