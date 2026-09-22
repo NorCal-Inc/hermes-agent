@@ -106,6 +106,9 @@ def test_codex_launcher_falls_back_to_hermes_managed_node_when_path_is_stripped(
     assert prefix == [str(node), str(script)]
     argv = ex._build_codex_verify({"prompt": "verify"})
     assert argv[:4] == [str(node), str(script), "exec", "verify"]
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert "sandbox_workspace_write.network_access=true" in argv
+    assert "read-only" not in argv
 
 
 def test_codex_launcher_prefers_path_binary(monkeypatch):

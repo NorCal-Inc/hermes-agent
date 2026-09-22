@@ -19852,7 +19852,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     * ``"clean_exit"`` — ``WIFEXITED`` with ``WEXITSTATUS == 0``. When the
       task is still ``running`` in the DB, this is a protocol violation
       (worker exited without calling ``kanban_complete`` / ``kanban_block``)
-      and should be auto-blocked immediately — retrying will just loop.
+      and should enter the bounded protocol-violation retry path before the breaker blocks it.
     * ``"rate_limited"`` — ``WIFEXITED`` with status
       ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
       provider rate-limited / exhausted quota, NOT because the task failed.
@@ -20973,9 +20973,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``) and enter the bounded protocol-violation retry path. Repeated clean exits
+    without a terminal transition eventually trip the circuit breaker instead
+    of looping forever.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a

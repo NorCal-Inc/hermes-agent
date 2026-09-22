@@ -2626,7 +2626,7 @@ KANBAN_CREATE_SCHEMA = {
                     "Explicit executor lane. 'claude' routes one ordinary "
                     "task directly to Claude Code before any Hermes agent/tool "
                     "loop. 'codex_verify' runs an independent Codex verifier "
-                    "under a read-only sandbox; assignee='atlas' is the exact "
+                    "with writable scratch and read-only target access; assignee='atlas' is the exact "
                     "compatibility shorthand. 'claude_recovery' is the bounded Claude-then-Codex "
                     "gate-repair lane. The worker never runs the normal Hermes "
                     "reasoning/tool loop for either lane. 'claude_recovery' "

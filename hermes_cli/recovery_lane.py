@@ -492,7 +492,7 @@ def run_codex_verifier(task_id: str) -> int:
         try:
             # Verifiers execute from the governed Kanban scratch root regardless
             # of the target repository path. This preserves execution.allowed_roots
-            # while the read-only Codex sandbox may inspect the target by absolute path.
+            # while Codex may inspect the target by absolute path without making it writable.
             verifier_cwd = kb.workspaces_root() / task.id / "atlas-verify"
             verifier_cwd.mkdir(parents=True, exist_ok=True)
             cwd = str(verifier_cwd)
