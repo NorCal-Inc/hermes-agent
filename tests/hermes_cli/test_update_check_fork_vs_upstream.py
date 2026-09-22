@@ -137,7 +137,7 @@ def test_behind_count_is_the_origin_relative_one(mock_run, _method, capsys):
 def test_nous_divergence_is_surfaced_but_labelled_as_review_only(
     mock_run, _method, capsys
 ):
-    from hermes_cli.update_cmd import UPSTREAM_REVIEW_TOOL
+    from hermes_cli.update_cmd import UPSTREAM_REVIEW_TOOL, UPSTREAM_REVIEW_TOOL_REPO
 
     _run_check(mock_run, origin_behind="0", upstream_behind="16140", fork_only="165")
 
@@ -152,6 +152,11 @@ def test_nous_divergence_is_surfaced_but_labelled_as_review_only(
     # And pointed at the out-of-band review path, not at `hermes update`.
     assert UPSTREAM_REVIEW_TOOL in out
     assert "will not install these" in out
+    # The script lives in a different repo. Naming it as a bare relative path
+    # would send the reader hunting for a file that is not in this checkout,
+    # so the repo must be named alongside it.
+    assert UPSTREAM_REVIEW_TOOL_REPO in out
+    assert "not this checkout" in out
 
 
 @patch("hermes_cli.config.detect_install_method", return_value="git")

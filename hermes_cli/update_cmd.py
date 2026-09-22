@@ -2682,7 +2682,12 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
 # Where a diverged fork's Nous-upstream delta gets reviewed. This is an
 # out-of-band intelligence review (read the upstream commits, decide what is
 # relevant, port it deliberately) — NOT something ``hermes update`` installs.
+#
+# The script lives in the operator's separate ops repo, NOT in this checkout.
+# Printing a bare relative path would send the reader looking for a file that
+# does not exist here, so the rendered line names the repo explicitly.
 UPSTREAM_REVIEW_TOOL = "scripts/ops/upstream-intelligence-watch.py"
+UPSTREAM_REVIEW_TOOL_REPO = "NorCal_Hermes ops repo"
 
 
 def _upstream_review_state(
@@ -2775,7 +2780,8 @@ def _format_upstream_review_lines(review: dict, branch: str) -> list[str]:
         f"{fork_word} of its own and",
         "  deliberately does not track Nous commit-for-commit, so 'hermes update' "
         "will not install these.",
-        f"  Review path: {UPSTREAM_REVIEW_TOOL} (upstream intelligence watch).",
+        f"  Review path: {UPSTREAM_REVIEW_TOOL} — upstream intelligence watch, "
+        f"in the {UPSTREAM_REVIEW_TOOL_REPO} (not this checkout).",
     ]
 
 
