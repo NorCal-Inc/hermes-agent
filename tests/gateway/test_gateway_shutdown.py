@@ -324,3 +324,44 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     assert status._pid_exists(4242) is False
 
 
+
+
+class TestMcpShutdownFailureIsReported:
+    """A failed MCP teardown must not read as a clean exit.
+
+    Both gateway exit paths wrapped ``shutdown_mcp_servers()`` in
+    ``except Exception: pass``, so a raise left every MCP connection and the
+    shared background loop up while the gateway reported a clean shutdown —
+    with nothing in the log to contradict it.
+
+    Upstream: af380f66ae
+    """
+
+    def test_failure_logs_a_warning_and_stays_non_fatal(self, monkeypatch, caplog):
+        import tools.mcp_tool as mcp_tool
+
+        def _boom():
+            raise TypeError("shutdown_mcp_servers() got an unexpected keyword argument")
+
+        monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", _boom)
+
+        with caplog.at_level("WARNING", logger="gateway.run"):
+            completed = gateway_run._shutdown_mcp_servers_reporting_failures()
+
+        assert completed is False, "a raising teardown must not report success"
+        assert any("MCP shutdown failed" in r.message for r in caplog.records), (
+            "a failed MCP teardown was swallowed — the gateway would report a "
+            "clean exit over open connections")
+
+    def test_success_reports_completion_without_warning(self, monkeypatch, caplog):
+        import tools.mcp_tool as mcp_tool
+
+        calls = []
+        monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: calls.append(1))
+
+        with caplog.at_level("WARNING", logger="gateway.run"):
+            completed = gateway_run._shutdown_mcp_servers_reporting_failures()
+
+        assert completed is True
+        assert calls == [1]
+        assert not [r for r in caplog.records if "MCP shutdown failed" in r.message]
