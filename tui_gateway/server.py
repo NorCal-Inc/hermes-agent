@@ -9881,6 +9881,15 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         verifier_text = f" by {verifier}" if verifier else ""
         suffix = f"\n{reason[:200]}" if reason else ""
         return f"❌ {board_tag}{tag}Kanban {task_id} verification failed{verifier_text}{suffix}"
+    if kind == "verification_acceptance_missing":
+        verifier_task = str(payload.get("verifier_task") or "").strip()
+        reason = str(payload.get("reason") or "").strip()
+        verifier_text = f" from {verifier_task}" if verifier_task else ""
+        suffix = f"\n{reason[:200]}" if reason else ""
+        return (
+            f"❌ {board_tag}{tag}Kanban {task_id} verifier PASS refused{verifier_text} "
+            f"— acceptance proof missing{suffix}"
+        )
     if kind == "notification_delivery_failed":
         platform = str(payload.get("platform") or "").strip()
         mode = str(payload.get("delivery_mode") or "").strip()
