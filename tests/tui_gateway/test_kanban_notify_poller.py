@@ -227,6 +227,32 @@ class TestCollectKanbanNotifications:
         assert "verification failed" in texts[0].lower()
         assert "regression suite failed" in texts[0]
 
+    def test_notification_delivery_failed_notifies_surviving_origin_route(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            kb._append_event(
+                conn, tid, "notification_delivery_failed",
+                {
+                    "platform": "telegram",
+                    "delivery_mode": "notify+wake",
+                    "attempts": 12,
+                    "failure_kind": "wake_only",
+                    "error": "bot disconnected",
+                },
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert tid in texts[0]
+        assert "notification delivery failed" in texts[0].lower()
+        assert "telegram/notify+wake" in texts[0]
+        assert "12 attempts" in texts[0]
+        assert "bot disconnected" in texts[0]
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]

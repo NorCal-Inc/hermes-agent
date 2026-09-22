@@ -470,6 +470,30 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify().message).toContain('codex_verify:t_v')
   })
 
+  it('notification_delivery_failed reports the lost return path', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'notification_delivery_failed', {
+        platform: 'telegram',
+        delivery_mode: 'notify+wake',
+        attempts: 12,
+        failure_kind: 'wake_only',
+        error: 'bot disconnected'
+      })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'error',
+      title: 'Notification delivery failed',
+      message: expect.stringContaining('telegram/notify+wake')
+    })
+    expect(lastNotify().message).toContain('12 attempts')
+    expect(lastNotify().message).toContain('bot disconnected')
+  })
+
   it('linked_task_gave_up notifies the owner about the failed linked task', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)

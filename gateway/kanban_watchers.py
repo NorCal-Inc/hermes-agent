@@ -654,6 +654,30 @@ class GatewayKanbanWatchersMixin:
                                 f"{verifier_text}"
                                 + (f"\n{reason_text}" if reason_text else "")
                             )
+                        elif kind == "notification_delivery_failed":
+                            platform = ""
+                            mode = ""
+                            attempts = ""
+                            failure_kind = ""
+                            error_text = ""
+                            if ev.payload:
+                                platform = str(ev.payload.get("platform") or "").strip()
+                                mode = str(ev.payload.get("delivery_mode") or "").strip()
+                                attempts = str(ev.payload.get("attempts") or "").strip()
+                                failure_kind = str(ev.payload.get("failure_kind") or "").strip()
+                                error_text = str(ev.payload.get("error") or "").strip()[:200]
+                            route = "/".join(x for x in (platform, mode) if x) or "notification route"
+                            attempt_text = f" after {attempts} attempts" if attempts else ""
+                            failure_text = f" ({failure_kind})" if failure_kind else ""
+                            wake_handoff = (
+                                f"Notification return path failed for {route}{attempt_text}{failure_text}"
+                                + (f": {error_text}" if error_text else "")
+                            )
+                            msg = (
+                                f"❌ {board_tag}{tag}Kanban {sub['task_id']} notification delivery FAILED"
+                                f" for {route}{attempt_text}{failure_text}"
+                                + (f"\n{error_text}" if error_text else "")
+                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -802,7 +826,14 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                await asyncio.to_thread(
+                                    self._kanban_drop_failed_sub,
+                                    sub,
+                                    board_slug,
+                                    fails,
+                                    str(exc),
+                                    "send",
+                                )
                                 sub_fail_counts.pop(sub_key, None)
                             else:
                                 await asyncio.to_thread(
@@ -875,6 +906,7 @@ class GatewayKanbanWatchersMixin:
                             if "linked_task_gave_up" in _wake_kinds: _parts.append("linked task gave up; needs attention")
                             if "block_loop_detected" in _wake_kinds: _parts.append("routed to triage; needs a human decision")
                             if "verification_failed" in _wake_kinds: _parts.append("verification failed; repair required")
+                            if "notification_delivery_failed" in _wake_kinds: _parts.append("notification return path failed; delivery route lost")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -929,7 +961,14 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await asyncio.to_thread(
+                                        self._kanban_drop_failed_sub,
+                                        sub,
+                                        board_slug,
+                                        fails,
+                                        str(_wk_err),
+                                        "wake_self_post",
+                                    )
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -1029,7 +1068,14 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await asyncio.to_thread(
+                                        self._kanban_drop_failed_sub,
+                                        sub,
+                                        board_slug,
+                                        fails,
+                                        str(_wk_err),
+                                        "wake_only",
+                                    )
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -1122,6 +1168,32 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_drop_failed_sub(
+        self,
+        sub: dict,
+        board: Optional[str],
+        attempts: int,
+        error: str,
+        failure_kind: str,
+    ) -> None:
+        """Drop an exhausted route while preserving the loss on the task."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.drop_notify_sub_after_delivery_failure(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                delivery_mode=sub.get("delivery_mode") or "notify",
+                attempts=attempts,
+                error=error,
+                failure_kind=failure_kind,
             )
         finally:
             conn.close()

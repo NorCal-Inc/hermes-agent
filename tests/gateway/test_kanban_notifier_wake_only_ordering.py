@@ -209,3 +209,18 @@ def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
     assert runner._kanban_sub_fail_counts == {}, (
         "counter entry must clear when the subscription is dropped"
     )
+    conn = kb.connect()
+    try:
+        failure_events = [
+            ev for ev in kb.list_events(conn, tid)
+            if ev.kind == "notification_delivery_failed"
+        ]
+    finally:
+        conn.close()
+    assert len(failure_events) == 1, (
+        "exhausting the notification return path must leave durable task evidence"
+    )
+    payload = failure_events[0].payload or {}
+    assert payload.get("platform") == "telegram"
+    assert payload.get("delivery_mode") == "wake"
+    assert payload.get("attempts") == 12

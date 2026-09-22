@@ -215,7 +215,7 @@ def test_notification_event_taxonomy_is_kernel_owned():
     assert kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(kb.KANBAN_NOTIFY_EVENT_KINDS)
     assert {
         "review_requested", "linked_task_gave_up", "block_loop_detected",
-        "verification_failed",
+        "verification_failed", "notification_delivery_failed",
     }.issubset(kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS)
     assert {"status", "archived", "unblocked"}.isdisjoint(
         kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
@@ -565,6 +565,70 @@ async def test_notifier_notify_plus_wake_wakes_on_verification_failed(kanban_hom
     assert tid in wake_text
     assert "regression suite failed" in wake_text
     assert "verification" in wake_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_notification_delivery_failed(kanban_home):
+    """A surviving route must surface loss of another task return path."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="return path owner", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="surviving-chat",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(
+            conn, tid, "notification_delivery_failed",
+            {
+                "platform": "api_server",
+                "delivery_mode": "notify+wake",
+                "attempts": 12,
+                "failure_kind": "wake_self_post",
+                "error": "session unavailable",
+            },
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    sent_text = fake_adapter.send.await_args.args[1]
+    assert "notification delivery FAILED" in sent_text
+    assert "api_server/notify+wake" in sent_text
+    assert "12 attempts" in sent_text
+    wake_mock.assert_awaited_once()
+    wake_text = wake_mock.await_args.kwargs["text"]
+    assert tid in wake_text
+    assert "return path failed" in wake_text.lower()
+    assert "session unavailable" in wake_text
 
 
 @pytest.mark.asyncio

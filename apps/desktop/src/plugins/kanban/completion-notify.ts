@@ -54,6 +54,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['linked_task_gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'warning' }],
   ['review_requested', { titleKey: 'col.review.label', toast: 'warning' }],
   ['verification_failed', { titleKey: 'notify.verificationFailedTitle', toast: 'error' }],
+  ['notification_delivery_failed', { titleKey: 'notify.notificationDeliveryFailedTitle', toast: 'error' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
 
@@ -141,6 +142,19 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const verifierText = verifier ? ` by ${verifier}` : ''
     const reasonText = reason ? `: ${reason}` : ''
     return `Verification failed${verifierText}${reasonText}`
+  }
+
+  if (kind === 'notification_delivery_failed') {
+    const platform = trimmed(payload?.platform)
+    const mode = trimmed(payload?.delivery_mode)
+    const attempts = payload?.attempts
+    const failureKind = trimmed(payload?.failure_kind)
+    const error = trimmed(payload?.error)
+    const route = [platform, mode].filter(Boolean).join('/') || 'notification route'
+    const attemptsText = attempts ? ` after ${attempts} attempts` : ''
+    const kindText = failureKind ? ` (${failureKind})` : ''
+    const errorText = error ? `: ${error}` : ''
+    return `Notification delivery failed for ${route}${attemptsText}${kindText}${errorText}`
   }
 
   if (kind === 'linked_task_gave_up') {

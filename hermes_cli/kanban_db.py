@@ -110,11 +110,12 @@ KANBAN_NOTIFY_EVENT_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "block_loop_detected",
     "review_requested", "linked_task_gave_up", "verification_failed",
+    "notification_delivery_failed",
 )
 KANBAN_ACTIVE_WAKE_EVENT_KINDS = frozenset({
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "block_loop_detected", "review_requested", "linked_task_gave_up",
-    "verification_failed",
+    "verification_failed", "notification_delivery_failed",
 })
 assert KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(KANBAN_NOTIFY_EVENT_KINDS)
 
@@ -24600,6 +24601,48 @@ def remove_notify_sub(
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         )
+    return cur.rowcount > 0
+
+
+def drop_notify_sub_after_delivery_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    attempts: int,
+    error: str,
+    failure_kind: str,
+) -> bool:
+    """Remove one exhausted notification route and leave durable evidence.
+
+    Normal unsubscription is intentionally silent. This path is different:
+    the notifier has exhausted its retry budget, so the task has lost a return
+    route. Delete that exact subscription and append the failure event in the
+    same transaction. Other subscriptions can then surface the event, while a
+    task with no surviving route still keeps the evidence on its board.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
+        if cur.rowcount:
+            _append_event(
+                conn,
+                task_id,
+                "notification_delivery_failed",
+                {
+                    "platform": platform,
+                    "delivery_mode": delivery_mode or "notify",
+                    "attempts": int(attempts),
+                    "failure_kind": failure_kind,
+                    "error": str(error)[:500],
+                },
+            )
     return cur.rowcount > 0
 
 
