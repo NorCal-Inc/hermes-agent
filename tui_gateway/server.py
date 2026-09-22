@@ -9732,7 +9732,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked", "review_requested",
+    "status", "archived", "unblocked", "block_loop_detected",
+    "review_requested", "linked_task_gave_up",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -9880,6 +9881,19 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         summary = str(payload.get("summary") or "").strip()
         handoff = f"\n{summary[:200]}" if summary else ""
         return f"👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+    if kind == "block_loop_detected":
+        reason = str(payload.get("reason") or "").strip()
+        recurrences = payload.get("recurrences")
+        count = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+        suffix = f": {reason[:160]}" if reason else ""
+        return f"🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — needs a human decision{count}{suffix}"
+    if kind == "linked_task_gave_up":
+        other_id = str(payload.get("task_id") or "").strip()
+        relation = str(payload.get("relation") or "").strip()
+        err = str(payload.get("error") or "").strip()
+        detail = f" ({relation})" if relation else ""
+        suffix = f"\n{err[:200]}" if err else ""
+        return f"⚠ {board_tag}{tag}Kanban {task_id}: linked task {other_id}{detail} gave up{suffix}"
     return None
 
 

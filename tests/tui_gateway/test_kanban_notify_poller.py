@@ -146,6 +146,51 @@ class TestCollectKanbanNotifications:
         assert "ready for review" in texts[0]
         assert "implementation ready for review" in texts[0]
 
+    def test_block_loop_detected_notifies_origin_session(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid, claimer="worker:1")
+            assert claimed is not None
+            assert kb.block_task(conn, tid, reason="missing capability", kind="capability")
+            assert kb.unblock_task(conn, tid)
+            claimed = kb.claim_task(conn, tid, claimer="worker:2")
+            assert claimed is not None
+            assert kb.block_task(conn, tid, reason="missing capability", kind="capability")
+            assert kb.get_task(conn, tid).status == "triage"
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert any("TRIAGE" in text for text in texts)
+        assert any("missing capability" in text for text in texts)
+
+    def test_linked_task_gave_up_notifies_governance_owner(self):
+        conn = kb.connect()
+        try:
+            owner = kb.create_task(conn, title="governance owner", assignee="worker")
+            kb.add_notify_sub(conn, task_id=owner, platform="tui", chat_id=SESSION_KEY)
+            assert kb.claim_task(conn, owner, claimer="owner:1") is not None
+            dep = kb.create_task(conn, title="execution child", assignee="worker")
+            kb.link_tasks(conn, dep, owner)
+            assert kb.block_task(conn, owner, reason="delegated", kind="dependency")
+            claimed = kb.claim_task(conn, dep, claimer="dep:1")
+            assert claimed is not None
+            assert kb._record_task_failure(
+                conn, dep, "worker died", outcome="crashed",
+                failure_limit=1, release_claim=True, end_run=True,
+            )
+            landed = kb.get_task(conn, owner)
+            assert landed.status == "blocked"
+            assert landed.block_kind == "needs_input"
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert any("linked task" in text and dep in text and "gave up" in text for text in texts)
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
