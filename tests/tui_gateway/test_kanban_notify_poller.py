@@ -123,6 +123,29 @@ class TestCollectKanbanNotifications:
         assert _collect_kanban_notifications(_session()) == []
         assert _sub_rows(tid) == []
 
+    def test_review_requested_notifies_origin_session_for_phase_advance(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid, claimer="worker:1")
+            assert claimed is not None
+            assert kb.request_review(
+                conn,
+                tid,
+                summary="implementation ready for review",
+                reviewer="reviewer",
+                expected_run_id=claimed.current_run_id,
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert tid in texts[0]
+        assert "ready for review" in texts[0]
+        assert "implementation ready for review" in texts[0]
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]

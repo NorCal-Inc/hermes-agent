@@ -438,6 +438,18 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'same cause 3x' })
   })
 
+  it('review_requested notifies with the implementation handoff', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'review_requested', { summary: 'implementation ready for review' })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'implementation ready for review' })
+  })
+
   it('gave_up carries the payload error; crashed and timed_out fall back to the task id', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)

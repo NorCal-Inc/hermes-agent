@@ -51,6 +51,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['completed', { titleKey: 'notify.completedTitle', toast: 'success' }],
   ['crashed', { titleKey: 'notify.crashedTitle', toast: 'error' }],
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
+  ['review_requested', { titleKey: 'col.review.label', toast: 'warning' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
 
@@ -120,7 +121,7 @@ function trimmed(value: unknown): string {
 function bodyFor(kind: string, ev: CompletionEvent): string {
   const payload = ev.payload
 
-  if (kind === 'completed') {
+  if (kind === 'completed' || kind === 'review_requested') {
     return trimmed(payload?.summary)
   }
 
