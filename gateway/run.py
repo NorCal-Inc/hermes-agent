@@ -15476,24 +15476,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         installed. For secondary profiles under multiplex, wrap the whole
         handler in ``_profile_runtime_scope`` so allowlists/tokens from that
         profile's ``.env`` are visible to ``get_secret`` / authz.
+
+        Same fail-closed contract as
+        :meth:`_make_profile_platform_event_handler`, on the more consequential
+        path: this factory is only ever called for a NAMED secondary profile,
+        so an unresolvable home is never "the launch profile's own work". The
+        old code ran ``_handle_message`` **unscoped** in that case, which means
+        ``_auth_env`` / ``_platform_gate_env`` decided profile B's inbound
+        traffic using the LAUNCH profile's allowlist and allow-all flag — a
+        fail-OPEN cross-lane admission decision, and silent.
+
+        "Unresolvable" means *no usable home*, not merely "the lookup raised".
+        ``get_profile_dir`` is pure path arithmetic: it normalizes the name and
+        joins it onto the profiles root, so a profile deleted or renamed after
+        startup returns a ``Path`` that does not exist rather than raising.
+        Scoping to that home would install an EMPTY secret scope and point
+        ``HERMES_HOME`` at nothing, so existence is checked at factory time and
+        again per event — the factory runs once per adapter install while the
+        home can vanish while the adapter is up.
+
+        Upstream: ``4aa9baf139`` (principle); see also ``bc12fc7048`` /
+        ``b09a62bb80`` for the event-path twin.
         """
         from hermes_cli.profiles import get_profile_dir
 
         try:
-            profile_home = get_profile_dir(profile_name)
+            profile_home = Path(get_profile_dir(profile_name))
+            if not profile_home.is_dir():
+                raise FileNotFoundError(
+                    f"profile home {str(profile_home)!r} is not an existing directory")
         except Exception:
             profile_home = None
+            logger.warning(
+                "Profile home for '%s' does not resolve; its inbound messages are "
+                "DROPPED rather than authorized against the launch profile's "
+                "allowlist", profile_name, exc_info=True)
+
+        reported_vanished = False
 
         async def _handler(event):
+            nonlocal reported_vanished
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
                     event.source.profile = profile_name
             except Exception:
                 pass
-            if profile_home is not None:
-                with _profile_runtime_scope(profile_home):
-                    return await self._handle_message(event)
-            return await self._handle_message(event)
+            if profile_home is None:
+                logger.debug(
+                    "Dropping inbound message for unresolvable profile '%s'",
+                    profile_name)
+                return None
+            if not profile_home.is_dir():
+                if not reported_vanished:
+                    reported_vanished = True
+                    logger.warning(
+                        "Profile home for '%s' disappeared while its adapter was "
+                        "running; inbound messages are DROPPED", profile_name)
+                else:
+                    logger.debug(
+                        "Dropping inbound message for vanished profile '%s'",
+                        profile_name)
+                return None
+            with _profile_runtime_scope(profile_home):
+                return await self._handle_message(event)
 
         return _handler
 

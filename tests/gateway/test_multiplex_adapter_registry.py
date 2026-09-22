@@ -1,7 +1,7 @@
 """Phase 3: secondary-profile adapter registry + same-token conflict detection."""
 import logging
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -74,7 +74,7 @@ class TestCredentialFingerprint:
 
 class TestProfileMessageHandler:
     @pytest.mark.asyncio
-    async def test_stamps_profile_on_unstamped_source(self):
+    async def test_stamps_profile_on_unstamped_source(self, monkeypatch, tmp_path):
         runner = GatewayRunner.__new__(GatewayRunner)
         seen = {}
 
@@ -83,6 +83,17 @@ class TestProfileMessageHandler:
             return "ok"
 
         runner._handle_message = _fake_handle
+        # The handler now requires a home that exists — a name with no
+        # directory behind it takes the drop path. Give "coder" a real home so
+        # this test keeps testing stamping.
+        coder_home = tmp_path / "profiles" / "coder"
+        coder_home.mkdir(parents=True)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda name: coder_home,
+        )
+        monkeypatch.setattr(
+            gateway_run, "_profile_runtime_scope", lambda _home: nullcontext(),
+        )
         handler = runner._make_profile_message_handler("coder")
 
         class _Src:

@@ -545,6 +545,151 @@ def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def _is_routed_home(target_home: "str | Path") -> bool:
+    """True when ``target_home`` is not the process's own (launch) home.
+
+    The authority test for "does this child act for ANOTHER profile".  Use
+    this rather than ``agent.secret_scope.is_multiplex_active()``: the
+    gateway-wide multiplex flag is off on a single-profile host, yet that host
+    still routes children to other profiles (the Kanban dispatcher spawning a
+    worker for its assignee, a dashboard backend serving ``?profile=B``).
+
+    Upstream: ``bc0a42fd96``.
+    """
+    from hermes_constants import hermes_home_key
+    try:
+        return hermes_home_key(target_home) != hermes_home_key(
+            get_process_hermes_home()
+        )
+    except Exception:
+        # Unprovable identity is not proof of sameness.
+        return True
+
+
+# Authorization gates: the env names platform adapters read to decide WHO may
+# talk to the agent (allow/deny lists, allow-all opt-ins, bot policy, channel
+# scoping).  They are not credentials, so no secret scrub touches them, and
+# most profiles' ``.env`` files do not define them, so a child's own dotenv
+# load never overwrites an inherited value.  A child spawned FOR profile B from
+# a process carrying profile A's gates — or a unit-file ``Environment=`` — would
+# enforce A's user/channel list as its own.  Matched by SHAPE so a gate added to
+# any adapter is covered without a second edit.  ``HERMES_*`` never counts:
+# ``HERMES_MEDIA_ALLOW_DIRS`` / ``HERMES_ALLOW_PRIVATE_URLS`` are process
+# settings, not adapter gates.
+_PROFILE_GATE_ENV_MARKERS = (
+    "_ALLOWED_",
+    "_ALLOW_ALL_",
+    "_ALLOW_FROM",
+    "_ALLOW_BOTS",
+    "_ALLOW_PUBLIC_",
+    "_IGNORED_CHANNELS",
+    "_NO_THREAD_CHANNELS",
+    "_FREE_RESPONSE_CHANNELS",
+    "_BACKFILL_CHANNELS",
+    "_GROUP_ALLOWED",
+)
+
+
+def is_profile_gate_env(name: str) -> bool:
+    """True for a platform authorization gate a routed child must not inherit.
+
+    ``DISCORD_ALLOWED_CHANNELS``, ``TELEGRAM_ALLOW_ALL_USERS``,
+    ``GATEWAY_ALLOWED_USERS``, ``WHATSAPP_GROUP_ALLOW_FROM`` and friends —
+    profile-scoped admission policy, not credentials.
+    """
+    upper = name.upper()
+    if upper.startswith("HERMES_") or upper.startswith("_"):
+        return False
+    return any(marker in upper for marker in _PROFILE_GATE_ENV_MARKERS)
+
+
+def strip_profile_gate_env(env: dict) -> dict:
+    """Drop every authorization gate from *env* in place."""
+    for key in [k for k in env if is_profile_gate_env(k)]:
+        del env[key]
+    return env
+
+
+def strip_launch_profile_env(
+    env: dict,
+    target_home: "str | Path | None" = None,
+    *,
+    routed: "bool | None" = None,
+) -> dict:
+    """Drop the LAUNCH profile's residue from a child env built for another profile.
+
+    The secret scrub in :func:`_sanitize_subprocess_env` is **name-based and
+    registry-derived**: it removes the provider/tool/messaging keys Hermes
+    itself knows about, plus the dynamic ``_is_hermes_internal_secret``
+    patterns.  It does not — and cannot — know that
+    ``<SOME_COMPANY>_INFO_EMAIL_PASSWORD`` in the launch profile's ``.env`` is
+    another lane's credential.  So a child built for profile B still received
+    every operator-defined secret the launch profile happens to carry.
+
+    The one thing that does identify launch-profile residue precisely is the
+    launch profile's OWN ``.env``: every name it defines is, by definition, the
+    launch profile's configuration.  A routed child re-loads its own
+    ``<HERMES_HOME>/.env`` (``load_hermes_dotenv``, ``override=True``) and
+    re-hydrates its own external sources, so a name the target profile
+    declares is restored by the child with the target's OWN value — the strip
+    is a no-op for it.  What the strip actually removes is the complement: the
+    names the target never declares, whose only possible value is the launch
+    profile's.  That is the borrowed set, and it is the whole leak.
+
+    ``_is_global_env`` names are preserved — ``PATH``, ``HOME``, ``TZ``,
+    ``HERMES_HOME``, ``TERMINAL_*``, ``HERMES_KANBAN_*`` are process/deployment
+    settings, not profile secrets, and a launch ``.env`` that pins one is
+    pinning it for the installation.
+
+    **Deliberate deviation from upstream** (``bc0a42fd96``'s tree also folds
+    ``TERMINAL_CONFIG_ENV_MAP`` into the residue set so a routed child bridges
+    its own terminal config): not taken here.  ``TERMINAL_*`` is
+    ``_is_global_env`` in this fork and the Kanban dispatcher deliberately pins
+    ``TERMINAL_CWD`` / ``TERMINAL_TIMEOUT`` per task, so stripping them would
+    fight a live, intentional contract rather than close a leak.
+
+    Authorization gates are the one residue a name list cannot see: a unit-file
+    ``Environment=`` or an operator export never appears in the launch
+    ``.env``, the secret scrub ignores non-credentials, and the target's own
+    ``.env`` rarely defines the key to overwrite it.  So the gate strip runs
+    unconditionally for a routed child.
+
+    No-op when there is no target, or when the target IS the launch profile.
+
+    ``routed`` lets a caller that has already established the verdict pass it
+    in.  The Kanban dispatcher needs this: a NAMED profile whose home does not
+    exist on disk has no path to compare, yet it is unambiguously another lane
+    (``"default"`` always resolves), so ``_is_routed_home`` cannot be the test
+    there.  ``None`` (default) auto-detects from ``target_home``.
+    """
+    from agent.secret_scope import _is_global_env, load_env_file
+    from hermes_constants import get_hermes_home_override
+
+    if routed is None:
+        target = target_home or get_hermes_home_override()
+        if not target or not _is_routed_home(target):
+            return env
+    elif not routed:
+        return env
+
+    launch_home = get_process_hermes_home()
+    # Folded compare: on Windows the env block is case-insensitive, so residue
+    # stored under a variant casing is the same variable and must go too. The
+    # selection folds the same way, so a lowercase ``path`` in the launch
+    # ``.env`` is still recognized as a global name and left alone.
+    try:
+        launch_names = set(load_env_file(Path(launch_home) / ".env"))
+    except Exception:
+        launch_names = set()
+    residue = {
+        name.upper() for name in launch_names
+        if not _is_global_env(name.upper())
+    }
+    for key in [k for k in env if k.upper() in residue]:
+        del env[key]
+    return strip_profile_gate_env(env)
+
+
 # Tier-1 secrets: stripped from EVERY spawned subprocess unconditionally —
 # even when the caller opts into credential inheritance for a model-driving
 # CLI (claude / codex / gemini).  These are not LLM provider credentials; no

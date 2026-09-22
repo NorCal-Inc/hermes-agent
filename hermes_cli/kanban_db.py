@@ -23393,6 +23393,72 @@ def _spawn_gateway_scoped_worker(
             pass
 
 
+def _worker_targets_routed_home(
+    profile_arg: str,
+    profile_home: Optional[str],
+) -> bool:
+    """True when this worker acts for a profile other than the dispatcher's own.
+
+    The authority test for scrubbing a worker's environment is "does this
+    worker act for a ROUTED home", not the gateway-wide
+    ``is_multiplex_active()`` flag. Gating on the flag leaves every
+    single-profile host — which is the common Kanban deployment, and this
+    one: ``gateway.multiplex_profiles`` is unset while 32 profiles exist —
+    building profile B's worker from the dispatcher's own environment.
+    Upstream: ``bc0a42fd96``.
+
+    ``profile_home`` is ``None`` when :func:`resolve_profile_env` raised. That
+    happens for exactly one reason: a NAMED profile with no directory on
+    disk. ``"default"`` always resolves (it *is* the launch root), so a raise
+    can never mean "the launch profile's own work" — it means the worker is
+    for another lane whose home is missing or was removed. Fail closed and
+    scrub, rather than hand that worker the dispatcher's environment because
+    its home could not be proven.
+    """
+    if profile_home is None:
+        from hermes_cli.profiles import normalize_profile_name
+        return normalize_profile_name(profile_arg) != "default"
+    from tools.environments.local import _is_routed_home
+    return _is_routed_home(profile_home)
+
+
+@contextlib.contextmanager
+def _worker_profile_scope(profile_home: str):
+    """Bind the assignee profile's own secret mapping for one spawn-env build.
+
+    The dispatcher runs detached from any turn, so nothing binds a profile for
+    it: ``_sanitize_subprocess_env`` resolves every
+    ``terminal.env_passthrough`` variable through
+    ``resolve_passthrough_value`` → ``get_secret``, which without a bound
+    scope reads the LAUNCH profile's ambient ``os.environ`` for a worker
+    spawned on B's behalf (and raises ``UnscopedSecretError`` under
+    multiplexing). Binding B's scope means those variables cross into the
+    child carrying B's OWN values.
+
+    Only the secret scope is bound, never the home override: *which* variables
+    may cross into a child is the DISPATCHER's ``terminal.env_passthrough``
+    policy — only their VALUES come from the assignee's scope.
+
+    External secret sources are deliberately NOT hydrated here.
+    ``build_profile_secret_scope`` folds in whatever
+    ``hydrate_profile_secret_sources`` already cached for that home, and
+    hydrating on demand would put a 1Password/Bitwarden round-trip inside the
+    dispatcher's spawn loop. The child re-runs ``load_hermes_dotenv`` against
+    its own ``HERMES_HOME`` and hydrates its own sources itself.
+    """
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(token)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -23410,6 +23476,11 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    A worker whose ``HERMES_HOME`` is a ROUTED home — any profile that is not
+    the dispatcher process's own — gets a scrubbed environment; see
+    :func:`_worker_targets_routed_home`. The launch profile's own worker keeps
+    the historical inherited environment unchanged.
     """
     import subprocess
     if not task.assignee:
@@ -23420,32 +23491,89 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"{KANBAN_WORKER_QUERY_PREFIX}{task.id}"
-    env = dict(os.environ)
+
+    # Resolve the assignee's HERMES_HOME first: it decides both the child's
+    # profile scope AND whether this worker's environment must be scrubbed.
+    #
+    # HERMES_HOME is injected so the worker reads the profile-scoped
+    # config.yaml (fallback_providers, toolsets, agent settings, etc.) instead
+    # of the root config.  Without this, when the child starts
+    # `hermes -p <name>` its _apply_profile_override() runs *before*
+    # hermes_constants is imported; if HERMES_HOME is absent from the child's
+    # env, get_hermes_home() falls back to Path.home() / ".hermes" (the
+    # DEFAULT profile root), ignoring the profile-specific config entirely.
+    # Fixes profile-scoped fallback_providers being invisible to kanban
+    # workers.
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        profile_home: Optional[str] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Profile dir doesn't exist — defer resolution to the CLI's
+        # _apply_profile_override() via HERMES_PROFILE (set below).
+        profile_home = None
+
+    # A worker for ANOTHER profile must not be built from the dispatcher's
+    # environment. The dispatcher runs inside the gateway
+    # (`kanban.dispatch_in_gateway`), so `dict(os.environ)` is the launch
+    # gateway's environment — its provider keys, its bot tokens, its
+    # systemd-injected secrets — and every lane's worker was previously built
+    # from that one identical environment, differing only in HERMES_HOME.
+    #
+    # `build_subprocess_env(scrub_secrets=True)` delegates to
+    # `_sanitize_subprocess_env`, the established owner of the scrub list
+    # (provider blocklist + `_is_hermes_internal_secret` dynamic patterns +
+    # HERMES_HOME/HOME propagation). The worker keeps its OWN lane's
+    # credentials because the child re-loads `<HERMES_HOME>/.env`, `.op.env`
+    # and its external secret sources itself (`load_hermes_dotenv`), and
+    # non-env auth (the profile-independent auth store / credential pool) is
+    # untouched by an environment scrub.
+    #
+    # `inherit_profile_home=False` keeps the NON-routed path byte-identical to
+    # the historical `dict(os.environ)`: the launch profile's own worker is
+    # unaffected by this change. On the scrub path the factory applies the
+    # HERMES_HOME/HOME contract regardless, which is what we want.
+    #
+    # `strip_launch_profile_env` is the second half, and the one the scrub
+    # alone cannot do: the scrub list is registry-derived, so it removes the
+    # provider/messaging keys Hermes knows about but not an operator-defined
+    # `<COMPANY>_..._PASSWORD` sitting in the launch profile's own `.env`. That
+    # strip is name-driven off the launch `.env` itself, plus a shape-matched
+    # sweep of authorization gates (which a unit file can inject without ever
+    # appearing in a dotenv).
+    from agent.secret_scope import is_multiplex_active
+    from tools.environments.local import (
+        build_subprocess_env,
+        strip_launch_profile_env,
+    )
+
+    routed = _worker_targets_routed_home(profile_arg, profile_home)
+    scrub_secrets = routed or is_multiplex_active()
+    scope = (
+        _worker_profile_scope(profile_home)
+        if scrub_secrets and profile_home
+        else contextlib.nullcontext()
+    )
+    with scope:
+        env = build_subprocess_env(
+            scrub_secrets=scrub_secrets,
+            inherit_profile_home=False,
+        )
+    # `routed=routed` rather than letting the helper re-derive it: a named
+    # profile with no home on disk has no path to compare, but it is still
+    # another lane, and that verdict is already settled above.
+    strip_launch_profile_env(env, profile_home, routed=routed)
+
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
-    # session binds ContextVars in this process.
+    # session binds ContextVars in this process. Runs AFTER the env build:
+    # `_sanitize_subprocess_env` re-injects any session var bound in the
+    # dispatcher's own context.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
 
-    # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
-    # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, `env = dict(os.environ)` copies only the parent's
-    # env, and when the child process starts `hermes -p <name>` the
-    # _apply_profile_override() runs *before* hermes_constants is imported.
-    # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
-    # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
-    # profile-specific config entirely.  Fixes profile-scoped fallback_providers
-    # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    if profile_home is not None:
+        env["HERMES_HOME"] = profile_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
