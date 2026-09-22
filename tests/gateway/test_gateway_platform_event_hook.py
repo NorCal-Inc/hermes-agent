@@ -612,16 +612,51 @@ class TestProfileScopedPlatformEventHandler:
 
         runner._handle_gateway_platform_event = dispatch
         monkeypatch.setattr(
-            "hermes_cli.profiles.get_profile_dir", lambda name: None,
+            "hermes_cli.profiles.get_profile_dir", lambda name: Path("/profiles/work"),
         )
         handler = runner._make_profile_platform_event_handler("work")
         source = _adapter()._source_from_reaction_for_auth(
             _auth_reaction_update(user_id=777)
         )
 
-        asyncio.run(handler({"platform": "telegram", "event_type": "reaction", "payload": {}}, source))
+        with patch("gateway.run._profile_runtime_scope", side_effect=lambda _home: nullcontext()):
+            asyncio.run(
+                handler({"platform": "telegram", "event_type": "reaction", "payload": {}}, source))
 
         assert captured["profile"] == "work"
+
+    def test_unresolvable_profile_home_drops_the_event(self, monkeypatch, caplog):
+        """A NAMED profile whose home is gone must not be authorized as the launch profile.
+
+        ``get_profile_dir`` raising used to collapse into the same ``None`` the
+        launch-owned path used, and the body then ran with NO profile scope —
+        so ``_is_user_authorized`` read the LAUNCH profile's allowlist and
+        allow-all flag and decided another lane's traffic.
+
+        Upstream: 4aa9baf139
+        """
+        runner = object.__new__(GatewayRunner)
+        dispatch = AsyncMock()
+        runner._handle_gateway_platform_event = dispatch
+
+        def _gone(_name):
+            raise FileNotFoundError("profile deleted mid-run")
+
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", _gone)
+
+        with caplog.at_level("WARNING", logger="gateway.run"):
+            handler = runner._make_profile_platform_event_handler("work")
+        assert any("does not resolve" in r.message for r in caplog.records), (
+            "an unresolvable profile home must be reported, not silently ignored")
+
+        source = _adapter()._source_from_reaction_for_auth(
+            _auth_reaction_update(user_id=777)
+        )
+        result = asyncio.run(
+            handler({"platform": "telegram", "event_type": "reaction", "payload": {}}, source))
+
+        assert result is None
+        dispatch.assert_not_awaited()
 
 
 class TestFixturePluginObservationPath:

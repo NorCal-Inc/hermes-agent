@@ -15543,21 +15543,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("gateway_platform_event hook dispatch failed", exc_info=True)
 
     def _make_profile_platform_event_handler(self, profile_name: str):
-        """Bind platform-event auth and hook dispatch to one multiplex profile."""
+        """Bind platform-event auth and hook dispatch to one multiplex profile.
+
+        This factory is only ever called for a NAMED secondary profile, so an
+        unresolvable home (deleted or renamed mid-run, invalid name, transient
+        OSError) is never "the launch profile's own work" — the two must not
+        collapse into one ``None``. Running the body unscoped resolved
+        ``_is_user_authorized`` against the LAUNCH profile's allowlist and
+        allow-all flag, i.e. one lane's admission policy deciding another
+        lane's traffic, and then dispatched the result to plugin hooks.
+
+        We bind nothing AND dispatch nothing in that case. Upstream binds
+        nothing but still dispatches; skipping is the stricter reading and the
+        one company isolation requires — the only thing lost is an
+        observability hook for a profile whose home no longer exists.
+
+        Upstream: 4aa9baf139
+        """
         from hermes_cli.profiles import get_profile_dir
 
         try:
             profile_home = get_profile_dir(profile_name)
         except Exception:
             profile_home = None
+            logger.warning(
+                "Profile home for '%s' does not resolve; its platform events are "
+                "DROPPED rather than authorized against the launch profile's "
+                "allowlist", profile_name, exc_info=True)
 
         async def _handler(event, source):
             if getattr(source, "profile", None) is None:
                 source.profile = profile_name
-            if profile_home is not None:
-                with _profile_runtime_scope(profile_home):
-                    return await self._handle_gateway_platform_event(event, source)
-            return await self._handle_gateway_platform_event(event, source)
+            if profile_home is None:
+                logger.debug(
+                    "Dropping platform event for unresolvable profile '%s'", profile_name)
+                return None
+            with _profile_runtime_scope(profile_home):
+                return await self._handle_gateway_platform_event(event, source)
 
         return _handler
 
