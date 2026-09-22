@@ -49,10 +49,30 @@ recovery_authorized, recovery_reason = validate_recovery_task(recovery_id) if re
 # Claude role rules must be synchronized even for recovery. The shared gate itself may
 # be red because repairing that named gate is the sole purpose of this session.
 claude_rules_ready = 'LOCAL/CANONICAL CLAUDE.md: OK' in ctx
+# Did the boot wrapper actually run and hand us a payload? ``proc is None`` means
+# subprocess.run itself raised (wrapper missing, not executable, or timed out), so the
+# context below is the synthetic fallback and proves nothing about doctrine loading.
+boot_wrapper_ran = proc is not None
+# Recovery authority must NOT depend on the wrapper's exit status. The wrapper exits 1 on
+# every DEGRADED boot (`raise SystemExit(1)` whenever it collected failures), so a
+# returncode term here made ``recovery_only`` true only when ``complete`` was already
+# true -- i.e. the recovery branch below was unreachable and a degraded session got the
+# HARD GATE with no way out. That is the circular deadlock doctrine constraint 15
+# forbids: "The recovery executor must not require the failed gate to be green before it
+# can repair that same gate." What still gates recovery is evidence independent of the
+# failed gate: an authorized card, a real payload, the shared constraints present in it,
+# and Claude's own rule file in sync.
 recovery_only = bool(
-    sid and recovery_authorized and shared_loaded and claude_rules_ready
-    and (proc is None or proc.returncode == 0)
+    sid and recovery_authorized and shared_loaded and claude_rules_ready and boot_wrapper_ran
 )
+# The blocking gate must be named, not merely declared red, or a recovery session has no
+# scope and an ordinary session has nothing to repair.
+failed_gates = [
+    line.split('FAILURE:', 1)[1].strip()
+    for line in ctx.splitlines()
+    if line.startswith('FAILURE:')
+]
+named_gate = '; '.join(failed_gates) if failed_gates else 'unnamed — boot wrapper reported no FAILURE line'
 
 state = {
     'session_id': sid,
@@ -64,6 +84,8 @@ state = {
     'recovery_authority_reason': recovery_reason,
     'claude_boot_complete': claude_complete,
     'shared_boot_complete': shared_complete,
+    'boot_wrapper_ran': boot_wrapper_ran,
+    'failed_gates': failed_gates,
     'boot_returncode': None if proc is None else proc.returncode,
 }
 if sid:
@@ -81,13 +103,18 @@ if recovery_only and not complete:
     hso['additionalContext'] = existing + (
         '\n\n<RECOVERY-ONLY>Normal execution remains blocked. This session may only diagnose '
         'and repair the failed boot gate named by its authorized recovery card, rerun '
-        'the deterministic gate, and report evidence.</RECOVERY-ONLY>'
+        'the deterministic gate, and report evidence.'
+        f'\nFAILED GATE: {named_gate}</RECOVERY-ONLY>'
     )
 elif not complete:
     msg = payload.get('systemMessage') or ''
     payload['systemMessage'] = (msg + ' | HARD GATE ACTIVE: all tools denied until a fresh session reaches COMPLETE').strip(' |')
     hso = payload.setdefault('hookSpecificOutput', {})
     existing = str(hso.get('additionalContext') or '')
-    hso['additionalContext'] = existing + '\n\n<HARD-GATE>INCOMPLETE BOOT. DO NOT EXECUTE TOOLS. REPAIR THE NAMED BLOCKING FAILURE, THEN START A FRESH SESSION.</HARD-GATE>'
+    hso['additionalContext'] = existing + (
+        '\n\n<HARD-GATE>INCOMPLETE BOOT. DO NOT EXECUTE TOOLS. REPAIR THE NAMED BLOCKING '
+        'FAILURE, THEN START A FRESH SESSION.'
+        f'\nFAILED GATE: {named_gate}</HARD-GATE>'
+    )
 
 print(json.dumps(payload))
