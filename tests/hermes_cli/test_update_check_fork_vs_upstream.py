@@ -39,6 +39,9 @@ def _git_side_effect(
     upstream_behind="16140",
     fork_only="165",
     upstream_fetch_ok=True,
+    is_shallow=False,
+    head_sha="head123",
+    origin_sha="origin123",
 ):
     """Drive the ``_cmd_update_check`` git pipeline off canned counts.
 
@@ -55,7 +58,7 @@ def _git_side_effect(
         if "remote get-url upstream" in joined:
             return subprocess.CompletedProcess(cmd, 0 if has_upstream else 1, stdout="", stderr="")
         if "--is-shallow-repository" in joined:
-            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=("true\n" if is_shallow else "false\n"), stderr="")
         if "fetch" in joined and "upstream" in joined:
             rc = 0 if upstream_fetch_ok else 128
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="fatal: no upstream\n")
@@ -63,6 +66,10 @@ def _git_side_effect(
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if "rev-parse" in joined and "--verify" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if is_shallow and joined.endswith("rev-parse HEAD"):
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{head_sha}\n", stderr="")
+        if is_shallow and joined.endswith("rev-parse origin/main"):
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{origin_sha}\n", stderr="")
         if "rev-list" in joined:
             if "HEAD..origin/" in joined:
                 count = origin_behind
@@ -221,6 +228,30 @@ def test_non_main_branch_never_consults_upstream(mock_run, _method, capsys):
     assert "upstream" not in out.lower()
     assert not any("upstream" in c for c in _commands(mock_run) if "fetch" in c)
 
+
+
+
+@patch("hermes_cli.banner._github_compare_behind", return_value=0)
+@patch("hermes_cli.config.detect_install_method", return_value="git")
+@patch("subprocess.run")
+def test_shallow_fork_still_reports_nous_review_state(
+    mock_run, _method, _compare, capsys
+):
+    """Shallow installs must not return before the separate review-only line."""
+    _run_check(
+        mock_run,
+        is_shallow=True,
+        head_sha="local-tip",
+        origin_sha="origin-tip",
+        upstream_behind="40",
+        fork_only="7",
+    )
+
+    out = capsys.readouterr().out
+    assert "Already up to date." in out
+    assert "40 commits on upstream/main" in out
+    assert "NOT an update backlog" in out
+    assert not any("40" in ln for ln in _behind_lines(out)), out
 
 # ------------------------------------------------------------ (c) banner is origin-only
 

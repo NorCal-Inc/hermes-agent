@@ -2922,13 +2922,24 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             if counted == 0:
                 # Local commits on top of the remote tip — not behind.
                 print("✓ Already up to date.")
-                return
-            if counted is not None:
-                commits_word = "commit" if counted == 1 else "commits"
-                print(f"⚕ Update available: {counted} {commits_word} behind {compare_branch}.")
             else:
-                print(f"⚕ Update available (behind {compare_branch}).")
-            print(f"  Run '{recommended_update_command()}' to install.")
+                if counted is not None:
+                    commits_word = "commit" if counted == 1 else "commits"
+                    print(f"⚕ Update available: {counted} {commits_word} behind {compare_branch}.")
+                else:
+                    print(f"⚕ Update available (behind {compare_branch}).")
+                print(f"  Run '{recommended_update_command()}' to install.")
+
+        # Shallow checkouts still need the same separately-labelled Nous review
+        # state as full-history checkouts. This is informational only and must
+        # not affect the actionable origin-relative update verdict above.
+        if branch == "main" and _is_fork(_get_origin_url(git_cmd, _m().PROJECT_ROOT)):
+            review = _upstream_review_state(
+                git_cmd, _m().PROJECT_ROOT, branch, depth_args
+            )
+            if review is not None:
+                for line in _format_upstream_review_lines(review, branch):
+                    print(line)
         return
 
     rev_result = subprocess.run(
