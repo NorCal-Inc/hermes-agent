@@ -216,6 +216,7 @@ def test_notification_event_taxonomy_is_kernel_owned():
     assert {
         "review_requested", "linked_task_gave_up", "block_loop_detected",
         "verification_failed", "notification_delivery_failed",
+        "verification_acceptance_missing",
     }.issubset(kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS)
     assert {"status", "archived", "unblocked"}.isdisjoint(
         kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
@@ -629,6 +630,58 @@ async def test_notifier_notify_plus_wake_wakes_on_notification_delivery_failed(k
     assert tid in wake_text
     assert "return path failed" in wake_text.lower()
     assert "session unavailable" in wake_text
+
+
+@pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_verification_acceptance_missing(kanban_home):
+    """A refused control-plane PASS must return immediately to the owner."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="control plane change", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(
+            conn, tid, "verification_acceptance_missing",
+            {
+                "verifier_task": "t_verify",
+                "verdict": "PASS",
+                "acceptance": None,
+                "reason": "control-plane PASS requires ACCEPTANCE: PASS",
+            },
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), timeout=10.0)
+
+    fake_adapter.send.assert_awaited_once()
+    wake_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio

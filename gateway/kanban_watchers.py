@@ -654,6 +654,22 @@ class GatewayKanbanWatchersMixin:
                                 f"{verifier_text}"
                                 + (f"\n{reason_text}" if reason_text else "")
                             )
+                        elif kind == "verification_acceptance_missing":
+                            verifier_task = ""
+                            reason_text = ""
+                            if ev.payload:
+                                verifier_task = str(ev.payload.get("verifier_task") or "").strip()
+                                reason_text = str(ev.payload.get("reason") or "").strip()[:200]
+                            verifier_text = f" from {verifier_task}" if verifier_task else ""
+                            wake_handoff = (
+                                f"Verifier PASS was refused{verifier_text} because acceptance proof is missing"
+                                + (f": {reason_text}" if reason_text else "")
+                            )
+                            msg = (
+                                f"❌ {board_tag}{tag}Kanban {sub['task_id']} verifier PASS refused"
+                                f"{verifier_text} — acceptance proof missing"
+                                + (f"\n{reason_text}" if reason_text else "")
+                            )
                         elif kind == "notification_delivery_failed":
                             platform = ""
                             mode = ""
@@ -907,6 +923,7 @@ class GatewayKanbanWatchersMixin:
                             if "block_loop_detected" in _wake_kinds: _parts.append("routed to triage; needs a human decision")
                             if "verification_failed" in _wake_kinds: _parts.append("verification failed; repair required")
                             if "notification_delivery_failed" in _wake_kinds: _parts.append("notification return path failed; delivery route lost")
+                            if "verification_acceptance_missing" in _wake_kinds: _parts.append("verifier PASS refused; acceptance proof missing")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",

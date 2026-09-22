@@ -54,6 +54,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['linked_task_gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'warning' }],
   ['review_requested', { titleKey: 'col.review.label', toast: 'warning' }],
   ['verification_failed', { titleKey: 'notify.verificationFailedTitle', toast: 'error' }],
+  ['verification_acceptance_missing', { titleKey: 'notify.verificationAcceptanceMissingTitle', toast: 'error' }],
   ['notification_delivery_failed', { titleKey: 'notify.notificationDeliveryFailedTitle', toast: 'error' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
@@ -142,6 +143,14 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const verifierText = verifier ? ` by ${verifier}` : ''
     const reasonText = reason ? `: ${reason}` : ''
     return `Verification failed${verifierText}${reasonText}`
+  }
+
+  if (kind === 'verification_acceptance_missing') {
+    const verifierTask = trimmed(payload?.verifier_task)
+    const reason = trimmed(payload?.reason)
+    const verifierText = verifierTask ? ` from ${verifierTask}` : ''
+    const reasonText = reason ? `: ${reason}` : ''
+    return `Verifier PASS refused${verifierText} — acceptance proof missing${reasonText}`
   }
 
   if (kind === 'notification_delivery_failed') {

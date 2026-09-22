@@ -470,6 +470,28 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify().message).toContain('codex_verify:t_v')
   })
 
+  it('verification_acceptance_missing reports the refused PASS', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'verification_acceptance_missing', {
+        verifier_task: 't_verify',
+        verdict: 'PASS',
+        acceptance: null,
+        reason: 'control-plane PASS requires ACCEPTANCE: PASS'
+      })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'error',
+      title: 'Verifier PASS refused',
+      message: expect.stringContaining('t_verify')
+    })
+    expect(lastNotify().message).toContain('acceptance proof missing')
+  })
+
   it('notification_delivery_failed reports the lost return path', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)

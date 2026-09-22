@@ -253,6 +253,27 @@ class TestCollectKanbanNotifications:
         assert "12 attempts" in texts[0]
         assert "bot disconnected" in texts[0]
 
+    def test_verification_acceptance_missing_notifies_origin_session(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            kb._append_event(
+                conn, tid, "verification_acceptance_missing",
+                {
+                    "verifier_task": "t_verify",
+                    "verdict": "PASS",
+                    "acceptance": None,
+                    "reason": "control-plane PASS requires ACCEPTANCE: PASS",
+                },
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+        assert len(texts) == 1
+        assert "acceptance" in texts[0].lower()
+        assert "t_verify" in texts[0]
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
