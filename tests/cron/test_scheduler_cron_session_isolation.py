@@ -61,6 +61,17 @@ def _clear_approval_state(monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    # ``check_execute_code_guard`` grew a single-query (-q) deny branch in
+    # 1596148ff2 that is evaluated *before* the cron and gateway branches, and
+    # ``HERMES_SINGLE_QUERY_SESSION`` is deliberately not a session ContextVar
+    # (it is absent from ``gateway.session_context._VAR_MAP``), so it always
+    # resolves from ``os.environ``. cli.py sets it process-globally for every
+    # ``hermes chat -q`` run — which is exactly how kanban workers spawn — so
+    # any pytest process descended from one inherits it and the gateway leg
+    # below would be denied for single-query reasons that have nothing to do
+    # with the cron isolation guarantee under test. Mask it like the other
+    # surface markers so this test measures cron pollution and nothing else.
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("cron-isolation-session")
