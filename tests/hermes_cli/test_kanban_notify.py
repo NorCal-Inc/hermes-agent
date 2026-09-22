@@ -405,6 +405,80 @@ async def test_notifier_notify_plus_wake_wakes_on_linked_task_gave_up(kanban_hom
 
 
 @pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_block_loop_detected(kanban_home):
+    """A repeated same-cause block routed to triage must wake its owner."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="looping task", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake",
+        )
+        claimed = kb.claim_task(conn, tid, claimer="worker1:1")
+        assert claimed is not None
+        assert kb.block_task(conn, tid, reason="missing capability", kind="capability")
+        # Consume the first blocker notification before the recurrence. The
+        # second notifier pass must therefore be driven by block_loop_detected,
+        # not by replaying the ordinary blocked event.
+        _old, _new, first_events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="",
+            kinds=(
+                "completed", "blocked", "gave_up", "crashed", "timed_out",
+                "status", "archived", "unblocked", "block_loop_detected",
+                "review_requested", "linked_task_gave_up",
+            ),
+        )
+        assert any(ev.kind == "blocked" for ev in first_events)
+        assert kb.unblock_task(conn, tid)
+        claimed = kb.claim_task(conn, tid, claimer="worker1:2")
+        assert claimed is not None
+        assert kb.block_task(conn, tid, reason="missing capability", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert fake_adapter.send.await_count >= 1
+    wake_mock.assert_awaited_once()
+    wake_text = wake_mock.await_args.kwargs["text"]
+    assert tid in wake_text
+    assert "missing capability" in wake_text
+    assert "triage" in wake_text.lower()
+
+
+@pytest.mark.asyncio
 async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_home):
     """Plain/default notify must remain passive even when the task carries a
     creator session_id. This guards against the older unconditional wake path

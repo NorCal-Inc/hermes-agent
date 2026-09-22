@@ -651,12 +651,18 @@ class GatewayKanbanWatchersMixin:
                             # TERMINAL_KINDS it produced zero notification and
                             # the task stalled in triage silently. Ping loudly.
                             reason = ""
+                            wake_reason = ""
                             recurrences = None
                             if ev.payload:
                                 if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                    wake_reason = str(ev.payload["reason"])[:160]
+                                    reason = f": {wake_reason}"
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+                            wake_handoff = (
+                                f"Task routed to triage after repeated same-cause blocking{rc}"
+                                + (f": {wake_reason}" if wake_reason else "")
+                            )
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
@@ -816,7 +822,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "linked_task_gave_up")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "linked_task_gave_up", "block_loop_detected")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -855,6 +861,7 @@ class GatewayKanbanWatchersMixin:
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             if "review_requested" in _wake_kinds: _parts.append("ready for review")
                             if "linked_task_gave_up" in _wake_kinds: _parts.append("linked task gave up; needs attention")
+                            if "block_loop_detected" in _wake_kinds: _parts.append("routed to triage; needs a human decision")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
