@@ -12,7 +12,7 @@ import yaml
 import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, _session_key_namespace
 
 
 def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", chat_id="67890"):
@@ -102,7 +102,10 @@ def _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile):
             history=[],
             source=source,
             session_id="session-1",
-            session_key=f"agent:{profile or 'main'}:local:dm",
+            # Use the real namespace resolver rather than an f-string: it
+            # collapses both ``None`` and the literal ``"default"`` to
+            # ``agent:main``, which a hand-rolled key would get wrong.
+            session_key=f"{_session_key_namespace(profile)}:local:dm",
         )
     )
 
@@ -215,13 +218,25 @@ class TestReasoningCommand:
     def test_thin_executive_ceiling_caps_default_profile_toolsets(self, tmp_path, monkeypatch):
         """Default/Erika profile is capped to the thin ``executive`` surface.
 
-        The ceiling is a deliberate capability boundary (2d92fcf007): the
-        default profile orchestrates governed work and must not receive
-        research, terminal, code-execution, memory or MCP tools — even when
-        ``platform_toolsets`` and ``mcp_servers`` are configured, as they are
-        in this fixture's config.
+        The ceiling is a deliberate capability boundary (2d92fcf007): on an
+        ordinary default-profile turn the agent orchestrates governed work and
+        does not receive research, terminal, code-execution, memory or MCP
+        tools — even when ``platform_toolsets`` and ``mcp_servers`` are
+        configured, as they are in this fixture's config.
+
+        Scope: this pins the ceiling in ``TurnRunner._run_agent`` only, which
+        is where every ``_thin_executive_mode`` branch lives. The
+        ``/background`` path (``_run_background_task_inner``) resolves
+        toolsets independently and is *not* capped; that gap predates this
+        test and is not asserted here either way.
         """
-        assert _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile=None) == ["executive"]
+        toolsets = _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile=None)
+        assert toolsets == ["executive"]
+        # Spelled out so the boundary, not just the literal, is what fails:
+        # a legitimate widening of the executive surface should still keep
+        # these off a default-profile turn.
+        for denied in ("terminal", "code_execution", "web", "memory", "exa"):
+            assert denied not in set(toolsets)
 
     def test_thin_executive_ceiling_does_not_apply_to_named_profiles(self, tmp_path, monkeypatch):
         """Named Team Leader / worker profiles keep their configured toolsets.
@@ -230,9 +245,10 @@ class TestReasoningCommand:
         tightening the ceiling to cover every profile, or dropping it
         entirely, fails one of the two.
         """
-        enabled_toolsets = _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile="team-leader")
-        assert enabled_toolsets != ["executive"]
-        assert "web" in set(enabled_toolsets)
+        enabled_toolsets = set(
+            _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile="team-leader")
+        )
+        assert "web" in enabled_toolsets
 
 
 class TestLoadShowReasoningCoercion:

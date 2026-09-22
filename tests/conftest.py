@@ -278,6 +278,16 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
+    # The surface marker for ``hermes chat -q``. ``cli.py`` sets it
+    # process-globally, and kanban workers spawn exactly that way, so any
+    # pytest run descended from one inherits it. ``check_execute_code_guard``
+    # evaluates its single-query deny branch *before* the cron and gateway
+    # branches, and this var is deliberately not a session ContextVar (absent
+    # from ``gateway.session_context._VAR_MAP``), so it always resolves from
+    # ``os.environ`` and cannot be masked by a bound session context the way
+    # ``HERMES_CRON_SESSION`` can. Leaked in, it denies approval-path tests
+    # for single-query reasons unrelated to what they assert.
+    "HERMES_SINGLE_QUERY_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
     "HERMES_MODEL",
