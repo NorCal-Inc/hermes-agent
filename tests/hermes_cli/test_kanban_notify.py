@@ -338,6 +338,73 @@ async def test_notifier_notify_plus_wake_wakes_on_review_requested(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_linked_task_gave_up(kanban_home):
+    """A linked dependency exhausting retries is an executive decision event.
+
+    The subscribed origin must wake, not merely receive a passive text ping,
+    because the related governance card is moved to needs_input.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        owner = kb.create_task(conn, title="governance owner", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=owner, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake",
+        )
+        assert kb.claim_task(conn, owner, claimer="owner:1") is not None
+        dep = kb.create_task(conn, title="execution child", assignee="worker1")
+        kb.link_tasks(conn, dep, owner)
+        assert kb.block_task(conn, owner, reason="delegated", kind="dependency")
+        claimed = kb.claim_task(conn, dep, claimer="dep:1")
+        assert claimed is not None
+        assert kb._record_task_failure(
+            conn, dep, "worker died", outcome="crashed",
+            failure_limit=1, release_claim=True, end_run=True,
+        )
+        landed = kb.get_task(conn, owner)
+        assert landed.status == "blocked"
+        assert landed.block_kind == "needs_input"
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert fake_adapter.send.await_count >= 1
+    wake_mock.assert_awaited_once()
+    wake_text = wake_mock.await_args.kwargs["text"]
+    assert owner in wake_text
+    assert dep in wake_text
+    assert "worker died" in wake_text
+
+
+@pytest.mark.asyncio
 async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_home):
     """Plain/default notify must remain passive even when the task carries a
     creator session_id. This guards against the older unconditional wake path

@@ -621,15 +621,23 @@ class GatewayKanbanWatchersMixin:
                             # retries. Surfacing this on BOTH sides is
                             # what keeps a gave_up task from stranding
                             # whoever is waiting on it without anyone
-                            # noticing — see _record_task_failure.
+                            # noticing — see _record_task_failure. Carry the
+                            # same evidence into an active wake subscription so
+                            # the governance owner can act without polling.
                             other_id = ""
                             relation = ""
                             err = ""
+                            wake_error = ""
                             if ev.payload:
                                 other_id = str(ev.payload.get("task_id") or "")
                                 relation = str(ev.payload.get("relation") or "")
                                 if ev.payload.get("error"):
-                                    err = f"\n{str(ev.payload['error'])[:200]}"
+                                    wake_error = str(ev.payload["error"])[:200]
+                                    err = f"\n{wake_error}"
+                            wake_handoff = (
+                                f"Linked task {other_id} ({relation}) gave up"
+                                + (f": {wake_error}" if wake_error else "")
+                            )
                             msg = (
                                 f"⚠ {board_tag}{tag}Kanban {sub['task_id']}: linked "
                                 f"task {other_id} ({relation}) gave up{err}"
@@ -808,7 +816,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "linked_task_gave_up")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -846,6 +854,7 @@ class GatewayKanbanWatchersMixin:
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             if "review_requested" in _wake_kinds: _parts.append("ready for review")
+                            if "linked_task_gave_up" in _wake_kinds: _parts.append("linked task gave up; needs attention")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
