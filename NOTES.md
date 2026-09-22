@@ -110,9 +110,22 @@ Four bullets, assessed separately against this fork:
 * **`(home key, job id)` in-flight keying — DOES NOT APPLY.** Upstream's stated
   motivation is "two profiles carrying a `daily-brief` no longer read as one
   job". Verified here: cron job ids are always `uuid.uuid4().hex[:12]`
-  (`cron/jobs.py:1875`) and there is **no caller-supplied-id path**, so two
-  profiles can never share an id and the bare-id set in `cron/scheduler.py`
-  cannot collide. Re-keying 45 call sites across `cron/scheduler.py`,
+  (`cron/jobs.py:1875`) and `add_job()` exposes **no caller-supplied-id
+  parameter**, so two profiles cannot share an id through any API and the
+  bare-id set in `cron/scheduler.py` cannot collide.
+
+  *Precision note (added on re-verification):* there is exactly one path by
+  which an id can enter from outside `add_job()` —
+  `_get_due_jobs_locked()` (`cron/jobs.py:3056`) repairs an id-less record by
+  recovering a drifted legacy `"job_id"` key, else synthesizing a uuid. That is
+  a corruption-repair path for a hand-edited `jobs.json`, not an API, and a
+  collision would need a human to write the *same* literal id into two
+  different profiles' job stores **and** multiplexing to be enabled. The
+  verdict is unchanged; the original wording ("no caller-supplied-id path") was
+  a shade absolute and is corrected here rather than left to be discovered by
+  the reviewer.
+
+  Re-keying 45 call sites across `cron/scheduler.py`,
   `cron/jobs.py`, `gateway/run.py`, `agent/monitoring/cron_health.py`,
   `tools/cronjob_tools.py` and ~15 test files would buy nothing here.
 * **Per-home parallel pool — real but currently inert.** See **Finding B**.
@@ -266,13 +279,23 @@ ever turned on, this should be ported in the same change.
 
 ## Tests run
 
-Runner note: `scripts/run_tests.sh` found no venv with pytest in this worktree
-(`.venv`/`venv` absent; the runtime venv at the main checkout has no pytest and
-`HERMES_PYTHON` is unset). Tests were run with a scratch venv
-(`/tmp/t82336f3d-venv`, pytest 9.1.1) against the runtime venv's site-packages,
-under `TZ=UTC LANG=C.UTF-8` and an isolated `HERMES_HOME`. This is **not** full
-CI parity (no per-file subprocess isolation, no credential-var unset sweep), and
-the branch should get a real `scripts/run_tests.sh` pass before merge.
+**Runner: full CI parity.** This worktree has no `.venv`/`venv` of its own, so
+`scripts/run_tests.sh` falls through its probe list. The sanctioned override
+supplies the interpreter instead — the fork checkout's own venv (pytest 9.1.1,
+all runtime deps present):
+
+```
+HERMES_PYTHON=/home/chris/.hermes/hermes-agent-next/venv/bin/python \
+  scripts/run_tests.sh <paths>
+```
+
+That is the real runner: per-file subprocess isolation via
+`run_tests_parallel.py`, credential-var unset sweep, `TZ=UTC`, `LANG=C.UTF-8`,
+`PYTHONHASHSEED=0`. An earlier revision of this file recorded a scratch-venv run
+and flagged the parity gap as outstanding — **that gap is now closed**; the
+results below are from the CI-parity runner.
+
+### Targeted subset — 15 files, 145 passed, 0 failed, 2 skipped (7.4s)
 
 ```
 tests/agent/test_secret_scope_tier1_migration.py
@@ -292,7 +315,20 @@ tests/gateway/test_shutdown_cache_cleanup.py
 tests/gateway/test_shutdown_watchdog.py
 ```
 
-Each new test was also run against the pre-fix code to confirm it fails there:
+### Regression sweep — `tests/gateway/` + `tests/cron/`
+
+Run in full because `gateway/run.py` is one of the two files this branch
+touches: **716 files, 6675 passed, 1 failed, 36 skipped (235.6s)**.
+
+The single failure is
+`tests/gateway/test_reasoning_command.py::TestReasoningCommand::test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets`
+(`assert 'web' in {'executive'}`). **Pre-existing, not caused by this branch** —
+confirmed by running that file in a throwaway worktree detached at the base
+commit `c4d6605e29`, where it fails identically (1 failed, 7 passed). It is a
+NorCal toolset-customization drift unrelated to this card's scope, and is left
+untouched and reported rather than fixed here.
+
+### Each new test was run against the pre-fix code to confirm it fails there
 
 * `TestAuthzAuthEnv::test_scoped_miss_returns_default_not_env` — fails with
   `assert 'profile-A' == ''`, i.e. the launch profile's allowlist reaching a
