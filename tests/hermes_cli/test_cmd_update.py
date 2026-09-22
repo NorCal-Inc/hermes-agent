@@ -709,10 +709,18 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_main_compares_against_origin(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """No --branch (or --branch=None) compares against origin/main.
+
+        Used to prefer ``upstream/main`` whenever an ``upstream`` remote
+        existed, which reported a diverged fork's whole Nous delta as an update
+        backlog (task t_de41461b). ``hermes update`` installs from origin, so
+        origin is the compare ref; the upstream delta is surfaced separately as
+        labelled review material — see
+        ``tests/hermes_cli/test_update_check_fork_vs_upstream.py``.
+        """
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
@@ -721,11 +729,12 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        # The verdict is computed against origin/main, never upstream/main.
+        verify_cmds = [c for c in commands if "rev-parse" in c and "--verify" in c]
+        assert verify_cmds and all("origin/main" in c for c in verify_cmds), verify_cmds
+        assert any("rev-list HEAD..origin/main" in c for c in commands), commands
+        assert not any("rev-list HEAD..upstream/main" in c for c in commands), commands
+        assert "Already up to date." in capsys.readouterr().out
 
 
 class TestCmdUpdateZipBranchRefusal:
