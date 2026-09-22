@@ -450,6 +450,22 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'implementation ready for review' })
   })
 
+  it('linked_task_gave_up notifies the owner about the failed linked task', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'linked_task_gave_up', { task_id: 't_child', relation: 'dependent', error: 'worker died' })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      message: expect.stringContaining('t_child')
+    })
+    expect(lastNotify().message).toContain('worker died')
+  })
+
   it('gave_up carries the payload error; crashed and timed_out fall back to the task id', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
