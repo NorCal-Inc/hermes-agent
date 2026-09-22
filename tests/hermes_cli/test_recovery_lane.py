@@ -297,17 +297,39 @@ def test_kanban_cli_create_defaults_executor_lane_none():
 
 
 def test_codex_verify_task_does_not_recursively_require_gauntlet_review(kanban_home):
+    # Retargeted for commit a43147e66e ("Reduce automatic Gauntlet verification
+    # scope"), which removed parent->child gauntlet inheritance from create_task.
+    # That removal is the fix for the verifier self-review loop recorded in vault
+    # Business/Operations/2026-09-20-transport-aware-boot-hardening.md, section
+    # "Round 5's routing, and a board defect": t_a1242c14 inherited
+    # gauntlet_enforced=1 from its parent and gauntlet-enforcing a *verifier* card
+    # is what produced the self-review loop on t_fd296c4a.
+    #
+    # The enforcement flag is therefore now set explicitly rather than inherited.
+    # It is still set, deliberately: the assertion under test is that the
+    # codex_verify lane is exempt from recursive review, and that claim is only
+    # falsifiable while gauntlet_enforced is True. Dropping the flag instead of
+    # re-sourcing it would make the final assertion pass vacuously.
     with kb.connect() as conn:
         subject = kb.create_task(
             conn, title="gauntlet subject", assignee="default", gauntlet=True
         )
         tid = kb.create_task(
-            conn, title="independent verify", assignee="atlas", parents=[subject]
+            conn, title="independent verify", assignee="atlas",
+            parents=[subject], gauntlet=True,
         )
         task = kb.get_task(conn, tid)
         assert task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
         assert task.gauntlet_enforced is True
         assert kb.gauntlet_required(conn, tid) is False
+
+        # Inheritance is gone: an ordinary child of the same governed parent is
+        # not enforced. Pinned here so the precondition above cannot quietly
+        # revert to being inherited rather than explicit.
+        ordinary = kb.create_task(
+            conn, title="implementation", assignee="default", parents=[subject]
+        )
+        assert kb.get_task(conn, ordinary).gauntlet_enforced is False
 
 
 def test_codex_verify_launcher_writes_only_governed_scratch(monkeypatch):
