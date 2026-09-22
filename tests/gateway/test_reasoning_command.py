@@ -46,6 +46,71 @@ def _make_runner():
     return runner
 
 
+def _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile):
+    """Drive ``_run_agent`` once and return the toolsets the agent was built with.
+
+    ``platform_toolsets`` and two ``mcp_servers`` are configured so the caller
+    can distinguish "resolved toolsets reached the agent" from "the
+    thin-executive ceiling replaced them".
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli: [web, memory]\n"
+        "mcp_servers:\n"
+        "  exa:\n"
+        "    url: https://mcp.exa.ai/mcp\n"
+        "  web-search-prime:\n"
+        "    url: https://api.z.ai/api/mcp/web_search_prime/mcp\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+        },
+    )
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    _CapturingAgent.last_init = None
+    runner = _make_runner()
+
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id="cli",
+        chat_name="CLI",
+        chat_type="dm",
+        user_id="user-1",
+        profile=profile,
+    )
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="ping",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=f"agent:{profile or 'main'}:local:dm",
+        )
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init is not None
+    return list(_CapturingAgent.last_init["enabled_toolsets"])
+
+
 class _CapturingAgent:
     """Fake agent that records init kwargs for assertions."""
 
@@ -134,65 +199,40 @@ class TestReasoningCommand:
 
 
     def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "platform_toolsets:\n"
-            "  cli: [web, memory]\n"
-            "mcp_servers:\n"
-            "  exa:\n"
-            "    url: https://mcp.exa.ai/mcp\n"
-            "  web-search-prime:\n"
-            "    url: https://api.z.ai/api/mcp/web_search_prime/mcp\n",
-            encoding="utf-8",
+        # Runs on a *named* profile on purpose. The thin-executive ceiling in
+        # ``_run_agent`` replaces the resolved toolsets with ``["executive"]``
+        # for the default/Erika profile, so a default-profile source measures
+        # that ceiling instead of the MCP toolset resolution this test names.
+        # See ``test_thin_executive_ceiling_*`` below, which lock the ceiling.
+        enabled_toolsets = set(
+            _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile="team-leader")
         )
-
-        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
-        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
-        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-        monkeypatch.setattr(
-            gateway_run,
-            "_resolve_runtime_agent_kwargs",
-            lambda: {
-                "provider": "openrouter",
-                "api_mode": "chat_completions",
-                "base_url": "https://openrouter.ai/api/v1",
-                "api_key": "test-key",
-            },
-        )
-        fake_run_agent = types.ModuleType("run_agent")
-        fake_run_agent.AIAgent = _CapturingAgent
-        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-        _CapturingAgent.last_init = None
-        runner = _make_runner()
-
-        source = SessionSource(
-            platform=Platform.LOCAL,
-            chat_id="cli",
-            chat_name="CLI",
-            chat_type="dm",
-            user_id="user-1",
-        )
-
-        result = asyncio.run(
-            runner._run_agent(
-                message="ping",
-                context_prompt="",
-                history=[],
-                source=source,
-                session_id="session-1",
-                session_key="agent:main:local:dm",
-            )
-        )
-
-        assert result["final_response"] == "ok"
-        assert _CapturingAgent.last_init is not None
-        enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
         assert "web" in enabled_toolsets
         assert "memory" in enabled_toolsets
         assert "exa" in enabled_toolsets
         assert "web-search-prime" in enabled_toolsets
+
+    def test_thin_executive_ceiling_caps_default_profile_toolsets(self, tmp_path, monkeypatch):
+        """Default/Erika profile is capped to the thin ``executive`` surface.
+
+        The ceiling is a deliberate capability boundary (2d92fcf007): the
+        default profile orchestrates governed work and must not receive
+        research, terminal, code-execution, memory or MCP tools — even when
+        ``platform_toolsets`` and ``mcp_servers`` are configured, as they are
+        in this fixture's config.
+        """
+        assert _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile=None) == ["executive"]
+
+    def test_thin_executive_ceiling_does_not_apply_to_named_profiles(self, tmp_path, monkeypatch):
+        """Named Team Leader / worker profiles keep their configured toolsets.
+
+        Pairs with the test above so the boundary is pinned from both sides:
+        tightening the ceiling to cover every profile, or dropping it
+        entirely, fails one of the two.
+        """
+        enabled_toolsets = _run_agent_capturing_toolsets(tmp_path, monkeypatch, profile="team-leader")
+        assert enabled_toolsets != ["executive"]
+        assert "web" in set(enabled_toolsets)
 
 
 class TestLoadShowReasoningCoercion:
