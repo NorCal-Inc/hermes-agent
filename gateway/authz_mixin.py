@@ -29,27 +29,33 @@ from gateway.whatsapp_identity import (
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
-    if not name:
-        return default
-    try:
-        from agent.secret_scope import get_secret
+    """Read allowlist/auth env with per-profile isolation under multiplex.
 
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+    Same rules as ``_platform_gate_env``: a scoped miss under multiplex
+    returns ``default`` and does NOT fall through to ``os.environ``. The
+    process env may hold another profile's first-writer-bridged value, so a
+    fallthrough leaks allowlists and allow-all flags across profiles — the
+    fail-OPEN direction of #72348, since ``GATEWAY_ALLOW_ALL_USERS`` from the
+    launch profile would admit every sender on a secondary profile's bot.
+    Single-profile deployments keep the legacy ``os.getenv`` read.
+
+    The previous body preferred ``get_secret(name)`` and then fell through to
+    ``os.getenv`` on BOTH a scoped miss and an ``UnscopedSecretError`` (caught
+    by a bare ``except Exception``) — exactly the "fallback-after-miss" shape
+    the multiplex contract in ``agent/secret_scope.py`` forbids.
+
+    Upstream: 2912c36aa4
+    """
+    return _platform_gate_env(name, default)
 
 
 def _platform_gate_env(name: str, default: str = "") -> str:
     """Read a platform allow/deny gate env var with per-profile isolation.
 
-    Like ``_auth_env`` but authoritative under multiplex: when a profile
-    secret scope is installed AND multiplexing is active, a key absent from
-    the scope returns ``default`` instead of falling through to
-    ``os.environ``. Under multiplex the process env may hold ANOTHER
+    Authoritative under multiplex: when a profile secret scope is installed
+    AND multiplexing is active, a key absent from the scope returns
+    ``default`` instead of falling through to ``os.environ``. Under multiplex
+    the process env may hold ANOTHER
     profile's first-writer-bridged value (the YAML→env bridges in the
     Discord/Telegram adapters' ``_apply_yaml_config`` are first-writer-wins),
     so falling through would leak profile A's allowlist into profile B
