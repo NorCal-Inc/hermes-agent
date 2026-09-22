@@ -30,7 +30,10 @@ COMPLETE_PAYLOAD = (
     "BOOT STATUS: COMPLETE\n"
     "BOOT TIME: 2026-09-03T13:46:31-05:00\n"
     "DOCTRINE VERSION: 2.28\n\n"
-    "REQUIRED-CHAIN FAILURES:\n(none)\n\n"
+    # Section names follow the post-c87f2ad84e generator, which split the old
+    # single "REQUIRED-CHAIN FAILURES" list into blockers and warnings.
+    "BLOCKING FAILURES:\n(none)\n\n"
+    "NON-BLOCKING WARNINGS:\n(none)\n\n"
     "CURRENT KANBAN CONTINUITY — canonical task database, shared-system lanes only:\n"
     "PRIMARY CURRENT TASK — use this first for generic current-task/status questions;\n"
     "  t_a373e1ea | RUNNING | title=Repair Erika fresh-session startup invariant\n"
@@ -41,8 +44,10 @@ DEGRADED_PAYLOAD = (
     "# NORTH CALEDONIA SHARED BOOT CONSTRAINTS\n\n"
     "<shared-boot-state>\n"
     "BOOT STATUS: DEGRADED — STOP BEFORE TASK EXECUTION\n"
-    "REQUIRED-CHAIN FAILURES:\n"
-    "- full skill integrity gate failed: changed=3 active_unfrozen=1 missing=0\n"
+    # c87f2ad84e dropped the full skill-integrity inventory as a boot gate; the
+    # skill/plugin supply-chain gate is the blocker that remains in that family.
+    "BLOCKING FAILURES:\n"
+    "- skill supply-chain gate failed rc=1: SKILL TRUST: FAIL — unregistered external install\n"
     "</shared-boot-state>"
 )
 
@@ -82,8 +87,13 @@ def test_complete_boot_carries_the_mandatory_startup_directive():
     assert boot.failure == ""
     assert "FRESH SESSION STARTUP — MANDATORY AND NOT OPERATOR-TRIGGERED." in boot.prompt
     assert "SHARED BOOT GATE: COMPLETE" in boot.prompt
-    assert "five-step startup protocol" in boot.prompt
-    assert "Do not wait to be told to boot." in boot.prompt
+    # Retargeted for commit c87f2ad84e ("Simplify boot control plane"), which
+    # replaced the five-step protocol recital and "Do not wait to be told to boot"
+    # with a compact directive. The directive's job is unchanged and still
+    # asserted: the boot already ran, so the session must act on the payload in
+    # front of it rather than re-running the generator or preloading doctrine.
+    assert "already ran for this session" in boot.prompt
+    assert "Do not re-run boot checks or preload doctrine bodies" in boot.prompt
 
 
 def test_complete_boot_still_resolves_current_kanban_continuity():
@@ -118,16 +128,30 @@ def test_degraded_payload_with_zero_exit_is_not_a_passed_gate():
     assert "SHARED BOOT GATE: DEGRADED — STOP BEFORE TASK EXECUTION" in boot.prompt
     assert "Ordinary task execution is blocked." in boot.prompt
     # The named failure is preserved for the operator and the recovery card.
-    assert "full skill integrity gate failed" in boot.prompt
+    assert "skill supply-chain gate failed" in boot.prompt
 
 
-def test_degraded_boot_routes_to_the_jarvis_recovery_lane():
+def test_degraded_boot_routes_to_the_bounded_recovery_lane():
+    # Retargeted for commit c87f2ad84e ("Simplify boot control plane"), which
+    # replaced the "Jarvis recovery override" card recipe (a literal
+    # executor_lane=/recovery_gate_cmd= spec the session was told to create)
+    # with a bounded recovery session that does not depend on Kanban being up.
+    # The routing guarantee is unchanged and still asserted; two guarantees the
+    # redesign ADDED are asserted here for the first time.
     boot = norcal_boot.build_session_boot_prompt(runner=_runner(stdout=DEGRADED_PAYLOAD))
     assert boot.complete is False
-    assert 'executor_lane="claude_recovery"' in boot.prompt
-    assert norcal_boot.RECOVERY_GATE_CMD in boot.prompt
-    assert boot.prompt.count("recovery task") >= 1
-    assert "do not poll" in boot.prompt
+    # Still routed to the recovery lane, and still exactly one bounded session.
+    assert "claude_recovery" in boot.prompt
+    assert "exactly one bounded recovery session" in boot.prompt
+    # Shared boot constraint 15: the recovery path must not require the failed
+    # gate -- or, here, Kanban -- to be healthy before it can repair it.
+    assert "independent of Kanban availability" in boot.prompt
+    # Guards the verifier self-review loop recorded in vault
+    # Business/Operations/2026-09-20-transport-aware-boot-hardening.md,
+    # "Round 5's routing, and a board defect".
+    assert "Do not create verifier chains or additional boot gates" in boot.prompt
+    # Ordinary work stays blocked until a fresh session proves a complete boot.
+    assert "Ordinary execution resumes only after a fresh session" in boot.prompt
 
 
 def test_prose_mention_of_a_complete_state_line_does_not_satisfy_the_gate():
