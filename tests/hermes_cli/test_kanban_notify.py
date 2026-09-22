@@ -218,6 +218,9 @@ def test_notification_event_taxonomy_is_kernel_owned():
         "verification_failed", "notification_delivery_failed",
         "verification_acceptance_missing",
     }.issubset(kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS)
+    assert set(kb.KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS).issubset(
+        kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
+    )
     assert {"status", "archived", "unblocked"}.isdisjoint(
         kb.KANBAN_ACTIVE_WAKE_EVENT_KINDS
     )
@@ -682,6 +685,46 @@ async def test_notifier_notify_plus_wake_wakes_on_verification_acceptance_missin
 
     fake_adapter.send.assert_awaited_once()
     wake_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_notifier_notify_plus_wake_wakes_on_verifier_return_attention(kanban_home):
+    """A verifier return that cannot close the subject wakes the owner."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="parked verification", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1", delivery_mode="notify+wake")
+        kb._append_event(
+            conn, tid, "verifier_verdict_unattested",
+            {"verifier_task": "t_verify", "verdict": "PASS", "reason": "launcher attestation missing"},
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+    wake_mock = AsyncMock()
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), timeout=10.0)
+    fake_adapter.send.assert_awaited_once()
+    wake_mock.assert_awaited_once()
+    assert "attestation missing" in wake_mock.await_args.kwargs["text"]
 
 
 @pytest.mark.asyncio

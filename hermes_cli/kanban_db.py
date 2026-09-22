@@ -106,18 +106,28 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Canonical subscription event taxonomy. Keep this in the Kanban kernel so
 # every Python delivery surface claims the same rows and applies the same
 # active-wake policy. UI formatting remains surface-specific.
+#
+# These verifier-return outcomes all mean the subject cannot legally leave
+# verification and no automatic next action exists. They therefore owe an
+# immediate owner return rather than waiting for stale supervision.
+KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS = (
+    "verifier_verdict_unattested",
+    "verification_blocker_returned",
+    "verifier_verdict_unreadable",
+    "verified_completion_deferred",
+)
 KANBAN_NOTIFY_EVENT_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "block_loop_detected",
     "review_requested", "linked_task_gave_up", "verification_failed",
     "notification_delivery_failed", "verification_acceptance_missing",
-)
+) + KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS
 KANBAN_ACTIVE_WAKE_EVENT_KINDS = frozenset({
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "block_loop_detected", "review_requested", "linked_task_gave_up",
     "verification_failed", "notification_delivery_failed",
     "verification_acceptance_missing",
-})
+}) | frozenset(KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS)
 assert KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(KANBAN_NOTIFY_EVENT_KINDS)
 
 # ---------------------------------------------------------------------------

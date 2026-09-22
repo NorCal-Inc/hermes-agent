@@ -193,6 +193,7 @@ type KanbanMessages = {
     gaveUpTitle: string
     verificationFailedTitle: string
     verificationAcceptanceMissingTitle: string
+    verificationNeedsAttentionTitle: string
     notificationDeliveryFailedTitle: string
     crashedTitle: string
     timedOutTitle: string
@@ -398,6 +399,7 @@ export const en: KanbanMessages = {
     gaveUpTitle: 'Task gave up',
     verificationFailedTitle: 'Verification failed',
     verificationAcceptanceMissingTitle: 'Verifier PASS refused',
+    verificationNeedsAttentionTitle: 'Verification needs attention',
     notificationDeliveryFailedTitle: 'Notification delivery failed',
     crashedTitle: 'Worker crashed — will retry',
     timedOutTitle: 'Task timed out — will retry',
@@ -602,6 +604,7 @@ const ja: KanbanMessages = {
     gaveUpTitle: 'タスクを断念しました',
     verificationFailedTitle: '検証に失敗しました',
     verificationAcceptanceMissingTitle: '検証 PASS が拒否されました',
+    verificationNeedsAttentionTitle: '検証に対応が必要です',
     notificationDeliveryFailedTitle: '通知の配信に失敗しました',
     crashedTitle: 'ワーカーがクラッシュ — 再試行します',
     timedOutTitle: 'タスクがタイムアウト — 再試行します',
@@ -803,6 +806,7 @@ const zh: KanbanMessages = {
     gaveUpTitle: '任务已放弃',
     verificationFailedTitle: '验证失败',
     verificationAcceptanceMissingTitle: '验证 PASS 被拒绝',
+    verificationNeedsAttentionTitle: '验证需要处理',
     notificationDeliveryFailedTitle: '通知发送失败',
     crashedTitle: '工作单元崩溃 — 将重试',
     timedOutTitle: '任务超时 — 将重试',
@@ -1004,6 +1008,7 @@ const zhHant: KanbanMessages = {
     gaveUpTitle: '任務已放棄',
     verificationFailedTitle: '驗證失敗',
     verificationAcceptanceMissingTitle: '驗證 PASS 被拒絕',
+    verificationNeedsAttentionTitle: '驗證需要處理',
     notificationDeliveryFailedTitle: '通知傳送失敗',
     crashedTitle: '工作單元當機 — 將重試',
     timedOutTitle: '任務逾時 — 將重試',

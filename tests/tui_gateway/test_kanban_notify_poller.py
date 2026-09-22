@@ -274,6 +274,22 @@ class TestCollectKanbanNotifications:
         assert "acceptance" in texts[0].lower()
         assert "t_verify" in texts[0]
 
+    def test_verifier_return_attention_notifies_origin_session(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            kb._append_event(
+                conn, tid, "verifier_verdict_unattested",
+                {"verifier_task": "t_verify", "verdict": "PASS", "reason": "launcher attestation missing"},
+            )
+        finally:
+            conn.close()
+        texts = _collect_kanban_notifications(_session())
+        assert len(texts) == 1
+        assert "not attested" in texts[0]
+        assert "t_verify" in texts[0]
+        assert "launcher attestation missing" in texts[0]
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]

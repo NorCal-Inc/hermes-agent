@@ -470,6 +470,28 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify().message).toContain('codex_verify:t_v')
   })
 
+  it('verifier return attention reports an unattested verdict', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'verifier_verdict_unattested', {
+        verifier_task: 't_verify',
+        verdict: 'PASS',
+        reason: 'launcher attestation missing'
+      })
+    ])
+
+    expect(fired).toBe(true)
+    expect(lastNotify()).toMatchObject({
+      kind: 'error',
+      title: 'Verification needs attention',
+      message: expect.stringContaining('not attested')
+    })
+    expect(lastNotify().message).toContain('t_verify')
+    expect(lastNotify().message).toContain('launcher attestation missing')
+  })
+
   it('verification_acceptance_missing reports the refused PASS', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)

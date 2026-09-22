@@ -654,6 +654,32 @@ class GatewayKanbanWatchersMixin:
                                 f"{verifier_text}"
                                 + (f"\n{reason_text}" if reason_text else "")
                             )
+                        elif kind in _kb.KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS:
+                            verifier_task = ""
+                            verdict = ""
+                            reason_text = ""
+                            if ev.payload:
+                                verifier_task = str(ev.payload.get("verifier_task") or "").strip()
+                                verdict = str(ev.payload.get("verdict") or "").strip()
+                                reason_text = str(ev.payload.get("reason") or ev.payload.get("detail") or "").strip()[:200]
+                            verifier_text = f" from {verifier_task}" if verifier_task else ""
+                            verdict_text = f" ({verdict})" if verdict else ""
+                            labels = {
+                                "verifier_verdict_unattested": "verifier verdict was not attested",
+                                "verification_blocker_returned": "verifier returned BLOCKER",
+                                "verifier_verdict_unreadable": "verifier returned no machine-readable verdict",
+                                "verified_completion_deferred": "verified task could not complete",
+                            }
+                            label = labels.get(kind, "verification needs attention")
+                            wake_handoff = (
+                                f"{label}{verifier_text}{verdict_text}"
+                                + (f": {reason_text}" if reason_text else "")
+                            )
+                            msg = (
+                                f"❌ {board_tag}{tag}Kanban {sub['task_id']} {label}"
+                                f"{verifier_text}{verdict_text}"
+                                + (f"\n{reason_text}" if reason_text else "")
+                            )
                         elif kind == "verification_acceptance_missing":
                             verifier_task = ""
                             reason_text = ""
@@ -924,6 +950,7 @@ class GatewayKanbanWatchersMixin:
                             if "verification_failed" in _wake_kinds: _parts.append("verification failed; repair required")
                             if "notification_delivery_failed" in _wake_kinds: _parts.append("notification return path failed; delivery route lost")
                             if "verification_acceptance_missing" in _wake_kinds: _parts.append("verifier PASS refused; acceptance proof missing")
+                            if any(k in _wake_kinds for k in _kb.KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS): _parts.append("verification return needs attention")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",

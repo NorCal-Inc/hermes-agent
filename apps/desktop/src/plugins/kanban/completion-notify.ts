@@ -55,6 +55,10 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['review_requested', { titleKey: 'col.review.label', toast: 'warning' }],
   ['verification_failed', { titleKey: 'notify.verificationFailedTitle', toast: 'error' }],
   ['verification_acceptance_missing', { titleKey: 'notify.verificationAcceptanceMissingTitle', toast: 'error' }],
+  ['verifier_verdict_unattested', { titleKey: 'notify.verificationNeedsAttentionTitle', toast: 'error' }],
+  ['verification_blocker_returned', { titleKey: 'notify.verificationNeedsAttentionTitle', toast: 'error' }],
+  ['verifier_verdict_unreadable', { titleKey: 'notify.verificationNeedsAttentionTitle', toast: 'error' }],
+  ['verified_completion_deferred', { titleKey: 'notify.verificationNeedsAttentionTitle', toast: 'error' }],
   ['notification_delivery_failed', { titleKey: 'notify.notificationDeliveryFailedTitle', toast: 'error' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
@@ -143,6 +147,22 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     const verifierText = verifier ? ` by ${verifier}` : ''
     const reasonText = reason ? `: ${reason}` : ''
     return `Verification failed${verifierText}${reasonText}`
+  }
+
+  if (['verifier_verdict_unattested', 'verification_blocker_returned', 'verifier_verdict_unreadable', 'verified_completion_deferred'].includes(kind)) {
+    const verifierTask = trimmed(payload?.verifier_task)
+    const verdict = trimmed(payload?.verdict)
+    const reason = trimmed(payload?.reason) || trimmed(payload?.detail)
+    const labels: Record<string, string> = {
+      verifier_verdict_unattested: 'Verifier verdict was not attested',
+      verification_blocker_returned: 'Verifier returned BLOCKER',
+      verifier_verdict_unreadable: 'Verifier returned no machine-readable verdict',
+      verified_completion_deferred: 'Verified task could not complete'
+    }
+    const verifierText = verifierTask ? ` from ${verifierTask}` : ''
+    const verdictText = verdict ? ` (${verdict})` : ''
+    const reasonText = reason ? `: ${reason}` : ''
+    return `${labels[kind] ?? 'Verification needs attention'}${verifierText}${verdictText}${reasonText}`
   }
 
   if (kind === 'verification_acceptance_missing') {

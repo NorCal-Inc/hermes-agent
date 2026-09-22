@@ -9844,6 +9844,10 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     who = getattr(task, "assignee", None) or ""
     tag = f"@{who} " if who else ""
     payload = getattr(ev, "payload", None) or {}
+    try:
+        from hermes_cli import kanban_db as _kb_format
+    except Exception:
+        _kb_format = None
     if kind == "completed":
         handoff = ""
         summary = payload.get("summary")
@@ -9881,6 +9885,24 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         verifier_text = f" by {verifier}" if verifier else ""
         suffix = f"\n{reason[:200]}" if reason else ""
         return f"❌ {board_tag}{tag}Kanban {task_id} verification failed{verifier_text}{suffix}"
+    if (
+        _kb_format is not None
+        and kind in _kb_format.KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS
+    ):
+        verifier_task = str(payload.get("verifier_task") or "").strip()
+        verdict = str(payload.get("verdict") or "").strip()
+        reason = str(payload.get("reason") or payload.get("detail") or "").strip()
+        verifier_text = f" from {verifier_task}" if verifier_task else ""
+        verdict_text = f" ({verdict})" if verdict else ""
+        labels = {
+            "verifier_verdict_unattested": "verifier verdict was not attested",
+            "verification_blocker_returned": "verifier returned BLOCKER",
+            "verifier_verdict_unreadable": "verifier returned no machine-readable verdict",
+            "verified_completion_deferred": "verified task could not complete",
+        }
+        label = labels.get(kind, "verification needs attention")
+        suffix = f"\n{reason[:200]}" if reason else ""
+        return f"❌ {board_tag}{tag}Kanban {task_id} {label}{verifier_text}{verdict_text}{suffix}"
     if kind == "verification_acceptance_missing":
         verifier_task = str(payload.get("verifier_task") or "").strip()
         reason = str(payload.get("reason") or "").strip()
