@@ -30130,6 +30130,32 @@ def _shutdown_gateway_health_export(runner: Any) -> None:
         logger.debug("gateway health OTLP export shutdown failed", exc_info=True)
 
 
+def _shutdown_mcp_servers_reporting_failures() -> bool:
+    """Close MCP connections on the way out; True when teardown completed.
+
+    The single seam for both gateway exit paths (the aborted-startup return and
+    the shutdown tail). Both previously wrote ``except Exception: pass``, so a
+    raise here — a changed signature, a wedged loop, a half-built registry —
+    left every MCP connection and the shared background loop UP while the
+    gateway still reported a clean exit, with nothing in the log to contradict
+    it. Upstream lost exactly that to the same ``pass`` and only found it as a
+    missing teardown in an unrelated test; a WARNING is the minimum that makes
+    the failure visible to the next session reading the log.
+
+    Failures stay non-fatal: the remaining teardown (cron ticker, housekeeping
+    threads, the clean-exit marker) must still run.
+
+    Upstream: af380f66ae
+    """
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
+        return True
+    except Exception:
+        logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+        return False
+
+
 def _gateway_stderr_formatter() -> logging.Formatter:
     """Return the redacting formatter used by the gateway stderr stream."""
     from agent.redact import RedactingFormatter
@@ -30670,11 +30696,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 if runner.exit_reason:
                     logger.error("Gateway exiting with failure: %s", runner.exit_reason)
                 return False
-            try:
-                from tools.mcp_tool import shutdown_mcp_servers
-                shutdown_mcp_servers()
-            except Exception:
-                pass
+            _shutdown_mcp_servers_reporting_failures()
             if runner.exit_code is not None:
                 raise SystemExit(runner.exit_code)
             return True
@@ -30829,11 +30851,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_thread.join(timeout=2)
 
     # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
+    _shutdown_mcp_servers_reporting_failures()
 
     # Stop the periodic memory monitor (if it was started above).
     # This also emits one final "[MEMORY] shutdown rss=..." line so the
