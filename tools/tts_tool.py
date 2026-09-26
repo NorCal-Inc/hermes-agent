@@ -2844,7 +2844,18 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     if wav_path != output_path:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            # Telegram/iOS voice bubbles require Ogg/Opus.  ffmpeg's
+            # default codec for an .ogg filename is Vorbis, which may play on
+            # desktop clients but is not a Telegram voice-note payload.
+            if output_path.lower().endswith(".ogg"):
+                conv_cmd = [
+                    ffmpeg, "-i", wav_path,
+                    "-acodec", "libopus", "-ac", "1", "-ar", "48000",
+                    "-b:a", "64k", "-vbr", "off", "-application", "voip",
+                    "-f", "ogg", "-y", "-loglevel", "error", output_path,
+                ]
+            else:
+                conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
             subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             os.remove(wav_path)
         else:
@@ -3051,7 +3062,18 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
     if wav_path != output_path:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            # Telegram/iOS voice bubbles require Ogg/Opus.  ffmpeg's
+            # default codec for an .ogg filename is Vorbis, which may play on
+            # desktop clients but is not a Telegram voice-note payload.
+            if output_path.lower().endswith(".ogg"):
+                conv_cmd = [
+                    ffmpeg, "-i", wav_path,
+                    "-acodec", "libopus", "-ac", "1", "-ar", "48000",
+                    "-b:a", "64k", "-vbr", "off", "-application", "voip",
+                    "-f", "ogg", "-y", "-loglevel", "error", output_path,
+                ]
+            else:
+                conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
             subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             try:
                 os.remove(wav_path)
@@ -3117,7 +3139,18 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
     if wav_path != output_path:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            # Telegram/iOS voice bubbles require Ogg/Opus.  ffmpeg's
+            # default codec for an .ogg filename is Vorbis, which may play on
+            # desktop clients but is not a Telegram voice-note payload.
+            if output_path.lower().endswith(".ogg"):
+                conv_cmd = [
+                    ffmpeg, "-i", wav_path,
+                    "-acodec", "libopus", "-ac", "1", "-ar", "48000",
+                    "-b:a", "64k", "-vbr", "off", "-application", "voip",
+                    "-f", "ogg", "-y", "-loglevel", "error", output_path,
+                ]
+            else:
+                conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
             subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             os.remove(wav_path)
         else:
