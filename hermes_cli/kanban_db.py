@@ -5895,6 +5895,15 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            # Production ledger projection (post-commit, best-effort). See
+            # _sync_production_ledger docstring. Moved here from the MCP
+            # tool-layer wrapper (tools/kanban_tools.py) so every direct
+            # caller of create_task (CLI, recovery_lane.py, kanban_swarm.py)
+            # gets the same projection the MCP tool always had, instead of
+            # only the MCP path — closing the gap identified in
+            # t_da07457d's FAIL verdict on t_faf6e26a (single authoritative
+            # path requirement).
+            _sync_production_ledger(conn, task_id, status=task_status, phase="create")
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -10487,6 +10496,12 @@ def claim_task(
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
+    # Production ledger projection (post-commit, best-effort). See
+    # _sync_production_ledger docstring — this closes the gap identified in
+    # t_da07457d's FAIL verdict on t_faf6e26a: only create/complete/block
+    # were projected before, so a card claimed (ready -> running) could show
+    # stale 'Open' in Postgres while Kanban had already moved it.
+    _sync_production_ledger(conn, task_id, status="running", phase="claim", run_id=run_id)
     return claimed
 
 
@@ -10651,7 +10666,11 @@ def claim_review_task(
                  "source_status": "review"},
                 run_id=run_id,
             )
-            return get_task(conn, task_id)
+            claimed_review = get_task(conn, task_id)
+            _sync_production_ledger(
+                conn, task_id, status="running", phase="claim_review", run_id=run_id,
+            )
+            return claimed_review
     # Only a refusal reaches here; every other path returned inside the
     # transaction above. The refusal is already durable, so opening the route
     # is post-commit and best-effort for the same reason ``request_review``
@@ -14301,6 +14320,85 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _sync_production_ledger(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: str,
+    phase: str,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    blocked_reason: Optional[str] = None,
+    run_id: Optional[int] = None,
+) -> None:
+    """Best-effort projection of a Kanban lifecycle transition into the
+    PostgreSQL operational ledger consumed by MAPS/dispatcher/verifier.
+
+    North Caledonia control-plane projection. PostgreSQL is the authoritative
+    operational ledger; Kanban is the executor queue. **Never raises.**
+    Kanban's own transition (already committed by the time any caller
+    reaches this helper) is durable and MUST NOT be reverted or reported as
+    failed merely because the projection to Postgres hiccups (app.py
+    restart, transient network blip, request timeout). Per Gauntlet
+    doctrine, infrastructure/transport failures are handled separately from
+    implementation failure and must never masquerade as a failed
+    kanban_claim/kanban_request_review/kanban_request_changes/kanban_unblock
+    — the caller already has a valid, durable transition. A sync failure is
+    recorded as a first-class ``production_ledger_sync_failed`` audit event
+    so it is visible and reconcilable instead of either silently dropped or
+    incorrectly surfaced as a transition failure.
+
+    ``phase`` names the calling transition (``claim``, ``claim_review``,
+    ``request_review``, ``request_changes``, ``unblock``,
+    ``review_reopened``, ``complete``, ``block``, ``create``) purely for the
+    audit trail; it does not change behaviour. This is the single choke
+    point every lifecycle-mutating function in this module calls so that
+    create/claim/request_review/request_changes/unblock/complete/block all
+    share one authoritative projection path instead of only the terminal
+    transitions (see t_faf6e26a / t_da07457d — the prior fix covered only
+    create/complete/block, leaving claim/request_review/request_changes/
+    unblock unsynchronized, which is exactly the gap this closes).
+    """
+    try:
+        task_row = get_task(conn, task_id)
+    except Exception:
+        task_row = None
+    try:
+        import urllib.request as _urlreq
+        _payload = json.dumps({
+            "task_id": task_id,
+            "title": task_row.title if task_row else task_id,
+            "assignee": task_row.assignee if task_row else "",
+            "status": status,
+            "summary": summary or "",
+            "result": result or "",
+            "blocked_reason": blocked_reason or "",
+        }).encode("utf-8")
+        _req = _urlreq.Request(
+            "http://127.0.0.1:5130/internal/kanban-sync", data=_payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with _urlreq.urlopen(_req, timeout=5) as _resp:
+            if not json.loads(_resp.read().decode("utf-8")).get("ok"):
+                raise RuntimeError("production ledger rejected transition")
+    except Exception as _sync_exc:
+        _log.warning(
+            "production ledger sync failed for task %s (phase=%s, status=%s): %s",
+            task_id, phase, status, _sync_exc,
+        )
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "production_ledger_sync_failed",
+                    {"phase": phase, "status": status, "error": str(_sync_exc)},
+                    run_id=run_id,
+                )
+        except Exception:
+            _log.debug(
+                "could not record production_ledger_sync_failed event for %s",
+                task_id,
+            )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15705,6 +15803,10 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
+            _sync_production_ledger(
+                conn, task_id, status="todo", phase="block", blocked_reason=reason,
+                run_id=run_id,
+            )
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
@@ -15830,6 +15932,11 @@ def block_task(
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
+    )
+    _sync_production_ledger(
+        conn, task_id,
+        status=(_blocked_task.status if _blocked_task else "blocked"),
+        phase="block", blocked_reason=reason, run_id=run_id,
     )
     return True
 
@@ -16360,6 +16467,12 @@ def request_review(
     # normal dependency predicate remains authoritative and keeps any
     # evidence-less handoff gated.
     recompute_ready(conn)
+    # Production ledger projection (post-commit, best-effort). See
+    # _sync_production_ledger docstring — this closes the gap identified in
+    # t_da07457d's FAIL verdict on t_faf6e26a.
+    _sync_production_ledger(
+        conn, task_id, status="review", phase="request_review", summary=summary,
+    )
     return _ret(True)
 
 
@@ -16487,6 +16600,13 @@ def request_changes(
             },
             run_id=run_id,
         )
+    # Production ledger projection (post-commit, best-effort). See
+    # _sync_production_ledger docstring — this closes the gap identified in
+    # t_da07457d's FAIL verdict on t_faf6e26a.
+    _sync_production_ledger(
+        conn, task_id, status=new_status, phase="request_changes",
+        summary=reason, run_id=run_id,
+    )
     return True, implementer
 
 
@@ -18427,7 +18547,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
-        return True
+    # Production ledger projection (post-commit, best-effort, outside the
+    # txn just closed). See _sync_production_ledger docstring — this closes
+    # the gap identified in t_da07457d's FAIL verdict on t_faf6e26a.
+    _sync_production_ledger(conn, task_id, status=new_status, phase="unblock")
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -18500,7 +18624,11 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "review_reopened",
             payload if payload != {"status": "ready"} else None,
         )
-        return True
+    # Production ledger projection (post-commit, best-effort). See
+    # _sync_production_ledger docstring — this closes the gap identified in
+    # t_da07457d's FAIL verdict on t_faf6e26a.
+    _sync_production_ledger(conn, task_id, status=new_status, phase="review_reopened")
+    return True
 
 
 def invalidate_descendants_for_parent_reopen(
