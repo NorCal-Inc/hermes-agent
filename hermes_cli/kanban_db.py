@@ -14860,6 +14860,50 @@ def complete_task(
             run_id=run_id,
             summary=(summary if summary is not None else result),
         )
+    # North Caledonia control-plane projection. PostgreSQL is the authoritative
+    # operational ledger; Kanban is the executor queue. Best-effort: Kanban's
+    # own completion (above) is already durable and MUST NOT be reverted or
+    # reported as failed merely because the projection to Postgres hiccups
+    # (app.py restart, transient network blip, request timeout). Per Gauntlet
+    # doctrine, infrastructure/transport failures are handled separately from
+    # implementation failure and must never masquerade as a failed
+    # kanban_complete — the caller already has a valid, terminal, durable
+    # result. A sync failure is recorded as a first-class audit event so it
+    # is visible and reconcilable, instead of either silently dropped or
+    # incorrectly surfaced as "completion failed".
+    try:
+        import urllib.request as _urlreq
+        _payload = json.dumps({
+            "task_id": task_id,
+            "title": _done_task.title if _done_task else task_id,
+            "assignee": _done_task.assignee if _done_task else "",
+            "status": "done",
+            "summary": summary or "",
+            "result": result or "",
+        }).encode("utf-8")
+        _req = _urlreq.Request(
+            "http://127.0.0.1:5130/internal/kanban-sync", data=_payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with _urlreq.urlopen(_req, timeout=5) as _resp:
+            if not json.loads(_resp.read().decode("utf-8")).get("ok"):
+                raise RuntimeError("production ledger rejected completion")
+    except Exception as _sync_exc:
+        _log.warning(
+            "production ledger sync failed for completed task %s: %s",
+            task_id, _sync_exc,
+        )
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "production_ledger_sync_failed",
+                    {"phase": "complete", "error": str(_sync_exc)},
+                    run_id=run_id,
+                )
+        except Exception:
+            _log.debug(
+                "could not record production_ledger_sync_failed event for %s",
+                task_id,
+            )
     return True
 
 

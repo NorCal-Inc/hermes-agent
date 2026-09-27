@@ -845,6 +845,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            # NOTE: kb.complete_task() already projects this completion into
+            # the production PostgreSQL ledger internally (single choke point
+            # shared by the CLI, dispatcher, and this MCP tool path) — do not
+            # duplicate that HTTP round-trip here.
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -921,6 +925,13 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
+            _sync_production_task(
+                task_id=tid,
+                title=landed.title if landed else "",
+                assignee=landed.assignee if landed else "",
+                status=landed.status if landed else "blocked",
+                blocked_reason=reason,
+            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -1384,6 +1395,43 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _sync_production_task(*, task_id: str, title: str = "", assignee: str = "",
+                          status: str = "ready", summary: str = "",
+                          result: str = "", blocked_reason: str = "") -> None:
+    """Best-effort projection of Kanban executor state into the PostgreSQL
+    operational ledger consumed by MAPS/dispatcher/verifier.
+
+    Never raises. The Kanban-side mutation this is called after (create/
+    complete/block) has already committed and is the authoritative record
+    for execution purposes; a transient failure reaching the Postgres
+    projection (app.py restart, network blip, timeout) must not be reported
+    back to the caller as a tool failure — that would turn a genuinely
+    successful kanban_complete/kanban_block/kanban_create into a false
+    failure and, per Gauntlet doctrine, infra/transport faults are handled
+    separately from implementation failure. Failures are logged so they
+    remain visible/reconcilable instead of silently vanishing.
+    """
+    import urllib.request
+    payload = json.dumps({
+        "task_id": task_id, "title": title, "assignee": assignee,
+        "status": status, "summary": summary, "result": result,
+        "blocked_reason": blocked_reason,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "http://127.0.0.1:5130/internal/kanban-sync",
+        data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            if not body.get("ok"):
+                raise RuntimeError(f"production task sync rejected {task_id}")
+    except Exception as exc:
+        logger.warning(
+            "production ledger sync failed for task %s (status=%s): %s",
+            task_id, status, exc,
+        )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1524,6 +1572,12 @@ def _handle_create(args: dict, **kw) -> str:
                 umbrella_task_id=umbrella_task_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            _sync_production_task(
+                task_id=new_tid,
+                title=new_task.title if new_task else str(title).strip(),
+                assignee=new_task.assignee if new_task else str(assignee),
+                status=new_task.status if new_task else str(initial_status),
+            )
             subscribed = _maybe_auto_subscribe(
                 conn,
                 new_tid,
