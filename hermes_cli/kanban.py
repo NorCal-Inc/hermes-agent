@@ -2520,7 +2520,11 @@ def _cmd_link(args: argparse.Namespace) -> int:
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+        try:
+            ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+        except kb.VerifierLinkProtected as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
     if not ok:
         print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
         return 1

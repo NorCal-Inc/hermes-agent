@@ -1756,7 +1756,10 @@ def delete_link(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        try:
+            ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        except kanban_db.VerifierLinkProtected as e:
+            raise HTTPException(status_code=409, detail=str(e))
         return {"ok": bool(ok)}
     finally:
         conn.close()

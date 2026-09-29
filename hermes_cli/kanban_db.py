@@ -6464,8 +6464,53 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
+class VerifierLinkProtected(ValueError):
+    """Unlinking would leave a live verifier's verdict with nowhere to go."""
+
+
+def _refuse_stranding_live_verifier(
+    conn: sqlite3.Connection, parent_id: str, child_id: str
+) -> None:
+    """Refuse to delete the only route a live verifier has to its subject.
+
+    ``verifier_subject_ids`` resolves a verdict's destination from the live
+    ``task_links`` edge OR a durable ``task_relations`` ``verifies`` row.
+    Auto-created verifiers get the durable row (``fbdf0d564d``); a verifier
+    made by hand has only the edge. Deleting that edge while the verifier is
+    still open is how four real verdicts were stranded on 2026-09-15 and how
+    ``t_fd296c4a`` lost its route on 2026-09-20. Refused only in exactly that
+    shape: open ``codex_verify`` child, edge present, no ``verifies`` row.
+    Archive the verifier first to detach it deliberately.
+    """
+    child = conn.execute(
+        "SELECT executor_lane, status, terminal_disposition FROM tasks WHERE id = ?",
+        (child_id,),
+    ).fetchone()
+    if child is None or child["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+        return
+    if child["status"] in ("done", "archived") or child["terminal_disposition"] is not None:
+        return
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (parent_id, child_id),
+    ).fetchone() is None:
+        return
+    if conn.execute(
+        "SELECT 1 FROM task_relations WHERE from_task_id = ? AND to_task_id = ? "
+        "AND relation = ?",
+        (child_id, parent_id, RELATION_VERIFIES),
+    ).fetchone() is not None:
+        return
+    raise VerifierLinkProtected(
+        f"refusing to unlink {parent_id} -> {child_id}: {child_id} is an open "
+        f"codex_verify verifier whose only route to {parent_id} is this link, so "
+        f"its verdict would be stranded. Archive {child_id} first to detach it."
+    )
+
+
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        _refuse_stranding_live_verifier(conn, parent_id, child_id)
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -16783,6 +16828,112 @@ def _extract_lesson_on_verify(
     return row
 
 
+ERROR_LESSON_AUTO_ACTOR = "loop:auto-resolution"
+# A one-term key ("overall", "step") matches unrelated errors; the live
+# backfill dry run (2026-09-29) produced four of those in twelve. Floor it.
+ERROR_LESSON_MIN_SIGNATURE_TERMS = 2
+
+
+def _record_error_lessons_on_resolution(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verifier: Optional[str],
+    reason: Optional[str],
+    evidence: Optional[dict],
+    run_id: Optional[int] = None,
+) -> list[int]:
+    """Automatic write half of retrieval-on-error (Christopher, 2026-09-29).
+
+    Fires on a PASS that follows a FAILED verdict on the same task: the one
+    moment both the error and its fix are known. Each failing criterion parsed
+    from the failed verdict's report becomes an error-keyed lesson through
+    :func:`record_error_lesson` -- the signature is the criterion, the lesson
+    is how it was resolved.
+
+    Deliberately narrow. Only parsed criteria (``failure_fingerprint`` source
+    ``criteria``) are keyed: whole-report fallback text and verifier reason
+    prose are boilerplate that would make every row match every other (the
+    reason :func:`_extract_lesson_on_failure` sets no signature), and run-level
+    errors are protocol/timeout noise. Rows are candidates (``active=0``) --
+    retrievable on error, binding nothing (ruling 2026-09-07: lessons are never
+    preloaded). Idempotent per (task, signature). **Never raises.**
+    """
+    recorded: list[int] = []
+
+    def _event(kind: str, detail: dict[str, Any]) -> None:
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, kind,
+                    {"verifier": verifier, "source": "record_verification", **detail},
+                    run_id=run_id,
+                )
+        except Exception:
+            pass
+
+    try:
+        failed = conn.execute(
+            "SELECT * FROM task_verifications WHERE task_id = ? AND state = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, VERIFICATION_FAILED),
+        ).fetchone()
+        if failed is None:
+            return recorded
+        fp = failure_fingerprint(_failed_verdict_report(conn, failed))
+        if fp["source"] != "criteria" or not fp["criteria"]:
+            _event(
+                "error_lesson_skipped",
+                {"reason": "no_parsed_failing_criteria",
+                 "failed_verification_id": int(failed["id"])},
+            )
+            return recorded
+        task = conn.execute(
+            "SELECT tenant FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        tenant = (task["tenant"] if task is not None else None) or None
+        payload = evidence if isinstance(evidence, dict) else {}
+        offered = str(
+            redact_review_value(payload.get(LESSON_EVIDENCE_KEY) or "")
+        ).strip()
+        summary = str(redact_review_value(reason or "")).strip()
+        for criterion in fp["criteria"]:
+            label = str(redact_review_value(criterion["label"]))
+            sig = error_signature(label)
+            if len(sig.split()) < ERROR_LESSON_MIN_SIGNATURE_TERMS:
+                continue
+            if conn.execute(
+                "SELECT 1 FROM task_lessons WHERE source_task_id = ? "
+                "AND error_signature = ? LIMIT 1",
+                (task_id, sig),
+            ).fetchone() is not None:
+                continue
+            text = (
+                f"Resolved in task {task_id} after failed verification "
+                f"{int(failed['id'])} ({label}); passed verification by "
+                f"{verifier or 'unknown'}: {summary or 'no summary recorded'}"
+            )
+            if offered:
+                text += f"\nVerifier-offered lesson: {offered}"
+            if len(text) > LESSON_MAX_CHARS:
+                text = text[: LESSON_MAX_CHARS - 3].rstrip() + "..."
+            row = record_error_lesson(
+                conn,
+                error_text=label,
+                lesson=text,
+                source_task_id=task_id,
+                created_by=ERROR_LESSON_AUTO_ACTOR,
+                tenant=tenant,
+            )
+            recorded.append(int(row["id"]))
+    except Exception as exc:
+        _event(
+            "error_lesson_error",
+            {"error": type(exc).__name__, "detail": str(exc)[:400]},
+        )
+    return recorded
+
+
 def _extract_lesson_on_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -17239,6 +17390,15 @@ def record_verification(
             conn,
             task_id,
             verifier=verifier,
+            evidence=evidence,
+            run_id=phase_run_id,
+        )
+        # A pass that follows a failure is where an error meets its fix.
+        _record_error_lessons_on_resolution(
+            conn,
+            task_id,
+            verifier=verifier,
+            reason=reason_text,
             evidence=evidence,
             run_id=phase_run_id,
         )
