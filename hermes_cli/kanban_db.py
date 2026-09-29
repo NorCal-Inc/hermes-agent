@@ -13750,6 +13750,40 @@ def clear_resolved_unroutable_rechecks(
     return cleared
 
 
+def clear_resolved_validation_loop_rechecks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None
+) -> list[str]:
+    """Retire validation-loop rechecks once their repair card is terminal or gone."""
+    now_ts = int(time.time()) if now is None else int(now)
+    cleared: list[str] = []
+    rows = conn.execute(
+        "SELECT id, task_id FROM observation_timers WHERE state = ? AND kind = ? "
+        "ORDER BY created_at, id",
+        (OBSERVATION_STATE_OBSERVING, VALIDATION_LOOP_TIMER_KIND),
+    ).fetchall()
+    for row in rows:
+        task_id = row["task_id"]
+        trow = conn.execute(
+            "SELECT status, terminal_disposition FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if trow is None:
+            close_observation_timer(
+                conn, row["id"], reason="task_gone", now=now_ts,
+            )
+            cleared.append(task_id)
+            continue
+        if (
+            trow["status"] in ("done", "archived")
+            or trow["terminal_disposition"] is not None
+        ):
+            close_observation_timer(
+                conn, row["id"], reason="subject_inactive", now=now_ts,
+            )
+            cleared.append(task_id)
+    return cleared
+
+
 def clear_resolved_lifecycle_stalls(
     conn: sqlite3.Connection, *, now: Optional[int] = None
 ) -> list[str]:
@@ -22542,6 +22576,7 @@ def _dispatch_once_locked(
             # nothing when there is none, and is the only pass that can see
             # that case at all.
             clear_resolved_unroutable_rechecks(conn)
+            clear_resolved_validation_loop_rechecks(conn)
             result.lifecycle_alarms = sweep_lifecycle_stall_alarms(
                 conn, _alarm_entries
             )

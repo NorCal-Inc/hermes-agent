@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import glob
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -512,32 +513,23 @@ vault_status, _ = run(["git", "-C", str(VAULT), "status", "--short", "--branch"]
 # on every startup; run vault-pr-check only when the current task requires PR truth.
 vault_prs = "ON-DEMAND — run /home/chris/.local/bin/vault-pr-check when the current task requires PR state."
 
-# Checkpoint freshness uses metadata only — never read Claude session bodies here, because
-# those may contain company-private context. Shared boot may compare timestamps, not commingle
-# session contents.
-claude_sessions = list((CH / ".claude/projects/-home-chris").glob("*.jsonl"))
-if claude_sessions:
-    newest_session = max(claude_sessions, key=lambda p: p.stat().st_mtime)
-    newest_session_ts = dt.datetime.fromtimestamp(newest_session.stat().st_mtime, tz=now.tzinfo)
-else:
-    newest_session = None
-    newest_session_ts = None
-
-if cp is not None:
-    checkpoint_ts = dt.datetime.fromtimestamp(cp.stat().st_mtime, tz=now.tzinfo)
-else:
-    checkpoint_ts = None
-
-if newest_session_ts and checkpoint_ts:
+# Continuity is deliberately separate from the immutable authority pin above.
+# The pin protects governance/company-boundary authority. The newest checkpoint protects
+# session continuity. Claude transcript mtimes are NOT a continuity signal: long-lived tmux
+# sessions append metadata while idle and previously made every boot look stale forever.
+continuity_cp = Path(checkpoints[-1]) if checkpoints else None
+if continuity_cp is not None:
+    continuity_ts = dt.datetime.fromtimestamp(continuity_cp.stat().st_mtime, tz=now.tzinfo)
+    source_hash_parts.append(f"continuity:{continuity_cp}:{sha(continuity_cp)}")
     checkpoint_freshness = (
-        f"FRESH — checkpoint mtime {checkpoint_ts.isoformat()} >= newest Claude session mtime {newest_session_ts.isoformat()}"
-        if checkpoint_ts >= newest_session_ts
-        else f"STALE — newest Claude session mtime {newest_session_ts.isoformat()} is newer than checkpoint mtime {checkpoint_ts.isoformat()}; treat carry-forward state as unverified"
+        f"FRESH — newest continuity checkpoint {continuity_cp.name} "
+        f"mtime={continuity_ts.isoformat()}; transcript mtimes intentionally ignored"
     )
-elif newest_session_ts and not checkpoint_ts:
-    checkpoint_freshness = "STALE — Claude session history exists but no checkpoint was found"
+    continuity_health = "PASS"
 else:
-    checkpoint_freshness = "UNVERIFIED — no Claude session metadata available for comparison"
+    continuity_ts = None
+    checkpoint_freshness = "STALE — no continuity checkpoint exists"
+    continuity_health = "FAIL"
 
 # Open-item reconciliation is intentionally on-demand. It is not a boot safety
 # gate and historically costs several seconds even when returning nonzero.
@@ -603,8 +595,26 @@ def pyproject_version(root: Path) -> str:
 
 target_v = pyproject_version(HERMES / "hermes-agent-next")
 
+# Operational readiness comes from the bounded light health-controller heartbeat. A stale,
+# missing, or degraded controller cannot be hidden by a technically successful boot.
+health_path = HERMES / "state/system-health-controller/heartbeat-light.json"
+operational_health = "FAIL"
+operational_detail = "health heartbeat unavailable"
+try:
+    health = json.loads(health_path.read_text(encoding="utf-8"))
+    health_status = str(health.get("status") or "UNKNOWN")
+    health_finished = float(health.get("finished_ts") or 0)
+    health_age = max(0, now.timestamp() - health_finished) if health_finished else 10**9
+    if health_status in {"GREEN", "GREEN_WITH_HOLDS"} and health_age <= 900:
+        operational_health = "PASS"
+    operational_detail = f"{health_status}; heartbeat_age_seconds={int(health_age)}"
+except Exception as exc:
+    operational_detail = f"unavailable: {type(exc).__name__}"
+
 fingerprint = hashlib.sha256("\n".join(source_hash_parts).encode()).hexdigest()
 boot_status = "DEGRADED — STOP BEFORE TASK EXECUTION" if blockers else "COMPLETE"
+technical_boot_health = "FAIL" if blockers else "PASS"
+ready = "YES" if technical_boot_health == "PASS" and continuity_health == "PASS" and operational_health == "PASS" else "NO"
 failure_text = "\n".join(f"- {x}" for x in blockers) if blockers else "(none)"
 warning_text = "\n".join(f"- {x}" for x in warnings) if warnings else "(none)"
 unranked_text = ", ".join(unranked) if unranked else "(none)"
@@ -617,6 +627,11 @@ BOOT CONSTRAINTS SHA256: {sha(BOOT_CONSTRAINTS)}
 
 <shared-boot-state>
 BOOT STATUS: {boot_status}
+TECHNICAL BOOT: {technical_boot_health}
+CONTINUITY: {continuity_health}
+OPERATIONAL: {operational_health} — {operational_detail}
+DECISIONS AWAITING CHRISTOPHER: {len(ap_rows) if 'ap_rows' in locals() else 0}
+READY: {ready}
 BOOT TIME: {now.isoformat()}
 BOOT SOURCE FINGERPRINT: {fingerprint}
 DOCTRINE VERSION: {version_of(readme)}
@@ -675,7 +690,7 @@ CURRENT KANBAN CONTINUITY — canonical task database, shared-system lanes only:
 {vault_blob}
 </shared-boot-state>
 
-This block is the shared canonical startup context. Identity files may specialize role and tone but may not override doctrine. If BOOT STATUS is DEGRADED, ordinary task execution is blocked and the named failure must be surfaced. The sole execution exception is an explicitly created substrate-recovery task whose objective is to repair that named failed gate: its executor may inspect and repair only the failed gate, rerun the same gate for evidence, and report the result. The original user request remains parked until the gate is verified green. Read company-specific notes only when the current authorized task requires that company's scope.""")
+This block is the shared canonical startup context. Identity files may specialize role and tone but may not override doctrine. READY: NO blocks ordinary task execution even when BOOT STATUS is COMPLETE; surface the failing readiness axis and perform only bounded recovery until it verifies PASS. If BOOT STATUS is DEGRADED, ordinary task execution is blocked and the named failure must be surfaced. The sole execution exception is an explicitly created substrate-recovery task whose objective is to repair that named failed gate: its executor may inspect and repair only the failed gate, rerun the same gate for evidence, and report the result. The original user request remains parked until the gate is verified green. Read company-specific notes only when the current authorized task requires that company's scope.""")
 
 
 

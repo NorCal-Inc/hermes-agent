@@ -104,3 +104,19 @@ def test_terminal_completion_still_requires_independent_pass(kanban_home):
         row = conn.execute('select status, verification_state from tasks where id=?', (tid,)).fetchone()
         assert row['status'] != 'done'
         assert row['verification_state'] != kb.VERIFICATION_VERIFIED
+
+
+def test_terminal_repair_retires_validation_loop_timer(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _repair(conn)
+        conn.execute(
+            "update tasks set status='archived', terminal_disposition='overtaken_by_events' where id=?",
+            (tid,),
+        )
+        assert kb.clear_resolved_validation_loop_rechecks(conn, now=2000000000) == [tid]
+        timer = conn.execute(
+            'select state, closed_reason from observation_timers where task_id=? and kind=?',
+            (tid, kb.VALIDATION_LOOP_TIMER_KIND),
+        ).fetchone()
+        assert timer['state'] == kb.OBSERVATION_STATE_CLOSED
+        assert timer['closed_reason'] == 'subject_inactive'

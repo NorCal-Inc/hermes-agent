@@ -86,13 +86,9 @@
     "nightly-executive-continuity-reconciliation": {
       "max_age_seconds": 93600
     },
-    "gauntlet-progress-census": {
-      "max_age_seconds": 900,
-      "pause_max_age_seconds": 604800
-    },
     "executive-significant-change-watch": {
       "max_age_seconds": 900,
-      "pause_max_age_seconds": 604800
+      "pause_max_age_seconds": 2592000
     }
   },
   "critical_user_timers": {
