@@ -630,7 +630,7 @@ BOOT STATUS: {boot_status}
 TECHNICAL BOOT: {technical_boot_health}
 CONTINUITY: {continuity_health}
 OPERATIONAL: {operational_health} — {operational_detail}
-DECISIONS AWAITING CHRISTOPHER: {len(ap_rows) if 'ap_rows' in locals() else 0}
+DECISIONS AWAITING CHRISTOPHER: SEE ACTIVE PRIORITIES ({len(ap_rows) if 'ap_rows' in locals() else 0} verified-open headings; boot does not infer which require a decision)
 READY: {ready}
 BOOT TIME: {now.isoformat()}
 BOOT SOURCE FINGERPRINT: {fingerprint}

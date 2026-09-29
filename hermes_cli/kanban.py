@@ -955,6 +955,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_lesson_record_error = sub.add_parser(
+        "lesson-record-error",
+        help=(
+            "Record the fix for a novel error as a non-binding candidate lesson "
+            "keyed to that error's stable signature"
+        ),
+    )
+    p_lesson_record_error.add_argument("task_id")
+    p_lesson_record_error.add_argument(
+        "--error", required=True,
+        help="The error text or failure message that was diagnosed.",
+    )
+    p_lesson_record_error.add_argument(
+        "--lesson", required=True,
+        help="The verified fix or rule that should be retrieved if this error recurs.",
+    )
+    p_lesson_record_error.add_argument(
+        "--actor", default=None,
+        help="Who recorded the candidate. Defaults to the acting profile.",
+    )
+
     p_lesson_retire = sub.add_parser(
         "lesson-retire",
         help="Stop injecting a lesson (the row and its history are kept)",
@@ -1533,6 +1554,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "gauntlet": _cmd_gauntlet,
             "exec":     _dispatch_exec,
             "lesson-promote": _cmd_lesson_promote,
+            "lesson-record-error": _cmd_lesson_record_error,
             "lesson-retire":  _cmd_lesson_retire,
             "lesson-approve": _cmd_lesson_approve,
             "lesson-candidates": _cmd_lesson_candidates,
@@ -3271,6 +3293,33 @@ def _cmd_lesson_promote(args: argparse.Namespace) -> int:
         f"Promoted lesson {lesson['id']} from verified task "
         f"{lesson['source_task_id']} — {scope}, binding on tasks matching "
         f"'{lesson['applicability']}'"
+    )
+    return 0
+
+
+def _cmd_lesson_record_error(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT tenant FROM tasks WHERE id = ?", (args.task_id,)
+        ).fetchone()
+        if row is None:
+            print(f"kanban: task {args.task_id} not found", file=sys.stderr)
+            return 1
+        try:
+            lesson = kb.record_error_lesson(
+                conn,
+                error_text=args.error,
+                lesson=args.lesson,
+                source_task_id=args.task_id,
+                created_by=getattr(args, "actor", None) or _profile_author(),
+                tenant=row["tenant"],
+            )
+        except ValueError as exc:
+            print(f"kanban: cannot record error lesson: {exc}", file=sys.stderr)
+            return 2
+    print(
+        f"Recorded candidate lesson {lesson['id']} from {args.task_id}. "
+        "It is retrievable by error signature but binds nothing until approved."
     )
     return 0
 
