@@ -149,7 +149,7 @@
   },
   "escalation_card_max_undispositioned_seconds": 604800,
   "company_health_probes": {
-    "authorized_by": "Christopher, 2026-09-16, in session (Glass Pepper current live scope is journal/reference only; health probe is the frontend root, not the retired API. Prior 2026-09-14 authorization remains for Orion and Logos.)",
+    "authorized_by": "Christopher, 2026-09-16, in session (Glass Pepper current live scope is journal/reference only; health probe is the frontend root, not the retired API. Prior 2026-09-14 authorization remains for Orion and Logos.) | 2026-10-03: NCASS ENT-002 moved from excluded to probed (ncass-inc, loopback root http://127.0.0.1:5140/) by Christopher in a Claude Code session: 'yes, add it to the health monitoring'; website reactivated the same day.",
     "boundaries": "Designated health endpoint only; unauthenticated loopback GET; record only entity/service id, timestamp, HTTP status code, latency/timeout result; never bodies, headers, cookies, auth material, logs, customer data, database output or diagnostic payloads; no shared Kanban card; coarse state only in shared findings",
     "timeout_seconds": 5,
     "record_dir": "~/.hermes/state/system-health-controller/company-health",
@@ -171,6 +171,12 @@
         "name": "The Glass Pepper",
         "service": "glass-pepper-web",
         "url": "http://127.0.0.1:5171/"
+      },
+      {
+        "entity_id": "ENT-002",
+        "name": "NCASS (ncass-inc)",
+        "service": "ncass-inc",
+        "url": "http://127.0.0.1:5140/"
       }
     ],
     "excluded_entities": [
@@ -178,15 +184,10 @@
         "entity_id": "ENT-001",
         "name": "North Caledonia",
         "reason": "dormant/hidden (Christopher, 2026-09-14)"
-      },
-      {
-        "entity_id": "ENT-002",
-        "name": "NCASS (ncass-inc)",
-        "reason": "dormant (Christopher, 2026-09-14)"
       }
     ],
     "registry_inconsistency": "Logged for later registry reconciliation, not edited in F2: entity-registry.md has no status field and no LCASS row; doctrine-v2/scopes marks Logos dormant and NorCal (parent) active; Glass Pepper absent from the scope manifests.",
-    "authorization_sha256": "5372896b845dddab9735f0427527943985747cb83922436d47e5a3850daececf"
+    "authorization_sha256": "66baf93ed46d40f8111c5a1731da18ea3593005b318e099709f1e79097029f03"
   },
   "shared_probe_timeout_seconds": 5,
   "shared_health_endpoints": {
@@ -255,8 +256,7 @@
     "companies": {
       "ENT-002": {
         "tokens": [
-          "ncass",
-          "lcass"
+          "ncass"
         ],
         "lead_profiles": [
           "ncass_lead"
