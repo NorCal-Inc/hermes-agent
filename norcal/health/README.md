@@ -47,7 +47,7 @@ Light: `company_health_endpoints`, `shared_endpoints_healthy`, `shared_units_act
 **Company health probes** — "Active company health may be observed through a minimal, non-content
 health probe. Dormant companies are excluded. Company health observations never become shared company
 data." The probe set in `company_health_probes` (Orion Formation Services ENT-004, Logos Covenant ENT-003,
-The Glass Pepper ENT-007) is pinned by `authorization_sha256`; North Caledonia ENT-001 and NCASS/LCASS
+The Glass Pepper ENT-007) is pinned by `authorization_sha256`; North Caledonia ENT-001 and NCASS
 ENT-002 are excluded. An unrecorded change, or listing an excluded entity, probes nothing. Probes are an
 unauthenticated loopback `GET` that reads only the status line (never body, headers or cookies). The exact
 status code and latency go only to `~/.hermes/state/system-health-controller/company-health/<ENT>.json`
