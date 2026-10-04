@@ -1359,6 +1359,24 @@ def _media_delivery_strict_mode() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _credential_home_roots() -> List[Path]:
+    """Every Hermes home whose credential stores the media denylist must cover.
+
+    Port of upstream NousResearch/hermes-agent #107609 (2026-09-10). The denylist used to be
+    built from the import-time ``_HERMES_HOME`` / ``_HERMES_ROOT`` only, so a
+    ``MEDIA:<root>/profiles/<other>/.env`` (or auth.json, state.db, config.yaml, ...) emitted in a
+    turn validated as deliverable and was uploaded to the chat. Verified live on this fork
+    2026-10-04 before the fix. Now: the ACTIVE home, the shared root and every
+    ``<root>/profiles/*``, enumerated at check time (profiles created after startup count).
+    """
+    roots: List[Path] = [get_hermes_home(), _HERMES_HOME, _HERMES_ROOT]
+    try:
+        roots.extend(p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir())
+    except OSError:
+        pass
+    return list(dict.fromkeys(roots))
+
+
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
@@ -1397,6 +1415,11 @@ def _media_delivery_denied_paths() -> List[Path]:
         # Bitwarden Secrets Manager plaintext and encrypted disk caches.
         os.path.join("cache", "bws_cache.json"),
         os.path.join("cache", "bws_cache.enc.json"),
+        # Whole conversation history and the kanban board (port of upstream's list with #107609).
+        # SQLite WAL/SHM sidecars are listed too: WAL mode touches them on every write, so
+        # recency trust alone would leak them.
+        "state.db", "state.db-wal", "state.db-shm",
+        "kanban.db", "kanban.db-wal", "kanban.db-shm",
     )
     # Directory trees whose every child is credential material.
     #
@@ -1410,8 +1433,11 @@ def _media_delivery_denied_paths() -> List[Path]:
     _ROOT_CREDENTIAL_DIRS = (
         "pairing",
         "mcp-tokens",
+        # Legacy transcript dir and the copied browser cookie/login store (upstream list).
+        "sessions",
+        "browser-profile",
     )
-    for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
+    for hermes_root in _credential_home_roots():
         for rel in _ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
         for rel in _ROOT_CREDENTIAL_DIRS:
