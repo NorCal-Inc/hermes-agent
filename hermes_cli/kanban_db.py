@@ -1326,6 +1326,38 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
     return s
 
 
+def _kanban_cfg(loader=None) -> dict:
+    """The effective ``kanban:`` config section for board rules.
+
+    Base = the BOARD's config (``kanban_home()/config.yaml``), which is shared by every
+    profile; overlay = the current process config's ``kanban:`` section (``loader``,
+    default ``load_config_readonly``). Workers run with a profile HERMES_HOME whose
+    config has no ``kanban:`` section, so without the base they silently used code
+    defaults (attempt limit 6 instead of the board's 12, 2026-10-05).
+    """
+    base: dict = {}
+    try:
+        import yaml
+        cfg_path = kanban_home() / "config.yaml"
+        if cfg_path.exists():
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            k = data.get("kanban") if isinstance(data, dict) else None
+            if isinstance(k, dict):
+                base = dict(k)
+    except Exception:
+        base = {}
+    overlay: dict = {}
+    try:
+        if loader is None:
+            from hermes_cli.config import load_config_readonly as loader
+        k = (loader() or {}).get("kanban")
+        if isinstance(k, dict):
+            overlay = k
+    except Exception:
+        overlay = {}
+    return {**base, **overlay}
+
+
 def kanban_home() -> Path:
     """Return the shared Hermes root that anchors the kanban board.
 
@@ -9059,7 +9091,7 @@ def gauntlet_objective_attempt_limit() -> int:
     """Total implementation+review+verifier run ceiling for one Gauntlet objective."""
     try:
         from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+        raw = _kanban_cfg(load_config_readonly).get(
             "gauntlet_objective_attempt_limit", GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
         )
         value = int(raw)
@@ -9196,7 +9228,7 @@ def repeated_error_limit() -> int:
     try:
         from hermes_cli.config import load_config
         return max(2, int(
-            (load_config() or {}).get("kanban", {}).get(
+            _kanban_cfg(load_config).get(
                 "repeated_error_limit", REPEATED_ERROR_LIMIT_DEFAULT
             )
         ))
@@ -10276,7 +10308,7 @@ def approve_runtime_cap(
 def gauntlet_canonical_ref() -> str:
     try:
         from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+        raw = _kanban_cfg(load_config_readonly).get(
             "gauntlet_canonical_ref", "origin/main"
         )
         return str(raw).strip() or "origin/main"
@@ -11357,7 +11389,7 @@ def gauntlet_enforcement_default() -> bool:
     try:
         from hermes_cli.config import load_config
         return bool(
-            (load_config() or {}).get("kanban", {}).get(
+            _kanban_cfg(load_config).get(
                 "gauntlet_enforcement", False
             )
         )
@@ -13163,7 +13195,7 @@ def _supervisory_routing() -> dict:
     try:
         from hermes_cli.config import load_config
 
-        kcfg = (load_config() or {}).get("kanban") or {}
+        kcfg = _kanban_cfg(load_config)
         supervisor = (
             str(kcfg.get("supervisory_profile") or "").strip()
             or SUPERVISORY_PROFILE_DEFAULT
@@ -20732,7 +20764,7 @@ def _kanban_config_int(key: str, default: int) -> int:
     """
     try:
         from hermes_cli.config import load_config
-        raw = (load_config() or {}).get("kanban", {}).get(key, default)
+        raw = _kanban_cfg(load_config).get(key, default)
     except Exception:
         return default
     if raw is None:
@@ -22144,7 +22176,7 @@ def review_dispatch_enabled() -> bool:
     try:
         from hermes_cli.config import load_config
         return bool(
-            (load_config() or {}).get("kanban", {}).get("review_dispatch", True)
+            _kanban_cfg(load_config).get("review_dispatch", True)
         )
     except Exception:
         return True
@@ -22244,7 +22276,7 @@ def configured_max_in_progress() -> Optional[int]:
     """
     try:
         from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+        raw = _kanban_cfg(load_config_readonly).get(
             "max_in_progress"
         )
     except Exception:
@@ -23217,7 +23249,7 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
         try:
             from hermes_cli.config import load_config
 
-            kanban_cfg = (load_config().get("kanban") or {})
+            kanban_cfg = _kanban_cfg(load_config)
         except Exception:
             kanban_cfg = {}
     max_bytes = _positive_int(
