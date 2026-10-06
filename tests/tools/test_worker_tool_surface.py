@@ -44,3 +44,12 @@ def test_execute_code_hidden_only_when_always_blocked(monkeypatch, single, mode,
     monkeypatch.setattr(ap, "_is_single_query_approval_context", lambda: single)
     monkeypatch.setattr(ap, "_get_single_query_approval_mode", lambda: mode)
     assert model_tools._single_query_execute_code_denied() is expected
+
+
+def test_eager_matches_plugin_toolset_name(monkeypatch):
+    class E:
+        def __init__(self, toolset): self.toolset = toolset
+    import tools.registry as reg
+    monkeypatch.setattr(reg.registry, "get_entry", lambda n: E("kanban") if n == "kanban_comment" else E("other"))
+    assert ts._is_eager_server_tool("kanban_comment", ("kanban",)) is True
+    assert ts._is_eager_server_tool("other_tool", ("kanban",)) is False

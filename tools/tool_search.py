@@ -257,7 +257,11 @@ def _is_eager_server_tool(name: str, eager_servers: Iterable[str]) -> bool:
         toolset = ""
     lname = name.lower()
     for srv in servers:
-        if toolset == f"mcp-{srv}" or lname.startswith(f"mcp__{srv}__") or lname.startswith(f"mcp_{srv}_"):
+        # MCP server (``mcp-<srv>`` toolset / ``mcp__<srv>__`` names) or a plugin
+        # toolset named exactly ``<srv>`` (e.g. ``kanban``) -- 2026-10-05 run 5:
+        # kanban_comment was still mis-called through tool_call.
+        if (toolset in (f"mcp-{srv}", srv) or lname.startswith(f"mcp__{srv}__")
+                or lname.startswith(f"mcp_{srv}_")):
             return True
     return False
 
