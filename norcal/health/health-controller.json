@@ -423,6 +423,31 @@
         "*REGRESSION*.txt"
       ],
       "authorization_sha256": "06e14413232f4ed8aecf21c904638decb3ceed51047a2133c433ec8c163d4d33"
+    },
+    "merged_worktree_removal": {
+      "enabled": true,
+      "authorized_by": "Christopher Hubbard, 2026-10-06, in session: the system finds drift, fixes it, verifies the fix and logs it; Telegram alert only on a block or error",
+      "repository": "/home/chris/.hermes/hermes-agent-next",
+      "base": "main",
+      "path_prefixes": [
+        "/home/chris/.hermes/worktrees",
+        "/home/chris/.hermes/kanban/workspaces",
+        "/tmp"
+      ],
+      "authorization_sha256": "2d4be68c3817c4fe47a891e0b38951a635b84d69629f316145e2b44ab8c1dbcd"
+    }
+  },
+  "closed_card_verification": {
+    "note": "Christopher 2026-10-06: watch starts at deployment; the cards already closed with verification pending were reported to him in session, not alerted.",
+    "watch_since": 1791323723
+  },
+  "worktree_hygiene": {
+    "repository": "/home/chris/.hermes/hermes-agent-next",
+    "base": "main",
+    "unmerged_max_age_seconds": 1209600,
+    "acknowledged": {
+      "/home/chris/.hermes/kanban/workspaces/t_ab4016a8/repo": "Christopher 2026-10-06: only copy of upstream-triage Findings A and C; kept until they are moved to the vault",
+      "/home/chris/.hermes/worktrees/hermes-mobile-v1": "Christopher 2026-10-06: Hermes Mobile v1 parked pending a product decision"
     }
   }
 }

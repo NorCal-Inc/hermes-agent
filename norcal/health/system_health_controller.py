@@ -3746,8 +3746,290 @@ class EvidenceAttachmentRecovery(RecoveryClass):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Closed-card verification and worktree hygiene (Christopher, 2026-10-06)
+# ---------------------------------------------------------------------------
+
+
+def _closed_at(conn, row) -> Optional[int]:
+    """When a done/archived card was closed: completed_at, else its last archive event."""
+    if row["completed_at"]:
+        return int(row["completed_at"])
+    event = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = 'archived' ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    return int(event["created_at"]) if event is not None else None
+
+
+class ClosedCardVerificationUnresolved(Invariant):
+    """A Gauntlet card closed while its verification is still pending.
+
+    Every verifier-routing invariant reads only review/triage/blocked subjects
+    (``_pending_gauntlet_subjects``), so a subject archived or completed
+    mid-verification left the controller's view entirely (t_4579c2b5,
+    2026-09-29). Detection only: the repair is a recorded disposition or a
+    verdict, and the controller can invent neither.
+    """
+
+    name = "closed_card_verification_unresolved"
+    tier = TIER_DEEP
+    source = ("kanban.db tasks (status done|archived, Gauntlet-required, verification_state pending), "
+              "task_verifications, archived events")
+    failure = ("a Gauntlet-required card closed at or after closed_card_verification.watch_since with "
+               "verification still pending, and either no terminal disposition or a 'completed' disposition "
+               "without a verified verdict")
+    evidence = ("closed_unverified:archived_no_disposition | closed_unverified:done_no_disposition | "
+                "closed_unverified:completed_without_verdict (subject = task id; detail status only)")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        since = (ctx.config.get("closed_card_verification") or {}).get("watch_since")
+        if not isinstance(since, (int, float)) or isinstance(since, bool):
+            return []
+        kb = _kb()
+        out: list[Finding] = []
+        with ctx.kanban() as conn:
+            rows = conn.execute(
+                "SELECT id, status, terminal_disposition, completed_at FROM tasks "
+                "WHERE status IN ('done', 'archived') AND verification_state = ? "
+                "AND (terminal_disposition IS NULL OR terminal_disposition = ?)",
+                (kb.VERIFICATION_PENDING, kb.DISPOSITION_COMPLETED),
+            ).fetchall()
+            for row in rows:
+                if not kb.gauntlet_required(conn, row["id"]):
+                    continue
+                closed = _closed_at(conn, row)
+                if closed is None or closed < since:
+                    continue
+                verified = conn.execute(
+                    "SELECT 1 FROM task_verifications WHERE task_id = ? AND state = ? LIMIT 1",
+                    (row["id"], kb.VERIFICATION_VERIFIED),
+                ).fetchone()
+                if verified is not None:
+                    continue
+                if row["terminal_disposition"] is None:
+                    signature = f"closed_unverified:{row['status']}_no_disposition"
+                else:
+                    signature = "closed_unverified:completed_without_verdict"
+                out.append(Finding(self.name, row["id"], signature, {"status": row["status"]}))
+        return out
+
+
+_WORKSPACE_TASK_RE = re.compile(r"/kanban/workspaces/(t_[0-9a-f]+)(?:/|$)")
+
+
+def _worktree_entries(ctx: Context, repo: str) -> Optional[list[dict]]:
+    """Parse ``git worktree list --porcelain`` into one dict per worktree, or None when unreadable."""
+    rc, raw = ctx.run_command(["git", "--no-optional-locks", "-C", repo, "worktree", "list", "--porcelain"], 30)
+    if rc != 0:
+        return None
+    entries: list[dict] = []
+    current: dict = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value if value else True
+    if current:
+        entries.append(current)
+    return entries
+
+
+def _worktree_merged(ctx: Context, repo: str, base: str, head: str) -> Optional[bool]:
+    """True when every commit of ``head`` is in ``base`` by ancestry or by patch; None when undeterminable."""
+    rc, _ = ctx.run_command(["git", "-C", repo, "merge-base", "--is-ancestor", head, base], 30)
+    if rc == 0:
+        return True
+    if rc != 1:
+        return None
+    rc, out = ctx.run_command(["git", "-C", repo, "cherry", base, head], 60)
+    if rc != 0:
+        return None
+    return not any(line.startswith("+") for line in out.splitlines())
+
+
+def _workspace_card_live(ctx: Context, path: str) -> bool:
+    """A kanban workspace whose card is still open belongs to that card, never to hygiene."""
+    match = _WORKSPACE_TASK_RE.search(path)
+    if not match:
+        return False
+    with ctx.kanban() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (match.group(1),)).fetchone()
+    return row is not None and row["status"] not in ("done", "archived")
+
+
+def _realpath(path: str) -> str:
+    return os.path.realpath(os.path.expanduser(path))
+
+
+class WorktreeHygiene(Invariant):
+    """Linked worktrees of the shared Hermes repository that outlived their work.
+
+    A clean worktree whose commits are all already in the base branch is
+    redundant (recoverable by ``merged_worktree_removal``). A worktree holding
+    unmerged commits or uncommitted changes past the age limit is escalated so
+    the work is decided on rather than lost or forgotten; the controller never
+    merges, commits or discards anything.
+    """
+
+    name = "worktree_hygiene"
+    tier = TIER_DEEP
+    source = ("git worktree list --porcelain, status --porcelain, merge-base --is-ancestor and cherry against "
+              "worktree_hygiene.base in worktree_hygiene.repository; kanban.db card status for kanban workspaces")
+    failure = ("a linked worktree (not the main checkout, not locked, not acknowledged, not the workspace of an "
+               "open card) that is clean with every commit already in base; or that holds unmerged commits or "
+               "uncommitted changes and whose last commit is older than unmerged_max_age_seconds")
+    evidence = ("merged_worktree (recoverable) | unmerged_worktree_stale | uncommitted_worktree_stale | "
+                "worktree_unreadable | worktree_list_unreadable (subject = worktree path; detail branch, commits)")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        cfg = ctx.config.get("worktree_hygiene") or {}
+        if not cfg.get("repository"):
+            return []
+        repo = _realpath(cfg["repository"])
+        base = str(cfg.get("base") or "main")
+        max_age = int(cfg.get("unmerged_max_age_seconds", 14 * 86400))
+        acknowledged = {_realpath(p) for p in (cfg.get("acknowledged") or {})}
+        entries = _worktree_entries(ctx, repo)
+        if entries is None:
+            return [Finding(self.name, repo, "worktree_list_unreadable", {})]
+        out: list[Finding] = []
+        for entry in entries:
+            path = str(entry.get("worktree") or "")
+            if not path or _realpath(path) == repo or entry.get("locked") or entry.get("prunable"):
+                continue
+            if _realpath(path) in acknowledged or _workspace_card_live(ctx, path):
+                continue
+            head = str(entry.get("HEAD") or "")
+            branch = str(entry.get("branch") or "").removeprefix("refs/heads/") or "detached"
+            rc, status = ctx.run_command(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"], 30)
+            merged = _worktree_merged(ctx, repo, base, head) if head else None
+            if rc != 0 or merged is None:
+                out.append(Finding(self.name, path, "worktree_unreadable", {"branch": branch}))
+                continue
+            dirty = bool(status.strip())
+            if merged and not dirty:
+                out.append(Finding(self.name, path, "merged_worktree", {"branch": branch}, recoverable=True))
+                continue
+            rc, stamp = ctx.run_command(["git", "-C", path, "log", "-1", "--format=%ct", "HEAD"], 30)
+            age = ctx.now() - int(stamp.strip()) if rc == 0 and stamp.strip().isdigit() else None
+            if age is not None and age <= max_age:
+                continue
+            signature = "uncommitted_worktree_stale" if dirty else "unmerged_worktree_stale"
+            out.append(Finding(self.name, path, signature, {"branch": branch}))
+        return out
+
+
+class MergedWorktreeRemoval(RecoveryClass):
+    name = "merged_worktree_removal"
+    binds = {"worktree_hygiene": ("merged_worktree",)}
+    trigger = "worktree_hygiene merged_worktree on a path under an allowlisted prefix"
+    mutation = "git -C <repository> worktree remove <path> (never --force; the branch ref is left in place)"
+    authorization_boundary = ("only linked worktrees of worktree_hygiene.repository under the spec's path_prefixes; "
+                              "never the main checkout; clean, not locked, every commit already in base, and not "
+                              "the workspace of an open kanban card — all re-checked by the gate before removal")
+    validator = ("the path is no longer a registered worktree and no longer exists on disk, and the removed "
+                 "worktree's HEAD commit (and its branch ref, when it had one) still resolves")
+    rollback = "git -C <repository> worktree add <path> <branch or HEAD commit recorded in the recovery detail>"
+    escalation_only = ("dirty, locked, unmerged, open-card or out-of-prefix worktrees; the main checkout; "
+                       "an unreadable repository")
+
+    def validate_spec(self, spec, config):
+        hygiene = config.get("worktree_hygiene") or {}
+        repo = spec.get("repository")
+        if not isinstance(repo, str) or not hygiene.get("repository") or _realpath(repo) != _realpath(hygiene["repository"]):
+            return "repository_not_watched_by_worktree_hygiene"
+        if spec.get("base") != (hygiene.get("base") or "main") or not _GIT_TOKEN_RE.match(str(spec.get("base"))):
+            return "base_mismatch"
+        prefixes = spec.get("path_prefixes")
+        if not isinstance(prefixes, list) or not prefixes:
+            return "no_path_prefixes"
+        root = _realpath(repo)
+        for prefix in prefixes:
+            if not isinstance(prefix, str) or not os.path.isabs(os.path.expanduser(prefix)):
+                return "path_prefix_not_absolute"
+            real = _realpath(prefix)
+            if real in ("/", root) or root.startswith(real.rstrip("/") + "/"):
+                return f"path_prefix_covers_main_checkout:{prefix}"
+        return None
+
+    def matches(self, finding, spec, config):
+        if not super().matches(finding, spec, config):
+            return False
+        path = _realpath(finding.subject)
+        if path == _realpath(spec["repository"]):
+            return False
+        return any(path.startswith(_realpath(p).rstrip("/") + "/") for p in spec["path_prefixes"])
+
+    @staticmethod
+    def _entry(ctx, repo, path):
+        entries = _worktree_entries(ctx, repo)
+        if entries is None:
+            return None, False
+        for entry in entries:
+            if _realpath(str(entry.get("worktree") or "")) == _realpath(path):
+                return entry, True
+        return None, True
+
+    def gate(self, ctx, finding, rec, spec):
+        repo, path = _realpath(spec["repository"]), finding.subject
+        entry, readable = self._entry(ctx, repo, path)
+        if not readable:
+            return Gate(GATE_REFUSED, "repo_unreadable")
+        if entry is None:
+            return Gate(GATE_CLEARED, "already_removed")
+        if entry.get("locked"):
+            return Gate(GATE_REFUSED, "worktree_locked")
+        if _workspace_card_live(ctx, path):
+            return Gate(GATE_REFUSED, "card_live")
+        rc, status = ctx.run_command(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"], 30)
+        if rc != 0:
+            return Gate(GATE_REFUSED, "worktree_unreadable")
+        if status.strip():
+            return Gate(GATE_REFUSED, "worktree_dirty_unknown_changes")
+        if _worktree_merged(ctx, repo, spec["base"], str(entry.get("HEAD") or "")) is not True:
+            return Gate(GATE_REFUSED, "not_merged")
+        return Gate(GATE_PROCEED)
+
+    def recover(self, ctx, finding, spec):
+        repo, path = _realpath(spec["repository"]), finding.subject
+        entry, _ = self._entry(ctx, repo, path)
+        if entry is None:
+            return RecoveryOutcome(False, "worktree_not_found", {})
+        head = str(entry.get("HEAD") or "")
+        branch = str(entry.get("branch") or "").removeprefix("refs/heads/")
+        rc, _ = ctx.run_command(["git", "-C", repo, "worktree", "remove", path], 60)
+        if rc != 0:
+            return RecoveryOutcome(False, "worktree_remove_failed", {"exit_code": rc})
+        return RecoveryOutcome(True, "worktree_removed", {"path": path, "head": head, "branch": branch})
+
+    def postcondition(self, ctx, finding, rec, spec):
+        repo, path = _realpath(spec["repository"]), finding.subject
+        entry, readable = self._entry(ctx, repo, path)
+        if not readable:
+            return "repo_unreadable"
+        if entry is not None or os.path.exists(path):
+            return "worktree_still_present"
+        detail = (rec.get("last_recovery") or {}).get("detail") or {}
+        head, branch = detail.get("head"), detail.get("branch")
+        if head:
+            rc, _ = ctx.run_command(["git", "-C", repo, "cat-file", "-e", f"{head}^{{commit}}"], 30)
+            if rc != 0:
+                return "head_commit_unreachable"
+        if branch:
+            rc, _ = ctx.run_command(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
+                                     f"refs/heads/{branch}"], 30)
+            if rc != 0:
+                return "branch_ref_missing"
+        return None
+
+
 F3_RECOVERY_CLASSES = (GatewayRestartRecovery, SharedServiceRestartRecovery, LeaseReconciliationRecovery,
-                       LifeWikiRetryRecovery, VaultSyncRecovery, EvidenceAttachmentRecovery)
+                       LifeWikiRetryRecovery, VaultSyncRecovery, EvidenceAttachmentRecovery,
+                       MergedWorktreeRemoval)
 
 #: Detectors no F3 class may ever act on (Christopher, 2026-09-14): escalate-only.
 ESCALATE_ONLY_INVARIANTS = (
@@ -3756,7 +4038,8 @@ ESCALATE_ONLY_INVARIANTS = (
     "runtime_ceilings_match_doctrine", "shared_endpoints_healthy", "resource_thresholds", "ownership_and_linkage",
     "task_graph_integrity", "backup_results", "escalation_cards_dispositioned", "critical_timers_active",
     "gateway_platforms_connected", "ready_backlog_explained", "verdict_returned_to_subject",
-    "verifier_child_stalled_in_todo", HOLD_INVARIANT, EXCEPTION_VALIDITY_INVARIANT,
+    "verifier_child_stalled_in_todo", "closed_card_verification_unresolved", HOLD_INVARIANT,
+    EXCEPTION_VALIDITY_INVARIANT,
 )
 
 
@@ -3768,7 +4051,7 @@ def default_recovery_classes() -> list[RecoveryClass]:
 F1_DETECT_ONLY = (
     ReadyBacklogExplained, RunLeaseConsistency, VerdictReturnedToSubject, VerifierChildStalledInTodo,
     GatewayPlatformsConnected, ResourceThresholds, OwnershipAndLinkage, TaskGraphIntegrity,
-    LifeWikiDailyNote, BackupResults, EscalationCardsDispositioned,
+    LifeWikiDailyNote, BackupResults, EscalationCardsDispositioned, ClosedCardVerificationUnresolved,
 )
 
 
@@ -3800,6 +4083,8 @@ def default_invariants() -> list[Invariant]:
         EscalationCardsDispositioned(),
         RepositoryDrift(),
         CompanyIsolation(),
+        ClosedCardVerificationUnresolved(),
+        WorktreeHygiene(),
     ]
 
 

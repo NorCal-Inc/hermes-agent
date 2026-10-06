@@ -2145,8 +2145,8 @@ class TestF3Contract:
         for name in ("subject_lane_relabelled", "verifier_child_deadlocked"):   # v1 verifier routing stays in-code
             assert name not in bound
 
-    #: Christopher Hubbard authorized all six bounded recovery classes live on
-    #: 2026-09-19. Their existing allowlists, bounds and postconditions remain the
+    #: Christopher Hubbard authorized the first six bounded recovery classes live on
+    #: 2026-09-19, and merged_worktree_removal on 2026-10-06. Their existing allowlists, bounds and postconditions remain the
     #: authority boundary; changing any scope field requires a newly pinned digest.
     def test_repository_config_authorizes_all_bounded_classes(self):
         config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
@@ -2157,7 +2157,8 @@ class TestF3Contract:
             authorized, problem = shc.recovery_authorization(config, klass)
             assert problem is None, (klass.name, problem)
             assert spec["enabled"] is True, klass.name
-            assert "Christopher Hubbard, 2026-09-19" in spec["authorized_by"]
+            authorized_on = {"merged_worktree_removal": "2026-10-06"}.get(klass.name, "2026-09-19")
+            assert f"Christopher Hubbard, {authorized_on}" in spec["authorized_by"], klass.name
             assert spec["authorization_sha256"] == shc.recovery_authorization_digest(klass.name, spec)
             assert authorized is not None
 
@@ -3655,3 +3656,225 @@ class TestLifeWikiValidationWaitsForTheNote:
         assert all(r["status"] == shc.STATUS_RESOLVED for r in final), [(r["invariant"], r["subject"], r["status"]) for r in final]
         assert {r["card_id"] for r in final} == cards
         assert all(len(r.get("recovery_reentries") or []) <= 1 for r in final)
+
+
+# ---------------------------------------------------------------------------
+# Closed-card verification and worktree hygiene (Christopher, 2026-10-06)
+# ---------------------------------------------------------------------------
+
+
+def _closed_pending_subject(conn, *, gauntlet=True):
+    """t_4579c2b5's shape: handed to verification, then archived before any verdict."""
+    tid = kb.create_task(conn, title="closed mid-verification", assignee="default", gauntlet=gauntlet)
+    claimed = kb.claim_task(conn, tid)
+    _attach(conn, tid)
+    assert kb.request_review(conn, tid, summary="done", expected_run_id=claimed.current_run_id) is True
+    assert kb.archive_task(conn, tid) is True
+    return tid
+
+
+class TestClosedCardVerificationUnresolved:
+    def _check(self, home, **cfg):
+        ctx = _ctx(home, config={"closed_card_verification": cfg})
+        return shc.ClosedCardVerificationUnresolved().check(ctx)
+
+    def test_archived_mid_verification_is_found(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _closed_pending_subject(conn)
+        (finding,) = [f for f in self._check(kanban_home, watch_since=time.time() - 600) if f.subject == tid]
+        assert finding.signature == "closed_unverified:archived_no_disposition"
+        assert finding.detail == {"status": "archived"} and not finding.recoverable
+
+    def test_cards_closed_before_watch_since_are_not_reported(self, kanban_home):
+        with kb.connect_closing() as conn:
+            _closed_pending_subject(conn)
+        assert self._check(kanban_home, watch_since=time.time() + 600) == []
+
+    def test_no_watch_since_means_no_detection(self, kanban_home):
+        with kb.connect_closing() as conn:
+            _closed_pending_subject(conn)
+        assert self._check(kanban_home) == []
+
+    def test_recorded_disposition_or_verified_verdict_clears_it(self, kanban_home):
+        with kb.connect_closing() as conn:
+            parked = _closed_pending_subject(conn)
+            verified = _closed_pending_subject(conn)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET terminal_disposition = ? WHERE id = ?",
+                             (kb.DISPOSITION_OVERTAKEN_BY_EVENTS, parked))
+                conn.execute("INSERT INTO task_verifications (task_id, state, verifier, created_at) "
+                             "VALUES (?, ?, 'codex_verify:test', ?)",
+                             (verified, kb.VERIFICATION_VERIFIED, int(time.time())))
+        assert self._check(kanban_home, watch_since=time.time() - 600) == []
+
+    def test_completed_without_verdict_is_found(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _closed_pending_subject(conn)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'done', terminal_disposition = ?, completed_at = ? "
+                             "WHERE id = ?", (kb.DISPOSITION_COMPLETED, int(time.time()), tid))
+        (finding,) = self._check(kanban_home, watch_since=time.time() - 600)
+        assert finding.signature == "closed_unverified:completed_without_verdict"
+
+    def test_escalates_without_mutating_the_card(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _closed_pending_subject(conn)
+            before = _board_snapshot(conn, [tid])
+        alerts = Alerts()
+        ctx = _ctx(kanban_home, alerts=alerts,
+                   config={"closed_card_verification": {"watch_since": time.time() - 600}})
+        result = shc.Controller(ctx, [shc.ClosedCardVerificationUnresolved()]).run(shc.TIER_DEEP)
+        assert len(result.escalated) == 1 and result.recovered == []
+        assert len(alerts.sent) == 1 and "closed mid-verification" not in alerts.sent[0][1]
+        with kb.connect_closing() as conn:
+            assert _board_snapshot(conn, [tid]) == before
+
+
+def _wt_git(*args, cwd=None, env=None):
+    full_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@t", **(env or {})}
+    return subprocess.run(["git", *args], cwd=cwd, env=full_env, check=True, capture_output=True, text=True).stdout
+
+
+def _commit(path, name, *, days_ago=0):
+    (Path(path) / name).write_text(name)
+    stamp = f"@{int(time.time()) - days_ago * 86400} +0000"
+    _wt_git("add", name, cwd=path)
+    _wt_git("commit", "-q", "-m", name, cwd=path, env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
+
+
+@pytest.fixture
+def shared_repo(tmp_path):
+    repo = tmp_path / "hermes-agent-next"
+    repo.mkdir()
+    _wt_git("init", "-q", "-b", "main", cwd=repo)
+    _commit(repo, "base.txt")
+    trees = tmp_path / "worktrees"
+    trees.mkdir()
+    return repo, trees
+
+
+def _add_worktree(repo, path, branch):
+    _wt_git("worktree", "add", "-q", "-b", branch, str(path), "main", cwd=repo)
+    return path
+
+
+def _real_run(argv, timeout):
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout
+
+
+def _hygiene_config(repo, trees, **extra):
+    return {"worktree_hygiene": {"repository": str(repo), "base": "main",
+                                 "unmerged_max_age_seconds": 14 * 86400, **extra}}
+
+
+class TestWorktreeHygiene:
+    def _findings(self, home, repo, trees, **extra):
+        ctx = _ctx(home, config=_hygiene_config(repo, trees, **extra), run_command=_real_run)
+        return {(Path(f.subject).name, f.signature) for f in shc.WorktreeHygiene().check(ctx)}
+
+    def test_classifies_each_worktree_and_skips_the_main_checkout(self, kanban_home, shared_repo):
+        repo, trees = shared_repo
+        merged = _add_worktree(repo, trees / "merged", "feat/merged")
+        _commit(merged, "m.txt")
+        _wt_git("merge", "-q", "--ff-only", "feat/merged", cwd=repo)
+        fresh = _add_worktree(repo, trees / "fresh", "feat/fresh")
+        _commit(fresh, "f.txt")
+        old = _add_worktree(repo, trees / "old", "feat/old")
+        _commit(old, "o.txt", days_ago=30)
+        dirty = _add_worktree(repo, trees / "dirty", "feat/dirty")
+        _commit(dirty, "d.txt", days_ago=30)
+        (dirty / "wip.txt").write_text("uncommitted")
+        assert self._findings(kanban_home, repo, trees) == {
+            ("merged", "merged_worktree"),
+            ("old", "unmerged_worktree_stale"),
+            ("dirty", "uncommitted_worktree_stale"),
+        }
+
+    def test_patch_equivalent_commits_count_as_merged(self, kanban_home, shared_repo):
+        repo, trees = shared_repo
+        picked = _add_worktree(repo, trees / "picked", "feat/picked")
+        _commit(picked, "p.txt", days_ago=30)
+        sha = _wt_git("rev-parse", "HEAD", cwd=picked).strip()
+        _wt_git("cherry-pick", sha, cwd=repo)                        # same patch, different commit id
+        assert self._findings(kanban_home, repo, trees) == {("picked", "merged_worktree")}
+
+    def test_acknowledged_and_open_card_worktrees_are_left_alone(self, kanban_home, shared_repo):
+        repo, trees = shared_repo
+        parked = _add_worktree(repo, trees / "parked", "feat/parked")
+        _commit(parked, "x.txt", days_ago=30)
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="live", assignee="default")
+        workspace = trees / "kanban" / "workspaces" / tid
+        workspace.parent.mkdir(parents=True)
+        live = _add_worktree(repo, workspace, "feat/live-card")
+        _commit(live, "l.txt", days_ago=30)
+        assert self._findings(kanban_home, repo, trees, acknowledged={str(parked): "parked"}) == set()
+
+
+class TestMergedWorktreeRemoval:
+    def _spec(self, repo, trees):
+        return {"repository": str(repo), "base": "main", "path_prefixes": [str(trees)]}
+
+    def _controller(self, home, repo, trees, alerts, clock):
+        config = _authorize(_hygiene_config(repo, trees), "merged_worktree_removal", **self._spec(repo, trees))
+        ctx = _ctx(home, clock=clock, alerts=alerts, config=config, run_command=_real_run)
+        return shc.Controller(ctx, [shc.WorktreeHygiene()], recoveries=[shc.MergedWorktreeRemoval()]), ctx
+
+    def test_merged_worktree_is_removed_verified_and_logged_without_an_alert(self, kanban_home, shared_repo):
+        repo, trees = shared_repo
+        merged = _add_worktree(repo, trees / "merged", "feat/merged")
+        _commit(merged, "m.txt")
+        head = _wt_git("rev-parse", "HEAD", cwd=merged).strip()
+        _wt_git("merge", "-q", "--ff-only", "feat/merged", cwd=repo)
+        alerts, clock = Alerts(), Clock()
+        controller, ctx = self._controller(kanban_home, repo, trees, alerts, clock)
+        result = controller.run(shc.TIER_DEEP)
+        assert len(result.recovered) == 1 and result.escalated == [] and alerts.sent == []
+        assert not merged.exists()
+        assert _wt_git("rev-parse", "refs/heads/feat/merged", cwd=repo).strip() == head      # branch kept
+        events = [json.loads(line) for line in (ctx.state_dir / "ledger.jsonl").read_text().splitlines()]
+        assert any(e["event"] == "recovery" and e["recovery_class"] == "merged_worktree_removal"
+                   and e["applied"] for e in events)
+        clock.advance(3600)
+        assert controller.run(shc.TIER_DEEP).escalated == []
+
+    def test_worktree_dirtied_after_detection_is_refused_and_escalated_once(self, kanban_home, shared_repo,
+                                                                           monkeypatch):
+        repo, trees = shared_repo
+        merged = _add_worktree(repo, trees / "merged", "feat/merged")
+        alerts, clock = Alerts(), Clock()
+        controller, ctx = self._controller(kanban_home, repo, trees, alerts, clock)
+        original_gate = shc.MergedWorktreeRemoval.gate
+
+        def dirty_then_gate(self, ctx, finding, rec, spec):
+            (merged / "late.txt").write_text("arrived between detection and recovery")
+            return original_gate(self, ctx, finding, rec, spec)
+
+        monkeypatch.setattr(shc.MergedWorktreeRemoval, "gate", dirty_then_gate)
+        result = controller.run(shc.TIER_DEEP)
+        assert result.recovered == [] and len(result.escalated) == 1 and len(alerts.sent) == 1
+        assert (merged / "late.txt").exists()
+
+    def test_spec_refuses_a_prefix_that_covers_the_main_checkout(self, shared_repo):
+        repo, trees = shared_repo
+        config = _hygiene_config(repo, trees)
+        klass = shc.MergedWorktreeRemoval()
+        assert klass.validate_spec({**self._spec(repo, trees), "path_prefixes": [str(repo.parent)]}, config) \
+            .startswith("path_prefix_covers_main_checkout")
+        assert klass.validate_spec({**self._spec(repo, trees), "repository": str(trees)}, config) \
+            == "repository_not_watched_by_worktree_hygiene"
+        assert klass.validate_spec(self._spec(repo, trees), config) is None
+
+    def test_out_of_prefix_worktree_is_never_matched(self, shared_repo):
+        repo, trees = shared_repo
+        klass = shc.MergedWorktreeRemoval()
+        spec = self._spec(repo, trees)
+        inside = shc.Finding("worktree_hygiene", str(trees / "a"), "merged_worktree", recoverable=True)
+        outside = shc.Finding("worktree_hygiene", str(repo.parent / "elsewhere"), "merged_worktree",
+                              recoverable=True)
+        main = shc.Finding("worktree_hygiene", str(repo), "merged_worktree", recoverable=True)
+        config = _hygiene_config(repo, trees)
+        assert klass.matches(inside, spec, config)
+        assert not klass.matches(outside, spec, config) and not klass.matches(main, spec, config)
