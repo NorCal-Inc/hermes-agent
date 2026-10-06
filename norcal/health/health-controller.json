@@ -446,7 +446,6 @@
     "base": "main",
     "unmerged_max_age_seconds": 1209600,
     "acknowledged": {
-      "/home/chris/.hermes/kanban/workspaces/t_ab4016a8/repo": "Christopher 2026-10-06: only copy of upstream-triage Findings A and C; kept until they are moved to the vault",
       "/home/chris/.hermes/worktrees/hermes-mobile-v1": "Christopher 2026-10-06: Hermes Mobile v1 parked pending a product decision"
     }
   }
