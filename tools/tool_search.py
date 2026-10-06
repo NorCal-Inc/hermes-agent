@@ -97,6 +97,11 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 4000
+    # MCP servers whose tools are NEVER deferred behind the bridge (2026-10-05).
+    # Lets a profile keep a huge catalog (e.g. Cloudflare) deferred while a small,
+    # constantly-used server (e.g. Playwright) is called directly -- models were
+    # mis-calling browser tools through tool_call (wrong wrapper, missing args).
+    eager_servers: Tuple[str, ...] = ()
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -145,6 +150,11 @@ class ToolSearchConfig:
         else:
             listing = "auto"
         listing_max_tokens = max(200, min(60000, _safe_int(raw.get("listing_max_tokens"), 4000)))
+        eager_raw = raw.get("eager_servers") or []
+        if isinstance(eager_raw, str):
+            eager_raw = [eager_raw]
+        eager_servers = tuple(sorted({str(x).strip().lower() for x in eager_raw
+                                      if isinstance(x, (str, int)) and str(x).strip()}))
 
         return cls(
             enabled=enabled,
@@ -153,6 +163,7 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            eager_servers=eager_servers,
         )
 
 
@@ -232,13 +243,37 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _is_eager_server_tool(name: str, eager_servers: Iterable[str]) -> bool:
+    """True when ``name`` belongs to one of the configured ``eager_servers``."""
+    servers = [s for s in eager_servers if s]
+    if not servers:
+        return False
+    toolset = ""
+    try:
+        from tools.registry import registry
+        entry = registry.get_entry(name)
+        toolset = (getattr(entry, "toolset", "") or "").lower() if entry is not None else ""
+    except Exception:
+        toolset = ""
+    lname = name.lower()
+    for srv in servers:
+        if toolset == f"mcp-{srv}" or lname.startswith(f"mcp__{srv}__") or lname.startswith(f"mcp_{srv}_"):
+            return True
+    return False
+
+
+def classify_tools(tool_defs: List[Dict[str, Any]],
+                   eager_servers: Optional[Iterable[str]] = None,
+                   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every core tool, plus any tool we can't classify. ``deferrable`` is the
-    candidate set for catalog entry.
+    every core tool, every tool of a configured ``eager_servers`` MCP server,
+    plus any tool we can't classify. ``deferrable`` is the candidate set for
+    catalog entry. ``eager_servers=None`` reads ``tools.tool_search.eager_servers``.
     """
+    if eager_servers is None:
+        eager_servers = load_config().eager_servers
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td in tool_defs:
@@ -248,7 +283,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name) and not _is_eager_server_tool(name, eager_servers):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -799,7 +834,7 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(incoming, eager_servers=config.eager_servers)
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 

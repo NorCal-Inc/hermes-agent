@@ -70,6 +70,16 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def _single_query_execute_code_denied() -> bool:
+    """True when this is a single-query run whose approval policy blocks execute_code."""
+    try:
+        from tools.approval import (_is_single_query_approval_context,
+                                    _get_single_query_approval_mode)
+        return _is_single_query_approval_context() and _get_single_query_approval_mode() == "deny"
+    except Exception:
+        return False
+
+
 def _is_dispatcher_owned_worker() -> bool:
     """False when HERMES_KANBAN_* is present but this execution does not own it
     (delegate_task child, or a cron job fired in-process from a worker)."""
@@ -390,6 +400,7 @@ def get_tool_definitions(
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
+                _single_query_execute_code_denied(),
                 profile_scope,
             )
         with _tool_defs_cache_lock:
@@ -608,6 +619,17 @@ def _compute_tool_definitions(
             if td.get("function", {}).get("name") != "browser_exec"
         ]
         available_tool_names.discard("browser_exec")
+
+    # Do not advertise a tool the approval layer is guaranteed to block. In a
+    # single-query (-q) run -- every kanban worker -- with approvals.single_query_mode
+    # "deny" (the default), execute_code is always BLOCKED, yet models kept
+    # calling it and then improvising (2026-10-05, Orion runs 1-4).
+    if "execute_code" in available_tool_names and _single_query_execute_code_denied():
+        filtered_tools = [
+            td for td in filtered_tools
+            if td.get("function", {}).get("name") != "execute_code"
+        ]
+        available_tool_names.discard("execute_code")
 
     if not quiet_mode:
         if filtered_tools:
