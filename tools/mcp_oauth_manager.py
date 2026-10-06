@@ -223,6 +223,16 @@ def _make_hermes_provider_class() -> Optional[type]:
             try:
                 content = await response.aread()
                 token_response = OAuthToken.model_validate_json(content)
+                # RFC 6749 §6 (port of upstream #106185): a refresh response may omit refresh_token
+                # (the AS does not rotate it) and scope (unchanged). Carry both forward from the
+                # tokens we already hold; storing the response verbatim erased the only refresh
+                # token, so the server died at the next expiry with a forced browser re-auth.
+                prior = self.context.current_tokens
+                if prior is not None:
+                    if token_response.refresh_token is None:
+                        token_response.refresh_token = prior.refresh_token
+                    if token_response.scope is None:
+                        token_response.scope = prior.scope
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)
