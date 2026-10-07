@@ -1948,8 +1948,10 @@ class TestF2Contract:
         block = config["company_health_probes"]
         assert shc._company_probe_problem(block) is None
         assert {e["entity_id"]: e["name"] for e in block["entities"]} == {
-            "ENT-004": "Orion Formation Services", "ENT-003": "Logos Covenant", "ENT-007": "The Glass Pepper"}
-        assert {e["entity_id"] for e in block["excluded_entities"]} == {"ENT-001", "ENT-002"}
+            "ENT-004": "Orion Formation Services", "ENT-003": "Logos Covenant", "ENT-007": "The Glass Pepper",
+            # NCASS added to health monitoring 2026-10-03 (ee51061, Christopher).
+            "ENT-002": "NCASS (ncass-inc)"}
+        assert {e["entity_id"] for e in block["excluded_entities"]} == {"ENT-001"}
         assert all(e["url"].startswith("http://127.0.0.1:") for e in block["entities"])
         assert "Christopher" in block["authorized_by"]
         assert "http://127.0.0.1:8082" not in json.dumps(config)   # north caledonia's unit is never probed
