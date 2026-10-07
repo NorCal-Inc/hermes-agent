@@ -1409,6 +1409,21 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
+        # Execution contract rules 1 + 2: a dispatcher-owned Kanban worker may
+        # not run a mutating tool without a valid, currently-active task
+        # contract (task exists, is running, claimed under this worker's lock),
+        # and that contract is re-read from the board on EVERY mutating call so
+        # a mid-run cancellation or reclaim stops the next outside change.
+        # No-op for interactive sessions and delegated children.
+        try:
+            from agent.task_contract_gate import task_contract_refusal
+
+            _contract_refusal = task_contract_refusal(function_name)
+        except Exception as _gate_err:  # fail closed: an unverifiable gate refuses
+            _contract_refusal = f"task contract gate unavailable ({type(_gate_err).__name__})"
+        if _contract_refusal is not None:
+            return tool_error(_contract_refusal)
+
         # Check plugin hooks for a block/approve/modify directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
