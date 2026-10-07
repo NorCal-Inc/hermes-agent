@@ -28,7 +28,11 @@ No LLM is involved. Alerts and cards carry identifiers, statuses and failure
 signatures only — never task titles, bodies, or company data.
 
 State model. ``strict`` (the default, and what an absent ``state_model`` means)
-reports GREEN or DEGRADED, and any held finding is DEGRADED. The TEMPORARY
+reports GREEN or DEGRADED, and any held finding is DEGRADED -- except a finding
+held ``awaiting_human`` (a subject the verifier re-queue guard is holding after
+a BLOCKER): that is a human's turn, not a fault, so it is visible in the
+heartbeat (``awaiting_human``) and alerted once per episode but never recovered,
+escalated or counted as DEGRADED in either model. The TEMPORARY
 ``governed_exceptions`` model (Christopher, 2026-09-14, stabilization only; see
 the README) reports GREEN, GREEN_WITH_HOLDS, RECOVERY, DEGRADED or ESCALATED:
 conditions covered by a valid, owner-approved governed exception are still
@@ -75,6 +79,11 @@ STATUS_RESOLVED = "resolved"
 #: individually escalated; folded into one escalation per hold.
 STATUS_HELD = "held"
 HOLD_INVARIANT = "recovery_hold"
+#: ``held_by`` of a finding the controller holds on its own because the subject
+#: is waiting on a human, not on a recovery (the verifier re-queue guard,
+#: Christopher 2026-10-07): never recovered, never escalated, never DEGRADED;
+#: one alert when the episode starts. Not a configured hold: no aggregate card.
+HELD_AWAITING_HUMAN = "awaiting_human"
 
 #: ``state_model`` values. Strict is the original GREEN/DEGRADED semantics.
 STATE_MODEL_STRICT = "strict"
@@ -163,6 +172,11 @@ class Finding:
     #: unsafe finding is never covered by an exception, never recovered, and
     #: escalates immediately. Not part of the fingerprint.
     unsafe: bool = False
+    #: The subject is waiting on a human decision that no recovery can supply
+    #: (e.g. the verifier re-queue guard is holding it after a BLOCKER). Held
+    #: as ``HELD_AWAITING_HUMAN``: no recovery, no escalation, no DEGRADED, one
+    #: alert per episode. Not part of the fingerprint.
+    awaiting_human: bool = False
     #: ``shared`` escalates with a governed card on the shared board plus the
     #: shared alert. ``company`` (company health probes, Christopher F2
     #: 2026-09-14) never creates a shared card: only the coarse shared summary
@@ -324,6 +338,8 @@ class PassResult:
     open: list[str]
     resolved: list[str]
     held: list[str] = dataclasses.field(default_factory=list)
+    #: Held ``HELD_AWAITING_HUMAN`` this pass: visible, never DEGRADED in either model.
+    awaiting_human: list[str] = dataclasses.field(default_factory=list)
     state_model: str = STATE_MODEL_STRICT
     #: Governed model only: fingerprint counts per class for this tier.
     classes: dict = dataclasses.field(default_factory=dict)
@@ -558,6 +574,9 @@ class Controller:
                         self._hold(finding, hold, inv.tier, state, result)
                         held.setdefault(hold["name"], []).append(finding)
                         continue
+                    if finding.awaiting_human:
+                        self._hold_awaiting_human(finding, inv.tier, state, result)
+                        continue
                     self._process(inv, finding, state, result)
                 present |= self._carry_pending_recoveries(inv, present, state, result)
                 self._resolve_absent(inv, present, state, result)
@@ -583,6 +602,7 @@ class Controller:
             "escalated": len(result.escalated),
             "open": len(result.open),
             "held": len(result.held),
+            "awaiting_human": len(result.awaiting_human),
         }
         if model == STATE_MODEL_GOVERNED:
             beat.update({
@@ -628,6 +648,8 @@ class Controller:
                 elif _finding_ids(finding) & frozen:
                     self._process(inv, dataclasses.replace(finding, recoverable=False),
                                   state, result, reason_override=ESCALATION_FROZEN_UNCOVERED)
+                elif finding.awaiting_human:
+                    self._hold_awaiting_human(finding, inv.tier, state, result)
                 else:
                     self._process(inv, finding, state, result)
             present |= self._carry_pending_recoveries(inv, present, state, result)
@@ -1157,7 +1179,36 @@ class Controller:
 
     # -- HOLD ----------------------------------------------------------------
 
-    def _hold(self, finding: Finding, hold: dict, tier: str, state: dict, result: PassResult) -> None:
+    def _hold_awaiting_human(self, finding: Finding, tier: str, state: dict,
+                             result: PassResult) -> None:
+        """Hold a finding whose subject is waiting on a human, not on a recovery.
+
+        The verifier re-queue guard case (t_e8eb2485, 2026-10-07): after a
+        BLOCKER the guard refuses a new verifier until someone says what
+        changed. Counting that refusal as a failed recovery exhausted the
+        budget, escalated light health and took boot to READY: NO. Here the
+        finding is recorded ``held`` (``held_by: awaiting_human``) -- no
+        recovery attempt, no escalation, no card, not DEGRADED -- with exactly
+        one alert when the episode starts. A released guard changes the
+        finding's signature, which resolves this fingerprint and starts a
+        fresh episode on the normal recovery path.
+        """
+        fp = finding.fingerprint
+        previous = state["fingerprints"].get(fp)
+        entering = previous is None or previous.get("status") != STATUS_HELD
+        self._hold(finding, {"name": HELD_AWAITING_HUMAN}, tier, state, result,
+                   bucket=result.awaiting_human)
+        if self.ctx.dry_run:
+            return
+        rec = state["fingerprints"][fp]
+        if entering:
+            rec["alert_delivered"] = False
+        # One alert per episode: queued on entry, retried only while undelivered
+        # (bounded by MAX_ALERT_ATTEMPTS like every other alert), never repeated.
+        self._deliver_alert(finding, rec)
+
+    def _hold(self, finding: Finding, hold: dict, tier: str, state: dict, result: PassResult,
+              *, bucket: Optional[list] = None) -> None:
         """Record a held finding. No recovery, no individual card or alert."""
         now = self.ctx.now()
         fp = finding.fingerprint
@@ -1181,7 +1232,7 @@ class Controller:
                               subject=finding.subject, hold=hold["name"], previous_status=previous)
         rec["last_seen"] = _iso(now)
         rec["observations"] = int(rec.get("observations", 0)) + 1
-        result.held.append(fp)
+        (result.held if bucket is None else bucket).append(fp)
 
     def _escalate_holds(self, tier: str, holds: list[dict], held: dict[str, list[Finding]],
                         state: dict, result: PassResult) -> None:
@@ -1256,6 +1307,17 @@ class Controller:
 
 def alert_text(finding: Finding, rec: dict) -> tuple[str, str]:
     """Identifiers and signatures only — never titles, bodies or company data."""
+    if rec.get("status") == STATUS_HELD:
+        # Held awaiting a human: not a fault, not degraded. Say what releases it.
+        return f"[health] {finding.invariant} HELD awaiting human", "\n".join([
+            f"invariant: {finding.invariant}",
+            f"subject: {finding.subject}",
+            f"signature: {finding.signature}",
+            f"fingerprint: {finding.fingerprint}",
+            f"held_by: {rec.get('held_by')}",
+            "recovery: none attempted (the subject is waiting on a human, not on the controller)",
+            "card: none",
+        ])
     subject = f"[health] {finding.invariant} DEGRADED"
     lines = [
         f"invariant: {finding.invariant}",
@@ -1351,10 +1413,16 @@ class VerifierRouteOpen(Invariant):
 
     name = "verifier_route_open"
     tier = TIER_LIGHT
-    source = "kanban.db tasks/task_events/task_attachments via kanban_db._open_verifier_child, _phase_reviewer_identities, subject_has_evidence"
+    source = "kanban.db tasks/task_events/task_attachments via kanban_db._open_verifier_child, _phase_reviewer_identities, subject_has_evidence, verifier_respawn_guard_holds"
     failure = "a Gauntlet subject pending verification in review for >60 s has no open verifier child and no installed independent reviewer"
-    evidence = "no_route:evidence_ready (recoverable) or no_route:evidence_missing; detail status, evidence"
+    evidence = ("no_route:evidence_ready (recoverable), no_route:evidence_missing, or "
+                "no_route:awaiting_human (held: the verifier re-queue guard refuses an identical "
+                "re-verification until a non-system comment or new review handoff); detail status, evidence")
     settle_seconds = 60
+    #: Signature while the re-queue guard holds the subject. Its own signature,
+    #: so the guard releasing (a human acted) starts a fresh fingerprint and a
+    #: fresh recovery budget instead of continuing a spent one.
+    AWAITING_HUMAN_SIGNATURE = "no_route:awaiting_human"
 
     def check(self, ctx: Context) -> list[Finding]:
         kb = _kb()
@@ -1380,6 +1448,19 @@ class VerifierRouteOpen(Invariant):
                 if row["status"] == "review" and reviewers:
                     continue  # an installed independent reviewer is a route
                 evidence = kb.subject_has_evidence(conn, tid)
+                if kb.verifier_respawn_guard_holds(conn, tid):
+                    # The last verifier returned no verdict (BLOCKER / unreadable)
+                    # and nothing has changed since. The guard will refuse the
+                    # child this recovery would open, so opening it is not a
+                    # recovery: the subject is waiting on a human. Read-only
+                    # predicate; the dispatch path records the refusal itself.
+                    out.append(Finding(
+                        self.name, tid, self.AWAITING_HUMAN_SIGNATURE,
+                        {"status": row["status"], "evidence": evidence,
+                         "held_by": "verifier_respawn_guard"},
+                        recoverable=False, awaiting_human=True,
+                    ))
+                    continue
                 out.append(Finding(
                     self.name, tid,
                     "no_route:" + ("evidence_ready" if evidence else "evidence_missing"),

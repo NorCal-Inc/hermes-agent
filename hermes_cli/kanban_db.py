@@ -12851,6 +12851,54 @@ _VERIFIER_NO_RESULT_KINDS = ("verification_blocker_returned", "verifier_verdict_
 _VERIFIER_SYSTEM_AUTHORS = ("verifier-return-path", _VERIFIER_RESPAWN_GUARD_AUTHOR)
 
 
+def _verifier_respawn_guard_anchor(
+    conn: sqlite3.Connection, subject_id: str
+) -> Optional[int]:
+    """The event id the re-queue guard is holding ``subject_id`` on, or None.
+
+    READ-ONLY. This is the rule itself: the last no-verdict verifier return
+    (BLOCKER or unreadable) with no new review handoff and no non-system
+    comment after it. Both :func:`verifier_respawn_guard_holds` (observers
+    such as the health controller) and :func:`_verifier_respawn_unchanged`
+    (the dispatch path, which also records the refusal) answer from this one
+    predicate so they can never disagree about whether the guard is holding.
+    """
+    last = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (subject_id, *_VERIFIER_NO_RESULT_KINDS),
+    ).fetchone()
+    if last is None:
+        return None
+    for ev in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('review_requested', 'commented')",
+        (subject_id, last["id"]),
+    ).fetchall():
+        if ev["kind"] == "review_requested":
+            return None
+        try:
+            author = json.loads(ev["payload"] or "{}").get("author")
+        except ValueError:
+            author = None
+        if author not in _VERIFIER_SYSTEM_AUTHORS:
+            return None
+    return int(last["id"])
+
+
+def verifier_respawn_guard_holds(conn: sqlite3.Connection, subject_id: str) -> bool:
+    """True when the no-identical-re-verification guard is holding ``subject_id``.
+
+    READ-ONLY: writes no event and no comment. A held subject is waiting on a
+    human (a non-system comment saying what changed, or a new review handoff),
+    not on the dispatcher; a monitor that asks this question must report it as
+    held rather than count the guard's refusal as a failed recovery
+    (t_e8eb2485, 2026-10-07: that miscount escalated light health and took
+    boot to READY: NO).
+    """
+    return _verifier_respawn_guard_anchor(conn, subject_id) is not None
+
+
 def _verifier_respawn_unchanged(conn: sqlite3.Connection, subject_id: str) -> bool:
     """True (and recorded once) when the last verifier produced no verdict and
     nothing has changed on the subject since.
@@ -12860,37 +12908,21 @@ def _verifier_respawn_unchanged(conn: sqlite3.Connection, subject_id: str) -> bo
     verifier against that state can only reproduce the same result --
     t_92521910 spent four verifier runs in 26 minutes that way. A new verifier
     is released only by a new review handoff or a non-system comment saying
-    what changed.
+    what changed. The rule lives in :func:`_verifier_respawn_guard_anchor`;
+    this wrapper adds the once-per-hold refusal record.
     """
-    last = conn.execute(
-        "SELECT id FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
-        "ORDER BY id DESC LIMIT 1",
-        (subject_id, *_VERIFIER_NO_RESULT_KINDS),
-    ).fetchone()
-    if last is None:
+    anchor = _verifier_respawn_guard_anchor(conn, subject_id)
+    if anchor is None:
         return False
-    for ev in conn.execute(
-        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
-        "AND kind IN ('review_requested', 'commented')",
-        (subject_id, last["id"]),
-    ).fetchall():
-        if ev["kind"] == "review_requested":
-            return False
-        try:
-            author = json.loads(ev["payload"] or "{}").get("author")
-        except ValueError:
-            author = None
-        if author not in _VERIFIER_SYSTEM_AUTHORS:
-            return False
     if conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
         "AND kind = 'verifier_respawn_refused_unchanged' LIMIT 1",
-        (subject_id, last["id"]),
+        (subject_id, anchor),
     ).fetchone() is None:
         with write_txn(conn):
             _append_event(
                 conn, subject_id, "verifier_respawn_refused_unchanged",
-                {"last_no_result_event": last["id"]},
+                {"last_no_result_event": anchor},
             )
             add_comment(
                 conn, subject_id, _VERIFIER_RESPAWN_GUARD_AUTHOR,

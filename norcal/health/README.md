@@ -118,7 +118,7 @@ or historically preserved conditions remain:
 | Status | Meaning |
 |---|---|
 | `GREEN` | no actionable fault, no recovery in flight, nothing escalated, no exception active |
-| `GREEN_WITH_HOLDS` | healthy; only conditions named by a valid governed exception remain (still observed every pass, visible in the heartbeat and state, one deduplicated card per exception) |
+| `GREEN_WITH_HOLDS` | healthy; only conditions named by a valid governed exception remain (still observed every pass, visible in the heartbeat and state, one deduplicated card per exception), or a subject held `awaiting_human` (the verifier re-queue guard is refusing an identical re-verification after a BLOCKER until a non-system comment or new review handoff; no recovery, no card, one alert per episode, never DEGRADED in either model) |
 | `RECOVERY` | an allowlisted repair ran and has not revalidated yet (budget left) |
 | `DEGRADED` | an actionable fault: detect-only escalation, a condition not yet confirmed, a new/changed condition on a frozen card (`frozen_condition_not_covered`), or an invalid/expired exception (`governed_exception_valid`) |
 | `ESCALATED` | automatic repair failed its budget, or the finding is unsafe (security/boundary) — never covered by an exception, escalated at once |

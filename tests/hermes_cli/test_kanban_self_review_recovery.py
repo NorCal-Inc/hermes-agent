@@ -1832,4 +1832,37 @@ class TestNoIdenticalReverification:
         with kb.connect_closing() as conn:
             tid = _subject_awaiting_verification(conn)
             assert kb._verifier_respawn_unchanged(conn, tid) is False
+            assert kb.verifier_respawn_guard_holds(conn, tid) is False
+
+    def test_guard_predicate_is_read_only_and_matches_the_dispatch_rule(self, kanban_home):
+        """t_e8eb2485, 2026-10-07: a monitor must be able to ask "is the guard
+        holding this subject?" without writing the refusal record."""
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            _run_verifier(conn, tid, "VERDICT: BLOCKER\nboot gate READY: NO")
+            before = _events(conn, tid)
+
+            assert kb.verifier_respawn_guard_holds(conn, tid) is True
+            assert kb.verifier_respawn_guard_holds(conn, tid) is True
+            assert _events(conn, tid) == before          # no event, no comment
+
+            # The dispatch path answers from the same rule and records once.
+            assert kb._verifier_respawn_unchanged(conn, tid) is True
+            assert len(_events(conn, tid, "verifier_respawn_refused_unchanged")) == 1
+            assert kb.verifier_respawn_guard_holds(conn, tid) is True   # the guard's own comment does not release
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is None
+
+            kb.add_comment(conn, tid, "christopher", "Changed: gate repaired")
+            assert kb.verifier_respawn_guard_holds(conn, tid) is False
+            assert kb._verifier_respawn_unchanged(conn, tid) is False
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is not None
+
+    def test_guard_predicate_releases_on_a_new_review_handoff(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            _run_verifier(conn, tid, "VERDICT: BLOCKER\nsandbox cannot read attachments")
+            assert kb.verifier_respawn_guard_holds(conn, tid) is True
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "review_requested", {"summary": "fixed", "implementer": "default"})
+            assert kb.verifier_respawn_guard_holds(conn, tid) is False
 

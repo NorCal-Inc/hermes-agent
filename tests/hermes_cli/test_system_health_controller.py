@@ -304,6 +304,194 @@ class TestVerifierRouteRecovery:
         assert alerts.sent == []
 
 
+def _return_blocker(conn, tid, note="VERDICT: BLOCKER\nboot gate READY: NO"):
+    """The open verifier child runs and returns no verdict (a BLOCKER)."""
+    child = kb._open_verifier_child(conn, tid)
+    assert child is not None
+    claimed = kb.claim_task(conn, child)
+    assert claimed is not None
+    with kb.write_txn(conn):
+        kb._append_event(conn, child, "codex_verifier_started", {"executor": "codex"},
+                         run_id=claimed.current_run_id)
+    assert kb.complete_task(conn, child, summary=note,
+                            expected_run_id=claimed.current_run_id) is True
+    assert "verification_blocker_returned" in _kinds(conn, tid)
+    assert kb._open_verifier_child(conn, tid) is None
+    return child
+
+
+def _blocked_subject(controller, clock, conn_factory=kb.connect_closing):
+    """A subject whose first verifier (opened by the controller) returned a BLOCKER."""
+    with conn_factory() as conn:
+        tid = _subject_evidence_after_handoff(conn)
+    first = controller.run(shc.TIER_LIGHT)
+    assert len(first.recovered) == 1
+    with conn_factory() as conn:
+        _return_blocker(conn, tid)
+    clock.advance(300)
+    return tid
+
+
+class TestVerifierRequeueGuardHeld:
+    """t_e8eb2485, 2026-10-07 12:17: after a BLOCKER the re-queue guard refused a
+    new verifier; the controller counted the refusal as a failed recovery,
+    escalated ``recovery_budget_exhausted`` and took boot to READY: NO. A
+    guard-held subject is a human's turn: held, visible, alerted once, never
+    recovered, escalated or DEGRADED."""
+
+    def test_blocker_is_held_and_light_status_stays_green(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        route = Counting(shc.VerifierRouteOpen())
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts), [route])
+        tid = _blocked_subject(controller, clock)
+        with kb.connect_closing() as conn:
+            kinds_before = _kinds(conn, tid)
+
+        result = controller.run(shc.TIER_LIGHT)
+
+        # Held, not recovered, not escalated, not open, not degraded.
+        assert result.status == "GREEN"
+        assert len(result.awaiting_human) == 1
+        assert result.recovered == [] and result.escalated == [] and result.open == []
+        assert result.held == []                      # not a configured hold either
+        assert route.recoveries == 1                  # only the original route-opening
+        (fp,) = result.awaiting_human
+        state = shc.StateStore(kanban_home / "state" / "system-health-controller").load()
+        rec = state["fingerprints"][fp]
+        assert rec["status"] == shc.STATUS_HELD and rec["held_by"] == shc.HELD_AWAITING_HUMAN
+        assert rec["signature"] == shc.VerifierRouteOpen.AWAITING_HUMAN_SIGNATURE
+        assert rec["card_id"] is None and rec["attempts"] == 0
+        # Exactly one alert, and it says held, not degraded.
+        assert len(alerts.sent) == 1
+        subject, text = alerts.sent[0]
+        assert "HELD awaiting human" in subject and "DEGRADED" not in subject
+        assert f"held_by: {shc.HELD_AWAITING_HUMAN}" in text and tid in text
+        with kb.connect_closing() as conn:
+            assert _health_cards(conn) == []
+            assert kb._open_verifier_child(conn, tid) is None
+            # The predicate is read-only: the controller wrote no refusal, no comment.
+            assert _kinds(conn, tid) == kinds_before
+            assert "verifier_respawn_refused_unchanged" not in _kinds(conn, tid)
+
+        # Later passes: still held, still GREEN, no second alert, no recovery.
+        for _ in range(3):
+            clock.advance(300)
+            again = controller.run(shc.TIER_LIGHT)
+            assert again.status == "GREEN" and again.awaiting_human == [fp]
+            assert again.escalated == [] and again.open == []
+        assert route.recoveries == 1 and len(alerts.sent) == 1
+        beat = shc.StateStore(kanban_home / "state" / "system-health-controller").read_heartbeat("light")
+        assert beat["status"] == "GREEN" and beat["awaiting_human"] == 1 and beat["escalated"] == 0
+
+    def test_governed_model_reports_green_with_holds_not_escalated(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        route = Counting(shc.VerifierRouteOpen())
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts, config=_governed()), [route])
+        _blocked_subject(controller, clock)
+
+        result = controller.run(shc.TIER_LIGHT)
+        assert result.status == shc.AGGREGATE_GREEN_WITH_HOLDS
+        assert result.classes == {"escalated": 0, "degraded": 0, "recovery": 0, "exception": 1}
+        assert len(result.awaiting_human) == 1 and result.escalated == []
+        assert route.recoveries == 1 and len(alerts.sent) == 1
+        clock.advance(300)
+        assert controller.run(shc.TIER_LIGHT).status == shc.AGGREGATE_GREEN_WITH_HOLDS
+        assert len(alerts.sent) == 1
+        with kb.connect_closing() as conn:
+            assert _health_cards(conn) == []
+
+    def test_non_system_comment_releases_the_hold_and_recovery_resumes(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        route = Counting(shc.VerifierRouteOpen())
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts), [route])
+        tid = _blocked_subject(controller, clock)
+        held = controller.run(shc.TIER_LIGHT)
+        (held_fp,) = held.awaiting_human
+
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, tid, "christopher", "Changed: leaked card archived; boot READY: YES")
+        clock.advance(300)
+        released = controller.run(shc.TIER_LIGHT)
+
+        # The held episode closes and the normal recovery path opens a fresh verifier.
+        assert held_fp in released.resolved
+        assert released.awaiting_human == [] and released.escalated == []
+        assert len(released.recovered) == 1 and released.recovered[0] != held_fp
+        assert released.status == "GREEN"
+        assert route.recoveries == 2
+        assert len(alerts.sent) == 1                  # the hold alert; recovery is silent
+        with kb.connect_closing() as conn:
+            child = kb._open_verifier_child(conn, tid)
+            assert child is not None and kb.get_task(conn, child).status == "ready"
+            assert _health_cards(conn) == []
+
+    def test_second_blocker_is_a_new_episode_with_one_more_alert(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        route = Counting(shc.VerifierRouteOpen())
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts), [route])
+        tid = _blocked_subject(controller, clock)
+        controller.run(shc.TIER_LIGHT)
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, tid, "christopher", "fixed the gate")
+        clock.advance(300)
+        controller.run(shc.TIER_LIGHT)               # recovery opens verifier #2
+        with kb.connect_closing() as conn:
+            _return_blocker(conn, tid, "VERDICT: BLOCKER\nstill broken")
+        clock.advance(300)
+        result = controller.run(shc.TIER_LIGHT)
+        assert result.status == "GREEN" and len(result.awaiting_human) == 1
+        assert route.recoveries == 2 and len(alerts.sent) == 2
+        clock.advance(300)
+        controller.run(shc.TIER_LIGHT)
+        assert len(alerts.sent) == 2
+
+    def test_undelivered_hold_alert_is_retried_but_bounded(self, kanban_home):
+        clock, alerts = Clock(), Alerts(ok=False)
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts), [shc.VerifierRouteOpen()])
+        _blocked_subject(controller, clock)
+        for _ in range(6):
+            result = controller.run(shc.TIER_LIGHT)
+            assert result.status == "GREEN" and result.escalated == []
+            clock.advance(300)
+        assert len(alerts.sent) == shc.MAX_ALERT_ATTEMPTS
+
+    def test_genuine_no_verifier_fault_still_recovers_and_escalates(self, kanban_home):
+        """No BLOCKER on the subject: the guard is not holding, so the recovery
+        path and its budget behave exactly as before this change."""
+        clock, alerts = Clock(), Alerts()
+        route = Counting(shc.VerifierRouteOpen(), recover_noop=True)
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts), [route])
+        with kb.connect_closing() as conn:
+            tid = _subject_evidence_after_handoff(conn)
+            assert kb.verifier_respawn_guard_holds(conn, tid) is False
+
+        results = [controller.run(shc.TIER_LIGHT)]
+        for _ in range(3):
+            clock.advance(300)
+            results.append(controller.run(shc.TIER_LIGHT))
+        assert all(r.awaiting_human == [] for r in results)
+        assert results[0].status == "DEGRADED" and len(results[0].open) == 1
+        assert route.recoveries == 2
+        assert sum(len(r.escalated) for r in results) == 1
+        assert len(alerts.sent) == 1 and "DEGRADED" in alerts.sent[0][0]
+        state = shc.StateStore(kanban_home / "state" / "system-health-controller").load()
+        (rec,) = state["fingerprints"].values()
+        assert rec["status"] == shc.STATUS_ESCALATED
+        assert rec["escalation_reason"] == shc.ESCALATION_BUDGET_EXHAUSTED
+        with kb.connect_closing() as conn:
+            assert len(_health_cards(conn)) == 1
+
+    def test_dry_run_holds_without_alerting(self, kanban_home):
+        clock, alerts = Clock(), Alerts()
+        controller = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts), [shc.VerifierRouteOpen()])
+        _blocked_subject(controller, clock)
+        dry = shc.Controller(_ctx(kanban_home, clock=clock, alerts=alerts, dry_run=True),
+                             [shc.VerifierRouteOpen()])
+        result = dry.run(shc.TIER_LIGHT)
+        assert len(result.awaiting_human) == 1 and result.status == "GREEN"
+        assert alerts.sent == []
+
+
 # ---------------------------------------------------------------------------
 # Subject damage and verifier-child deadlock (failures 6 and 7)
 # ---------------------------------------------------------------------------
