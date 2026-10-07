@@ -12494,6 +12494,62 @@ def _retire_unroutable_recheck(
         return False
 
 
+_VERIFIER_RESPAWN_GUARD_AUTHOR = "verifier-respawn-guard"
+_VERIFIER_NO_RESULT_KINDS = ("verification_blocker_returned", "verifier_verdict_unreadable")
+_VERIFIER_SYSTEM_AUTHORS = ("verifier-return-path", _VERIFIER_RESPAWN_GUARD_AUTHOR)
+
+
+def _verifier_respawn_unchanged(conn: sqlite3.Connection, subject_id: str) -> bool:
+    """True (and recorded once) when the last verifier produced no verdict and
+    nothing has changed on the subject since.
+
+    Christopher, 2026-10-07: no identical re-verification. A BLOCKER or an
+    unreadable verdict leaves the subject exactly as it was, so another
+    verifier against that state can only reproduce the same result --
+    t_92521910 spent four verifier runs in 26 minutes that way. A new verifier
+    is released only by a new review handoff or a non-system comment saying
+    what changed.
+    """
+    last = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (subject_id, *_VERIFIER_NO_RESULT_KINDS),
+    ).fetchone()
+    if last is None:
+        return False
+    for ev in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('review_requested', 'commented')",
+        (subject_id, last["id"]),
+    ).fetchall():
+        if ev["kind"] == "review_requested":
+            return False
+        try:
+            author = json.loads(ev["payload"] or "{}").get("author")
+        except ValueError:
+            author = None
+        if author not in _VERIFIER_SYSTEM_AUTHORS:
+            return False
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'verifier_respawn_refused_unchanged' LIMIT 1",
+        (subject_id, last["id"]),
+    ).fetchone() is None:
+        with write_txn(conn):
+            _append_event(
+                conn, subject_id, "verifier_respawn_refused_unchanged",
+                {"last_no_result_event": last["id"]},
+            )
+            add_comment(
+                conn, subject_id, _VERIFIER_RESPAWN_GUARD_AUTHOR,
+                "Re-verification refused: the last verifier returned no verdict "
+                "and nothing has changed since. Fix the blocker, then post a "
+                "comment saying what changed; that comment releases one new "
+                "verifier.",
+            )
+    return True
+
+
 def _ensure_independent_verifier_child(
     conn: sqlite3.Connection, subject_id: str, *, implementer: Optional[str]
 ) -> Optional[str]:
@@ -12582,6 +12638,9 @@ def _ensure_independent_verifier_child(
                     )
         _retire_unroutable_recheck(conn, subject_id, reason="verifier_child_open")
         return existing
+    # No identical re-verification -- see _verifier_respawn_unchanged.
+    if _verifier_respawn_unchanged(conn, subject_id):
+        return None
     if not _subject_evidence_is_dispatchable(conn, subject_id):
         if not _unroutable_alarm_is_owed(conn, subject_id):
             # Same unchanged fact, inside the same 10-minute window. Silence is

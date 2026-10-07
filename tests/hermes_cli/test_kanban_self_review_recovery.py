@@ -1798,3 +1798,37 @@ class TestVerifierChildReuseIntegrity:
             assert kb._open_verifier_child(conn, subject) == fresh
             assert len(_events(conn, subject, "independent_verifier_child_created")) == 2
             assert sorted(kb.child_ids(conn, subject)) == sorted([invalid, fresh])
+
+
+class TestNoIdenticalReverification:
+    """Christopher, 2026-10-07: a BLOCKER must not auto-requeue a verifier
+    until something changed (t_92521910: four BLOCKERs in 26 minutes)."""
+
+    def test_blocker_does_not_respawn_until_a_change_is_recorded(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            first = _run_verifier(conn, tid, "VERDICT: BLOCKER\nboot gate READY: NO")
+
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is None
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is None
+            assert len(_events(conn, tid, "verifier_respawn_refused_unchanged")) == 1
+            assert kb._open_verifier_child(conn, tid) is None
+
+            kb.add_comment(conn, tid, "christopher", "Changed: leaked card archived; boot READY: YES")
+            second = kb._ensure_independent_verifier_child(conn, tid, implementer="default")
+            assert second is not None and second != first
+
+    def test_new_review_handoff_releases_a_verifier(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            _run_verifier(conn, tid, "VERDICT: BLOCKER\nsandbox cannot read attachments")
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is None
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "review_requested", {"summary": "fixed", "implementer": "default"})
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is not None
+
+    def test_pass_and_fail_paths_are_untouched(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            assert kb._verifier_respawn_unchanged(conn, tid) is False
+
