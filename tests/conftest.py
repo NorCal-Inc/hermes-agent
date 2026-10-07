@@ -1785,3 +1785,10 @@ def all_assignees_spawnable(monkeypatch):
     """
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    # Company-lane gate (execution contract rule 3): a synthetic assignee has
+    # no profile.yaml and therefore no company, and an UNTAGGED profile is
+    # refused on any tenant-tagged card. Pretend every synthetic identity is
+    # in the shared lane so existing board tests keep their tenant-tagged
+    # fixtures. Tests that assert the lane gate itself install their own
+    # mapping — see tests/hermes_cli/test_kanban_tenant_isolation.py.
+    monkeypatch.setattr(profiles, "profile_company", lambda name: profiles.SHARED_LANE)

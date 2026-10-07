@@ -831,7 +831,10 @@ def read_profile_meta(profile_dir: Path) -> dict:
     raises — a corrupt profile.yaml on an unrelated profile must not
     break ``hermes profile list``.
     """
-    empty = {"description": "", "description_auto": False, "display_name": ""}
+    empty = {
+        "description": "", "description_auto": False, "display_name": "",
+        "company": "",
+    }
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
         return empty
@@ -847,7 +850,61 @@ def read_profile_meta(profile_dir: Path) -> dict:
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
         "display_name": str(data.get("display_name") or "").strip(),
+        "company": normalize_company_lane(data.get("company")) or "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Company lane — which company a profile executes for.
+#
+# Doctrine (sovereignty.md, data-isolation.md, execution contract rule 3): one
+# task, one company — or SHARED/GOVERNANCE when doctrine explicitly authorizes
+# it; uncertain company scope is FORBIDDEN. The Kanban gate that enforces this
+# at claim/dispatch time (``kanban_db.tenant_claim_conflict``) needs to know
+# which lane a PROFILE belongs to. That fact lives here, in the profile's own
+# ``profile.yaml`` under ``company:``, because the profile directory is the
+# unit of identity the dispatcher already resolves (``profile_exists``) and
+# nothing else on disk records it mechanically — the entity registry is prose.
+#
+# Values are free-form slugs compared case-insensitively against a task's
+# ``tenant``. ``SHARED_LANE`` is the one reserved value: a profile in the
+# shared lane (Erika, the shared digesters, and the ``default`` carrier
+# profile that Claude Code / Codex executions ride on) may execute any task;
+# a company profile may execute only its own company's tasks.
+#
+# An UNTAGGED profile is not "shared" — it is unknown, and unknown is
+# forbidden the moment a task declares a company. Tagging is an operator act
+# (Christopher / Erika), never inferred from the profile name.
+# ---------------------------------------------------------------------------
+
+SHARED_LANE = "shared"
+
+
+def normalize_company_lane(value: object) -> Optional[str]:
+    """Canonical form of a company/tenant slug; ``None`` when empty."""
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    return text or None
+
+
+def profile_company(name: str) -> Optional[str]:
+    """Return the company lane a profile executes for, or ``None`` if untagged.
+
+    ``default`` has no profile directory and is the carrier every direct
+    executor lane (Claude Code, Codex verify) rides on; those execution
+    services legitimately span company lanes under doctrine, so ``default``
+    IS the shared lane. Every other profile is whatever its ``profile.yaml``
+    says, and nothing if it says nothing.
+    """
+    canon = normalize_profile_name(name)
+    if canon == "default":
+        return SHARED_LANE
+    try:
+        meta = read_profile_meta(get_profile_dir(canon))
+    except Exception:
+        return None
+    return normalize_company_lane(meta.get("company"))
 
 
 def write_profile_meta(
@@ -856,6 +913,7 @@ def write_profile_meta(
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,
+    company: Optional[str] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -886,6 +944,14 @@ def write_profile_meta(
             existing["display_name"] = display_name.strip()
         else:
             existing.pop("display_name", None)
+    if company is not None:
+        # Empty string clears the key (the profile becomes untagged, which
+        # the Kanban lane gate treats as unknown — not as shared).
+        lane = normalize_company_lane(company)
+        if lane:
+            existing["company"] = lane
+        else:
+            existing.pop("company", None)
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).

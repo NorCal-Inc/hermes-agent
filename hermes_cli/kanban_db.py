@@ -342,6 +342,11 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     # Append-only history refusal (execution contract rule 8): a delete the
     # gate turned away is not someone working the card.
     "history_delete_refused",
+    # Company-lane refusal (execution contract rule 3). The dispatcher
+    # re-evaluates a misrouted card every tick; the record is written once
+    # per distinct conflict, but a refusal is still not someone working
+    # the card.
+    "claim_refused_tenant_conflict",
     # Supervisory alarm bookkeeping. Every one of these is written BY the
     # watchdogs that read this clock, so counting them as progress would make
     # each alarm silence its own successor: the card would look freshly touched
@@ -5064,6 +5069,136 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return PROFILE_ASSIGNEE_ALIASES.get(normalized, normalized)
 
 
+# ---------------------------------------------------------------------------
+# Company isolation at claim and dispatch (execution contract rule 3;
+# sovereignty.md; data-isolation.md).
+#
+# ``tasks.tenant`` is the task's company lane. A profile's lane is recorded in
+# its ``profile.yaml`` (``profiles.profile_company``). Until this gate the
+# ``tenant`` column scoped only which LESSONS a task received; no claim or
+# dispatch path read it to decide who may execute the task, so company
+# isolation on the board rested on routing convention and the agent's own
+# judgment (Phase 3 discovery, t_5d7052f9, verified by t_85eaad92).
+#
+# The rule, applied identically at every door (create, assign, claim, review
+# claim, dispatcher ready loop, dispatcher review loop):
+#
+#   task has no tenant              -> allowed. Every card created before this
+#                                      gate is untagged; refusing them would
+#                                      halt the board. Whether untagged cards
+#                                      should ALSO be refused is a separate
+#                                      decision (see the proposal summary).
+#   profile is in the shared lane   -> allowed on any task. Erika, the shared
+#                                      digesters and the ``default`` carrier
+#                                      for Claude Code / Codex span lanes by
+#                                      doctrine.
+#   profile is untagged             -> REFUSED on a tagged task. Unknown is
+#                                      not shared; uncertainty is forbidden.
+#   task is SHARED                  -> REFUSED for a company profile. Shared
+#                                      infrastructure routes to shared
+#                                      executors (hierarchy.md, direct-task
+#                                      chain-of-command rule).
+#   otherwise                       -> allowed only when the two lanes match.
+#
+# Refusals are recorded on the card (``execution_refused`` /
+# ``claim_refused_tenant_conflict``) so the misrouting is visible on
+# ``hermes kanban tail`` instead of silently parking the card forever.
+# ---------------------------------------------------------------------------
+
+TENANT_SHARED = "shared"
+
+
+def _normalize_lane(value: object) -> Optional[str]:
+    from hermes_cli.profiles import normalize_company_lane
+
+    return normalize_company_lane(value)
+
+
+def _profile_lane(assignee: Optional[str]) -> Optional[str]:
+    """Company lane of an assignee token; ``None`` when untagged/unknown."""
+    if assignee is None:
+        return None
+    if assignee in (EXECUTOR_LANE_CLAUDE, "atlas"):
+        # Legacy shorthand for the direct executor lanes — they ride the
+        # shared ``default`` carrier (see _normalize_shorthand_lane).
+        return TENANT_SHARED
+    # Imported inside the function so a monkeypatched
+    # ``profiles.profile_company`` is honoured at call time.
+    from hermes_cli.profiles import profile_company
+
+    try:
+        return _normalize_lane(profile_company(assignee))
+    except Exception:
+        return None
+
+
+def tenant_claim_conflict(
+    task_tenant: Optional[str], assignee: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Return a conflict record when *assignee* may not execute a task in
+    *task_tenant*, or ``None`` when the lanes are compatible.
+
+    Pure on its inputs apart from the profile-lane lookup, so every door can
+    ask the same question and get the same answer.
+    """
+    lane = _normalize_lane(task_tenant)
+    if lane is None or assignee is None:
+        return None
+    profile_lane = _profile_lane(assignee)
+    base = {
+        "assignee": assignee,
+        "task_tenant": lane,
+        "profile_company": profile_lane,
+    }
+    if profile_lane == TENANT_SHARED:
+        return None
+    if profile_lane is None:
+        return {"reason": "tenant_unknown_profile", **base}
+    if lane == TENANT_SHARED:
+        return {"reason": "shared_task_company_profile", **base}
+    if lane != profile_lane:
+        return {"reason": "tenant_mismatch", **base}
+    return None
+
+
+def _assert_assignee_in_lane(
+    task_tenant: Optional[str], assignee: Optional[str], *, context: str,
+) -> None:
+    """Raise ``ValueError`` when assigning *assignee* would cross a company lane."""
+    conflict = tenant_claim_conflict(task_tenant, assignee)
+    if conflict is None:
+        return
+    raise ValueError(
+        f"{context}: profile {assignee!r} (company lane "
+        f"{conflict['profile_company'] or 'untagged'}) may not execute a task "
+        f"in lane {conflict['task_tenant']!r} ({conflict['reason']}). One task, "
+        f"one company; uncertain scope is forbidden. Tag the profile's "
+        f"company in its profile.yaml, or route the task to a profile in that "
+        f"lane or in the shared lane."
+    )
+
+
+def _emit_unless_last_identical(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict,
+) -> bool:
+    """Append ``kind`` unless the most recent event of that kind on the card
+    already carries the same payload. One record per distinct refusal, not
+    one per dispatcher tick."""
+    last = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if last is not None and last["payload"]:
+        try:
+            if json.loads(last["payload"]) == payload:
+                return False
+        except (TypeError, ValueError):
+            pass
+    _append_event(conn, task_id, kind, payload)
+    return True
+
+
 def _assert_assignee_dispatchable(assignee: Optional[str], *, context: str) -> None:
     """Raise ``ValueError`` unless *assignee* names something that can dispatch.
 
@@ -5644,6 +5779,9 @@ def create_task(
     # and only genuinely undispatchable names are refused. An unassigned card
     # (assignee=None) is still legal — triage cards are created that way.
     _assert_assignee_dispatchable(assignee, context="cannot create task")
+    # Company isolation (rule 3): the same lane check every claim path applies,
+    # asked here while the caller is still around to be told.
+    _assert_assignee_in_lane(tenant, assignee, context="cannot create task")
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -6253,7 +6391,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee, executor_lane, "
-            "gauntlet_enforced, verification_state "
+            "gauntlet_enforced, verification_state, tenant "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6264,6 +6402,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # Company isolation (rule 3), at the assignment boundary.
+        _assert_assignee_in_lane(
+            row["tenant"], profile, context=f"cannot assign {task_id!r}",
+        )
         # Same carve-out request_review applies: on a Gauntlet subject that is
         # awaiting verification, "atlas" means "open the independent verifier
         # route", never "make the subject its own verification artifact". On
@@ -10569,6 +10711,22 @@ def claim_task(
                           {"reason": "validation_loop_missing", "detail": loop_reason,
                            "source": "claim_task"})
             return None
+        # Company isolation (rule 3): the claim is the last door before a
+        # worker runs under this profile, and the one every surface — the
+        # dispatcher, a terminal lane, manual SQL that flipped status — has
+        # to pass through. Fail closed here even if an upstream check was
+        # skipped.
+        lane_row = conn.execute(
+            "SELECT assignee, tenant FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if lane_row is not None:
+            conflict = tenant_claim_conflict(lane_row["tenant"], lane_row["assignee"])
+            if conflict is not None:
+                _append_event(
+                    conn, task_id, "execution_refused",
+                    {**conflict, "source": "claim_task"},
+                )
+                return None
         # Structural invariant: never transition ready -> running while a
         # parent dependency is unsatisfied. This is the single enforcement
         # point regardless of which writer (create_task, link_tasks,
@@ -10754,6 +10912,19 @@ def claim_review_task(
                           {"reason": "validation_loop_missing", "detail": loop_reason,
                            "source": "claim_review_task"})
             return None
+        # Company isolation (rule 3): a review claim is a claim. The reviewer
+        # profile must be in the task's lane or in the shared lane.
+        lane_row = conn.execute(
+            "SELECT assignee, tenant FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if lane_row is not None:
+            conflict = tenant_claim_conflict(lane_row["tenant"], lane_row["assignee"])
+            if conflict is not None:
+                _append_event(
+                    conn, task_id, "execution_refused",
+                    {**conflict, "source": "claim_review_task"},
+                )
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -20308,6 +20479,13 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_tenant_conflict: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks refused this tick because their assignee's company lane does not
+    match the task's ``tenant`` (rule 3). Each entry is
+    ``(task_id, assignee, reason)``. Operator-actionable: tag the profile's
+    company in its profile.yaml or route the card to a profile in its lane.
+    A ``claim_refused_tenant_conflict`` event is recorded on the card once per
+    distinct conflict, not once per tick."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -23133,7 +23311,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, executor_lane FROM tasks "
+        "SELECT id, assignee, executor_lane, tenant FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         # Irreversible disposition = never dispatch again. claim_task
         # enforces this too; filtering here as well keeps a disposed card out
@@ -23147,7 +23325,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, tenant FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             f"AND {_not_irreversibly_disposed_sql()} "
             "ORDER BY priority DESC, created_at ASC"
@@ -23360,6 +23538,24 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Company isolation (rule 3): never spend a spawn slot on a claim
+        # ``claim_task`` is certain to refuse. Checked here as well as there
+        # so the refusal is visible in the tick result and recorded on the
+        # card once per distinct conflict rather than once per tick.
+        _lane_conflict = tenant_claim_conflict(
+            row["tenant"] if "tenant" in row.keys() else None, row_assignee,
+        )
+        if _lane_conflict is not None:
+            result.skipped_tenant_conflict.append(
+                (row["id"], row_assignee, _lane_conflict["reason"])
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _emit_unless_last_identical(
+                        conn, row["id"], "claim_refused_tenant_conflict",
+                        {**_lane_conflict, "source": "dispatch"},
+                    )
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -23507,6 +23703,21 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Company isolation (rule 3) — same check as the ready loop.
+        _lane_conflict = tenant_claim_conflict(
+            row["tenant"] if "tenant" in row.keys() else None, row["assignee"],
+        )
+        if _lane_conflict is not None:
+            result.skipped_tenant_conflict.append(
+                (row["id"], row["assignee"], _lane_conflict["reason"])
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _emit_unless_last_identical(
+                        conn, row["id"], "claim_refused_tenant_conflict",
+                        {**_lane_conflict, "source": "review_dispatch"},
+                    )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
