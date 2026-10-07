@@ -834,6 +834,8 @@ class TestTheDatabaseEnforcesTheInvariants:
             doomed_timer = kb.arm_observation_timer(conn, doomed, now=T0)
             kb.emit_observation_tick(conn, doomed_timer.id, now=T0 + 300)
 
+            # Append-only history: a card is purged only once archived.
+            assert kb.archive_task(conn, doomed) is True
             assert kb.delete_task(conn, doomed) is True
 
             assert kb.get_observation_timer(conn, doomed_timer.id) is None
@@ -1360,6 +1362,8 @@ class TestTheRawSQLHolesFoundByReview:
             doomed = _task(conn, "to be deleted")
             timer = kb.arm_observation_timer(conn, doomed, now=T0)
             kb.emit_observation_tick(conn, timer.id, now=T0 + 300)
+            # Append-only history: a card is purged only once archived.
+            assert kb.archive_task(conn, doomed) is True
             assert kb.delete_task(conn, doomed) is True
             assert kb.get_observation_timer(conn, timer.id) is None
             assert conn.execute(

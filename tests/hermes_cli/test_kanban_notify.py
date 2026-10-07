@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -1492,7 +1493,7 @@ def _make_done_task_with_sub(kb, conn, *, title, chat_id):
 def _backdate_task(kb, conn, tid, *, days):
     """Push a task's entire event history + completion into the past."""
     past = int(__import__("time").time()) - days * 86400
-    with kb.write_txn(conn):
+    with kb.write_txn(conn), rewrite_task_history(conn):
         conn.execute(
             "UPDATE task_events SET created_at = ? WHERE task_id = ?",
             (past, tid),

@@ -10,6 +10,7 @@ from hermes_cli.execution_effects import (
     mark_applied,
     prepare_effect,
 )
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
 
@@ -235,7 +236,8 @@ os._exit(17)
     # Make the run immediately eligible for crash detection and supply the
     # process exit status the dispatcher normally receives from its reap pass.
     conn.execute("UPDATE tasks SET started_at=started_at-9999 WHERE id=?", (tid,))
-    conn.execute("UPDATE task_runs SET started_at=started_at-9999 WHERE id=?", (run_id,))
+    with rewrite_task_history(conn):
+        conn.execute("UPDATE task_runs SET started_at=started_at-9999 WHERE id=?", (run_id,))
     conn.commit()
     kb._record_worker_exit(child.pid, rc << 8)
 

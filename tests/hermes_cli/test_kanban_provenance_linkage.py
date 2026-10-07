@@ -642,6 +642,8 @@ class TestRelationApiGuards:
                 owner="erika",
                 umbrella_id=umbrella,
             )
+            # Append-only history: a card is purged only once archived.
+            assert kb.archive_task(conn, repair) is True
             assert kb.delete_task(conn, repair) is True
             assert conn.execute(
                 "SELECT COUNT(*) AS n FROM task_relations"

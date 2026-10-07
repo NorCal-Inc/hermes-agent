@@ -292,16 +292,22 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             # Backdate both the task-level first-start timestamp and the active
             # run timestamp so elapsed > limit under the per-run runtime model.
             old_started = int(time.time()) - 30
+            # Fixture-only rewrite of a run's start time. Task history is
+            # append-only (trg_task_runs_identity_immutable refuses exactly
+            # this UPDATE), so suspend that trigger for the backdate and
+            # reinstall it before the code under test runs.
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE tasks SET started_at = ? WHERE id = ?",
                     (old_started, tid),
                 )
+                conn.execute("DROP TRIGGER trg_task_runs_identity_immutable")
                 conn.execute(
                     "UPDATE task_runs SET started_at = ? "
                     "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                     (old_started, tid),
                 )
+            kb._ensure_task_history_append_only(conn)
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
@@ -478,12 +484,18 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
         # Simulate legacy: set running + claim_lock directly, leave
         # current_run_id NULL and delete the run row the claim created.
         kb.claim_task(conn, tid)
+        # Fixture-only deletion of a run row to fake a pre-task_runs board.
+        # Task history is append-only (trg_task_runs_no_delete_while_task_lives
+        # refuses this DELETE), so suspend that trigger for the setup and
+        # reinstall it before the migration under test runs.
         with kb.write_txn(conn):
+            conn.execute("DROP TRIGGER trg_task_runs_no_delete_while_task_lives")
             conn.execute("DELETE FROM task_runs WHERE task_id = ?", (tid,))
             conn.execute(
                 "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
                 (tid,),
             )
+        kb._ensure_task_history_append_only(conn)
 
         # Sanity: no runs, no pointer.
         assert kb.list_runs(conn, tid) == []

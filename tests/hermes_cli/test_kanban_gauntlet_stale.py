@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 
 
@@ -98,10 +99,11 @@ def _age(conn, tid, seconds: int) -> None:
         "WHERE id = ?",
         (seconds, seconds, tid),
     )
-    conn.execute(
-        "UPDATE task_events SET created_at = created_at - ? WHERE task_id = ?",
-        (seconds, tid),
-    )
+    with rewrite_task_history(conn):
+        conn.execute(
+            "UPDATE task_events SET created_at = created_at - ? WHERE task_id = ?",
+            (seconds, tid),
+        )
     conn.commit()
 
 

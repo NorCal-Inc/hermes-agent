@@ -18,6 +18,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 
 # D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
@@ -170,7 +171,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
         reason="Correct the implementation.",
         expected_run_id=review.current_run_id,
     ) == (True, "builder")
-    with kb.write_txn(conn):
+    with kb.write_txn(conn), rewrite_task_history(conn):
         if bad_payload is None:
             conn.execute(
                 "DELETE FROM task_events "
@@ -295,11 +296,12 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
         summary="Ready.",
         expected_run_id=implementation.current_run_id,
     )
-    conn.execute(
-        "UPDATE task_events SET payload = ? "
-        "WHERE task_id = ? AND kind = 'review_requested'",
-        (bad_payload, task_id),
-    )
+    with rewrite_task_history(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND kind = 'review_requested'",
+            (bad_payload, task_id),
+        )
     conn.commit()
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
@@ -321,7 +323,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
 
 def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
     task_id, _review = _claimed_review(conn, "Non-object claimed payload")
-    with kb.write_txn(conn):
+    with kb.write_txn(conn), rewrite_task_history(conn):
         conn.execute(
             "UPDATE task_events SET payload = '[]' "
             "WHERE task_id = ? AND kind = 'claimed' "
@@ -372,10 +374,11 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "WHERE id = ?",
                 (old, task_id),
             )
-            conn.execute(
-                "UPDATE task_runs SET started_at = ? WHERE id = ?",
-                (old, review.current_run_id),
-            )
+            with rewrite_task_history(conn):
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                    (old, review.current_run_id),
+                )
         assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
 
     retried = kb.get_task(conn, task_id)
@@ -481,10 +484,11 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
             "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
             (999_998, old, timed_out_id),
         )
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_998, old, timed_out_run.current_run_id),
-        )
+        with rewrite_task_history(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
+                (999_998, old, timed_out_run.current_run_id),
+            )
     assert timed_out_id in kb.enforce_max_runtime(conn, signal_fn=lambda *_: None)
     timed_out = kb.get_task(conn, timed_out_id)
     assert timed_out is not None
@@ -496,10 +500,11 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
             "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
             (999_999, old, crashed_id),
         )
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
-            (999_999, old, crashed_run.current_run_id),
-        )
+        with rewrite_task_history(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
+                (999_999, old, crashed_run.current_run_id),
+            )
     assert crashed_id in kb.detect_crashed_workers(conn)
     crashed = kb.get_task(conn, crashed_id)
     assert crashed is not None

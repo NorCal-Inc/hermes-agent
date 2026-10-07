@@ -61,6 +61,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 
 # D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
@@ -958,7 +959,7 @@ def _legacy_parked_subject(conn, *, assignee="erika"):
     tid = _subject_awaiting_verification(conn, assignee=assignee)
     cid = kb._open_verifier_child(conn, tid)
     assert cid is not None
-    with kb.write_txn(conn):
+    with kb.write_txn(conn), rewrite_task_history(conn):
         conn.execute("DELETE FROM task_links WHERE child_id = ?", (cid,))
         conn.execute("DELETE FROM tasks WHERE id = ?", (cid,))
         conn.execute(

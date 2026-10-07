@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 
 # D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
@@ -110,9 +111,10 @@ def test_genuine_crash_still_reclaims(conn):
     kb._set_worker_pid(conn, tid, dead.pid)
     # Rewind started_at so the launch grace window doesn't skip the check.
     conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (tid,))
-    conn.execute(
-        "UPDATE task_runs SET started_at = started_at - 9999 WHERE task_id=?", (tid,)
-    )
+    with rewrite_task_history(conn):
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - 9999 WHERE task_id=?", (tid,)
+        )
     conn.commit()
     kb._record_worker_exit(dead.pid, 1 << 8)  # nonzero exit → crash
 

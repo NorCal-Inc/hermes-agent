@@ -45,6 +45,7 @@ import pytest
 
 from hermes_cli import exec_supervisor as ex
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 from hermes_cli import recovery_lane as rl
 
 
@@ -691,11 +692,12 @@ class TestBoardLevelLiveness:
         try:
             with kb.connect_closing() as conn:
                 tid = _running_card(conn, workroot, pid=proc.pid)
-                conn.execute(
-                    "UPDATE task_runs SET started_at = started_at - 7200 "
-                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                    (tid,),
-                )
+                with rewrite_task_history(conn):
+                    conn.execute(
+                        "UPDATE task_runs SET started_at = started_at - 7200 "
+                        "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                        (tid,),
+                    )
                 conn.commit()
 
                 reclaimed = kb.detect_stale_running(
@@ -728,11 +730,12 @@ class TestBoardLevelLiveness:
         assert _wait_gone(proc.pid)
         with kb.connect_closing() as conn:
             tid = _running_card(conn, workroot, pid=proc.pid)
-            conn.execute(
-                "UPDATE task_runs SET started_at = started_at - 7200 "
-                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (tid,),
-            )
+            with rewrite_task_history(conn):
+                conn.execute(
+                    "UPDATE task_runs SET started_at = started_at - 7200 "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (tid,),
+                )
             conn.commit()
             reclaimed = kb.detect_stale_running(conn, stale_timeout_seconds=3600)
             task = kb.get_task(conn, tid)

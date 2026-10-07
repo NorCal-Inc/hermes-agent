@@ -1538,7 +1538,20 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     try:
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            # Task history is append-only: only an archived card can be
+            # purged. Distinguish "no such card" from "card exists, archive
+            # it first" so the dashboard can show the actionable message.
+            current = kanban_db.get_task(conn, task_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"task {task_id} is {current.status!r}; archive it before "
+                    "deleting (task history is append-only until the card "
+                    "is archived)"
+                ),
+            )
         return {"deleted": True, "task_id": task_id}
     finally:
         conn.close()

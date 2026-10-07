@@ -42,6 +42,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 
 @pytest.fixture
@@ -443,10 +444,11 @@ class TestIndependenceAgainstAssignee:
                 ).fetchone()
                 payload = json.loads(row["payload"])
                 payload["implementer"] = "bob"
-                conn.execute(
-                    "UPDATE task_events SET payload = ? WHERE id = ?",
-                    (json.dumps(payload), row["id"]),
-                )
+                with rewrite_task_history(conn):
+                    conn.execute(
+                        "UPDATE task_events SET payload = ? WHERE id = ?",
+                        (json.dumps(payload), row["id"]),
+                    )
             assert kb.get_task(conn, tid).assignee == "alice"
 
             ok, detail = kb.record_verification(
@@ -471,10 +473,11 @@ class TestIndependenceAgainstAssignee:
                 ).fetchone()
                 payload = json.loads(row["payload"])
                 payload["implementer"] = "bob"
-                conn.execute(
-                    "UPDATE task_events SET payload = ? WHERE id = ?",
-                    (json.dumps(payload), row["id"]),
-                )
+                with rewrite_task_history(conn):
+                    conn.execute(
+                        "UPDATE task_events SET payload = ? WHERE id = ?",
+                        (json.dumps(payload), row["id"]),
+                    )
             kb.record_verification(conn, tid, passed=True, verifier="alice")
             blocked = _events(conn, tid, "verification_blocked_self_review")
             assert blocked, "refusal must leave the durable event the board reads"

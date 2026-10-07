@@ -339,6 +339,9 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     # something really happened to the card.
     "execution_refused",
     "execution_reconcile_failed",
+    # Append-only history refusal (execution contract rule 8): a delete the
+    # gate turned away is not someone working the card.
+    "history_delete_refused",
     # Supervisory alarm bookkeeping. Every one of these is written BY the
     # watchdogs that read this clock, so counting them as progress would make
     # each alarm silence its own successor: the card would look freshly touched
@@ -4603,6 +4606,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ("priority",           "reprioritized"),
         ("spawn_auto_blocked", "gave_up"),
     )
+    # The rename is the one sanctioned rewrite of a task_events row, and it
+    # runs inside schema init only. The append-only trigger below would
+    # refuse it on a legacy board that still carries old kinds, so suspend
+    # that single trigger for the rename and let the ensure pass at the end
+    # of this function reinstate it.
+    conn.execute("DROP TRIGGER IF EXISTS trg_task_events_append_only_update")
     for old, new in _EVENT_RENAMES:
         conn.execute(
             "UPDATE task_events SET kind = ? WHERE kind = ?",
@@ -4616,6 +4625,119 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # while the connection is open and already inside the schema-init lock.
     from hermes_cli.execution_effects import ensure_effect_schema
     ensure_effect_schema(conn, commit=False)
+
+    # LAST, after every rebuild above: ``_rebuild_drifted_tables`` drops and
+    # recreates the history tables, which takes their triggers with them.
+    _ensure_task_history_append_only(conn)
+
+
+# ---------------------------------------------------------------------------
+# Task history is append-only (operations.md "Five-minute Gauntlet execution
+# and supervision ceiling": prior runs, evidence, verifier results, comments
+# and failure history are never deleted or rewritten; execution-honesty.md
+# "An agent's own violation record is append-only task history").
+#
+# Enforced at the storage layer, not in the write paths, for the same reason
+# the observation-timer triggers are: a convention is only as strong as the
+# next caller's memory of it. ``delete_task`` hard-deleted a live card's
+# comments, events and runs with no status check at all until this pass
+# (found by independent verifier t_85eaad92 on 2026-10-06), and nothing in
+# the schema would have noticed a direct ``UPDATE task_comments``.
+#
+# What the triggers say:
+#   * a comment is never edited;
+#   * an event is never edited (the one-shot kind rename in
+#     ``_migrate_add_optional_columns`` suspends this trigger for itself);
+#   * a run's identity (which task, when it started) is never edited —
+#     its lifecycle columns (status, outcome, ended_at, claim fields,
+#     summary, metadata, error) still change, because ending a run is how
+#     history gets written, not how it gets rewritten;
+#   * no comment, event or run row is deleted while its card is still on
+#     the board. The only way history leaves the database is as the cascade
+#     of its own card's purge, after that card has been archived and then
+#     explicitly deleted — and the delete paths below delete the card row
+#     FIRST so the cascade is the one DELETE these triggers let through.
+#
+# ``CREATE TRIGGER IF NOT EXISTS`` rather than SCHEMA_SQL so existing boards
+# pick the rule up on their next init, which is where the live rows are.
+# ---------------------------------------------------------------------------
+
+TASK_HISTORY_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS trg_task_comments_append_only_update
+BEFORE UPDATE ON task_comments
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'task history is append-only: comments cannot be edited');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_task_comments_no_delete_while_task_lives
+BEFORE DELETE ON task_comments
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'task history is append-only: comments cannot be deleted while their task exists');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_task_events_append_only_update
+BEFORE UPDATE ON task_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'task history is append-only: events cannot be edited');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_task_events_no_delete_while_task_lives
+BEFORE DELETE ON task_events
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'task history is append-only: events cannot be deleted while their task exists');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_task_runs_identity_immutable
+BEFORE UPDATE OF task_id, started_at ON task_runs
+FOR EACH ROW WHEN NEW.task_id IS NOT OLD.task_id
+               OR NEW.started_at IS NOT OLD.started_at
+BEGIN
+    SELECT RAISE(ABORT, 'task history is append-only: a run cannot be re-homed or re-dated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_task_runs_no_delete_while_task_lives
+BEFORE DELETE ON task_runs
+FOR EACH ROW WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'task history is append-only: runs cannot be deleted while their task exists');
+END;
+"""
+
+TASK_HISTORY_TRIGGER_NAMES: tuple[str, ...] = (
+    "trg_task_comments_append_only_update",
+    "trg_task_comments_no_delete_while_task_lives",
+    "trg_task_events_append_only_update",
+    "trg_task_events_no_delete_while_task_lives",
+    "trg_task_runs_identity_immutable",
+    "trg_task_runs_no_delete_while_task_lives",
+)
+
+
+def _ensure_task_history_append_only(conn: sqlite3.Connection) -> None:
+    """Install the append-only history triggers (idempotent).
+
+    Each trigger is created only when its table exists: the migration pass
+    is also run directly against partial legacy databases (tests do this,
+    and so does ``hermes kanban repair`` on a damaged board), and a trigger
+    on a missing table is a hard error rather than a no-op.
+    """
+    present = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('task_comments', 'task_events', 'task_runs')"
+        )
+    }
+    for statement in TASK_HISTORY_TRIGGERS_SQL.split("END;"):
+        statement = statement.strip()
+        if not statement:
+            continue
+        table = statement.split(" ON ", 1)[1].split()[0]
+        if table in present:
+            conn.execute(statement + "\nEND;")
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -19647,64 +19769,90 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row or row["status"] != "archived":
-            return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        )
-        # Governance relations cascade with the row for the same reason the
-        # dependency links do: a relation whose endpoint no longer exists is
-        # not evidence, it is a dangling pointer that makes the linkage
-        # read-back report a link the board cannot honour.
-        conn.execute(
-            "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        # Timers cascade AFTER the card row, not before it, because
-        # ``trg_obs_timer_no_delete_while_task_lives`` refuses to let a timer be
-        # deleted while its subject is still on the board. ``delete_task``
-        # already had this order; this path did not, and the trigger is what
-        # makes the difference load-bearing instead of stylistic.
-        _delete_observation_timers_for_task(conn, task_id)
-        return cur.rowcount == 1
+        return _purge_archived_task_locked(conn, task_id)
+
+
+def _purge_archived_task_locked(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Shared cascade for both delete paths. Caller holds ``write_txn``.
+
+    The card row goes FIRST. The append-only history triggers
+    (``trg_task_*_no_delete_while_task_lives``) refuse to delete a comment,
+    event or run while its card still exists, and
+    ``trg_obs_timer_no_delete_while_task_lives`` says the same for timers.
+    Deleting the card first — and only when it is ``archived`` — is what
+    turns every DELETE below into the one cascade the triggers permit.
+
+    The status check is in the DELETE's WHERE clause, not a prior SELECT,
+    so a card un-archived between the two cannot be purged by a stale read.
+    """
+    cur = conn.execute(
+        "DELETE FROM tasks WHERE id = ? AND status = 'archived'",
+        (task_id,),
+    )
+    if cur.rowcount != 1:
+        return False
+    conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (task_id, task_id),
+    )
+    # Governance relations cascade with the row for the same reason the
+    # dependency links do: a relation whose endpoint no longer exists is
+    # not evidence, it is a dangling pointer that makes the linkage
+    # read-back report a link the board cannot honour.
+    conn.execute(
+        "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
+        (task_id, task_id),
+    )
+    conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+    # Timers cascade AFTER the card row, not before it, because
+    # ``trg_obs_timer_no_delete_while_task_lives`` refuses to let a timer be
+    # deleted while its subject is still on the board.
+    _delete_observation_timers_for_task(conn, task_id)
+    return True
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and cascade to all related rows.
+    """Hard-delete an ARCHIVED task and cascade to all related rows.
+
+    Same precondition as :func:`delete_archived_task`, and the same cascade.
+    Until this gate the two paths differed in exactly one way: this one had
+    no status check, so a dashboard ``DELETE /tasks/{id}`` could erase a
+    live card's comments, events and runs — including any entry recording
+    an agent's own violation — in one call. Task history is append-only
+    (operations.md; execution-honesty.md 1.5); a card has to be archived,
+    a visible and reversible step, before its history can be purged.
+
+    Returns ``True`` if the task was archived and has been deleted. Returns
+    ``False`` if the task was not found OR is not archived; in the latter
+    case a ``history_delete_refused`` event is appended to the card so the
+    attempt itself is on the record.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
-
-    Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    the cascade is explicit and runs in a single ``write_txn``.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute(
-            "DELETE FROM task_relations WHERE from_task_id = ? OR to_task_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        _delete_observation_timers_for_task(conn, task_id)
-    recompute_ready(conn)
-    return True
+        if _purge_archived_task_locked(conn, task_id):
+            purged = True
+        else:
+            purged = False
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is not None:
+                _append_event(
+                    conn, task_id, "history_delete_refused",
+                    {
+                        "reason": "task_not_archived",
+                        "status": row["status"],
+                        "source": "delete_task",
+                    },
+                )
+    if purged:
+        recompute_ready(conn)
+    return purged
 
 
 # ---------------------------------------------------------------------------
@@ -25313,15 +25461,23 @@ def rewind_notify_cursor(
 def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
-    """Delete task_events rows older than ``older_than_seconds`` for tasks
-    in a terminal state (``done`` or ``archived``). Returns the number of
-    rows deleted. Running / ready / blocked tasks keep their full event
-    history."""
+    """Delete ORPHANED task_events rows older than ``older_than_seconds`` —
+    rows whose task no longer exists on the board. Returns the number of
+    rows deleted.
+
+    This used to also delete aged events of ``done`` / ``archived`` tasks.
+    It no longer does: task history is append-only for as long as the card
+    exists (operations.md "prior runs, evidence, verifier results, comments,
+    and failure history are never deleted or rewritten"), and the
+    ``trg_task_events_no_delete_while_task_lives`` trigger would refuse the
+    old statement row by row. The retention knob now only reaps rows left
+    behind by purges that pre-date the cascade (200 such rows were on the
+    live board on 2026-10-07)."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "DELETE FROM task_events WHERE created_at < ? "
+            "AND task_id NOT IN (SELECT id FROM tasks)",
             (cutoff,),
         )
     return int(cur.rowcount or 0)

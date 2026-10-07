@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
 
@@ -398,7 +399,8 @@ def _break_run_closed(conn, tid, child, run):
 def _break_run_from_earlier_phase(conn, tid, child, run):
     phase = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'review_requested'",
                          (tid,)).fetchone()[0]
-    conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (phase - 10, run))
+    with rewrite_task_history(conn):
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (phase - 10, run))
 
 
 def _break_child_not_running(conn, tid, child, run):

@@ -36,6 +36,7 @@ import pytest
 
 from hermes_cli import exec_supervisor as ex
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 from hermes_cli import recovery_lane as rl
 
 
@@ -461,11 +462,12 @@ class TestRetryBudget:
                     "started_at = started_at - 600 WHERE id = ?",
                     (proc.pid, tid),
                 )
-                conn.execute(
-                    "UPDATE task_runs SET started_at = started_at - 600 "
-                    "WHERE task_id = ?",
-                    (tid,),
-                )
+                with rewrite_task_history(conn):
+                    conn.execute(
+                        "UPDATE task_runs SET started_at = started_at - 600 "
+                        "WHERE task_id = ?",
+                        (tid,),
+                    )
                 conn.commit()
 
                 timed_out = kb.enforce_max_runtime(

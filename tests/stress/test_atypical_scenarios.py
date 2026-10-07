@@ -497,12 +497,15 @@ def _(home, kb):
     try:
         tid = kb.create_task(conn, title="time-travel", assignee="w")
         kb.claim_task(conn, tid)
-        # Force a future started_at via raw SQL
+        # Force a future started_at via raw SQL. Task history is append-only
+        # at the storage layer, so the fixture rewrite says so explicitly.
+        from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
         future = int(time.time()) + 3600
-        conn.execute(
-            "UPDATE task_runs SET started_at = ? WHERE task_id = ?",
-            (future, tid),
-        )
+        with rewrite_task_history(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE task_id = ?",
+                (future, tid),
+            )
         conn.commit()
         # Complete normally — ended_at will be now, < started_at
         kb.complete_task(conn, tid, summary="time-skewed")

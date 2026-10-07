@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 
 # D8 (defect packet t_db0af7e0): every path that writes ``tasks.assignee``
@@ -252,7 +253,7 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
         ) == (True, "builder")
         # Corrupt the changes_requested payload so re-review cannot recover
         # the prior reviewer.
-        with kb.write_txn(conn):
+        with kb.write_txn(conn), rewrite_task_history(conn):
             conn.execute(
                 "UPDATE task_events SET payload = '{\"reviewer\": 42}' "
                 "WHERE task_id = ? AND kind = 'changes_requested'",

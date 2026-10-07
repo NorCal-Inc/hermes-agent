@@ -469,8 +469,34 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
+def test_delete_task_refuses_unarchived_card(client):
+    """Task history is append-only: a live card cannot be hard-deleted.
+
+    The dashboard DELETE used to be the one path that erased a card's
+    comments, events and runs with no status check (verifier t_85eaad92,
+    2026-10-06). It now answers 409 with an actionable message and leaves
+    the card and its history exactly as they were.
+    """
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    client.post(f"/api/plugins/kanban/tasks/{t['id']}/comments", json={"body": "keep me"})
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 409
+    assert "archive" in r.json()["detail"]
+    # Still on the board, comment intact.
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 200
+    with kb.connect() as conn:
+        assert [c.body for c in kb.list_comments(conn, t["id"])] == ["keep me"]
+    # A card that does not exist is still a 404, not a 409.
+    r = client.delete("/api/plugins/kanban/tasks/t_doesnotexist")
+    assert r.status_code == 404
+
+
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    # Append-only history: archive first (a visible, reversible step), then purge.
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"})
+    assert r.status_code == 200
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
     assert r.json()["deleted"] is True
@@ -823,6 +849,11 @@ def test_dashboard_confirm_dispatches_expected_delete(client):
     """
     t = client.post("/api/plugins/kanban/tasks",
                     json={"title": "x"}).json()["task"]
+    # Task history is append-only: the card must be archived before the
+    # confirm's DELETE can succeed (an unarchived card answers 409, and the
+    # bundle surfaces that ``detail`` inline exactly as #26744 requires).
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"})
+    assert r.status_code == 200, r.text
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200, r.text
     # 404 on the now-deleted task confirms removal.

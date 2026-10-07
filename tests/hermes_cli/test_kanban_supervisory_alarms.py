@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.hermes_cli.kanban_history_rewrite import rewrite_task_history
 
 
 @pytest.fixture
@@ -532,10 +533,11 @@ def _park_stale(conn, *, age: int, now: int, status: str = "review") -> str:
             "created_at = ?, started_at = ? WHERE id = ?",
             (status, kb.VERIFICATION_PENDING, now - age, now - age, tid),
         )
-        conn.execute(
-            "UPDATE task_events SET created_at = ? WHERE task_id = ?",
-            (now - age, tid),
-        )
+        with rewrite_task_history(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                (now - age, tid),
+            )
     return tid
 
 
@@ -1518,10 +1520,11 @@ class TestStaleDispositionActuator:
             with kb.write_txn(conn):
                 kb._append_event(conn, subject, "commented", {"author":"test","len":1})
                 later = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-                conn.execute(
-                    "UPDATE task_events SET created_at=? WHERE id=?",
-                    (int(rel_event["created_at"]), int(later)),
-                )
+                with rewrite_task_history(conn):
+                    conn.execute(
+                        "UPDATE task_events SET created_at=? WHERE id=?",
+                        (int(rel_event["created_at"]), int(later)),
+                    )
             entry = kb.GauntletStaleTask(
                 task_id=subject,
                 status="blocked",
