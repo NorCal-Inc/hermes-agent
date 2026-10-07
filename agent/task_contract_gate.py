@@ -23,7 +23,9 @@ half-formed environment could keep mutating the world under a dead contract.
 What this gate does NOT do: it does not touch interactive sessions (no
 ``HERMES_KANBAN_TASK`` → not a governed executor → no change), delegated
 children or in-process cron jobs (``is_dispatcher_owned_worker_context`` is
-False), or read-only tools. Rule 2: the board is re-read on every mutating call (one primary-key SELECT),
+False), or read-only tools. Board-mutating ``kanban_*`` tools are gated the
+same way as filesystem/terminal tools (see ``BOARD_MUTATING_KANBAN_TOOLS``);
+read-only ``kanban_*`` tools are not. Rule 2: the board is re-read on every mutating call (one primary-key SELECT),
 so a cancellation, reclaim, or claim expiry that lands mid-run stops the very
 next outside state change instead of being discovered at the next heartbeat.
 This is the mechanical form of operations.md "Owner cancellation and
@@ -54,6 +56,46 @@ def _mutating_tool_names() -> frozenset:
         return MUTATING_TOOL_NAMES
     except Exception:  # pragma: no cover - defensive import guard
         return frozenset({"terminal", "execute_code", "write_file", "patch"})
+
+
+# Kanban tools that write to the board (tasks, runs, comments, links,
+# attachments, lessons). The board is outside state exactly like the
+# filesystem is, so a worker under a dead contract may not touch it either
+# (Phase 4 finding 2, t_e8eb2485). Kept separate from the guardrail
+# ``MUTATING_TOOL_NAMES`` on purpose: that set has other consumers (loop
+# detection, idempotency) and must not change shape for this gate.
+#
+# Read-only kanban tools (``kanban_show``, ``kanban_list``,
+# ``kanban_attachments``, ``kanban_lessons``) are intentionally absent: a
+# worker whose contract has died may still look at the board to find out why.
+#
+# ``kanban_heartbeat`` IS gated. A live claim passes the gate, so a healthy
+# worker's explicit heartbeat is unaffected; the automatic claim keepalive
+# (``tools.kanban_tools.heartbeat_current_worker_from_env``) writes through
+# ``kanban_db`` directly, never through tool dispatch, so it is unaffected too.
+# What the gate stops is a worker whose claim has already expired or been
+# reclaimed re-arming ``claim_expires`` on a task the dispatcher now owns.
+BOARD_MUTATING_KANBAN_TOOLS = frozenset(
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_request_review",
+        "kanban_request_changes",
+        "kanban_heartbeat",
+        "kanban_comment",
+        "kanban_create",
+        "kanban_link",
+        "kanban_attach",
+        "kanban_attach_url",
+        "kanban_promote_lesson",
+        "kanban_retire_lesson",
+    }
+)
+
+
+def _is_gated_tool(tool_name: str) -> bool:
+    return tool_name in _mutating_tool_names() or tool_name in BOARD_MUTATING_KANBAN_TOOLS
 
 
 @dataclass(frozen=True)
@@ -143,14 +185,16 @@ _LAST_REFUSAL: dict = {}
 def task_contract_refusal(tool_name: str, *, environ=None) -> Optional[str]:
     """Rules 1 + 2 entry point for the tool dispatcher.
 
-    Returns None (allow) for: non-mutating tools; processes that are not
-    Kanban workers; delegated/non-dispatcher-owned contexts. Otherwise the
+    Returns None (allow) for: non-mutating tools (including read-only kanban
+    tools); processes that are not Kanban workers; delegated/non-dispatcher-
+    owned contexts. Gated tools are the guardrail ``MUTATING_TOOL_NAMES`` plus
+    ``BOARD_MUTATING_KANBAN_TOOLS``. Otherwise the
     board is read LIVE on this call (no cache) and the refusal text is returned
     when the contract is missing, incomplete, or no longer active. A refusal is
     logged once per distinct reason to keep a tight tool loop from flooding
     the log; the refusal itself is returned every time.
     """
-    if tool_name not in _mutating_tool_names():
+    if not _is_gated_tool(tool_name):
         return None
     contract = read_task_contract(environ)
     if contract is None:
