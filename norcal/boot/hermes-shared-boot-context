@@ -584,6 +584,15 @@ if st_rc != 0:
     blockers.append(f"skill supply-chain gate failed rc={st_rc}: {skill_trust or 'no verifier output'}")
     skill_trust = skill_trust or "SKILL TRUST: FAIL — verifier returned no output"
 
+# Rule 6 step 1 (approved 2026-10-07): the production-roles registry is pinned by sha256 in
+# its verifier and ships with no profiles. Report-only — nothing authorizes on it yet — but a
+# missing, unparseable or drifted registry fails closed as a boot BLOCKER.
+production_roles, pr_rc = run([str(HERMES / "security/production-roles/verify.py")], timeout=20)
+if pr_rc != 0:
+    blockers.append(f"production-roles registry gate failed rc={pr_rc}: {production_roles or 'no verifier output'}")
+    if not production_roles.startswith("PRODUCTION ROLES:"):
+        production_roles = f"PRODUCTION ROLES: FAIL rc={pr_rc} — {production_roles or 'verifier returned no output'}"
+
 # Runtime identity without reading secrets.
 def pyproject_version(root: Path) -> str:
     p = root / "pyproject.toml"
@@ -666,6 +675,9 @@ NON-BLOCKING WARNINGS:
 
 SKILL / PLUGIN SUPPLY-CHAIN GATE:
 {skill_trust}
+
+PRODUCTION ROLES REGISTRY (rule 6 step 1; pinned, report-only, no roles assigned):
+{production_roles}
 
 LOCAL VAULT GIT STATE:
 {vault_status or '(clean/no output)'}

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "schema": "norcal.production-roles.v1",
+  "mode": "report-only",
+  "approved": "2026-10-07 Christopher: rule 6 design 1C / 2B pinned registry / 3A; report-only first",
+  "notes": [
+    "Erika may permit only roles that already exist in this registry; she cannot add roles.",
+    "christopher_only roles are never assignable to a profile. Live money and Locked surfaces (firewall, ports, service units) stay Christopher-only.",
+    "Ships EMPTY: no profile holds any production role until Christopher approves an entry and the pin in verify.py is re-attested."
+  ],
+  "roles": {
+    "stripe_live": {"christopher_only": true, "profiles": []},
+    "deploy": {"christopher_only": false, "profiles": []},
+    "dns": {"christopher_only": false, "profiles": []},
+    "firewall": {"christopher_only": true, "profiles": []},
+    "ports": {"christopher_only": true, "profiles": []},
+    "service_units": {"christopher_only": true, "profiles": []}
+  }
+}
