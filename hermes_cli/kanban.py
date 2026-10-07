@@ -2638,9 +2638,24 @@ def _cmd_attachments(args: argparse.Namespace) -> int:
 
 
 def _cmd_attach_rm(args: argparse.Namespace) -> int:
-    """Delete an attachment by id (removes the row and the on-disk blob)."""
+    """Delete an attachment by id (removes the row and the on-disk blob).
+
+    Refused unless the owning card is archived: attachments are evidence
+    and task history is append-only until the card is archived (rule 8).
+    """
     with kb.connect_closing() as conn:
-        removed = kb.delete_attachment(conn, args.attachment_id)
+        try:
+            removed = kb.delete_attachment(conn, args.attachment_id)
+        except kb.AttachmentDeleteRefused as exc:
+            print(
+                f"kanban: refused to delete attachment {args.attachment_id} "
+                f"({exc.attachment.filename}): task {exc.attachment.task_id} is "
+                f"{exc.status!r}; archive the card first "
+                f"(hermes kanban archive {exc.attachment.task_id}). Task history, "
+                "including attachments, is append-only until the card is archived.",
+                file=sys.stderr,
+            )
+            return 1
     if removed is None:
         print(f"no such attachment: {args.attachment_id}", file=sys.stderr)
         return 1

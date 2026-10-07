@@ -1278,7 +1278,13 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        att = kanban_db.delete_attachment(conn, attachment_id)
+        try:
+            att = kanban_db.delete_attachment(conn, attachment_id)
+        except kanban_db.AttachmentDeleteRefused as e:
+            # Attachments are append-only task history until the card is
+            # archived (rule 8) — same 409 the task DELETE answers for a
+            # live card, so the dashboard can show the actionable message.
+            raise HTTPException(status_code=409, detail=str(e))
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}

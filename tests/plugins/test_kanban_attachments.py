@@ -101,11 +101,14 @@ def test_add_list_get_delete_attachment(kanban_home, tmp_path):
         got = kb.get_attachment(conn, att_id)
         assert got is not None and got.id == att_id
 
+        # Attachments are append-only history until the card is archived.
+        assert kb.archive_task(conn, task_id)
         removed = kb.delete_attachment(conn, att_id)
         assert removed is not None and removed.id == att_id
         assert kb.list_attachments(conn, task_id) == []
         assert not blob.exists(), "delete should unlink the on-disk blob"
         assert kb.get_attachment(conn, att_id) is None
+        assert [e.kind for e in kb.list_events(conn, task_id)][-1] == "attachment_removed"
     finally:
         conn.close()
 
@@ -116,6 +119,89 @@ def test_delete_attachment_missing_returns_none(kanban_home):
         assert kb.delete_attachment(conn, 999999) is None
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Rule 8 parity — attachments on a live card are evidence and cannot be
+# deleted; the card must be archived first (same gate as delete_task).
+# ---------------------------------------------------------------------------
+
+
+def _attach_blob(conn, task_id: str, name: str = "evidence.txt") -> tuple[int, Path]:
+    dest_dir = kb.task_attachments_dir(task_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    blob = dest_dir / name
+    blob.write_bytes(b"evidence bytes")
+    att_id = kb.add_attachment(
+        conn, task_id, filename=name, stored_path=str(blob),
+        content_type="text/plain", size=blob.stat().st_size,
+    )
+    return att_id, blob
+
+
+def test_delete_attachment_on_live_card_is_refused_and_recorded(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = _make_task(conn, title="live card")
+        att_id, blob = _attach_blob(conn, task_id)
+        events_before = len(kb.list_events(conn, task_id))
+
+        live_status = kb.get_task(conn, task_id).status
+        assert live_status != "archived"
+
+        with pytest.raises(kb.AttachmentDeleteRefused) as excinfo:
+            kb.delete_attachment(conn, att_id)
+        assert excinfo.value.attachment.id == att_id
+        assert excinfo.value.status == live_status
+        assert "archive" in str(excinfo.value)
+
+        # Row and blob both survive.
+        assert kb.get_attachment(conn, att_id) is not None
+        assert blob.exists(), "refusal must not unlink the on-disk blob"
+        assert blob.read_bytes() == b"evidence bytes"
+
+        # The refusal itself is on the record, and only the refusal.
+        events = kb.list_events(conn, task_id)
+        assert len(events) == events_before + 1
+        last = events[-1]
+        assert last.kind == "attachment_delete_refused"
+        assert last.payload["reason"] == "task_not_archived"
+        assert last.payload["status"] == live_status
+        assert last.payload["attachment_id"] == att_id
+        assert last.payload["filename"] == "evidence.txt"
+
+
+@pytest.mark.usefixtures("all_assignees_spawnable")
+def test_delete_attachment_refused_on_done_card_too(kanban_home):
+    """``done`` is not ``archived``: a completed card still holds its evidence."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="done card", assignee="worker")
+        att_id, blob = _attach_blob(conn, task_id)
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.complete_task(conn, task_id, result="done")
+        with pytest.raises(kb.AttachmentDeleteRefused) as excinfo:
+            kb.delete_attachment(conn, att_id)
+        assert excinfo.value.status == "done"
+        assert kb.get_attachment(conn, att_id) is not None
+        assert blob.exists()
+
+
+def test_delete_attachment_on_archived_card_is_allowed(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = _make_task(conn, title="archived card")
+        att_id, blob = _attach_blob(conn, task_id)
+        assert kb.archive_task(conn, task_id)
+
+        removed = kb.delete_attachment(conn, att_id)
+        assert removed is not None and removed.id == att_id
+        assert kb.get_attachment(conn, att_id) is None
+        assert not blob.exists()
+        kinds = [e.kind for e in kb.list_events(conn, task_id)]
+        assert kinds[-1] == "attachment_removed"
+        assert "attachment_delete_refused" not in kinds
+
+
+def test_attachment_delete_refused_is_not_lifecycle_progress():
+    assert "attachment_delete_refused" in kb._GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS
 
 
 def test_attachments_root_is_per_board(kanban_home, monkeypatch):
@@ -198,9 +284,21 @@ def test_upload_list_download_delete_roundtrip(client):
     assert r.status_code == 200
     assert r.content == content
 
-    # Delete removes the row and the file
+    # Delete on a live card is refused (409) — attachments are append-only
+    # task history until the card is archived — and the bytes survive.
     r = client.delete(f"/api/plugins/kanban/attachments/{att_id}")
-    assert r.status_code == 200
+    assert r.status_code == 409, r.text
+    assert "archive" in r.json()["detail"]
+    assert client.get(f"/api/plugins/kanban/attachments/{att_id}").content == content
+
+    # After archiving, delete removes the row and the file
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, task_id)
+    finally:
+        conn.close()
+    r = client.delete(f"/api/plugins/kanban/attachments/{att_id}")
+    assert r.status_code == 200, r.text
     assert client.get(f"/api/plugins/kanban/attachments/{att_id}").status_code == 404
     assert client.get(
         f"/api/plugins/kanban/tasks/{task_id}/attachments"
@@ -284,12 +382,57 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     listed = run_slash(f"attachments {task_id}")
     assert "upload.txt" in listed
 
+    # Live card: attach-rm refuses, says what to do, leaves row + blob.
+    refused = run_slash(f"attach-rm {att_id}")
+    assert "refused" in refused and "archive the card first" in refused, refused
+    assert "Deleted attachment" not in refused
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, task_id)
+        assert [a.id for a in atts] == [att_id]
+        assert Path(atts[0].stored_path).read_bytes() == b"cli file body"
+        assert [e.kind for e in kb.list_events(conn, task_id)][-1] == "attachment_delete_refused"
+    finally:
+        conn.close()
+
+    # Archived card: attach-rm deletes.
+    archived = run_slash(f"archive {task_id}")
+    assert "rchived" in archived, archived
     removed = run_slash(f"attach-rm {att_id}")
-    assert "Deleted attachment" in removed
+    assert "Deleted attachment" in removed, removed
     conn = kb.connect()
     try:
         assert kb.list_attachments(conn, task_id) == []
     finally:
         conn.close()
+
+
+def test_cli_attach_rm_unknown_id_still_no_such_attachment(kanban_home):
+    from hermes_cli.kanban import run_slash
+
+    out = run_slash("attach-rm 999999")
+    assert "no such attachment: 999999" in out, out
+
+
+def test_cli_attach_rm_returns_nonzero_on_live_card(kanban_home, monkeypatch, capsys):
+    """The argparse handler itself returns 1 on refusal (run_slash hides rc)."""
+    import argparse
+    from hermes_cli.kanban import _cmd_attach_rm
+
+    with kb.connect_closing() as conn:
+        task_id = _make_task(conn, title="rc check")
+        att_id, blob = _attach_blob(conn, task_id)
+
+    rc = _cmd_attach_rm(argparse.Namespace(attachment_id=att_id))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "archive the card first" in err and task_id in err
+    assert blob.exists()
+
+    with kb.connect_closing() as conn:
+        assert kb.archive_task(conn, task_id)
+    rc = _cmd_attach_rm(argparse.Namespace(attachment_id=att_id))
+    assert rc == 0
+    assert not blob.exists()
 
 

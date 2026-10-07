@@ -342,6 +342,9 @@ _GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS = (
     # Append-only history refusal (execution contract rule 8): a delete the
     # gate turned away is not someone working the card.
     "history_delete_refused",
+    # Same rule, attachment surface: an ``attach-rm`` the gate turned away
+    # because the card is still live is a refusal, not progress.
+    "attachment_delete_refused",
     # Company-lane refusal (execution contract rule 3). The dispatcher
     # re-evaluates a misrouted card every tick; the record is written once
     # per distinct conflict, but a refusal is still not someone working
@@ -8608,21 +8611,77 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
     )
 
 
+class AttachmentDeleteRefused(PermissionError):
+    """Raised when an attachment's owning card is not archived.
+
+    Attachments are evidence (execution contract rule 8, same footing as
+    comments, events and runs): a card must be archived — a visible and
+    reversible step — before anything on it can be purged. Carries the
+    attachment row and the card's current status so callers can print an
+    actionable "archive the card first" message.
+    """
+
+    def __init__(self, attachment: "Attachment", status: Optional[str]):
+        self.attachment = attachment
+        self.status = status
+        super().__init__(
+            f"attachment {attachment.id} ({attachment.filename}) belongs to "
+            f"{attachment.task_id} which is {status!r}; archive the card "
+            "before deleting its attachments"
+        )
+
+
 def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     """Delete an attachment row and its on-disk blob. Returns the removed row.
 
     Returns ``None`` when no row matched. The blob is removed best-effort
     (a missing file is not an error); the metadata row is the source of
     truth for whether an attachment "exists".
+
+    Only an attachment on an ARCHIVED card can be deleted. Until this gate
+    ``hermes kanban attach-rm`` (and the dashboard DELETE) erased the row
+    and the blob on a live card in one call, while rule 8 already protected
+    the card's comments, events and runs. The status check is in the
+    DELETE's WHERE clause, not a prior SELECT, so a card un-archived between
+    the two cannot lose an attachment to a stale read. A refused delete
+    raises :class:`AttachmentDeleteRefused` after appending an
+    ``attachment_delete_refused`` event so the attempt itself is on the
+    record; the blob is never touched on refusal.
     """
+    refused: Optional[AttachmentDeleteRefused] = None
     with write_txn(conn):
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
-        conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
-        _append_event(
-            conn, att.task_id, "attachment_removed", {"filename": att.filename}
+        cur = conn.execute(
+            "DELETE FROM task_attachments WHERE id = ? AND task_id IN "
+            "(SELECT id FROM tasks WHERE status = 'archived')",
+            (attachment_id,),
         )
+        if cur.rowcount != 1:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (att.task_id,)
+            ).fetchone()
+            status = row["status"] if row is not None else None
+            _append_event(
+                conn, att.task_id, "attachment_delete_refused",
+                {
+                    "reason": "task_not_archived",
+                    "status": status,
+                    "attachment_id": att.id,
+                    "filename": att.filename,
+                    "source": "delete_attachment",
+                },
+            )
+            # Raise AFTER the txn commits — raising inside ``write_txn``
+            # would roll the refusal record back along with everything else.
+            refused = AttachmentDeleteRefused(att, status)
+        else:
+            _append_event(
+                conn, att.task_id, "attachment_removed", {"filename": att.filename}
+            )
+    if refused is not None:
+        raise refused
     try:
         p = Path(att.stored_path)
         if p.is_file():
