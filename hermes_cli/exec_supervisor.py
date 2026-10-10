@@ -103,6 +103,13 @@ STATUS_CONTROLLER_LOST = "controller_lost"
 STATUS_STALE = "stale"
 STATUS_TERMINATED = "terminated"
 STATUS_RECOVERED = "recovered"
+#: The board withdrew this execution's authority to work: its card was
+#: cancelled or archived, replaced by a different run, or left ``running``
+#: and did not return within ``HANDOFF_GRACE_SECONDS`` while the foreign CLI
+#: was still running. Terminal, supervisor-initiated, and deliberately NOT an
+#: infrastructure termination — see ``INFRASTRUCTURE_STATUSES`` for why those
+#: two must never be confused.
+STATUS_CONTRACT_REVOKED = "contract_revoked"
 
 ACTIVE_STATUSES = (STATUS_LAUNCHING, STATUS_RUNNING)
 TERMINAL_STATUSES = (
@@ -113,6 +120,7 @@ TERMINAL_STATUSES = (
     STATUS_STALE,
     STATUS_TERMINATED,
     STATUS_RECOVERED,
+    STATUS_CONTRACT_REVOKED,
 )
 #: Terminal statuses that mean "the executor finished the work it was asked to
 #: do". Everything else is a non-success, and a non-success must never be
@@ -131,12 +139,24 @@ SUCCESS_STATUSES = (STATUS_COMPLETED,)
 #: genuinely reports the executor's own exit code. It only stays trustworthy
 #: because ``_settle`` reclassifies a signalled death away from it — see
 #: ``_note_termination_intent``.
+#:
+#: ``STATUS_CONTRACT_REVOKED`` is ALSO deliberately absent, even though the
+#: supervisor is the one that sends the signal. An infrastructure termination
+#: is read downstream as "resume me" (``recovery_lane`` blocks the card with a
+#: resume instruction). A revoked contract is the opposite: the board already
+#: decided this run must not continue, so a resume instruction would re-open
+#: exactly the work the board just withdrew.
 INFRASTRUCTURE_STATUSES = (
     STATUS_TIMED_OUT,
     STATUS_CONTROLLER_LOST,
     STATUS_STALE,
     STATUS_TERMINATED,
 )
+
+#: Terminal statuses the SUPERVISOR decides to end a process group with, as
+#: opposed to the executor's own exit. Used only to keep a recorded termination
+#: intent from being downgraded to plain ``terminated`` by a later settler.
+SUPERVISOR_INITIATED_STATUSES = INFRASTRUCTURE_STATUSES + (STATUS_CONTRACT_REVOKED,)
 
 
 def is_infrastructure_termination(status: Optional[str]) -> bool:
@@ -193,6 +213,27 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60
 #: every call, and a 60 s cadence would write ~60 rows an hour per card for no
 #: extra safety — the board's own windows are measured in hours.
 DEFAULT_BOARD_HEARTBEAT_INTERVAL_SECONDS = 300
+
+#: How long a bound execution may keep running after its card has LEFT
+#: ``running`` without being handed to another run (``current_run_id`` NULL,
+#: or still this run's) before the supervisor revokes the contract.
+#:
+#: A card leaving ``running`` is NOT by itself a withdrawal of authority. Live
+#: data (2026-10-09, 30 days): 23 of 131 ``claude.headless`` runs moved their
+#: OWN card to review/blocked via ``kanban_request_review``/``kanban_block``
+#: and then kept running 3–266 s (5 of them over 60 s) before exiting — the
+#: normal tail of a run writing its final summary and attachments. After such
+#: a self-handoff the row reads ``status=review, current_run_id=NULL``,
+#: byte-identical to an operator block. Revoking on first sight would kill a
+#: share of those runs mid-tail and the recovery lane would return before
+#: harvesting their deliverables. So a left-running card starts a clock, and
+#: only a process still alive when the clock passes this bound is revoked.
+#: 300 s sits above the 266 s maximum observed tail with margin; it is still
+#: a fraction of the runtime cap, so an orphaned process after an operator
+#: block is ended within minutes, not hours. Cancelled/archived cards and
+#: cards owned by a DIFFERENT run are revoked immediately — there is no
+#: legitimate tail to protect in either case.
+HANDOFF_GRACE_SECONDS = 300
 
 # ---------------------------------------------------------------------------
 # THE TIMEOUT HIERARCHY — one authoritative order, highest authority first
@@ -1217,8 +1258,120 @@ def heartbeat_if_live(
     return heartbeat(conn, execution_id, now=now)
 
 
+#: Written once at launch when the execution binds to a live task contract.
+CONTRACT_BOUND_EVENT = "contract_bound"
+#: Written once at launch when the task row did not offer a bindable contract
+#: (not ``running``, or no ``current_run_id``). Enforcement is skipped and this
+#: row says so, so the absence of revocation is visibly a choice, not a miss.
+CONTRACT_UNBOUND_EVENT = "contract_unbound"
+#: Written by the pump the moment it decides to end the execution because its
+#: contract no longer holds. Names which check failed.
+CONTRACT_REVOKED_EVENT = "contract_revoked"
+#: Written once when the pump first sees the card outside ``running`` with no
+#: other run owning it, i.e. when the handoff grace clock starts. A run that
+#: then exits on its own leaves this row and no ``contract_revoked`` row, so
+#: the ledger shows a self-handoff tail as what it was.
+CONTRACT_HANDOFF_OBSERVED_EVENT = "contract_handoff_observed"
+
+
+@dataclass(frozen=True)
+class TaskContract:
+    """The board identity a supervised execution was launched under.
+
+    Read from the task ROW at launch — never accepted from the caller — for the
+    same reason ``bridge_board_heartbeat`` refuses a remembered run id: the row
+    is the authority on which attempt this is.
+    """
+
+    task_id: str
+    run_id: int
+
+
+def bind_task_contract(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[TaskContract]:
+    """Read the contract an execution for ``task_id`` would run under, now.
+
+    Returns None when the row is not currently a live, running attempt — the
+    card is not ``running``, carries no ``current_run_id``, or does not exist.
+    In that case there is nothing to revoke later, and the caller records the
+    execution as unbound rather than inventing a contract to enforce.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return None
+    return TaskContract(task_id=task_id, run_id=int(row["current_run_id"]))
+
+
+#: Card statuses that withdraw authority the moment they are seen. Everything
+#: else that is not ``running`` is a handoff candidate (see
+#: ``HANDOFF_GRACE_SECONDS``).
+CONTRACT_REVOKING_STATUSES = frozenset({"cancelled", "archived"})
+
+
+@dataclass(frozen=True)
+class ContractCheck:
+    """Outcome of one re-read of a bound contract against the task row.
+
+    Exactly one of three shapes:
+
+    - ``holds`` — the card is ``running`` under the bound run.
+    - ``revoke`` set — authority is gone NOW: ``task_missing``,
+      ``status_cancelled``, ``status_archived`` or ``run_replaced:<id>``.
+    - ``handoff`` set — the card has left ``running`` but no other run owns
+      it (``current_run_id`` NULL or still ours). Names the status seen. This
+      is what a run's own ``kanban_request_review``/``kanban_block`` looks
+      like from the row, and it is indistinguishable from an operator block;
+      the pump decides between the two with a clock, not a read.
+    """
+
+    revoke: Optional[str] = None
+    handoff: Optional[str] = None
+
+    @property
+    def holds(self) -> bool:
+        return self.revoke is None and self.handoff is None
+
+
+def check_task_contract(
+    conn: sqlite3.Connection, contract: TaskContract
+) -> ContractCheck:
+    """One primary-key SELECT: does the recorded contract still hold?
+
+    Order of checks, first match wins: row missing → ``task_missing``;
+    status cancelled/archived → ``status_<status>``; ``current_run_id``
+    non-NULL and not ours → ``run_replaced:<id>`` (a different run owns the
+    card, whatever its status); status not ``running`` → handoff candidate
+    (``ContractCheck.handoff``); otherwise holds. Raises on a read error so
+    the caller can tell "the board said no" from "the board could not be
+    read" — the two get very different treatment (see
+    ``LivenessPump._enforce_contract``).
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (contract.task_id,),
+    ).fetchone()
+    if row is None:
+        return ContractCheck(revoke="task_missing")
+    status = row["status"]
+    if status in CONTRACT_REVOKING_STATUSES:
+        return ContractCheck(revoke=f"status_{status}")
+    current = row["current_run_id"]
+    if current is not None and int(current) != contract.run_id:
+        return ContractCheck(revoke=f"run_replaced:{int(current)}")
+    if status != "running":
+        return ContractCheck(handoff=str(status))
+    return ContractCheck()
+
+
 def bridge_board_heartbeat(
-    conn: sqlite3.Connection, task_id: str, *, execution_id: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    execution_id: str,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Carry proven executor liveness up to the board's own watchdog.
 
@@ -1236,7 +1389,11 @@ def bridge_board_heartbeat(
     to "which attempt is this and who owns it", and a caller passing a
     remembered run id is exactly how a heartbeat lands on the wrong attempt
     after a reclaim. Nothing is written unless the card is still ``running``
-    and still carries a run.
+    and still carries a run. When the caller knows which run its execution was
+    launched under (``expected_run_id``, itself read from the row at launch),
+    a row that now names a DIFFERENT run is refused outright: after a reclaim
+    the current run belongs to someone else's process, and this one's liveness
+    says nothing about it.
 
     Liveness is not progress, and this function does not pretend otherwise —
     it is called only from a pump that has just re-proven the process against
@@ -1254,6 +1411,8 @@ def bridge_board_heartbeat(
         return False
     run_id = row["current_run_id"]
     if run_id is None:
+        return False
+    if expected_run_id is not None and int(run_id) != int(expected_run_id):
         return False
     touched = False
     with contextlib.suppress(Exception):
@@ -1290,6 +1449,10 @@ class LivenessPump:
         interval: Optional[int] = None,
         board_interval: Optional[int] = None,
         connect=None,
+        contract: Optional[TaskContract] = None,
+        terminate_grace_seconds: Optional[int] = None,
+        contract_read_grace_seconds: Optional[int] = None,
+        handoff_grace_seconds: Optional[int] = None,
     ):
         # Resolved from the module globals at construction, not bound as
         # default arguments: a default argument freezes the value at import
@@ -1299,10 +1462,40 @@ class LivenessPump:
             interval = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
         if board_interval is None:
             board_interval = DEFAULT_BOARD_HEARTBEAT_INTERVAL_SECONDS
+        if terminate_grace_seconds is None:
+            terminate_grace_seconds = DEFAULT_TERMINATE_GRACE_SECONDS
+        if contract_read_grace_seconds is None:
+            contract_read_grace_seconds = DEFAULT_STALE_HEARTBEAT_SECONDS
+        if handoff_grace_seconds is None:
+            handoff_grace_seconds = HANDOFF_GRACE_SECONDS
         self.execution_id = execution_id
         self.task_id = task_id
         self.interval = max(1, int(interval))
         self.board_interval = max(self.interval, int(board_interval or 0) or self.interval)
+        #: Rule 2 (live task contract) for foreign CLIs. ``None`` means this
+        #: execution is not bound to a running board attempt and nothing
+        #: below ever terminates it on the board's account.
+        self.contract = contract
+        self.terminate_grace_seconds = max(0, int(terminate_grace_seconds))
+        #: How long the board may be UNREADABLE before that alone revokes
+        #: the contract. A single failed read is a busy database, not a
+        #: cancelled card; only a read that keeps failing past the existing
+        #: stale-heartbeat bound is treated as loss of the contract. ``0``
+        #: disables that path entirely (mirrors the stale-heartbeat setting).
+        self.contract_read_grace_seconds = max(0, int(contract_read_grace_seconds))
+        #: How long the card may sit outside ``running`` — with no OTHER run
+        #: owning it — while this process is still alive, before that is read
+        #: as an orphan rather than a run finishing its own handoff. See
+        #: ``HANDOFF_GRACE_SECONDS`` for the data behind the default.
+        self.handoff_grace_seconds = max(0, int(handoff_grace_seconds))
+        #: Set exactly once, by the pump thread, when it revokes. The
+        #: synchronous waiter reads it after ``communicate`` returns so the
+        #: settlement cannot be out-raced by the child's own exit code.
+        self.revocation: Optional[dict] = None
+        self._contract_unreadable_since: Optional[float] = None
+        #: Monotonic time of the FIRST tick that saw the card outside
+        #: ``running`` without another owner; None while the contract holds.
+        self._handoff_since: Optional[float] = None
         self._connect = connect or kb.connect
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1384,11 +1577,20 @@ class LivenessPump:
                         # rather than spin: continuing would only produce more
                         # refusals, and the reconciler owns what happens next.
                         break
+                    # Contract BEFORE board heartbeat, every tick: a revoked
+                    # run must never get one more heartbeat on its way out,
+                    # and a reclaimed card's new run must never be touched by
+                    # the old run's pump at all.
+                    if self.contract is not None and self._enforce_contract(conn):
+                        break
                     now = time.monotonic()
                     if self.task_id and (now - last_board) >= self.board_interval:
                         last_board = now
                         if bridge_board_heartbeat(
-                            conn, self.task_id, execution_id=self.execution_id
+                            conn, self.task_id, execution_id=self.execution_id,
+                            expected_run_id=(
+                                self.contract.run_id if self.contract else None
+                            ),
                         ):
                             self.board_emitted += 1
                 except Exception:
@@ -1414,7 +1616,117 @@ class LivenessPump:
             "refused": self.refused,
             "errors": self.errors,
             "board_emitted": self.board_emitted,
+            "contract_revoked": self.revocation is not None,
         }
+
+    # -- Rule 2: the live task contract --------------------------------
+
+    def _enforce_contract(self, conn) -> bool:
+        """Re-check the recorded contract; revoke if it no longer holds.
+
+        Returns True when the execution has been revoked (the pump must stop).
+
+        Read errors are NOT revocations. The first failure starts a clock and
+        is logged; the contract is only treated as lost once the board has
+        been continuously unreadable for longer than
+        ``contract_read_grace_seconds`` (the stale-heartbeat bound). That bound
+        was chosen because it is already the system's answer to "how long may
+        a liveness signal be missing before we act on its absence" — reusing
+        it keeps one bound rather than inventing a second one, and it is far
+        longer than any transient lock or WAL checkpoint. A successful read
+        resets the clock.
+
+        A card that has LEFT ``running`` with no other run owning it is not
+        revoked on sight either. That row is exactly what a run's own
+        ``kanban_request_review``/``kanban_block`` produces moments before
+        the CLI exits on its own, and it is indistinguishable from an operator
+        block. The first such observation starts the handoff clock; the
+        process is revoked only if it is still alive once
+        ``handoff_grace_seconds`` have passed. If the card is seen back in
+        ``running`` under THIS run before then, the clock is cleared. A card
+        cancelled or archived, or owned by a DIFFERENT run, is revoked at
+        once — no tail is legitimate there.
+        """
+        try:
+            check = check_task_contract(conn, self.contract)
+        except Exception:
+            self.errors += 1
+            now = time.monotonic()
+            if self._contract_unreadable_since is None:
+                self._contract_unreadable_since = now
+                _log.warning(
+                    "execution %s: could not re-read task contract for %s; "
+                    "will retry next tick", self.execution_id, self.contract.task_id,
+                    exc_info=True,
+                )
+                return False
+            unreadable_for = now - self._contract_unreadable_since
+            if (
+                self.contract_read_grace_seconds
+                and unreadable_for > self.contract_read_grace_seconds
+            ):
+                return self._revoke(conn, f"contract_unreadable:{int(unreadable_for)}s")
+            return False
+        self._contract_unreadable_since = None
+        if check.revoke is not None:
+            return self._revoke(conn, check.revoke)
+        if check.handoff is None:
+            # Running under our run again (or still): any handoff observed
+            # earlier was the card passing through, not leaving.
+            self._handoff_since = None
+            return False
+        now = time.monotonic()
+        if self._handoff_since is None:
+            self._handoff_since = now
+            self._note(conn, CONTRACT_HANDOFF_OBSERVED_EVENT, {
+                "task_id": self.contract.task_id,
+                "run_id": self.contract.run_id,
+                "status": check.handoff,
+                "grace_seconds": self.handoff_grace_seconds,
+            })
+            return False
+        if (now - self._handoff_since) <= self.handoff_grace_seconds:
+            return False
+        return self._revoke(conn, f"handoff_grace_expired:{check.handoff}")
+
+    def _revoke(self, conn, failed_check: str) -> bool:
+        record = get_execution(conn, self.execution_id)
+        if record is None or record.is_terminal:
+            # Already settled by someone else; nothing left to end.
+            return True
+        reason = f"contract_revoked:{failed_check}"
+        self.revocation = {
+            "failed_check": failed_check,
+            "task_id": self.contract.task_id,
+            "run_id": self.contract.run_id,
+            "reason": reason,
+        }
+        # Intent FIRST, so whichever settler wins the race classifies this as
+        # a revocation and not as the executor's own non-zero exit. Same
+        # mechanism as every other supervisor-initiated kill.
+        _note_termination_intent(
+            conn, self.execution_id, status=STATUS_CONTRACT_REVOKED, reason=reason,
+        )
+        self._note(conn, CONTRACT_REVOKED_EVENT, dict(self.revocation))
+        outcome = terminate_process_group(
+            pid=record.pid,
+            pgid=record.pgid,
+            proc_key=record.proc_key,
+            grace_seconds=self.terminate_grace_seconds,
+        )
+        self._note(conn, "contract_revoked_terminate", {
+            "signalled": outcome.signalled,
+            "dead": outcome.dead,
+            "detail": outcome.detail,
+        })
+        if not outcome.dead:
+            _log.error(
+                "execution %s: contract revoked (%s) but the process group "
+                "could not be confirmed dead (%s); the controller's own "
+                "finaliser and the reconciler still own it",
+                self.execution_id, failed_check, outcome.detail,
+            )
+        return True
 
     def _note(self, conn, kind: str, payload: dict) -> None:
         with contextlib.suppress(Exception):
@@ -2051,6 +2363,33 @@ def run_supervised(
                     },
                 )
 
+        # Rule 2 for foreign CLIs: record, at launch and from the ROW, which
+        # board attempt this execution works under. The pump re-checks it on
+        # every liveness tick and ends the process group the moment the card
+        # stops being this run's to work on. Executions with no task are not
+        # bound; a task that is not a live running attempt right now is
+        # recorded as unbound rather than guessed at.
+        contract: Optional[TaskContract] = None
+        if task_id:
+            try:
+                contract = bind_task_contract(conn, task_id)
+            except Exception:
+                _log.warning(
+                    "execution %s: could not read task %s to bind its contract",
+                    execution_id, task_id, exc_info=True,
+                )
+            with contextlib.suppress(Exception):
+                if contract is not None:
+                    _append_execution_event(
+                        conn, execution_id, CONTRACT_BOUND_EVENT,
+                        {"task_id": contract.task_id, "run_id": contract.run_id},
+                    )
+                else:
+                    _append_execution_event(
+                        conn, execution_id, CONTRACT_UNBOUND_EVENT,
+                        {"task_id": task_id},
+                    )
+
         proc: Optional[subprocess.Popen] = None
         proc_key: Optional[str] = None
         pump: Optional[LivenessPump] = None
@@ -2101,7 +2440,13 @@ def run_supervised(
             # pump's whole contract is re-proving the recorded PID against the
             # kernel, and until the attach commits there is no recorded PID to
             # prove anything about.
-            pump = LivenessPump(execution_id, task_id=task_id).start()
+            pump = LivenessPump(
+                execution_id,
+                task_id=task_id,
+                contract=contract,
+                terminate_grace_seconds=policy.terminate_grace_seconds,
+                contract_read_grace_seconds=policy.stale_heartbeat_seconds,
+            ).start()
 
             try:
                 stdout, stderr = proc.communicate(timeout=effective_timeout)
@@ -2111,6 +2456,13 @@ def run_supervised(
                     STATUS_COMPLETED if exit_code == 0 else STATUS_FAILED
                 )
                 settled_reason = None if exit_code == 0 else "nonzero_exit"
+                if pump.revocation is not None:
+                    # The pump ended this process because the board withdrew
+                    # the run. Whatever exit code the CLI chose on SIGTERM —
+                    # including 0 — is the signal coming back, not a verdict
+                    # on the work, and it must not read as a completion.
+                    settled_status = STATUS_CONTRACT_REVOKED
+                    settled_reason = pump.revocation["reason"]
             except subprocess.TimeoutExpired:
                 timed_out = True
                 settled_status = STATUS_TIMED_OUT
@@ -2232,7 +2584,9 @@ def _finalise_controller_execution(
         # not be settled as the executor's own verdict.
         _note_termination_intent(
             conn, execution_id,
-            status=(status if status in INFRASTRUCTURE_STATUSES else STATUS_TERMINATED),
+            status=(
+                status if status in SUPERVISOR_INITIATED_STATUSES else STATUS_TERMINATED
+            ),
             reason=reason or "controller_finalised_live_process",
         )
         outcome = terminate_process_group(
@@ -2844,6 +3198,14 @@ def route_task_from_execution(
         # it out of 'running' and refuse the richer handoff it is about to
         # make. Nothing is skipped: the completion guard is in the kernel.
         return "routing_owned_by_caller"
+    if record.status == STATUS_CONTRACT_REVOKED:
+        # The board already decided this run: cancelled, archived, handed to
+        # a different run, or left running for longer than the handoff grace
+        # with this process orphaned. Nothing here may write to that card — a
+        # failure event or a recovery route would land on whatever run is
+        # current now, which is not this one. The execution ledger carries
+        # the durable record (``contract_revoked`` event + termination_reason).
+        return "contract_revoked"
     task = kb.get_task(conn, record.task_id)
     if task is None:
         return None

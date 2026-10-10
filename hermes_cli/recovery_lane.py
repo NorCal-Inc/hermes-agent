@@ -115,6 +115,18 @@ class AttemptResult:
         return ex.is_infrastructure_termination(self.execution_status)
 
     @property
+    def revoked(self) -> bool:
+        """Whether the BOARD withdrew this attempt's run while it was working.
+
+        Cancelled or archived, handed to a different run, or left running
+        past the supervisor's handoff grace with the process still alive. Not
+        an infrastructure termination and not an implementation failure: the
+        card already has a decision, and this attempt must write nothing more
+        to it — least of all a "resume me" block.
+        """
+        return self.execution_status == ex.STATUS_CONTRACT_REVOKED
+
+    @property
     def evidence(self) -> str:
         suffix = f" [execution {self.execution_id}]" if self.execution_id else ""
         if self.error:
@@ -129,7 +141,10 @@ class AttemptResult:
             # human and the next executor read off the blocked card, and
             # "execution ended failed (rc=143)" was read as an implementation
             # failure on t_aef6bbe1 when it was the supervisor's own SIGTERM.
-            klass = "infrastructure" if self.infrastructure else "implementation"
+            if self.revoked:
+                klass = "contract_revoked"
+            else:
+                klass = "infrastructure" if self.infrastructure else "implementation"
             return (
                 f"[{self.executor}] execution ended "
                 f"{self.execution_status} (rc={self.returncode}) "
@@ -513,6 +528,12 @@ def run_codex_verifier(task_id: str) -> int:
             _build_codex_verifier_prompt(task), cwd, timeout, task_id=task_id,
         )
         if not attempt.ok:
+            if attempt.revoked:
+                # The supervisor ended this run because the card stopped
+                # being ours (cancelled/archived, replaced by another run, or
+                # orphaned past the handoff grace). Write nothing to the
+                # card: it is no longer this run's to route.
+                return 1
             _capacity_text = "\n".join(
                 part for part in (attempt.stdout, attempt.stderr, attempt.error or "") if part
             ).lower()
@@ -635,6 +656,14 @@ def run_claude_executor(task_id: str) -> int:
         # and treating that as success is exactly the split-brain this lane
         # was rewired to end.
         if not attempt.ok:
+            if attempt.revoked:
+                # A revoked contract is NOT a resume instruction. The board
+                # cancelled or archived this card, handed it to another run,
+                # or left it outside running past the handoff grace while the
+                # CLI was still working; the decision already exists and any write
+                # from here — a block, a comment — would land on a run that is
+                # not ours. The execution ledger holds the durable record.
+                return 1
             # An infrastructure termination is a RESUME instruction, not a
             # verdict on the work: the workspace, the session transcript and
             # any attachments the attempt already produced are intact, and the
