@@ -90,6 +90,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "terminal_disposition": t.terminal_disposition,
         "disposition_reason": t.disposition_reason,
         "disposition_at": t.disposition_at,
+        # Rule 6: structured production authorization (role names from the
+        # installed registry). Empty on ordinary cards.
+        "production_actions": list(t.production_actions or []),
     }
 
 
@@ -455,6 +458,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "repair falls under. Required together "
                                "with --recovery-owner and "
                                "--repairs-task-id.")
+    p_create.add_argument("--production-action", action="append", default=[],
+                          dest="production_actions", metavar="ROLE",
+                          help="Production role this card explicitly "
+                               "authorizes (repeatable). Rule 6: the ONLY "
+                               "way a card grants production authority — "
+                               "body text never does. ROLE must exist in "
+                               "the installed production-roles registry "
+                               "(~/.hermes/security/production-roles/). "
+                               "Set at creation only, immutable afterwards "
+                               "(a changed authorization is a new card), "
+                               "and refused from a dispatcher-owned worker.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1990,6 +2004,24 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    production_actions = list(getattr(args, "production_actions", None) or [])
+    if production_actions:
+        # Rule 6: validate against the installed registry (and refuse a
+        # worker) before opening the board, so a refused grant is a clean
+        # exit with no connection touched. create_task re-checks both.
+        try:
+            production_actions = kb.validate_production_actions(production_actions)
+        except kb.ProductionActionError as exc:
+            print(f"kanban: --production-action: {exc}", file=sys.stderr)
+            return 2
+        if "HERMES_KANBAN_TASK" in os.environ:  # presence, not value
+            print(
+                "kanban: --production-action is refused from a dispatcher-owned "
+                "worker (HERMES_KANBAN_TASK is set); a worker can never grant "
+                "production authority to another card",
+                file=sys.stderr,
+            )
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -2020,6 +2052,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             recovery_owner=getattr(args, "recovery_owner", None),
             repairs_task_id=getattr(args, "repairs_task_id", None),
             umbrella_task_id=getattr(args, "umbrella_task_id", None),
+            production_actions=production_actions or None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2204,6 +2237,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
+    if task.production_actions:
+        # Rule 6: the structured authorization is the only one that counts.
+        print(f"  production actions: {', '.join(task.production_actions)}")
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")

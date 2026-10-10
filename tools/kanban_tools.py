@@ -1401,6 +1401,19 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    # Rule 6 (production authority): no agent-facing path may grant
+    # production authority to a card. The structured field is set only by an
+    # interactive operator through ``hermes kanban create
+    # --production-action``; this tool refuses the argument in every form,
+    # even an empty list, so the refusal is unambiguous in the transcript.
+    for _pa_key in ("production_actions", "production_action"):
+        if _pa_key in args:
+            return tool_error(
+                "production_actions cannot be set through kanban_create: a "
+                "worker or agent never grants production authority to a card. "
+                "Only an interactive operator may set it, at creation, with "
+                "`hermes kanban create --production-action <role>`."
+            )
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")

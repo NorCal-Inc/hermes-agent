@@ -1997,10 +1997,26 @@ class Task:
     # Identity accountable for this card's recovery decision. Set by
     # ``create_repair_task``; None on ordinary cards.
     recovery_owner: Optional[str] = None
+    # Rule 6 (production authority), design 3A: the production roles this
+    # card EXPLICITLY permits, as a structured list of role names from the
+    # installed registry (``production_roles_registry_path``). Never read
+    # from body text. Set only at creation, by an interactive operator —
+    # never by a dispatcher-owned worker or the ``kanban_create`` tool — and
+    # immutable afterwards (``trg_tasks_production_actions_immutable``):
+    # changing an authorization means a new card. Empty on ordinary cards.
+    production_actions: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
+        production_actions_value: list[str] = []
+        if "production_actions" in keys and row["production_actions"]:
+            try:
+                parsed_pa = json.loads(row["production_actions"])
+                if isinstance(parsed_pa, list):
+                    production_actions_value = [str(r) for r in parsed_pa if r]
+            except Exception:
+                production_actions_value = []
         # Parse skills JSON blob if present
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
@@ -2151,6 +2167,7 @@ class Task:
                 if "recovery_owner" in keys and row["recovery_owner"]
                 else None
             ),
+            production_actions=production_actions_value,
         )
 
 
@@ -2405,7 +2422,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Identity accountable for this card's recovery decision, recorded
     -- structurally so "who owns this repair?" is answerable without reading
     -- the body. Required by ``create_repair_task``; NULL elsewhere.
-    recovery_owner       TEXT
+    recovery_owner       TEXT,
+    -- Rule 6 production authority (design 3A): JSON list of production role
+    -- names this card explicitly permits. Structured, never body text. Set
+    -- only at creation and immutable afterwards (see
+    -- trg_tasks_production_actions_immutable). '[]' on ordinary cards.
+    production_actions   TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -4423,6 +4445,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "control_plane_authority", "control_plane_authority TEXT"
         )
 
+    if "production_actions" not in cols:
+        # Rule 6 production authority. '[]' on every legacy row: no existing
+        # card is retro-authorized for anything — authority is granted only
+        # at creation, through the structured field, by an operator.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "production_actions",
+            "production_actions TEXT NOT NULL DEFAULT '[]'",
+        )
+
     if "regression_required" not in cols:
         # 0 on every legacy row. Nothing is retro-armed: the requirement is
         # evidence-driven, and a board migrated mid-flight has no recorded
@@ -4826,7 +4859,20 @@ FOR EACH ROW WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
 BEGIN
     SELECT RAISE(ABORT, 'task history is append-only: runs cannot be deleted while their task exists');
 END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tasks_production_actions_immutable
+BEFORE UPDATE OF production_actions ON tasks
+FOR EACH ROW WHEN NEW.production_actions IS NOT OLD.production_actions
+BEGIN
+    SELECT RAISE(ABORT, 'production_actions is immutable after creation: changing a production authorization means a new card');
+END;
 """
+
+# Rule 6 (production authority): the structured authorization field is set
+# once, at creation, and never rewritten. Installed by the same pass as the
+# rule 8 history triggers because it protects the same thing — the record of
+# what an operator actually authorized — from the next caller's convenience.
+PRODUCTION_ACTIONS_TRIGGER_NAME = "trg_tasks_production_actions_immutable"
 
 TASK_HISTORY_TRIGGER_NAMES: tuple[str, ...] = (
     "trg_task_comments_append_only_update",
@@ -4835,6 +4881,7 @@ TASK_HISTORY_TRIGGER_NAMES: tuple[str, ...] = (
     "trg_task_events_no_delete_while_task_lives",
     "trg_task_runs_identity_immutable",
     "trg_task_runs_no_delete_while_task_lives",
+    PRODUCTION_ACTIONS_TRIGGER_NAME,
 )
 
 
@@ -4849,14 +4896,22 @@ def _ensure_task_history_append_only(conn: sqlite3.Connection) -> None:
     present = {
         r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name IN ('task_comments', 'task_events', 'task_runs')"
+            "AND name IN ('task_comments', 'task_events', 'task_runs', 'tasks')"
         )
     }
+    # The production_actions trigger names its column, so a partial legacy
+    # ``tasks`` table that predates the column must not get it until the
+    # additive migration above has added the column.
+    task_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    } if "tasks" in present else set()
     for statement in TASK_HISTORY_TRIGGERS_SQL.split("END;"):
         statement = statement.strip()
         if not statement:
             continue
         table = statement.split(" ON ", 1)[1].split()[0]
+        if table == "tasks" and "production_actions" not in task_cols:
+            continue
         if table in present:
             conn.execute(statement + "\nEND;")
 
@@ -5599,6 +5654,108 @@ def is_governed_automation(conn: sqlite3.Connection, task_id: str) -> bool:
     return prov.get("actor_kind") == ACTOR_KIND_GOVERNED_AUTOMATION
 
 
+# ---------------------------------------------------------------------------
+# Rule 6 — production authority (design 3A, approved 2026-10-07; ruling
+# 2026-10-09, norcal/security/production-roles/).
+#
+# A card "explicitly permits" a production action through the STRUCTURED
+# ``production_actions`` field, never through body text. The field is:
+#   * validated against the INSTALLED registry
+#     (~/.hermes/security/production-roles/production-roles.json) — an
+#     unknown role name is refused, and so is a missing or unreadable
+#     registry (fail closed: no registry, no authority);
+#   * settable only at creation, and only by an interactive operator. A
+#     dispatcher-owned worker (``HERMES_KANBAN_TASK`` in its environment)
+#     can never grant production authority to another card, and the
+#     ``kanban_create`` tool refuses the argument outright;
+#   * immutable afterwards (``PRODUCTION_ACTIONS_TRIGGER_NAME``).
+# Every grant is also recorded as a ``production_action_authorized`` event on
+# the new card, so the append-only history carries who authorized what.
+# ---------------------------------------------------------------------------
+
+PRODUCTION_ROLES_REGISTRY_ENV = "HERMES_PRODUCTION_ROLES_REGISTRY"
+PRODUCTION_ACTION_AUTHORIZED_EVENT = "production_action_authorized"
+
+
+class ProductionActionError(ValueError):
+    """A ``production_actions`` grant was refused (unknown role, missing
+    registry, or an actor that may not grant production authority)."""
+
+
+def production_roles_registry_path() -> Path:
+    """Path of the installed production-roles registry.
+
+    ``HERMES_PRODUCTION_ROLES_REGISTRY`` overrides it (tests, staging a
+    registry for review); otherwise the installed copy under the user's
+    ``~/.hermes/security/production-roles/``.
+    """
+    override = (os.environ.get(PRODUCTION_ROLES_REGISTRY_ENV) or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".hermes" / "security" / "production-roles" / "production-roles.json"
+
+
+def load_production_roles(path: Optional[Path] = None) -> dict[str, dict]:
+    """Return the ``roles`` map of the installed registry.
+
+    Raises :class:`ProductionActionError` when the registry is missing or
+    malformed. Callers that merely want to know whether any registry exists
+    should catch it; ``create_task`` deliberately does not, because a grant
+    against an unverifiable registry is exactly what rule 6 forbids.
+    """
+    reg_path = Path(path) if path is not None else production_roles_registry_path()
+    try:
+        raw = json.loads(reg_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ProductionActionError(
+            f"production-roles registry not found at {reg_path}; refusing to "
+            "grant production authority without an installed registry"
+        ) from None
+    except (OSError, ValueError) as exc:
+        raise ProductionActionError(
+            f"production-roles registry at {reg_path} is unreadable: {exc}"
+        ) from exc
+    roles = raw.get("roles") if isinstance(raw, dict) else None
+    if not isinstance(roles, dict) or not roles:
+        raise ProductionActionError(
+            f"production-roles registry at {reg_path} declares no roles"
+        )
+    return roles
+
+
+def validate_production_actions(
+    roles: Optional[Iterable[str]],
+    *,
+    registry_path: Optional[Path] = None,
+) -> list[str]:
+    """Normalise and validate a requested ``production_actions`` list.
+
+    Returns the de-duplicated role names in request order (empty list for
+    ``None`` / no non-blank entries). Any name not present in the installed
+    registry raises :class:`ProductionActionError` naming the offending
+    role and the roles that do exist.
+    """
+    if roles is None:
+        return []
+    if isinstance(roles, str):
+        roles = [roles]
+    cleaned: list[str] = []
+    for r in roles:
+        name = str(r or "").strip()
+        if name and name not in cleaned:
+            cleaned.append(name)
+    if not cleaned:
+        return []
+    known = load_production_roles(registry_path)
+    unknown = [name for name in cleaned if name not in known]
+    if unknown:
+        raise ProductionActionError(
+            f"unknown production role(s): {', '.join(unknown)}; the installed "
+            f"registry defines: {', '.join(sorted(known))}"
+        )
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5635,6 +5792,7 @@ def create_task(
     repairs_task_id: Optional[str] = None,
     umbrella_task_id: Optional[str] = None,
     control_plane_authority: Optional[str] = None,
+    production_actions: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5702,6 +5860,27 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    # Rule 6: validate the production authorization before anything is
+    # written, and refuse it from a dispatcher-owned worker. The env check
+    # comes first so a worker learns it may not grant authority at all, not
+    # merely that it named a role wrong.
+    production_actions_list: list[str] = []
+    if production_actions is not None:
+        requested = (
+            [production_actions] if isinstance(production_actions, str)
+            else [str(r or "").strip() for r in production_actions]
+        )
+        if any(requested):
+            # Presence, not value: an empty or blank HERMES_KANBAN_TASK still marks
+            # a worker environment (Codex t_7e126eb3 / t_2f9a1fd4).
+            if "HERMES_KANBAN_TASK" in os.environ:
+                raise ProductionActionError(
+                    "a dispatcher-owned worker cannot grant production "
+                    "authority to another card (HERMES_KANBAN_TASK is set); "
+                    "production_actions may only be set from an interactive "
+                    "session"
+                )
+            production_actions_list = validate_production_actions(requested)
     # Resolve before any validation that can raise, so a rejected creation
     # never half-populates provenance state, and so every successful creation
     # carries it — there is no path through this function that produces a card
@@ -6156,9 +6335,10 @@ def create_task(
                         gauntlet_enforced,
                         actor_kind, actor_id, actor_lane, actor_run_id,
                         creation_cause, recovery_owner,
-                        control_plane, control_plane_authority
+                        control_plane, control_plane_authority,
+                        production_actions
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?, ?, ?, ?)
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6195,6 +6375,7 @@ def create_task(
                         recovery_owner,
                         1 if is_control_plane else 0,
                         control_plane_authority,
+                        json.dumps(production_actions_list),
                     ),
                 )
                 for pid in parents:
@@ -6302,6 +6483,18 @@ def create_task(
                         ),
                     },
                 )
+                if production_actions_list:
+                    # Rule 6: the grant lives in append-only history too, not
+                    # only on the (trigger-protected) row.
+                    _append_event(
+                        conn,
+                        task_id,
+                        PRODUCTION_ACTION_AUTHORIZED_EVENT,
+                        {
+                            "roles": list(production_actions_list),
+                            "created_by": created_by,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             # Production ledger projection (post-commit, best-effort). See
             # _sync_production_ledger docstring. Moved here from the MCP
