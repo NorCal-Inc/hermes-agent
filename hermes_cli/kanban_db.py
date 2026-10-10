@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -3070,6 +3071,17 @@ _CORRUPT_BACKUP_RETENTION = 10
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
 
+# ``open()`` errnos that mean the lock FILE cannot be created or opened for
+# write because the caller has no write access to the board directory (a
+# read-only mount, a sandbox with ``~/.hermes`` read-only, a directory owned
+# by another user). A caller in that position cannot be a writer anyway, so
+# there is nothing for the cross-process init lock to serialize: proceed
+# without it, exactly as the timeout path already does, instead of failing
+# every read-only ``kanban show`` / ``list`` / ``attachments``.
+_INIT_LOCK_UNAVAILABLE_ERRNOS = frozenset({errno.EROFS, errno.EACCES, errno.EPERM})
+# Lock paths already warned about in this process (warn once, not per connect).
+_INIT_LOCK_UNAVAILABLE_WARNED: set[str] = set()
+
 
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections.
@@ -3137,10 +3149,34 @@ def _cross_process_init_lock(path: Path):
     additive migrations), so the worst case of two processes racing first-init
     is redundant work, not corruption. A bounded "proceed anyway" beats an
     unbounded hang that silently stops the board.
+
+    Yields ``True`` when the lock file itself could not be opened because the
+    board directory is not writable for this caller (EROFS / EACCES / EPERM —
+    e.g. the Codex verifier sandbox mounts ``~/.hermes`` read-only). Such a
+    caller cannot write the board either, so the lock has nothing to protect;
+    we warn once per process and proceed without it, and :func:`connect` uses
+    the flag to skip the write-requiring parts of first-connect init on an
+    already-initialised board. Yields ``False`` on the normal path (lock
+    acquired, or bounded-timeout proceed). Any other ``OSError`` from the open
+    still propagates unchanged.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".init.lock")
-    handle = lock_path.open("a+b")
+    try:
+        handle = lock_path.open("a+b")
+    except OSError as exc:
+        if exc.errno not in _INIT_LOCK_UNAVAILABLE_ERRNOS:
+            raise
+        if str(lock_path) not in _INIT_LOCK_UNAVAILABLE_WARNED:
+            _INIT_LOCK_UNAVAILABLE_WARNED.add(str(lock_path))
+            _log.warning(
+                "kanban init lock %s cannot be opened (%s) — proceeding without "
+                "the cross-process lock in read-only mode (this caller cannot "
+                "write the board, so there is nothing to serialize).",
+                lock_path, exc.strerror or exc,
+            )
+        yield True
+        return
     acquired = False
     try:
         deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
@@ -3179,7 +3215,7 @@ def _cross_process_init_lock(path: Path):
                 "able to block this connect indefinitely (#36644).",
                 lock_path, _INIT_LOCK_TIMEOUT_SECONDS,
             )
-        yield
+        yield False
     finally:
         try:
             if acquired:
@@ -3842,6 +3878,48 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _schema_objects(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+    """Every user object (``(type, name)``) plus every table column
+    (``("column", "<table>.<col>")``) visible on ``conn``."""
+    objects: set[tuple[str, str]] = set()
+    rows = conn.execute(
+        "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    for row in rows:
+        kind, name = str(row[0]), str(row[1])
+        objects.add((kind, name))
+        if kind == "table":
+            quoted = name.replace('"', '""')
+            for col in conn.execute(f'PRAGMA table_info("{quoted}")').fetchall():
+                objects.add(("column", f"{name}.{col[1]}"))
+    return objects
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    """Whether first-connect init would be a no-op on ``conn``'s database.
+
+    Used only by the read-only path of :func:`connect` (board directory not
+    writable, see :func:`_cross_process_init_lock`), where the schema script
+    and the additive migrations cannot run. Rather than hand-maintain a list
+    of every column and index those passes create, run them against a
+    throwaway in-memory database and require every object and column they
+    produce to already exist on disk. The passes are additive, so superset
+    on disk means they would have changed nothing.
+    """
+    if not _schema_is_present(conn):
+        return False
+    reference = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        reference.row_factory = sqlite3.Row
+        reference.executescript(SCHEMA_SQL)
+        _migrate_add_optional_columns(reference)
+        _migrate_observation_timer_uniqueness(reference)
+        expected = _schema_objects(reference)
+    finally:
+        reference.close()
+    return expected <= _schema_objects(conn)
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -3921,13 +3999,33 @@ def connect(
             path,
         )
 
-    with _cross_process_init_lock(path):
-        # Read-only file/sidecar preflight (port of kilocode#12508) —
-        # repair-or-refuse before the header/integrity probes so a stray
-        # read-only kanban.db fails with an actionable message instead of
-        # "attempt to write a readonly database" mid-init.
-        from hermes_state import preflight_db_writability
-        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
+    with _cross_process_init_lock(path) as lock_unavailable:
+        # ``True`` only when the board directory is not writable for this
+        # caller (read-only mount / sandbox). Such a caller can only read, so
+        # the writability preflight, WAL activation and schema/migration pass
+        # below are skipped; an already-initialised board opens read-only, an
+        # uninitialised one fails with one clear line. Writers never take this
+        # branch (they can open the lock file) and behave exactly as before.
+        read_only = bool(lock_unavailable)
+        if read_only:
+            try:
+                db_present = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                db_present = False
+            if not db_present:
+                raise sqlite3.OperationalError(
+                    f"kanban.db ({path.name}) does not exist and {path.parent} "
+                    f"is not writable for this user, so it cannot be created "
+                    f"here. Initialise the board from a context with write "
+                    f"access (`hermes kanban init`)."
+                )
+        else:
+            # Read-only file/sidecar preflight (port of kilocode#12508) —
+            # repair-or-refuse before the header/integrity probes so a stray
+            # read-only kanban.db fails with an actionable message instead of
+            # "attempt to write a readonly database" mid-init.
+            from hermes_state import preflight_db_writability
+            preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)
@@ -3947,8 +4045,11 @@ def connect(
                 # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
                 # falls back to DELETE with one ERROR log so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                # Skipped read-only: a reader cannot change the persistent
+                # journal mode, and SQLite already opened the file read-only.
+                if not read_only:
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
@@ -3966,7 +4067,19 @@ def connect(
                 # wrong-data returns.
                 conn.execute("PRAGMA cell_size_check=ON")
                 needs_init = resolved not in _INITIALIZED_PATHS
-                if needs_init:
+                if needs_init and read_only:
+                    # No lock, no write access: the schema script and the
+                    # additive migrations cannot run here. Accept the board
+                    # only if they would have been a no-op anyway.
+                    if not _schema_is_current(conn):
+                        raise sqlite3.OperationalError(
+                            f"kanban.db ({path.name}) schema is not current and "
+                            f"{path.parent} is not writable for this user, so "
+                            f"it cannot be migrated here. Run `hermes kanban "
+                            f"init` from a context with write access first."
+                        )
+                    _INITIALIZED_PATHS.add(resolved)
+                elif needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                     # migrations. Cached so subsequent connect() calls in the same
                     # process are cheap. The lock prevents same-process dispatcher
