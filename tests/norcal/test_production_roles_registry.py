@@ -32,7 +32,9 @@ REPO = Path(__file__).resolve().parents[2]
 ROLES_SRC = REPO / "norcal" / "security" / "production-roles"
 BOOT_SRC = REPO / "norcal" / "boot"
 ROLE_CLASSES = ("stripe_live", "deploy", "dns", "firewall", "ports", "service_units")
-CHRISTOPHER_ONLY = {"stripe_live", "firewall", "ports", "service_units"}
+# 2026-10-09 Christopher: every role is Christopher-authorized only; executed by Claude Code or Codex.
+CHRISTOPHER_ONLY = set(ROLE_CLASSES)
+AUTHORIZED_EXECUTORS = {"claude", "codex"}
 
 
 def _run_verifier(base: Path) -> subprocess.CompletedProcess:
@@ -65,6 +67,7 @@ def test_shipped_registry_is_empty_and_marks_locked_surfaces_christopher_only():
     for name, role in reg["roles"].items():
         assert role["profiles"] == [], f"{name} ships with profiles assigned"
         assert role["christopher_only"] is (name in CHRISTOPHER_ONLY), name
+    assert set(reg["christopher_authorized_executors"]) == AUTHORIZED_EXECUTORS
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,9 @@ def _schema_errors():
     (lambda r: r["roles"].__setitem__("database", {"christopher_only": False, "profiles": []}), "role classes mismatch"),
     (lambda r: r["roles"]["dns"].__setitem__("profiles", "all"), "profiles must be a list"),
     (lambda r: r.__setitem__("version", "1"), "version missing or not an integer"),
+    (lambda r: r["roles"]["deploy"]["profiles"].append("orion_formation_services_lead"), "christopher_only role must have no profiles"),
+    (lambda r: r["christopher_authorized_executors"].append("default"), "christopher_authorized_executors must be"),
+    (lambda r: r.pop("christopher_authorized_executors"), "christopher_authorized_executors must be"),
 ])
 def test_schema_rejects_shape_violations_even_if_repinned(mutate, needle):
     """A future re-pin cannot smuggle in a profile on a Christopher-only role or a new role class."""

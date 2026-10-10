@@ -4,7 +4,7 @@ Approved by Christopher 2026-10-07 (design 1C / 2B pinned registry / 3A; report-
 
 | File | Purpose |
 |---|---|
-| `production-roles.json` | The registry. Six role classes (`stripe_live`, `deploy`, `dns`, `firewall`, `ports`, `service_units`), each with `profiles: []`. `stripe_live`, `firewall`, `ports` and `service_units` are `christopher_only` and can never hold a profile. Ships empty. |
+| `production-roles.json` | The registry. Six role classes (`stripe_live`, `deploy`, `dns`, `firewall`, `ports`, `service_units`), each with `profiles: []`. Since 2026-10-09 every role is `christopher_only`: no Hermes profile holds one; a production action runs only on a card where Christopher authorized that exact action, executed by Claude Code or Codex (`christopher_authorized_executors`). Ships empty. |
 | `verify.py` | Integrity gate. Holds the pinned sha256 of the approved registry and checks shape. Prints one `PRODUCTION ROLES:` line; non-zero exit on missing / unparseable / drifted / malformed. |
 
 **Install location:** `~/.hermes/security/production-roles/` (both files, next to

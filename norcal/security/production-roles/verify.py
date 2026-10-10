@@ -22,10 +22,11 @@ BASE = Path(__file__).resolve().parent
 REG = BASE / "production-roles.json"
 
 # sha256 of the approved production-roles.json bytes. Re-attest only on Christopher's approval.
-PINNED_SHA256 = "44b16aa78ce90f8ea4693f8e321c69a2046f2f18eb92069ac1bc7f3a7b2faa4d"
+PINNED_SHA256 = "ef1ebd7efc369ff9881d6a44c199aac23bff713b5afeabde8bc8a20c53e121f9"
 
 ROLE_CLASSES = ("stripe_live", "deploy", "dns", "firewall", "ports", "service_units")
-CHRISTOPHER_ONLY = frozenset({"stripe_live", "firewall", "ports", "service_units"})
+CHRISTOPHER_ONLY = frozenset(ROLE_CLASSES)  # 2026-10-09: every role is Christopher-authorized only
+AUTHORIZED_EXECUTORS = ("claude", "codex")
 
 
 def schema_errors(reg) -> list:
@@ -34,6 +35,9 @@ def schema_errors(reg) -> list:
         return ["registry root is not an object"]
     if not isinstance(reg.get("version"), int):
         errors.append("version missing or not an integer")
+    executors = reg.get("christopher_authorized_executors")
+    if not isinstance(executors, list) or sorted(executors) != sorted(AUTHORIZED_EXECUTORS):
+        errors.append(f"christopher_authorized_executors must be {list(AUTHORIZED_EXECUTORS)}")
     roles = reg.get("roles")
     if not isinstance(roles, dict):
         return errors + ["roles missing or not an object"]

@@ -6,12 +6,15 @@
   "notes": [
     "Erika may permit only roles that already exist in this registry; she cannot add roles.",
     "christopher_only roles are never assignable to a profile. Live money and Locked surfaces (firewall, ports, service units) stay Christopher-only.",
+    "2026-10-09 Christopher: every role is christopher_only. No Hermes profile holds a production role. A production action runs only on a card where Christopher has authorized that exact action, and only through an executor listed in christopher_authorized_executors (Claude Code or Codex).",
+    "Locked surfaces (firewall, ports) additionally require Christopher's explicit order in session, per the global protocol; the card authorization records that order.",
     "Ships EMPTY: no profile holds any production role until Christopher approves an entry and the pin in verify.py is re-attested."
   ],
+  "christopher_authorized_executors": ["claude", "codex"],
   "roles": {
     "stripe_live": {"christopher_only": true, "profiles": []},
-    "deploy": {"christopher_only": false, "profiles": []},
-    "dns": {"christopher_only": false, "profiles": []},
+    "deploy": {"christopher_only": true, "profiles": []},
+    "dns": {"christopher_only": true, "profiles": []},
     "firewall": {"christopher_only": true, "profiles": []},
     "ports": {"christopher_only": true, "profiles": []},
     "service_units": {"christopher_only": true, "profiles": []}
