@@ -1424,6 +1424,26 @@ def handle_function_call(
         if _contract_refusal is not None:
             return tool_error(_contract_refusal)
 
+        # Execution contract rule 6 (production authority), segment 6b:
+        # REPORT-ONLY surface gate. A terminal/execute_code command or a
+        # write_file/patch target that touches a named production surface
+        # (firewall, ports, service units, DNS records, deploy, Stripe live)
+        # records a production_action_unauthorized event on the worker's card
+        # (payload is redacted: role, tool, matcher id; never the command or
+        # path). It returns None in every case while the registry is
+        # report-only, and a gate error can never break the tool call.
+        try:
+            from agent.production_authority_gate import production_authority_refusal
+
+            _production_refusal = production_authority_refusal(function_name, function_args)
+        except Exception as _prod_gate_err:  # report-only: never let the gate break a call
+            logger.warning(
+                "production authority gate error (allowing): %s", type(_prod_gate_err).__name__
+            )
+            _production_refusal = None
+        if _production_refusal is not None:
+            return tool_error(_production_refusal)
+
         # Check plugin hooks for a block/approve/modify directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
