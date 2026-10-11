@@ -24,7 +24,23 @@ HERMES = CH / ".hermes"
 DOCTRINE = HERMES / "doctrine"
 VAULT = CH / "services/life-wiki/vault"
 API_VAULT = VAULT / "artifacts/api-server/vault"
-KANBAN_DB = HERMES / "kanban.db"
+
+
+def resolve_kanban_db() -> Path:
+    """Board file this boot reads.
+
+    ``HERMES_KANBAN_DB`` pins the file directly, with the same precedence as
+    ``hermes_cli.kanban_db.kanban_db_path()``; the dispatcher sets it for every
+    worker and the worker sandbox binds only that board. Without the pin the
+    canonical shared board is used.
+    """
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return HERMES / "kanban.db"
+
+
+KANBAN_DB = resolve_kanban_db()
 DAILY_INDEX_LINES = 12
 KANBAN_RECENT_SECONDS = 48 * 60 * 60
 BOOT_COMPACT = True
