@@ -1,0 +1,78 @@
+# Example lane manifest for the per-company kanban worker sandbox (bubblewrap).
+# Live copy (not created by this proposal): ~/.hermes/security/worker-sandbox/lanes.yaml
+# Design + decisions: vault/Business/Systems/2026-10-11-worker-sandbox-design.md
+# Paths only. Never put a secret value in this file.
+#
+# Lane decisions (Christopher, 2026-10-11):
+# - repo map: Logos-Covenant -> logos; NCASS-INC -> ncass; North-Caledonia,
+#   NorCal_Hermes -> northcaledonia; OrionFormationServicesInc -> orion;
+#   The-Glass-Pepper -> glasspepper; vault Business/Companies/<X> by name.
+# - logos also owns Logos-Investment-Group and iKBR-Active-Trader.
+# - LC-eProducts-LLC under orion SHORT TERM (re-ask when the LLC's use is decided).
+# - Side projects in NO lane (hidden from every company worker): BobtailBoss,
+#   CDL-Prep-Helper, Route-Plan-Go, Grants-101.
+# - Logos + TripTracker form a lane group (each sees the other's repos/vault).
+#   TripTracker code lives at /home/chris/TripTrackertechnologies.
+# - LLM credential (option 1): shared platform credential files bound READ-ONLY
+#   into every lane; nothing else from $HOME.
+
+version: 1
+
+# Per-lane HOME inside the sandbox: <sandbox_home_root>/<lane> (holds the lane's
+# own .npm, .cache, Downloads, etc.). Created by the operator / C1.2 probe.
+sandbox_home_root: /home/chris/.hermes/security/worker-sandbox/homes
+
+# Read-only in every lane.
+shared_ro:
+  - /home/chris/.hermes/doctrine
+
+# Exact FILES, read-only, every lane. A directory here is rejected.
+credentials_ro:
+  - /home/chris/.claude/.credentials.json
+  - /home/chris/.hermes/auth.json
+
+groups:
+  logos_triptracker: [logos, triptracker]
+
+lanes:
+  logos:
+    repos:
+      - /home/chris/hermes/repos/Logos-Covenant
+    vault:
+      - /home/chris/services/life-wiki/vault/Business/Companies/Logos-Covenant-Inc
+      - /home/chris/services/life-wiki/vault/Business/Companies/Logos-Investment-Group
+      - /home/chris/services/life-wiki/vault/Business/Companies/iKBR-Active-Trader
+    browser_profiles: []
+  triptracker:
+    repos:
+      - /home/chris/TripTrackertechnologies
+    vault:
+      - /home/chris/services/life-wiki/vault/Business/Companies/TripTracker
+    browser_profiles: []
+  ncass:
+    repos:
+      - /home/chris/hermes/repos/NCASS-INC
+    vault:
+      - /home/chris/services/life-wiki/vault/Business/Companies/NCASS
+    browser_profiles: []
+  northcaledonia:
+    repos:
+      - /home/chris/hermes/repos/North-Caledonia
+      - /home/chris/hermes/repos/NorCal_Hermes
+    vault:
+      - /home/chris/services/life-wiki/vault/Business/Companies/North-Caledonia-Inc
+    browser_profiles: []
+  orion:
+    repos:
+      - /home/chris/hermes/repos/OrionFormationServicesInc
+    vault:
+      # Both spellings exist on disk today (2026-10-11); consolidate later.
+      - /home/chris/services/life-wiki/vault/Business/Companies/Orion-Formation-Services
+      - /home/chris/services/life-wiki/vault/Business/Companies/Orion_Formation_Services
+      - /home/chris/services/life-wiki/vault/Business/Companies/LC-eProducts-LLC   # short term, re-ask
+    browser_profiles: []
+  glasspepper:
+    repos:
+      - /home/chris/hermes/repos/The-Glass-Pepper
+    vault: []   # no Business/Companies folder for Glass Pepper exists yet (2026-10-11)
+    browser_profiles: []
