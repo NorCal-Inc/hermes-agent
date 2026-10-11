@@ -153,3 +153,20 @@ def test_sigterm_outer_bwrap_kills_inner_worker():
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_enforced_lane_gets_openrouter_key_in_env_not_argv(monkeypatch):
+    _setup(monkeypatch, manifest={"lanes": {"orion": {}}})
+    monkeypatch.setattr(kdb, "_shared_openrouter_key", lambda: "FAKE-OR-KEY")
+    env = {}
+    out = _apply(_task(), env)
+    assert env["OPENROUTER_API_KEY"] == "FAKE-OR-KEY"
+    assert not any("FAKE-OR-KEY" in a for a in out)
+
+
+def test_unsandboxed_lane_env_untouched(monkeypatch):
+    _setup(monkeypatch, mode="off", manifest={"lanes": {}})
+    monkeypatch.setattr(kdb, "_shared_openrouter_key", lambda: "FAKE-OR-KEY")
+    env = {}
+    _apply(_task(), env)
+    assert "OPENROUTER_API_KEY" not in env

@@ -24717,6 +24717,22 @@ def _bwrap_version() -> str:
     return _BWRAP_VERSION
 
 
+_OPENROUTER_ENV = "OPENROUTER_API_KEY"
+
+
+def _shared_openrouter_key() -> Optional[str]:
+    """The platform OpenRouter key from the dispatcher env or the root .env."""
+    val = os.environ.get(_OPENROUTER_ENV)
+    if val:
+        return val
+    try:
+        from dotenv import dotenv_values
+        from hermes_constants import get_default_hermes_root
+        return dotenv_values(get_default_hermes_root() / ".env").get(_OPENROUTER_ENV) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _apply_worker_sandbox(
     task: Task,
     cmd: list[str],
@@ -24766,6 +24782,16 @@ def _apply_worker_sandbox(
     if not wrapped or wrapped[0] != "bwrap":
         raise RuntimeError(f"{refuse}: sandbox wrapper was not applied")
     env[ws.SANDBOX_NO_REFRESH_ENV] = "1"
+    # Hermes agents reach models through OpenRouter (shared platform
+    # credential). The sandbox hides the root .env, so hand the key to the
+    # child through its environment; never through argv, which is world-
+    # readable in /proc/<pid>/cmdline.
+    if not env.get(_OPENROUTER_ENV):
+        key = _shared_openrouter_key()
+        if key:
+            env[_OPENROUTER_ENV] = key
+        else:
+            _log.warning("worker sandbox: %s not available for lane %s", _OPENROUTER_ENV, lane)
     _log.info(
         "kanban worker spawn task=%s lane=%s sandbox=1 bwrap=%s",
         task.id, lane, _bwrap_version(),
