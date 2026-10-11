@@ -84,6 +84,10 @@ HOLD_INVARIANT = "recovery_hold"
 #: Christopher 2026-10-07): never recovered, never escalated, never DEGRADED;
 #: one alert when the episode starts. Not a configured hold: no aggregate card.
 HELD_AWAITING_HUMAN = "awaiting_human"
+#: ``held_by`` value for an informational finding (Rule 6 segment 6e,
+#: Christopher 2026-10-11): visible in the ledger and heartbeat, never
+#: recovered, never escalated, never alerted, never DEGRADED.
+HELD_INFORMATIONAL = "informational"
 
 #: ``state_model`` values. Strict is the original GREEN/DEGRADED semantics.
 STATE_MODEL_STRICT = "strict"
@@ -177,6 +181,10 @@ class Finding:
     #: as ``HELD_AWAITING_HUMAN``: no recovery, no escalation, no DEGRADED, one
     #: alert per episode. Not part of the fingerprint.
     awaiting_human: bool = False
+    #: Report-only signal that must stay visible without paging: held as
+    #: ``HELD_INFORMATIONAL`` -- no recovery, no escalation, no card, no alert,
+    #: not DEGRADED. Not part of the fingerprint.
+    informational: bool = False
     #: ``shared`` escalates with a governed card on the shared board plus the
     #: shared alert. ``company`` (company health probes, Christopher F2
     #: 2026-09-14) never creates a shared card: only the coarse shared summary
@@ -577,6 +585,9 @@ class Controller:
                     if finding.awaiting_human:
                         self._hold_awaiting_human(finding, inv.tier, state, result)
                         continue
+                    if finding.informational:
+                        self._hold(finding, {"name": HELD_INFORMATIONAL}, inv.tier, state, result)
+                        continue
                     self._process(inv, finding, state, result)
                 present |= self._carry_pending_recoveries(inv, present, state, result)
                 self._resolve_absent(inv, present, state, result)
@@ -650,6 +661,8 @@ class Controller:
                                   state, result, reason_override=ESCALATION_FROZEN_UNCOVERED)
                 elif finding.awaiting_human:
                     self._hold_awaiting_human(finding, inv.tier, state, result)
+                elif finding.informational:
+                    self._hold(finding, {"name": HELD_INFORMATIONAL}, inv.tier, state, result)
                 else:
                     self._process(inv, finding, state, result)
             present |= self._carry_pending_recoveries(inv, present, state, result)
@@ -1816,6 +1829,67 @@ class CriticalCronJobsHealthy(Invariant):
                     script_path = ctx.hermes_home / "scripts" / script_path
                 if not script_path.exists():
                     out.append(Finding(self.name, name, "script_missing", {}))
+        return out
+
+
+#: Rule 6 production authority (agent/production_authority_gate.py) event kinds
+#: on the worker card, and how far back the light pass looks for them.
+PRODUCTION_ACTION_REFUSED_EVENT = "production_action_refused"
+PRODUCTION_ACTION_UNAUTHORIZED_EVENT = "production_action_unauthorized"
+PRODUCTION_ACTION_WINDOW_SECONDS = 900  # 15 min: alert fires on the first light pass, then READY recovers on its own (Claude Code review 2026-10-11; card proposed 24 h)
+
+
+class ProductionActionsRefused(Invariant):
+    """The Rule 6 gate blocked (or, report-only, would have blocked) a production action.
+
+    Nothing else reads these card events, so without this a refusal is silent
+    (Christopher, 2026-10-11). A refusal is unsafe: escalated at once through
+    the controller's alert path. A report-only ``production_action_unauthorized``
+    match is informational: held, visible, never paged. Detect-only: the
+    controller never unblocks, retries or modifies the card.
+    """
+
+    name = "production_actions_refused"
+    tier = TIER_LIGHT
+    source = ("kanban.db task_events kind production_action_refused / production_action_unauthorized "
+              "(agent/production_authority_gate.py redacted payload) within PRODUCTION_ACTION_WINDOW_SECONDS")
+    failure = ("a production_action_refused event on any card in the window (unsafe, escalated); a "
+               "production_action_unauthorized report-only event in the window (informational, held)")
+    evidence = ("refused:<role> (unsafe) | unauthorized_report_only:<role> (informational); subject = card id; "
+                "detail role, tool, matcher, executor_lane, event_at -- never command text")
+
+    def check(self, ctx: Context) -> list[Finding]:
+        cutoff = int(ctx.now()) - PRODUCTION_ACTION_WINDOW_SECONDS
+        latest: dict[tuple[str, str, str], dict] = {}
+        with ctx.kanban() as conn:
+            rows = conn.execute(
+                "SELECT task_id, kind, payload, created_at FROM task_events "
+                "WHERE kind IN (?, ?) AND created_at >= ? ORDER BY id",
+                (PRODUCTION_ACTION_REFUSED_EVENT, PRODUCTION_ACTION_UNAUTHORIZED_EVENT, cutoff),
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            role = str(payload.get("role") or "unknown")
+            # Only the redacted identifiers; the gate never records command text and neither does this.
+            latest[(row["task_id"], role, row["kind"])] = {
+                "role": role,
+                "tool": str(payload.get("tool") or ""),
+                "matcher": str(payload.get("matcher") or ""),
+                "executor_lane": str(payload.get("executor_lane") or ""),
+                "event_at": _iso(int(row["created_at"])),
+            }
+        out: list[Finding] = []
+        for (task_id, role, kind), detail in latest.items():
+            if kind == PRODUCTION_ACTION_REFUSED_EVENT:
+                out.append(Finding(self.name, task_id, f"refused:{role}", detail, unsafe=True))
+            else:
+                out.append(Finding(self.name, task_id, f"unauthorized_report_only:{role}", detail,
+                                   informational=True))
         return out
 
 
@@ -4119,8 +4193,8 @@ ESCALATE_ONLY_INVARIANTS = (
     "runtime_ceilings_match_doctrine", "shared_endpoints_healthy", "resource_thresholds", "ownership_and_linkage",
     "task_graph_integrity", "backup_results", "escalation_cards_dispositioned", "critical_timers_active",
     "gateway_platforms_connected", "ready_backlog_explained", "verdict_returned_to_subject",
-    "verifier_child_stalled_in_todo", "closed_card_verification_unresolved", HOLD_INVARIANT,
-    EXCEPTION_VALIDITY_INVARIANT,
+    "verifier_child_stalled_in_todo", "closed_card_verification_unresolved", "production_actions_refused",
+    HOLD_INVARIANT, EXCEPTION_VALIDITY_INVARIANT,
 )
 
 
@@ -4133,6 +4207,7 @@ F1_DETECT_ONLY = (
     ReadyBacklogExplained, RunLeaseConsistency, VerdictReturnedToSubject, VerifierChildStalledInTodo,
     GatewayPlatformsConnected, ResourceThresholds, OwnershipAndLinkage, TaskGraphIntegrity,
     LifeWikiDailyNote, BackupResults, EscalationCardsDispositioned, ClosedCardVerificationUnresolved,
+    ProductionActionsRefused,
 )
 
 
@@ -4144,6 +4219,7 @@ def default_invariants() -> list[Invariant]:
         SubjectReviewRegressed(),
         GatewayHeartbeatFresh(),
         CriticalCronJobsHealthy(),
+        ProductionActionsRefused(),
         CounterpartHeartbeatFresh(TIER_LIGHT),
         ReadyBacklogExplained(),
         RunLeaseConsistency(),
