@@ -1306,7 +1306,135 @@ class TestQuickSnapshotProjectsKanban:
             conn.close()
         return home
 
+    @staticmethod
+    def _snapshot_files(hermes_home: Path, snap_id: str) -> set[str]:
+        snap = hermes_home / "state-snapshots" / snap_id
+        return {
+            p.relative_to(snap).as_posix()
+            for p in snap.rglob("*")
+            if p.is_file() and p.name != "manifest.json"
+        }
 
+    @staticmethod
+    def _relocate_default_board(hermes_home: Path, *, symlink: bool) -> Path:
+        """Move <root>/kanban.db to <root>/kanban-db/kanban.db, optionally
+        leaving a back-compat symlink at the old path."""
+        new_dir = hermes_home / "kanban-db"
+        new_dir.mkdir()
+        real = new_dir / "kanban.db"
+        (hermes_home / "kanban.db").rename(real)
+        if symlink:
+            _symlink_file_or_skip(hermes_home / "kanban.db", real)
+        return real
+
+    def test_default_kanban_db_regular_file_snapshotted(self, hermes_home):
+        """Legacy layout: <root>/kanban.db is a regular file and is captured
+        under its own name (unchanged behaviour)."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        files = self._snapshot_files(hermes_home, snap_id)
+        assert "kanban.db" in files
+        assert "kanban-db/kanban.db" not in files
+
+    def test_default_kanban_db_behind_symlink_snapshotted_once_from_real_path(
+        self, hermes_home
+    ):
+        """Relocated layout with a back-compat symlink: the board must be
+        captured exactly once, keyed by the real path, so a restore writes
+        the real file and leaves the symlink in place."""
+        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
+
+        real = self._relocate_default_board(hermes_home, symlink=True)
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        files = self._snapshot_files(hermes_home, snap_id)
+        assert "kanban-db/kanban.db" in files
+        assert "kanban.db" not in files
+        manifest = json.loads(
+            (hermes_home / "state-snapshots" / snap_id / "manifest.json").read_text()
+        )
+        kanban_entries = [k for k in manifest["files"] if k.endswith("kanban.db")]
+        assert kanban_entries == ["kanban-db/kanban.db"]
+
+        # Simulate data loss at the real location, then restore.
+        conn = sqlite3.connect(str(real))
+        conn.execute("DELETE FROM tasks")
+        conn.commit()
+        conn.close()
+
+        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+        link = hermes_home / "kanban.db"
+        assert link.is_symlink(), "restore must not replace the symlink with a file"
+        assert not real.is_symlink()
+        conn = sqlite3.connect(str(real))
+        rows = conn.execute("SELECT * FROM tasks").fetchall()
+        conn.close()
+        assert rows == [("t1", "todo")]
+
+    def test_default_kanban_db_relocated_without_symlink_snapshotted(self, hermes_home):
+        """Relocated layout once the compatibility symlink is gone: the
+        board at <root>/kanban-db/kanban.db must still be captured."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        self._relocate_default_board(hermes_home, symlink=False)
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        files = self._snapshot_files(hermes_home, snap_id)
+        assert "kanban-db/kanban.db" in files
+        assert "kanban.db" not in files
+
+    def test_default_kanban_db_symlink_outside_home_skipped(self, hermes_home, tmp_path):
+        """A kanban.db symlink pointing outside HERMES_HOME is not followed."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        (hermes_home / "kanban.db").unlink()
+        outside = tmp_path / "outside-kanban.db"
+        conn = sqlite3.connect(str(outside))
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, data TEXT)")
+        conn.execute("INSERT INTO tasks VALUES (?, ?)", ("x1", "leak"))
+        conn.commit()
+        conn.close()
+        _symlink_file_or_skip(hermes_home / "kanban.db", outside)
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        assert snap_id is not None
+        files = self._snapshot_files(hermes_home, snap_id)
+        assert not any(name.endswith("kanban.db") for name in files)
+
+    def test_no_default_kanban_db_is_not_an_error(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+
+        (hermes_home / "kanban.db").unlink()
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        assert snap_id is not None
+        files = self._snapshot_files(hermes_home, snap_id)
+        assert not any(name.endswith("kanban.db") for name in files)
+        assert "projects.db" in files
+
+    def test_full_zip_backup_relocated_board_once_and_skips_unrelated_symlink(
+        self, hermes_home, tmp_path
+    ):
+        """Full zip backup: the relocated board lands once, from the real
+        path; the back-compat symlink and an unrelated symlink elsewhere
+        under HERMES_HOME are both skipped."""
+        from hermes_cli import backup as backup_mod
+
+        self._relocate_default_board(hermes_home, symlink=True)
+        outside = tmp_path / "outside-note.txt"
+        outside.write_text("outside data\n")
+        (hermes_home / "skills").mkdir()
+        _symlink_file_or_skip(hermes_home / "skills" / "stray-link.txt", outside)
+
+        out_zip = tmp_path / "full.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+        assert result is not None
+        with zipfile.ZipFile(out_zip) as zf:
+            names = zf.namelist()
+            assert names.count("kanban-db/kanban.db") == 1
+            assert "kanban.db" not in names
+            assert "skills/stray-link.txt" not in names
+            assert all(zf.read(n) != b"outside data\n" for n in names)
 
     def test_non_default_kanban_board_snapshotted(self, hermes_home):
         """#52889 completeness: non-default boards live at

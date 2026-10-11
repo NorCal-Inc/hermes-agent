@@ -1293,7 +1293,7 @@ _QUICK_STATE_FILES = (
     "response_store.db",                # gateway conversation history / tool payloads
     "memory_store.db",                  # holographic memory facts/entities
     "verification_evidence.db",         # agent verification audit trail
-    "kanban.db",                        # default board (back-compat <root>/kanban.db)
+    "kanban.db",                        # default board; resolved to its real location (<root>/kanban.db or <root>/kanban-db/kanban.db) by _default_kanban_store_rel()
     "kanban/boards",                    # non-default boards: each <slug>/kanban.db + board metadata (workspaces/ + attachments/ are skipped as regenerable)
     # Pairing stores (generic + per-platform JSONs outside state.db)
     "pairing",                          # legacy location (gateway/pairing.py)
@@ -1303,6 +1303,54 @@ _QUICK_STATE_FILES = (
 
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 _QUICK_DEFAULT_KEEP = 20
+
+# Default kanban board store. Historically a regular file at <root>/kanban.db;
+# it may be relocated to <root>/kanban-db/kanban.db with a back-compat symlink
+# left at the old path. Resolved per snapshot by _default_kanban_store_rel().
+_DEFAULT_KANBAN_DB_REL = "kanban.db"
+_RELOCATED_KANBAN_DB_REL = "kanban-db/kanban.db"
+
+
+def _default_kanban_store_rel(home: Path) -> Optional[str]:
+    """Return the home-relative path of the default board's real ``kanban.db``.
+
+    Handles both layouts without following arbitrary symlinks:
+
+    - ``<root>/kanban.db`` is a regular file (legacy) -> ``"kanban.db"``.
+    - ``<root>/kanban.db`` is a symlink -> dereferenced exactly once; the
+      target is used only when it is a regular (non-symlink) file inside
+      ``home``, so the snapshot records the real location and a restore
+      writes the real file instead of replacing the symlink. A link whose
+      target is outside ``home``, missing, or itself a symlink is skipped.
+    - no ``<root>/kanban.db`` at all -> ``<root>/kanban-db/kanban.db`` when
+      that is a regular file.
+
+    Returns ``None`` when there is no default board to snapshot.
+    """
+    legacy = home / _DEFAULT_KANBAN_DB_REL
+    if legacy.is_symlink():
+        try:
+            target = Path(os.path.normpath(legacy.parent / os.readlink(legacy)))
+        except OSError:
+            return None
+        if target.is_symlink() or not target.is_file():
+            return None
+        try:
+            rel = target.resolve().relative_to(home.resolve())
+        except (OSError, ValueError):
+            logger.warning(
+                "Quick snapshot skipped %s: symlink target is outside %s",
+                _DEFAULT_KANBAN_DB_REL,
+                home,
+            )
+            return None
+        return rel.as_posix()
+    if legacy.is_file():
+        return _DEFAULT_KANBAN_DB_REL
+    relocated = home / _RELOCATED_KANBAN_DB_REL
+    if relocated.is_file() and not relocated.is_symlink():
+        return _RELOCATED_KANBAN_DB_REL
+    return None
 
 
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
@@ -1398,6 +1446,13 @@ def _create_quick_snapshot_locked(
     oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
+        if rel == _DEFAULT_KANBAN_DB_REL:
+            # Resolve the default board to its real on-disk location so the
+            # manifest key (and therefore the restore destination) is the
+            # real file, not a back-compat symlink.
+            rel = _default_kanban_store_rel(home)
+            if rel is None:
+                continue
         src = home / rel
         if not src.exists():
             continue
