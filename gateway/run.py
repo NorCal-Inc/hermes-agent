@@ -13240,9 +13240,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
+        # C1.2d: gateway-owned Codex refresh for the ROOT auth store plus the
+        # trimmed per-lane credential files sandboxed company workers read.
+        # A no-op unless kanban.worker_sandbox.mode is enforce and the lane
+        # manifest exists (hermes_cli.codex_lane_creds.run_once decides).
+        self._spawn_supervised(self._codex_lane_creds_watcher, "codex_lane_creds_watcher")
+
         logger.info("Press Ctrl+C to stop")
-        
+
         return True
+
+    async def _codex_lane_creds_watcher(self, interval: float = 60.0) -> None:
+        """Keep the root openai-codex token fresh and regenerate lane credential files.
+
+        One owner for Codex rotation (refresh tokens are single-use); sandboxed
+        workers never refresh (``HERMES_SANDBOX_NO_REFRESH=1``). The tick body
+        is blocking I/O (+ one HTTPS call when inside the skew window), so it
+        runs in a thread. Failures are logged and retried next tick.
+        """
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                from hermes_cli.codex_lane_creds import run_once
+                result = await asyncio.to_thread(run_once)
+                bad = {k: v for k, v in (result.get("lanes") or {}).items() if v != "ok"}
+                if result.get("refresh") == "refreshed" or bad:
+                    logger.info("codex lane creds: refresh=%s lanes=%s", result.get("refresh"), bad or "ok")
+            except Exception:  # noqa: BLE001
+                logger.warning("codex lane creds: tick failed", exc_info=True)
+            await asyncio.sleep(interval)
 
     _MAX_SUPERVISED_RESTARTS = 5
     # A task that ran at least this long before crashing is treated as having

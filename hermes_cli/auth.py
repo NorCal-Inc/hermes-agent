@@ -4005,14 +4005,43 @@ def refresh_codex_oauth_pure(
     return updated
 
 
+SANDBOX_NO_REFRESH_ENV = "HERMES_SANDBOX_NO_REFRESH"
+CODEX_REFRESH_OWNED_BY_GATEWAY_CODE = "codex_refresh_owned_by_gateway"
+
+
+def _sandbox_refresh_disabled() -> bool:
+    """True inside a company worker sandbox (worker_sandbox.wrap sets the flag).
+
+    A sandboxed worker reads a trimmed, read-only, per-lane copy of the root
+    store whose refresh token belongs to the gateway (hermes_cli.codex_lane_creds).
+    It must never consume that single-use refresh token itself.
+    """
+    return is_truthy_value(os.environ.get(SANDBOX_NO_REFRESH_ENV, ""))
+
+
+def _codex_refresh_owned_by_gateway_error() -> "AuthError":
+    return AuthError(
+        "Codex access token is expired and credential refresh is owned by the gateway "
+        f"({SANDBOX_NO_REFRESH_ENV}=1): this sandboxed worker never rotates tokens. "
+        "Wait for the gateway's codex lane refresher to regenerate the lane credential.",
+        provider="openai-codex",
+        code=CODEX_REFRESH_OWNED_BY_GATEWAY_CODE,
+        relogin_required=False,
+    )
+
+
 def _refresh_codex_auth_tokens(
     tokens: Dict[str, str],
     timeout_seconds: float,
 ) -> Dict[str, str]:
     """Refresh Codex access token using the refresh token.
-    
+
     Saves the new tokens to Hermes auth store automatically.
     """
+    if _sandbox_refresh_disabled():
+        # Defence in depth for every caller: no network refresh, no CLI
+        # recovery, no store write from inside a sandbox.
+        raise _codex_refresh_owned_by_gateway_error()
     try:
         refreshed = refresh_codex_oauth_pure(
             str(tokens.get("access_token", "") or ""),
@@ -4193,6 +4222,15 @@ def resolve_codex_runtime_credentials(
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+
+    if _sandbox_refresh_disabled():
+        # Sandboxed worker: use the gateway-materialised access token as-is.
+        # Expired (skew 0) is a hard, clearly-attributed error rather than a
+        # refresh — the refresh token in the lane file is the gateway's.
+        if _codex_access_token_is_expiring(access_token, 0):
+            raise _codex_refresh_owned_by_gateway_error()
+        force_refresh = False
+        refresh_if_expiring = False
 
     should_refresh = bool(force_refresh)
     if (not should_refresh) and refresh_if_expiring:

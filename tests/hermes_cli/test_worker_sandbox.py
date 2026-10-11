@@ -139,13 +139,82 @@ def test_profile_home_must_not_be_hermes_root(tmp_path):
 def test_credential_files_bound_ro_only_when_listed(tmp_path):
     cred = str(HOME / ".claude" / ".credentials.json")
     auth = str(HOME / ".hermes" / "auth.json")
-    without = _build(tmp_path)
+    trimmed = ws.lane_creds_file("logos", HOME)
+    m = _manifest(tmp_path)
+    m["lanes"]["logos"]["llm_source"] = "claude_code"
+    without = _build(tmp_path, manifest=m)
     assert cred not in without and auth not in without
-    with_creds = _build(tmp_path, manifest=_manifest(tmp_path, credentials_ro=[cred, auth]))
+    m["credentials_ro"] = [cred, auth]
+    with_creds = _build(tmp_path, manifest=m)
     ro = _binds(with_creds, "--ro-bind")
     rw = _binds(with_creds, "--bind")
-    assert (cred, cred) in ro and (auth, auth) in ro
-    assert all(s not in (cred, auth) for s, _ in rw)
+    assert (cred, cred) in ro
+    # C1.2d: the root store is never bound as-is, even when listed.
+    assert (auth, auth) not in ro and auth not in with_creds
+    assert all(s not in (cred, auth, trimmed) for s, _ in rw)
+
+
+# ---------------------------------------------------------------- C1.2d trimmed codex store
+
+def test_codex_lane_binds_trimmed_file_at_root_auth_path_and_sets_no_refresh(tmp_path):
+    auth = str(HOME / ".hermes" / "auth.json")
+    trimmed = ws.lane_creds_file("logos", HOME)
+    assert trimmed == str(HOME / ".hermes" / "security" / "worker-sandbox" / "creds" / "logos" / "auth.json")
+    m = _manifest(tmp_path, credentials_ro=[auth])  # default llm_source: codex
+    argv = _build(tmp_path, manifest=m)
+    ro = _binds(argv, "--ro-bind")
+    assert (trimmed, auth) in ro
+    assert (auth, auth) not in ro
+    assert all(s != auth for s, _ in ro)  # the real root store is never a bind source
+    assert ("--setenv", "HERMES_SANDBOX_NO_REFRESH") in zip(argv, argv[1:])
+    assert argv[argv.index("HERMES_SANDBOX_NO_REFRESH") + 1] == "1"
+    # the trimmed file is bound even when credentials_ro does not list the root store
+    argv2 = _build(tmp_path, manifest=_manifest(tmp_path, credentials_ro=[]))
+    assert (trimmed, auth) in _binds(argv2, "--ro-bind")
+
+
+def test_codex_lane_missing_trimmed_file_fails_closed(tmp_path):
+    trimmed = ws.lane_creds_file("logos", HOME)
+    with pytest.raises(ws.SandboxConfigError, match="codex-sourced"):
+        _build(tmp_path, exists=lambda p: p != trimmed)
+    # explicit llm_source: codex behaves the same as the default
+    m = _manifest(tmp_path)
+    m["lanes"]["logos"]["llm_source"] = "codex"
+    with pytest.raises(ws.SandboxConfigError, match="codex-sourced"):
+        _build(tmp_path, manifest=m, exists=lambda p: p != trimmed)
+
+
+def test_claude_code_lane_gets_no_root_store_view(tmp_path):
+    auth = str(HOME / ".hermes" / "auth.json")
+    cred = str(HOME / ".claude" / ".credentials.json")
+    m = _manifest(tmp_path, credentials_ro=[cred, auth])
+    m["lanes"]["logos"]["llm_source"] = "claude_code"
+    argv = _build(tmp_path, manifest=m, exists=lambda p: p != ws.lane_creds_file("logos", HOME))
+    assert auth not in argv and ws.lane_creds_file("logos", HOME) not in argv
+    assert (cred, cred) in _binds(argv, "--ro-bind")
+    assert argv[argv.index("HERMES_SANDBOX_NO_REFRESH") + 1] == "1"
+
+
+def test_unknown_llm_source_rejected(tmp_path):
+    m = _manifest(tmp_path)
+    m["lanes"]["logos"]["llm_source"] = "openrouter"
+    with pytest.raises(ws.SandboxConfigError, match="llm_source"):
+        _build(tmp_path, manifest=m)
+
+
+def test_wrap_codex_lane_binds_trimmed_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(ws, "lane_for", lambda p: "logos")
+    trimmed = Path(ws.lane_creds_file("logos", Path.home()))
+    monkeypatch.setattr(ws, "lane_creds_file", lambda lane, home: str(tmp_path / "creds" / lane / "auth.json"))
+    with pytest.raises(ws.SandboxConfigError):
+        _wrap(tmp_path)  # file not materialised yet -> no unsandboxed spawn, no spawn at all
+    f = tmp_path / "creds" / "logos" / "auth.json"
+    f.parent.mkdir(parents=True)
+    f.write_text("{}", encoding="utf-8")
+    out = _wrap(tmp_path)
+    assert out[0] == "bwrap"
+    assert (str(f), str(Path.home() / ".hermes" / "auth.json")) in _binds(out, "--ro-bind")
+    assert str(trimmed) not in out
 
 
 def test_credential_entry_may_not_be_directory_or_nested(tmp_path):
@@ -237,7 +306,9 @@ def _wrap(tmp_path, *, cfg=ENFORCE, lane="logos", executor_lane=None, manifest="
 
 def test_wrap_enforced_lane_gets_bwrap_prefix(tmp_path, monkeypatch):
     monkeypatch.setattr(ws, "lane_for", lambda p: "logos")
-    out = _wrap(tmp_path)
+    m = _manifest(tmp_path)
+    m["lanes"]["logos"]["llm_source"] = "claude_code"  # codex path (real creds file) covered below
+    out = _wrap(tmp_path, manifest=m)
     assert out[0] == "bwrap"
     assert out[-len(CMD):] == CMD
     assert out[-len(CMD) - 1] == "--"
@@ -315,14 +386,16 @@ def test_sandbox_config_rejects_unknown_mode():
 def test_bwrap_hides_secrets_and_home(tmp_path):
     for d in ("ws", "kanban", "profile", "homes/logos"):
         (tmp_path / d).mkdir(parents=True)
-    m = _manifest(tmp_path, shared_ro=[], lanes={"logos": {"repos": [], "vault": []}})
+    # claude_code lane: the live run must not require a creds file under the REAL home.
+    m = _manifest(tmp_path, shared_ro=[], lanes={"logos": {"repos": [], "vault": [], "llm_source": "claude_code"}})
     argv = ws.build_bwrap_argv("logos", "p", tmp_path / "profile", tmp_path / "ws", m,
                                kanban_db_dir=tmp_path / "kanban", home=HOME)
     probe = (
         "test ! -e /home/chris/.hermes/secrets/Orion.env && test ! -e /home/chris/.hermes/secrets"
         " && test ! -e /home/chris/.ssh && test ! -e /home/chris/.hermes/cache/op_cache.json"
+        " && test ! -e /home/chris/.hermes/auth.json"
         " && test ! -e /var/run/docker.sock && test ! -e /run/user/$(id -u)"
-        " && test \"$HOME\" = \"%s\" && test \"$HERMES_ENV_SOURCED\" = 1"
+        " && test \"$HOME\" = \"%s\" && test \"$HERMES_ENV_SOURCED\" = 1 && test \"$HERMES_SANDBOX_NO_REFRESH\" = 1"
         " && test \"$PWD\" = \"%s\" && touch \"%s/ok\""
     ) % (tmp_path / "homes" / "logos", tmp_path / "ws", tmp_path / "ws")
     res = subprocess.run(argv + ["--", "/bin/sh", "-c", probe], capture_output=True, text=True, timeout=60)

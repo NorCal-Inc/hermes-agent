@@ -93,9 +93,19 @@ def test_readonly_checks_follow_manifest_binding(tmp_path):
     assert c["runtime_repo_readonly"]["target"] == ws.runtime_code_paths(HOME)[0]
     assert c["hermes_skills_readonly"]["kind"] == "readonly"  # bound ro by the manifest
     assert c["npm_hidden"]["kind"] == "hidden"  # not bound at all
-    assert c["credential_auth.json_readonly"] == {
-        "name": "credential_auth.json_readonly", "kind": "readonly",
+    # C1.2d: the root store is never bound as-is; a codex lane sees the trimmed copy at that path.
+    assert "credential_auth.json_readonly" not in c
+    assert c["trimmed_codex_store_readonly"] == {
+        "name": "trimmed_codex_store_readonly", "kind": "readonly",
         "target": str(HOME / ".hermes" / "auth.json"), "file": True}
+    assert c["sandbox_no_refresh_set"] == {
+        "name": "sandbox_no_refresh_set", "kind": "env_equals", "target": "HERMES_SANDBOX_NO_REFRESH", "value": "1"}
+    mc = _manifest(tmp_path)
+    mc["lanes"]["triptracker"]["llm_source"] = "claude_code"
+    cc = _by_name(_checks(tmp_path, manifest=mc))
+    assert "trimmed_codex_store_readonly" not in cc
+    assert cc["root_auth_store_hidden"] == {
+        "name": "root_auth_store_hidden", "kind": "hidden", "target": [str(HOME / ".hermes" / "auth.json")]}
     m = _manifest(tmp_path, shared_ro=[])
     m["lanes"]["triptracker"]["extra_rw"] = [str(HOME / ".npm")]
     c2 = _by_name(_checks(tmp_path, manifest=m))
@@ -246,6 +256,10 @@ def test_real_probe_passes_with_temp_manifest_and_scratch_dirs(tmp_path, lane, p
     m["credentials_ro"] = [p for p in m["credentials_ro"] if os.path.isfile(p)]
     if lane not in m["lanes"]:
         pytest.skip(f"lane {lane} repo not present on this host")
+    # C1.2d: a codex lane needs the gateway-materialised trimmed file under the REAL
+    # home, which a test must never create; run the live probe as a claude_code lane
+    # (root store hidden) and leave the codex bind to the unit tests.
+    m["lanes"][lane]["llm_source"] = "claude_code"
     prefix = ws.build_bwrap_argv(lane, profile, tmp_path / "profile", tmp_path / "ws", m,
                                  kanban_db_dir=tmp_path / "kanban", home=HOME)
     checks = ws.probe_checks(lane, profile, tmp_path / "profile", tmp_path / "ws", m,

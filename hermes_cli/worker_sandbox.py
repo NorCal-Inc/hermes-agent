@@ -31,11 +31,21 @@ Manifest schema (paths only, never secrets)::
       <group>: [<lane>, <lane>]      # lanes in a group see each other's repos/vault
     lanes:
       <lane>:
+        llm_source: codex | claude_code     # default codex (C1.2d)
         repos: [<dir>, ...]
         vault: [<dir>, ...]
         browser_profiles: [<dir>, ...]
         extra_ro: [<path>, ...]
         extra_rw: [<path>, ...]
+
+LLM credential (C1.2d). The ROOT store ``~/.hermes/auth.json`` is never bound
+into a sandbox, even when ``credentials_ro`` lists it. A ``codex`` lane gets
+the gateway-materialised, trimmed, per-lane copy
+``~/.hermes/security/worker-sandbox/creds/<lane>/auth.json`` bound read-only
+AT ``~/.hermes/auth.json`` (fail closed when that file is missing), plus
+``HERMES_SANDBOX_NO_REFRESH=1`` so it never rotates the token itself. A
+``claude_code`` lane gets no root-store view at all; it keeps only the exact
+``credentials_ro`` files (``~/.claude/.credentials.json``).
 """
 
 from __future__ import annotations
@@ -78,6 +88,14 @@ _FORBIDDEN_HOME_REL: List[str] = [
 ]
 _FORBIDDEN_ABS: List[str] = ["/var/run/docker.sock", "/run/docker.sock", "/run/user"]
 _CREDENTIAL_FILE_PARENTS_REL: List[str] = [".claude", ".codex"]
+
+# C1.2d: LLM credential source of a lane and the per-lane trimmed codex store.
+LLM_SOURCE_CODEX = "codex"
+LLM_SOURCE_CLAUDE_CODE = "claude_code"
+LLM_SOURCES = (LLM_SOURCE_CODEX, LLM_SOURCE_CLAUDE_CODE)
+ROOT_AUTH_STORE_REL = Path(".hermes") / "auth.json"
+LANE_CREDS_RELPATH = Path(".hermes") / "security" / "worker-sandbox" / "creds"
+SANDBOX_NO_REFRESH_ENV = "HERMES_SANDBOX_NO_REFRESH"
 
 _warned_missing_manifest = False
 
@@ -218,6 +236,20 @@ def _lane_paths(manifest: Dict[str, Any], lane: str, key: str) -> List[str]:
     return out
 
 
+def lane_llm_source(manifest: Dict[str, Any], lane: str) -> str:
+    """``llm_source`` of a lane (``codex`` default). Unknown values fail closed."""
+    spec = (manifest.get("lanes") or {}).get(str(lane).strip().casefold()) or {}
+    raw = str(spec.get("llm_source") or LLM_SOURCE_CODEX).strip().casefold()
+    if raw not in LLM_SOURCES:
+        raise SandboxConfigError(f"worker sandbox: lane {lane!r} llm_source must be one of {LLM_SOURCES}, got {raw!r}")
+    return raw
+
+
+def lane_creds_file(lane: str, home: Path) -> str:
+    """Host path of the gateway-materialised trimmed codex store for ``lane``."""
+    return _norm(home / LANE_CREDS_RELPATH / str(lane).strip().casefold() / "auth.json")
+
+
 def runtime_code_paths(home: Path) -> List[str]:
     """Read-only code the worker needs: repo checkout + venv, node, ~/.local/bin, playwright browsers."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -282,12 +314,28 @@ def build_bwrap_argv(
         _check_allowed(n, home)
         argv += ["--ro-bind", n, n]
 
+    root_auth = _norm(home / ROOT_AUTH_STORE_REL)
     for p in manifest.get("credentials_ro") or []:
         n = _norm(p)
+        if n == root_auth:
+            # The root store is the whole provider pool; it is never bound as-is.
+            # A codex lane gets the trimmed per-lane copy below instead.
+            continue
         if n.endswith("/") or (exists(n) and os.path.isdir(n)):
             raise SandboxConfigError(f"worker sandbox: credentials_ro entry {n} is a directory; exact files only")
         _check_allowed(n, home, allow_credential_file=True)
         argv += ["--ro-bind", n, n]
+
+    llm_source = lane_llm_source(manifest, lane)
+    if llm_source == LLM_SOURCE_CODEX:
+        trimmed = lane_creds_file(lane, home)
+        if not exists(trimmed) or os.path.isdir(trimmed):
+            raise SandboxConfigError(
+                f"worker sandbox: lane {lane!r} is codex-sourced but the trimmed credential "
+                f"{trimmed} is missing (the gateway codex lane refresher materialises it); refusing to spawn"
+            )
+        _check_allowed(trimmed, home)
+        argv += ["--ro-bind", trimmed, root_auth]
 
     argv += ["--bind", profile_home_s, profile_home_s]
     argv += ["--bind", workspace_s, workspace_s]
@@ -311,6 +359,9 @@ def build_bwrap_argv(
 
     argv += ["--setenv", "HOME", lane_home]
     argv += ["--setenv", "HERMES_ENV_SOURCED", "1"]
+    # Token rotation is owned by the gateway (hermes_cli.codex_lane_creds);
+    # hermes_cli.auth honours this flag and never consumes the refresh token.
+    argv += ["--setenv", SANDBOX_NO_REFRESH_ENV, "1"]
     argv += ["--chdir", workspace_s]
     return argv
 
@@ -494,9 +545,16 @@ def probe_checks(
             add(f"{label}_readonly", "readonly", n)
         else:
             add(f"{label}_hidden", "hidden", [n])
+    root_auth = _norm(home / ROOT_AUTH_STORE_REL)
     for p in manifest.get("credentials_ro") or []:
         n = _norm(p)
+        if n == root_auth:
+            continue  # never bound as-is; covered by the trimmed-store check below
         add(f"credential_{Path(n).name}_readonly", "readonly", n, file=True)
+    if lane_llm_source(manifest, lane) == LLM_SOURCE_CODEX:
+        add("trimmed_codex_store_readonly", "readonly", root_auth, file=True)
+    else:
+        add("root_auth_store_hidden", "hidden", [root_auth])
 
     # --- MUST WORK ------------------------------------------------------
     add("profile_dir_rw", "rw", profile_home_s)
@@ -508,6 +566,7 @@ def probe_checks(
         add("https_head", "https_head", PROBE_HTTPS_URL)
     add("op_service_account_token_absent", "env_absent", "OP_SERVICE_ACCOUNT_TOKEN")
     add("hermes_env_sourced_set", "env_equals", "HERMES_ENV_SOURCED", value="1")
+    add("sandbox_no_refresh_set", "env_equals", SANDBOX_NO_REFRESH_ENV, value="1")
     return checks
 
 
