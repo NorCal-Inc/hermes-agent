@@ -1,5 +1,6 @@
-"""Execution-contract rule 6 (production authority), segment 6b: the
-REPORT-ONLY production-surface gate.
+"""Execution-contract rule 6 (production authority): the production-surface
+gate. Segment 6b built it REPORT-ONLY; segment 6d added REFUSE mode, which
+the installed registry's ``mode`` field selects.
 
 Doctrine basis: hierarchy.md 2.5 "Production authority". Design approved by
 Christopher 2026-10-07 (options note t_92521910, gate-rule6-OPTIONS.md):
@@ -22,30 +23,42 @@ rule 1-2 task-contract hook. A process that reaches this hook is a
 Hermes-native agent, which is never one of the authorized executors (Claude
 Code and Codex are separate processes that do not dispatch through
 ``model_tools``). So every surface match seen here is, by construction,
-unauthorized -- and that is exactly what this segment is for: to show, on
-the card, where production-shaped actions are happening today before the
-gate is flipped to refuse.
+unauthorized. In report-only mode that is what the gate is for: to show, on
+the card, where production-shaped actions are happening. In refuse mode the
+same match stops the call.
 
-What the gate does on a match, in ``mode: report-only`` (the only mode this
-segment implements):
+What the gate does on an unauthorized match depends on the INSTALLED
+registry's ``mode``:
 
-* records ONE ``production_action_unauthorized`` event per matched role on
-  the card named by ``HERMES_KANBAN_TASK`` (payload: role, tool name, matcher
-  id, executor lane, registry state -- NEVER the command text, code, path or
-  file content, which can contain secrets);
-* when there is no card (interactive session, no ``HERMES_KANBAN_TASK``),
-  logs one WARNING line with the same redacted fields;
-* returns ``None`` -- the tool call is ALLOWED. Always. Nothing in this file
-  refuses anything.
+``mode: report-only``
+    * records ONE ``production_action_unauthorized`` event per matched role
+      on the card named by ``HERMES_KANBAN_TASK`` (payload: role, tool name,
+      matcher id, executor lane, registry state -- NEVER the command text,
+      code, path or file content, which can contain secrets);
+    * when there is no card (interactive session, no ``HERMES_KANBAN_TASK``),
+      logs one WARNING line with the same redacted fields;
+    * returns ``None`` -- the tool call is ALLOWED.
 
-What refuse mode will do later (NOT in this segment): the same
-``ProductionDecision`` is computed; when ``decision.authorized`` is False and
-the registry says ``mode: refuse``, the hook returns a refusal string (the
-dispatcher turns it into a tool error, exactly like the rule 1-2 gate) and
-records ``production_action_refused`` instead. Until that segment lands, a
-registry whose ``mode`` is anything other than ``report-only`` is still
-treated as report-only here, and the registry state is recorded in the event
-so the mismatch is visible.
+``mode: refuse`` (exactly that string, registry state ``ok``)
+    * records ONE ``production_action_refused`` event per matched role on the
+      same card (same redacted payload, ``action: "refused"``), or one WARNING
+      line when there is no card;
+    * returns a short refusal string naming the role(s) and the requirement
+      (a Christopher-authorized card executed by Claude Code or Codex). The
+      dispatcher turns the string into a tool error, exactly like the rule
+      1-2 gate. The string never carries the command text, code, path or
+      file content.
+
+Any other mode, or a missing / unparseable / invalid registry
+    Today's report-only behaviour: record ``production_action_unauthorized``
+    (the payload carries ``registry_state`` and ``registry_mode`` so the
+    mismatch is visible) and allow. The boot gate (sibling ``verify.py``)
+    already fails closed on a missing or drifted registry; this hook does not
+    second-guess it.
+
+An authorized decision records nothing and allows in every mode. The gate
+never raises on purpose; the dispatcher additionally wraps the call so a gate
+exception can never break a tool call (it logs and allows).
 
 The credential half (1C, A half: ``hermes-run`` refusing to load
 production-tagged secrets into an unauthorized profile) is NOT here.
@@ -102,8 +115,8 @@ Surface list (one entry per role; read-only forms deliberately do not match):
     ``stripe`` CLI with ``--live``.
 
 Matchers are regular expressions over text and are knowingly incomplete; a
-miss is a missed report, never a wrongful refusal, because this segment
-refuses nothing.
+miss is a missed report (or, in refuse mode, a missed refusal), never a
+wrongful refusal of a non-production call.
 """
 
 from __future__ import annotations
@@ -123,6 +136,13 @@ ENV_TASK = "HERMES_KANBAN_TASK"
 ENV_RUN_ID = "HERMES_KANBAN_RUN_ID"
 
 EVENT_UNAUTHORIZED = "production_action_unauthorized"
+EVENT_REFUSED = "production_action_refused"
+
+MODE_REPORT_ONLY = "report-only"
+MODE_REFUSE = "refuse"
+
+ACTION_ALLOWED = "allowed_report_only"
+ACTION_REFUSED = "refused"
 
 #: The lane this hook executes under. ``model_tools.handle_function_call``
 #: only ever runs inside a Hermes-native agent process; Claude Code and Codex
@@ -217,7 +237,7 @@ class ProductionDecision:
     authorized: bool
     reason: str
 
-    def event_payload(self) -> dict:
+    def event_payload(self, action: str = ACTION_ALLOWED) -> dict:
         """Redacted, card-safe payload. No command text, code, path or content."""
         role = self.match.role if self.registry.state == "ok" else "unknown"
         return {
@@ -230,8 +250,13 @@ class ProductionDecision:
             "registry_mode": self.registry.mode,
             "authorized": self.authorized,
             "reason": self.reason,
-            "action": "allowed_report_only",
+            "action": action,
         }
+
+    @property
+    def refuse(self) -> bool:
+        """True only when the registry is intact and says exactly ``refuse``."""
+        return self.registry.state == "ok" and self.registry.mode == MODE_REFUSE
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +577,14 @@ def decide(
 
 
 def _record(decision: ProductionDecision, tool_name: str, environ) -> None:
-    payload = {"tool": tool_name, **decision.event_payload()}
+    """Record the unauthorized decision: ``production_action_refused`` when
+    the decision refuses, ``production_action_unauthorized`` otherwise. One
+    event on the card, or one WARNING line when there is no card."""
+    if decision.refuse:
+        kind, action, label = EVENT_REFUSED, ACTION_REFUSED, "refuse"
+    else:
+        kind, action, label = EVENT_UNAUTHORIZED, ACTION_ALLOWED, "report-only"
+    payload = {"tool": tool_name, **decision.event_payload(action)}
     task_id = decision.task_id
     if task_id:
         run_raw = (environ.get(ENV_RUN_ID) or "").strip()
@@ -565,18 +597,30 @@ def _record(decision: ProductionDecision, tool_name: str, environ) -> None:
 
             with kb.connect() as conn:
                 with kb.write_txn(conn):
-                    kb._append_event(conn, task_id, EVENT_UNAUTHORIZED, payload, run_id=run_id)
+                    kb._append_event(conn, task_id, kind, payload, run_id=run_id)
             return
         except Exception as exc:
             logger.warning(
                 "production authority gate: could not record %s on %s (%s)",
-                EVENT_UNAUTHORIZED, task_id, type(exc).__name__,
+                kind, task_id, type(exc).__name__,
             )
     logger.warning(
-        "production authority gate (report-only): %s tool=%s role=%s matcher=%s executor=%s "
+        "production authority gate (%s): %s tool=%s role=%s matcher=%s executor=%s "
         "registry=%s reason=%s",
-        EVENT_UNAUTHORIZED, tool_name, payload["role"], payload["matcher"],
+        label, kind, tool_name, payload["role"], payload["matcher"],
         payload["executor_lane"], payload["registry_state"], payload["reason"],
+    )
+
+
+def _refusal_text(tool_name: str, roles: list) -> str:
+    """Short refusal for the dispatcher. Names the role(s) and the
+    requirement only; never the command text, code, path or content."""
+    return (
+        f"production authority: {tool_name} refused -- it touches production "
+        f"role(s) {', '.join(roles)}. Every production role is christopher_only: "
+        "this action requires a Christopher-authorized card (production_actions "
+        "naming the role) executed by Claude Code or Codex; a Hermes-native "
+        "agent is never an authorized executor. The refusal is recorded on the card."
     )
 
 
@@ -593,15 +637,16 @@ def production_authority_refusal(
     executor_lane: str = HERMES_NATIVE_EXECUTOR,
     registry_path: Optional[Path] = None,
 ) -> Optional[str]:
-    """Rule 6 entry point for the tool dispatcher. REPORT-ONLY: always
-    returns ``None`` (allow). Side effects only: on a production-surface
-    match, one ``production_action_unauthorized`` event per matched role on
-    the ``HERMES_KANBAN_TASK`` card, or a WARNING log line when there is no
-    card.
+    """Rule 6 entry point for the tool dispatcher. Returns ``None`` (allow) or
+    a refusal string (the dispatcher turns it into a tool error).
 
-    Refuse mode (a later segment) will return a refusal string from the same
-    ``ProductionDecision`` when ``authorized`` is False and the registry's
-    ``mode`` is ``refuse``.
+    On a production-surface match, each unauthorized role is recorded on the
+    ``HERMES_KANBAN_TASK`` card (or as a WARNING log line when there is no
+    card). With the installed registry in ``mode: refuse`` the event is
+    ``production_action_refused`` and the call is refused; in
+    ``mode: report-only``, or with any other / missing / unparseable
+    registry, the event is ``production_action_unauthorized`` and the call
+    is allowed. An authorized decision records nothing.
     """
     matches = match_surfaces(tool_name, args)
     if not matches:
@@ -610,6 +655,7 @@ def production_authority_refusal(
     task_id = (env.get(ENV_TASK) or "").strip() or None
     registry = load_registry(registry_path)
     card_actions = _card_production_actions(task_id) if task_id else ()
+    refused_roles: list = []
     for match in matches:
         decision = decide(
             match,
@@ -621,4 +667,8 @@ def production_authority_refusal(
         if decision.authorized:
             continue
         _record(decision, tool_name, env)
+        if decision.refuse:
+            refused_roles.append(match.role)
+    if refused_roles:
+        return _refusal_text(tool_name, refused_roles)
     return None

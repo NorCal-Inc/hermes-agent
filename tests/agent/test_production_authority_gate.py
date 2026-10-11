@@ -7,7 +7,8 @@ match on a worker card records exactly one production_action_unauthorized
 event whose payload carries no command text / path / content; (d) a card
 with production_actions does not make a Hermes-native worker authorized;
 (e) a gate exception never breaks the tool call; (f) report-only never
-returns a refusal.
+returns a refusal. Refuse mode (segment 6d) is covered in
+test_production_authority_refuse.py.
 """
 
 from __future__ import annotations
@@ -365,14 +366,20 @@ def test_report_only_returns_none_for_every_matching_form(conn, monkeypatch, rol
     assert len(_events(conn, tid)) >= 1
 
 
-def test_refuse_mode_registry_is_still_report_only_in_this_segment(conn, monkeypatch, tmp_path):
+def test_refuse_mode_registry_refuses_and_records_refused_not_unauthorized(conn, monkeypatch, tmp_path):
+    """Segment 6d: a ``mode: refuse`` registry is no longer treated as
+    report-only. Full refuse-mode coverage lives in
+    test_production_authority_refuse.py; this pins the mode switch."""
     p = tmp_path / "refuse.json"
     p.write_text(json.dumps({**REGISTRY, "mode": "refuse"}))
     tid = _task(conn)
     monkeypatch.setenv(gate.ENV_TASK, tid)
-    assert gate.production_authority_refusal("terminal", {"command": "ufw allow 22"}, registry_path=p) is None
-    payload = _events(conn, tid)[0].payload
-    assert payload["registry_mode"] == "refuse" and payload["action"] == "allowed_report_only"
+    out = gate.production_authority_refusal("terminal", {"command": "ufw allow 22"}, registry_path=p)
+    assert isinstance(out, str) and "firewall" in out
+    assert _events(conn, tid) == []
+    refused = [e for e in kb.list_events(conn, tid) if e.kind == gate.EVENT_REFUSED]
+    assert len(refused) == 1
+    assert refused[0].payload["registry_mode"] == "refuse" and refused[0].payload["action"] == "refused"
 
 
 # ---------------------------------------------------------------------------
