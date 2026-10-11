@@ -111,6 +111,25 @@ def test_readonly_checks_follow_manifest_binding(tmp_path):
     c2 = _by_name(_checks(tmp_path, manifest=m))
     assert "hermes_skills_hidden" in c2 and "hermes_skills_readonly" not in c2
     assert "npm_hidden" not in c2 and "npm_readonly" not in c2
+    assert not [n for n in c2 if n.startswith("skill_root_")]
+
+
+def test_skill_roots_get_readonly_rows_when_present(tmp_path):
+    roots = [str(HOME / ".claude" / "plugins"), str(HOME / ".claude" / "settings.json"), str(HOME / ".agents")]
+    c = _by_name(_checks(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=roots)))
+    assert c["skill_root_claude_plugins_readonly"] == {
+        "name": "skill_root_claude_plugins_readonly", "kind": "readonly", "target": roots[0], "file": False}
+    assert c["skill_root_claude_settings.json_readonly"] == {
+        "name": "skill_root_claude_settings.json_readonly", "kind": "readonly", "target": roots[1], "file": True}
+    assert c["skill_root_agents_readonly"] == {
+        "name": "skill_root_agents_readonly", "kind": "readonly", "target": roots[2], "file": False}
+    # still hidden: the rest of ~/.claude's neighbours and ~/.codex
+    assert c["claude_json_hidden"]["kind"] == "hidden" and c["codex_dir_hidden"]["kind"] == "hidden"
+    with pytest.raises(ws.SandboxConfigError):
+        _checks(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=[str(HOME / ".claude" / "projects")]))
+    for bad in ("/home/chris/.claude/plugins", {}, 0, False, [1]):
+        with pytest.raises(ws.SandboxConfigError):
+            _checks(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=bad))
 
 
 def test_must_work_checks(tmp_path):
@@ -132,10 +151,83 @@ def test_must_work_checks(tmp_path):
 
 
 def test_check_table_carries_no_values_only_names_and_paths(tmp_path):
-    for c in _checks(tmp_path):
-        assert set(c) <= {"name", "kind", "target", "file", "value"}
+    outside = ws.outside_processes([os.getpid()])
+    for c in _checks(tmp_path, outside_pids=[4242] + outside):
+        assert set(c) <= {"name", "kind", "target", "file", "value", "identity"}
         assert c["kind"] in ("hidden", "readonly", "rw", "kanban_lock", "pid_hidden", "dns",
                              "https_head", "env_absent", "env_equals")
+        if "identity" in c:
+            # a clock-tick count and a hash: never argv, never environ
+            assert set(c["identity"]) == {"starttime", "cmdline_sha256"}
+            assert c["identity"]["starttime"].isdigit()
+            assert len(c["identity"]["cmdline_sha256"]) == 64
+
+
+# ---------------------------------------------------------------- outside-pid identity (t_338366fd fix)
+
+def test_process_identity_reads_starttime_and_cmdline_hash(tmp_path):
+    ident = ws.process_identity(os.getpid())
+    assert ident is not None and set(ident) == {"starttime", "cmdline_sha256"}
+    assert ident["starttime"].isdigit() and len(ident["cmdline_sha256"]) == 64
+    # stable across two reads of the same live process
+    assert ws.process_identity(os.getpid()) == ident
+    assert ws.process_identity(2 ** 22 - 1) is None or isinstance(ws.process_identity(2 ** 22 - 1), dict)
+    # comm with spaces/parens does not shift the starttime field (synthetic /proc)
+    fake = tmp_path / "proc" / "77"
+    fake.mkdir(parents=True)
+    (fake / "stat").write_text("77 (we ird) name) S 1 77 77 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 123456 1 1 "
+                               "18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n")
+    (fake / "cmdline").write_bytes(b"x\0y\0")
+    got = ws.process_identity(77, proc=str(tmp_path / "proc"))
+    assert got["starttime"] == "123456"
+    assert got["cmdline_sha256"] == __import__("hashlib").sha256(b"x\0y\0").hexdigest()
+
+
+def test_outside_processes_skips_pid_1_and_2_and_unreadable(tmp_path):
+    me = os.getpid()
+    recs = ws.outside_processes([1, 2, None, 0, "x", me, me, 2 ** 22 - 1])
+    assert [r["pid"] for r in recs] == [me] or [r["pid"] for r in recs] == [me, 2 ** 22 - 1]
+    assert recs[0]["identity"] == ws.process_identity(me)
+    assert not [r for r in recs if r["pid"] in (0, 1, 2)]
+    # records flow into the check table as pid_hidden rows carrying the identity
+    c = _by_name(_checks(tmp_path, outside_pids=recs))
+    row = c[f"outside_pid_{me}_environ_hidden"]
+    assert row["kind"] == "pid_hidden" and row["target"] == me and row["identity"] == recs[0]["identity"]
+
+
+def _run_probe_script(checks, env=None):
+    env = env or {"PATH": os.environ.get("PATH", "/usr/bin")}
+    proc = subprocess.run(["/usr/bin/python3", "-I", "-c", ws.PROBE_SCRIPT, json.dumps(checks)],
+                          capture_output=True, text=True, timeout=60, env=env)
+    assert proc.returncode == 0, proc.stderr
+    return {r["name"]: r for r in json.loads(proc.stdout)}
+
+
+def test_pid_hidden_number_collision_with_different_identity_is_not_visible():
+    """The verifier's false 'visible': the OUTSIDE pid number exists inside the sandbox too,
+    but it is a different process. Here the current process stands in for the colliding
+    in-sandbox pid; the recorded identity is of some other (fabricated) outside process."""
+    me = os.getpid()
+    real = ws.process_identity(me)
+    forged = {"starttime": str(int(real["starttime"]) + 1), "cmdline_sha256": "0" * 64}
+    got = _run_probe_script([
+        {"name": "collide_diff_identity", "kind": "pid_hidden", "target": me, "identity": forged},
+        {"name": "collide_diff_starttime_only", "kind": "pid_hidden", "target": me,
+         "identity": {"starttime": forged["starttime"], "cmdline_sha256": real["cmdline_sha256"]}},
+        {"name": "collide_diff_cmdline_only", "kind": "pid_hidden", "target": me,
+         "identity": {"starttime": real["starttime"], "cmdline_sha256": forged["cmdline_sha256"]}},
+        {"name": "same_identity_visible", "kind": "pid_hidden", "target": me, "identity": real},
+        {"name": "legacy_number_only_visible", "kind": "pid_hidden", "target": me},
+        {"name": "absent_pid_hidden", "kind": "pid_hidden", "target": 2 ** 22 - 1, "identity": forged},
+    ])
+    assert got["collide_diff_identity"]["ok"] is True
+    assert "identity differs" in got["collide_diff_identity"]["detail"]
+    assert got["collide_diff_starttime_only"]["ok"] is True
+    assert got["collide_diff_cmdline_only"]["ok"] is True
+    # the same process, really visible in the same namespace, is still caught
+    assert got["same_identity_visible"]["ok"] is False
+    assert got["legacy_number_only_visible"]["ok"] is False
+    assert got["absent_pid_hidden"]["ok"] is True
 
 
 # ---------------------------------------------------------------- runner / exit code
@@ -262,12 +354,79 @@ def test_real_probe_passes_with_temp_manifest_and_scratch_dirs(tmp_path, lane, p
     m["lanes"][lane]["llm_source"] = "claude_code"
     prefix = ws.build_bwrap_argv(lane, profile, tmp_path / "profile", tmp_path / "ws", m,
                                  kanban_db_dir=tmp_path / "kanban", home=HOME)
+    # Outside processes by identity, recorded before bwrap: when this test itself runs in a
+    # pid namespace (small pid numbers) the number alone would collide with the probe inside.
+    outside = ws.outside_processes([os.getpid(), os.getppid(), ws._gateway_pid()])
+    assert outside and outside[0]["pid"] == os.getpid() or os.getpid() <= 2
     checks = ws.probe_checks(lane, profile, tmp_path / "profile", tmp_path / "ws", m,
-                             kanban_db_dir=tmp_path / "kanban", home=HOME, outside_pids=[os.getpid()],
+                             kanban_db_dir=tmp_path / "kanban", home=HOME, outside_pids=outside,
                              network=False)
     res = ws.run_probe(prefix, checks, python=ws._probe_python(HOME))
     assert res["exit_code"] == 0, ws.format_probe(res)
+    assert [r for r in res["results"] if r["name"].startswith("outside_pid_")]
     assert not list((tmp_path / "ws").iterdir()) and not list((tmp_path / "profile").iterdir())
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap not installed")
+@pytest.mark.skipif(Path.home() != HOME, reason="test assumes the hermes host home")
+def test_real_probe_pid_number_collision_inside_namespace_is_hidden(tmp_path):
+    """Run the real inner script inside bwrap with a check for pid 2 (the sandboxed command
+    itself) carrying the identity of an OUTSIDE pid-2-numbered or forged process: must be hidden."""
+    for d in ("ws", "profile", "homes/triptracker"):
+        (tmp_path / d).mkdir(parents=True)
+    m = _manifest(tmp_path, shared_ro=[], credentials_ro=[])
+    m["lanes"] = {"triptracker": {"repos": [], "vault": [], "llm_source": "claude_code"}}
+    prefix = ws.build_bwrap_argv("triptracker", "triptracker_lead", tmp_path / "profile", tmp_path / "ws", m, home=HOME)
+    forged = {"starttime": "1", "cmdline_sha256": "0" * 64}
+    checks = [
+        {"name": "pid2_forged_identity", "kind": "pid_hidden", "target": 2, "identity": forged},
+        {"name": "pid1_forged_identity", "kind": "pid_hidden", "target": 1, "identity": forged},
+        {"name": "pid2_number_only_legacy", "kind": "pid_hidden", "target": 2},
+    ]
+    res = ws.run_probe(prefix, checks, python=ws._probe_python(HOME))
+    got = {r["name"]: r for r in res["results"]}
+    assert got["pid2_forged_identity"]["ok"] is True, got
+    assert got["pid1_forged_identity"]["ok"] is True, got
+    # and this is exactly the false "visible" the number-only check produced (t_338366fd)
+    assert got["pid2_number_only_legacy"]["ok"] is False
+
+
+SKILL_TRUST_VERIFY = HOME / ".hermes" / "security" / "skill-trust" / "verify.py"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap not installed")
+@pytest.mark.skipif(Path.home() != HOME, reason="test assumes the hermes host home")
+@pytest.mark.skipif(not SKILL_TRUST_VERIFY.is_file(), reason="skill-trust verifier not present")
+def test_real_skill_trust_gate_passes_with_skill_roots_ro(tmp_path):
+    """verify.py exits 0 inside the sandbox once the three skill roots are ro-bound (C1.2c)."""
+    for d in ("ws", "profile", "homes/triptracker"):
+        (tmp_path / d).mkdir(parents=True)
+    roots = [str(HOME / ".claude" / "plugins"), str(HOME / ".claude" / "settings.json"), str(HOME / ".agents")]
+    if not all(os.path.exists(p) for p in roots):
+        pytest.skip("skill roots not all present on this host")
+    m = _manifest(tmp_path, shared_ro=[str(HOME / ".hermes" / "skills"), str(SKILL_TRUST_VERIFY.parent)],
+                  credentials_ro=[], skill_roots_ro=roots)
+    m["lanes"] = {"triptracker": {"repos": [], "vault": [], "llm_source": "claude_code"}}
+    prefix = ws.build_bwrap_argv("triptracker", "triptracker_lead", tmp_path / "profile", tmp_path / "ws", m, home=HOME)
+    for p in roots:
+        assert prefix[prefix.index(p) - 1] == "--ro-bind"
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+    res = subprocess.run(prefix + ["--", "/usr/bin/python3", "-I", str(SKILL_TRUST_VERIFY)],
+                         capture_output=True, text=True, timeout=300, env=env)
+    assert res.returncode == 0, (res.stdout.strip().splitlines() or [""])[0]
+    assert res.stdout.startswith("SKILL TRUST: PASS")
+    # the probe's own MUST-BE-READ-ONLY rows for the three roots pass in there too
+    checks = [c for c in ws.probe_checks("triptracker", "triptracker_lead", tmp_path / "profile", tmp_path / "ws", m,
+                                         home=HOME, network=False) if c["name"].startswith("skill_root_")]
+    assert len(checks) == 3
+    pr = ws.run_probe(prefix, checks, python=ws._probe_python(HOME))
+    assert pr["exit_code"] == 0, ws.format_probe(pr)
+    # and the roots are genuinely read-only in there
+    write = subprocess.run(prefix + ["--", "/bin/sh", "-c",
+                           "touch %s/.probe 2>/dev/null && echo WROTE; touch %s/.probe 2>/dev/null && echo WROTE; "
+                           "touch %s 2>/dev/null && echo WROTE; exit 0" % (roots[0], roots[2], roots[1])],
+                           capture_output=True, text=True, timeout=60, env=env)
+    assert "WROTE" not in write.stdout
 
 
 def test_main_requires_manifest_and_known_lane(tmp_path, capsys):

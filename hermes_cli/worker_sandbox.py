@@ -27,6 +27,7 @@ Manifest schema (paths only, never secrets)::
     sandbox_home_root: /home/chris/.hermes/security/worker-sandbox/homes
     shared_ro: [<dir or file bound read-only into every lane>, ...]
     credentials_ro: [<exact FILE bound read-only into every lane>, ...]
+    skill_roots_ro: [<skill-trust root bound read-only into every lane>, ...]
     groups:
       <group>: [<lane>, <lane>]      # lanes in a group see each other's repos/vault
     lanes:
@@ -46,6 +47,17 @@ AT ``~/.hermes/auth.json`` (fail closed when that file is missing), plus
 ``HERMES_SANDBOX_NO_REFRESH=1`` so it never rotates the token itself. A
 ``claude_code`` lane gets no root-store view at all; it keeps only the exact
 ``credentials_ro`` files (``~/.claude/.credentials.json``).
+
+``skill_roots_ro`` (C1.2c) exists so the skill supply-chain gate
+(``~/.hermes/security/skill-trust/verify.py``, run by boot-context) can see
+the roots it hashes. The key must be absent/``None`` or a *list of strings*;
+any other type (a scalar string, a mapping, a number, a bool, a list holding
+a non-string) raises :class:`SandboxConfigError` (fail closed, never "treated
+as empty"). Entries are validated against a fixed allow-list of exactly three
+paths (:data:`_SKILL_ROOTS_ALLOWED_REL`); anything else, in particular any
+other path under ``~/.claude`` or ``~/.codex``, raises
+:class:`SandboxConfigError`. It does not loosen ``credentials_ro`` or any
+forbidden path.
 """
 
 from __future__ import annotations
@@ -88,6 +100,15 @@ _FORBIDDEN_HOME_REL: List[str] = [
 ]
 _FORBIDDEN_ABS: List[str] = ["/var/run/docker.sock", "/run/docker.sock", "/run/user"]
 _CREDENTIAL_FILE_PARENTS_REL: List[str] = [".claude", ".codex"]
+
+# The ONLY paths ``skill_roots_ro`` may name (relative to $HOME), with the
+# kind each must be. These are the roots the skill-trust gate hashes; nothing
+# else under ``.claude``/``.codex`` is ever admitted through this key.
+_SKILL_ROOTS_ALLOWED_REL: Dict[str, str] = {
+    ".claude/plugins": "dir",
+    ".claude/settings.json": "file",
+    ".agents": "dir",
+}
 
 # C1.2d: LLM credential source of a lane and the per-lane trimmed codex store.
 LLM_SOURCE_CODEX = "codex"
@@ -217,6 +238,76 @@ def _check_allowed(src: str, home: Path, *, allow_credential_file: bool = False)
         raise SandboxConfigError(f"worker sandbox: refusing to bind forbidden path {s} (under {root})")
 
 
+def skill_roots_allowed(home: Path) -> Dict[str, str]:
+    """``{normalised absolute path: "dir"|"file"}`` of the admissible skill roots."""
+    return {_norm(home / rel): kind for rel, kind in _SKILL_ROOTS_ALLOWED_REL.items()}
+
+
+def _skill_roots_entries(manifest: Dict[str, Any]) -> List[str]:
+    """Type gate for ``skill_roots_ro``: absent/``None`` -> ``[]``; a list of
+    strings -> that list; anything else raises (fail closed).
+
+    A scalar string is NOT a one-element list here (unlike the lenient
+    ``kanban.worker_sandbox.lanes`` config key): a manifest typo must stop the
+    spawn, not silently bind or silently skip.
+    """
+    raw = manifest.get("skill_roots_ro")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise SandboxConfigError(
+            f"worker sandbox: skill_roots_ro must be a list of paths, got {type(raw).__name__}"
+        )
+    out: List[str] = []
+    for i, p in enumerate(raw):
+        if not isinstance(p, str) or not p.strip():
+            raise SandboxConfigError(
+                f"worker sandbox: skill_roots_ro[{i}] must be a non-empty path string, got {type(p).__name__}"
+            )
+        out.append(p)
+    return out
+
+
+def _check_skill_root(src: str, home: Path, exists: Callable[[str], bool]) -> str:
+    """Validate one ``skill_roots_ro`` entry; return its normalised path.
+
+    Fail closed: the entry must spell one of the allow-listed roots (no ``..``
+    components), must not be or sit behind a symlink (so it cannot point
+    outside its own location), must exist, and must have the expected kind.
+    """
+    raw = str(src)
+    if ".." in Path(raw).parts:
+        raise SandboxConfigError(f"worker sandbox: skill_roots_ro entry {raw} contains a '..' component")
+    n = _norm(raw)
+    allowed = skill_roots_allowed(home)
+    if n not in allowed:
+        raise SandboxConfigError(
+            f"worker sandbox: skill_roots_ro entry {n} is not an allowed skill root "
+            f"(allowed: {', '.join(sorted(allowed))})"
+        )
+    rel = os.path.relpath(n, _norm(home))
+    if os.path.realpath(n) != os.path.join(os.path.realpath(str(home)), rel):
+        raise SandboxConfigError(f"worker sandbox: skill_roots_ro entry {n} is a symlink; refusing to follow it")
+    if not exists(n):
+        raise SandboxConfigError(f"worker sandbox: skill_roots_ro entry {n} does not exist")
+    kind = allowed[n]
+    if os.path.lexists(n):
+        if kind == "dir" and not os.path.isdir(n):
+            raise SandboxConfigError(f"worker sandbox: skill_roots_ro entry {n} must be a directory")
+        if kind == "file" and not os.path.isfile(n):
+            raise SandboxConfigError(f"worker sandbox: skill_roots_ro entry {n} must be a regular file")
+    return n
+
+
+def _skill_roots(manifest: Dict[str, Any], home: Path, exists: Callable[[str], bool]) -> List[str]:
+    out: List[str] = []
+    for p in _skill_roots_entries(manifest):
+        n = _check_skill_root(p, home, exists)
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def _lane_paths(manifest: Dict[str, Any], lane: str, key: str) -> List[str]:
     """Paths for ``key`` of ``lane`` plus, for repos/vault, its group peers."""
     lanes = manifest.get("lanes") or {}
@@ -312,6 +403,9 @@ def build_bwrap_argv(
     for p in manifest.get("shared_ro") or []:
         n = _norm(p)
         _check_allowed(n, home)
+        argv += ["--ro-bind", n, n]
+
+    for n in _skill_roots(manifest, home, exists):
         argv += ["--ro-bind", n, n]
 
     root_auth = _norm(home / ROOT_AUTH_STORE_REL)
@@ -424,7 +518,12 @@ def wrap(
 #   readonly      creating a temp file under the path must fail (EROFS/EACCES)
 #   rw            create + unlink a temp file under the path must succeed
 #   kanban_lock   ``BEGIN IMMEDIATE; ROLLBACK`` on <dir>/kanban.db must succeed
-#   pid_hidden    /proc/<pid> of a process outside the sandbox must not exist
+#   pid_hidden    /proc/<pid> of a process outside the sandbox must not exist.
+#                 With an ``identity`` (starttime + cmdline hash recorded
+#                 OUTSIDE, see :func:`outside_processes`) the pid only counts
+#                 as visible when the process at that number inside the
+#                 sandbox has the same identity: pid numbers are reused inside
+#                 a fresh pid namespace, so a bare number is not evidence.
 #   dns           getaddrinfo(host) must return at least one address
 #   https_head    HEAD <url> must return any HTTP status (status only)
 #   env_absent    the variable must not be in the environment
@@ -445,9 +544,59 @@ EXIT_PROBE_CONFIG = 2
 EXIT_PROBE_RUNNER = 3
 
 
+def process_identity(pid: int, proc: str = "/proc") -> Optional[Dict[str, str]]:
+    """``{"starttime": <stat field 22>, "cmdline_sha256": <hex>}`` of ``pid``, or ``None``.
+
+    Values only, never content: the start time is a clock tick count and the
+    command line is reduced to a hash, so the record can travel in the check
+    table without carrying argv (which may hold tokens).
+    """
+    import hashlib
+    try:
+        with open(f"{proc}/{int(pid)}/stat", "rb") as fh:
+            stat = fh.read()
+        # comm (field 2) may contain spaces/parens; everything after the last
+        # ')' is fields 3.. so field 22 (starttime) is index 19 there.
+        _head, _sep, rest = stat.rpartition(b")")
+        fields = rest.split()
+        starttime = fields[19].decode("ascii")
+        with open(f"{proc}/{int(pid)}/cmdline", "rb") as fh:
+            cmdline = fh.read()
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return None
+    return {"starttime": starttime, "cmdline_sha256": hashlib.sha256(cmdline).hexdigest()}
+
+
+def outside_processes(candidates: Iterable[Optional[int]], proc: str = "/proc") -> List[Dict[str, Any]]:
+    """Identity records for processes that live OUTSIDE the sandbox about to be built.
+
+    Call this *before* launching bwrap, in the probe's own pid namespace. Pids
+    1 and 2 are never chosen (inside the sandbox they are bwrap and the probed
+    command, and when the probe itself runs inside a pid namespace they are
+    its own ancestors), and a pid whose identity cannot be read is dropped.
+    Each record is ``{"pid": int, "identity": {...}}``.
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for pid in candidates:
+        try:
+            p = int(pid or 0)
+        except (TypeError, ValueError):
+            continue
+        if p <= 2 or p in seen:
+            continue
+        ident = process_identity(p, proc)
+        if ident is None:
+            continue
+        seen.add(p)
+        out.append({"pid": p, "identity": ident})
+    return out
+
+
 def _manifest_bound_paths(manifest: Dict[str, Any], lane: str) -> Dict[str, List[str]]:
     """Paths the lane would get, split by bind mode (normalised)."""
     ro = [_norm(p) for p in (manifest.get("shared_ro") or [])]
+    ro += [_norm(p) for p in _skill_roots_entries(manifest)]
     ro += _lane_paths(manifest, lane, "extra_ro")
     rw: List[str] = []
     for key in ("repos", "vault", "browser_profiles", "extra_rw"):
@@ -474,12 +623,17 @@ def probe_checks(
     kanban_db_dir: Optional[os.PathLike | str] = None,
     home: Optional[Path] = None,
     uid: Optional[int] = None,
-    outside_pids: Iterable[int] = (),
+    outside_pids: Iterable[Any] = (),
     exists: Optional[Callable[[str], bool]] = None,
     listdir: Optional[Callable[[str], List[str]]] = None,
     network: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Pure function: the check table for one lane (names and paths only)."""
+    """Pure function: the check table for one lane (names and paths only).
+
+    ``outside_pids`` holds bare ints (legacy, number-only comparison) and/or
+    :func:`outside_processes` records; the latter carry the identity the
+    in-sandbox check must match before it may report "visible".
+    """
     home = Path(home) if home is not None else Path.home()
     exists = exists or os.path.exists
     listdir = listdir or (lambda d: sorted(os.listdir(d)))
@@ -530,8 +684,14 @@ def probe_checks(
         except OSError:
             pass
     add("other_profiles_hidden", "hidden", others)
-    for pid in outside_pids:
-        add(f"outside_pid_{int(pid)}_environ_hidden", "pid_hidden", int(pid))
+    for entry in outside_pids:
+        if isinstance(entry, dict):
+            pid = int(entry["pid"])
+            ident = entry.get("identity") or {}
+            add(f"outside_pid_{pid}_environ_hidden", "pid_hidden", pid,
+                identity={"starttime": str(ident["starttime"]), "cmdline_sha256": str(ident["cmdline_sha256"])})
+        else:
+            add(f"outside_pid_{int(entry)}_environ_hidden", "pid_hidden", int(entry))
 
     # --- MUST BE READ-ONLY ----------------------------------------------
     repo_root = runtime_code_paths(home)[0]
@@ -551,6 +711,10 @@ def probe_checks(
         if n == root_auth:
             continue  # never bound as-is; covered by the trimmed-store check below
         add(f"credential_{Path(n).name}_readonly", "readonly", n, file=True)
+    allowed_roots = skill_roots_allowed(home)
+    for n in _skill_roots(manifest, home, exists):
+        label = os.path.relpath(n, _norm(home)).replace("/", "_").strip("._")
+        add(f"skill_root_{label}_readonly", "readonly", n, file=(allowed_roots[n] == "file"))
     if lane_llm_source(manifest, lane) == LLM_SOURCE_CODEX:
         add("trimmed_codex_store_readonly", "readonly", root_auth, file=True)
     else:
@@ -572,7 +736,7 @@ def probe_checks(
 
 # Runs inside the sandbox. Self-contained; stdlib only; prints JSON results.
 PROBE_SCRIPT = r'''
-import errno, json, os, socket, sqlite3, sys, tempfile, http.client, urllib.parse
+import errno, hashlib, json, os, socket, sqlite3, sys, tempfile, http.client, urllib.parse
 
 def _errname(e):
     return errno.errorcode.get(getattr(e, "errno", None) or -1, type(e).__name__)
@@ -620,9 +784,31 @@ def kanban_lock(c):
     except sqlite3.Error as e:
         return (False, type(e).__name__)
 
+def _identity(pid):
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            stat = fh.read()
+        rest = stat.rpartition(b")")[2].split()
+        starttime = rest[19].decode("ascii")
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmdline = fh.read()
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return None
+    return {"starttime": starttime, "cmdline_sha256": hashlib.sha256(cmdline).hexdigest()}
+
 def pid_hidden(c):
-    p = "/proc/%d" % c["target"]
-    return (not os.path.exists(p), "visible" if os.path.exists(p) else "")
+    pid = c["target"]
+    if not os.path.exists("/proc/%d" % pid):
+        return (True, "")
+    want = c.get("identity")
+    if not want:
+        return (False, "visible")          # legacy number-only check
+    have = _identity(pid)
+    if have is None:
+        return (True, "pid vanished while checking")
+    if have.get("starttime") == want.get("starttime") and have.get("cmdline_sha256") == want.get("cmdline_sha256"):
+        return (False, "visible (identity matches outside process)")
+    return (True, "pid number reused inside namespace; identity differs")
 
 def dns(c):
     try:
@@ -815,12 +1001,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"probe: lane home {lane_home} missing (pass --create-lane-home)", file=sys.stderr)
             return EXIT_PROBE_CONFIG
         lane_home.mkdir(parents=True, exist_ok=True)
-    pids = [os.getpid()]
-    gw = _gateway_pid()
-    if gw:
-        pids.append(gw)
+    # Recorded here, outside bwrap, by identity: inside the sandbox's fresh pid
+    # namespace these numbers may be reused by the probe's own processes.
+    outside = outside_processes([os.getpid(), os.getppid(), _gateway_pid()])
     checks = probe_checks(lane, args.profile, profile_home, workspace, manifest,
-                          kanban_db_dir=kd, home=home, outside_pids=pids, network=not args.skip_network)
+                          kanban_db_dir=kd, home=home, outside_pids=outside, network=not args.skip_network)
     result = run_probe(prefix, checks, python=_probe_python(home))
     result["lane"] = lane
     result["profile"] = args.profile

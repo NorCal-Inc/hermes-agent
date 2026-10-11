@@ -31,6 +31,17 @@ credentials_ro:
   - /home/chris/.claude/.credentials.json
   - /home/chris/.hermes/auth.json
 
+# Skill-trust roots, read-only, every lane (C1.2c). The boot-context skill
+# supply-chain gate (~/.hermes/security/skill-trust/verify.py) hashes these and
+# fails closed when they are missing, which marks the worker's boot DEGRADED.
+# Must be a YAML list of strings (a bare string, mapping or number is rejected).
+# Only these three paths are accepted here; any other path under ~/.claude or
+# ~/.codex is rejected. ~/.hermes/skills (also hashed) belongs in shared_ro.
+skill_roots_ro:
+  - /home/chris/.claude/plugins
+  - /home/chris/.claude/settings.json
+  - /home/chris/.agents
+
 groups:
   logos_triptracker: [logos, triptracker]
 

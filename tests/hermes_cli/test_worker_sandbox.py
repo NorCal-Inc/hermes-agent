@@ -228,6 +228,167 @@ def test_credential_entry_may_not_be_directory_or_nested(tmp_path):
         _build(tmp_path, manifest=_manifest(tmp_path, credentials_ro=[str(HOME / ".ssh" / "id_ed25519")]))
 
 
+# ---------------------------------------------------------------- skill roots (C1.2c)
+
+SKILL_ROOTS = [str(HOME / ".claude" / "plugins"), str(HOME / ".claude" / "settings.json"), str(HOME / ".agents")]
+
+
+def test_skill_roots_bound_ro_only_when_listed(tmp_path):
+    without = "\n".join(_build(tmp_path))
+    for p in SKILL_ROOTS:
+        assert p not in without
+    argv = _build(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=SKILL_ROOTS))
+    ro = _binds(argv, "--ro-bind")
+    rw = _binds(argv, "--bind")
+    for p in SKILL_ROOTS:
+        assert (p, p) in ro
+        assert all(s != p for s, _ in rw)
+    # the roots do not drag the rest of ~/.claude or ~/.codex in
+    joined = "\n".join(argv)
+    assert str(HOME / ".claude" / ".credentials.json") not in joined
+    assert str(HOME / ".claude.json") not in joined
+    assert str(HOME / ".codex") not in joined
+    # ro-bound after the $HOME tmpfs so they survive the overlay
+    home_tmpfs = argv.index(str(HOME)) - 1
+    assert all(argv.index(p) > home_tmpfs for p in SKILL_ROOTS)
+
+
+def test_skill_roots_absent_or_none_means_no_binds(tmp_path):
+    for m in (_manifest(tmp_path), _manifest(tmp_path, skill_roots_ro=None), _manifest(tmp_path, skill_roots_ro=[])):
+        joined = "\n".join(_build(tmp_path, manifest=m))
+        assert all(p not in joined for p in SKILL_ROOTS)
+
+
+@pytest.mark.parametrize("bad", [
+    "/home/chris/.claude/plugins",   # scalar string: NOT a one-element list
+    "",
+    {},
+    {"a": "/home/chris/.claude/plugins"},
+    0,
+    1,
+    False,
+    True,
+    3.5,
+    [1],
+    [None],
+    [True],
+    [""],
+    ["/home/chris/.claude/plugins", 1],
+    [["/home/chris/.claude/plugins"]],
+    [{"path": "/home/chris/.claude/plugins"}],
+    ("/home/chris/.claude/plugins",),  # tuple is not a list either
+    ["/home/chris/.claude/.credentials.json"],
+])
+def test_skill_roots_rejects_malformed_values_fail_closed(tmp_path, bad):
+    """Verifier t_6d1df5a4 finding: a scalar was accepted and {}, 0, False were treated as []."""
+    with pytest.raises(ws.SandboxConfigError):
+        _build(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=bad))
+    with pytest.raises(ws.SandboxConfigError):
+        ws.probe_checks("logos", "p", HOME / ".hermes" / "profiles" / "p", tmp_path / "ws",
+                        _manifest(tmp_path, skill_roots_ro=bad), home=HOME, uid=1000,
+                        exists=lambda p: True, listdir=lambda d: [])
+
+
+@pytest.mark.parametrize("bad", [
+    "/home/chris/.claude/.credentials.json",
+    "/home/chris/.claude.json",
+    "/home/chris/.claude/projects",
+    "/home/chris/.claude",
+    "/home/chris/.codex",
+    "/home/chris/.codex/auth.json",
+    "/home/chris/.claude/plugins/../.credentials.json",   # traversal
+    "/home/chris/.claude/plugins/..",
+    "/home/chris/.claude/plugins/some-plugin",            # nested under an allowed root
+    "/home/chris/.agents/skills",
+    "/home/chris/.hermes/secrets",
+    "/home/chris/.ssh",
+    "/home/chris/.hermes/skills",                         # legitimate elsewhere, not via this key
+])
+def test_skill_roots_rejects_everything_outside_the_allow_list(tmp_path, bad):
+    with pytest.raises(ws.SandboxConfigError):
+        _build(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=[bad]))
+    # one bad entry poisons the whole build even alongside good ones
+    with pytest.raises(ws.SandboxConfigError):
+        _build(tmp_path, manifest=_manifest(tmp_path, skill_roots_ro=SKILL_ROOTS + [bad]))
+
+
+def test_skill_roots_do_not_loosen_other_keys(tmp_path):
+    # ~/.claude stays forbidden for every other key (~/.agents was never forbidden)
+    for p in SKILL_ROOTS[:2]:
+        with pytest.raises(ws.SandboxConfigError):
+            _build(tmp_path, manifest=_manifest(tmp_path, shared_ro=[p]))
+        m = _manifest(tmp_path)
+        m["lanes"]["logos"]["extra_ro"] = [p]
+        with pytest.raises(ws.SandboxConfigError):
+            _build(tmp_path, manifest=m)
+    with pytest.raises(ws.SandboxConfigError):
+        _build(tmp_path, manifest=_manifest(tmp_path, credentials_ro=[str(HOME / ".claude" / "plugins")]))
+    # the credential file is still admitted ONLY through credentials_ro, unchanged
+    argv = _build(tmp_path, manifest=_manifest(
+        tmp_path, skill_roots_ro=SKILL_ROOTS, credentials_ro=[str(HOME / ".claude" / ".credentials.json")]))
+    assert (str(HOME / ".claude" / ".credentials.json"),) * 2 in _binds(argv, "--ro-bind")
+
+
+def _fake_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    (home / ".claude" / "plugins").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (home / ".agents").mkdir()
+    return home
+
+
+def _build_home(tmp_path: Path, home: Path, roots: list[str]) -> list[str]:
+    m = _manifest(tmp_path, shared_ro=[], skill_roots_ro=roots)
+    m["lanes"]["logos"]["llm_source"] = "claude_code"  # no trimmed codex store under a fake home
+    return ws.build_bwrap_argv("logos", "p", home / ".hermes" / "profiles" / "p", tmp_path / "ws", m,
+                               home=home, exists=os.path.exists)
+
+
+def test_skill_roots_real_fs_accepts_all_three(tmp_path):
+    home = _fake_home(tmp_path)
+    roots = [str(home / ".claude" / "plugins"), str(home / ".claude" / "settings.json"), str(home / ".agents")]
+    ro = _binds(_build_home(tmp_path, home, roots), "--ro-bind")
+    for p in roots:
+        assert (p, p) in ro
+
+
+@pytest.mark.parametrize("rel", [".claude/plugins", ".claude/settings.json", ".agents"])
+def test_skill_roots_symlink_pointing_outside_rejected(tmp_path, rel):
+    home = _fake_home(tmp_path)
+    target = home / rel
+    if target.is_dir():
+        target.rmdir()
+    else:
+        target.unlink()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "settings.json").write_text("{}\n", encoding="utf-8")
+    target.symlink_to(outside / "settings.json" if rel.endswith(".json") else outside)
+    with pytest.raises(ws.SandboxConfigError):
+        _build_home(tmp_path, home, [str(target)])
+
+
+def test_skill_roots_symlinked_parent_rejected(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    real = tmp_path / "elsewhere"
+    (real / "plugins").mkdir(parents=True)
+    (home / ".claude").symlink_to(real)
+    with pytest.raises(ws.SandboxConfigError):
+        _build_home(tmp_path, home, [str(home / ".claude" / "plugins")])
+
+
+def test_skill_roots_wrong_kind_or_missing_rejected(tmp_path):
+    home = _fake_home(tmp_path)
+    (home / ".claude" / "settings.json").unlink()
+    (home / ".claude" / "settings.json").mkdir()
+    with pytest.raises(ws.SandboxConfigError):
+        _build_home(tmp_path, home, [str(home / ".claude" / "settings.json")])
+    (home / ".agents").rmdir()
+    with pytest.raises(ws.SandboxConfigError):
+        _build_home(tmp_path, home, [str(home / ".agents")])
+
+
 # ---------------------------------------------------------------- lane isolation
 
 def test_rw_binds_profile_workspace_kanban_dir_and_lane_home(tmp_path):
@@ -284,6 +445,12 @@ def test_example_manifest_parses_and_builds_every_lane():
                                           home=HOME, exists=lambda p: True))
     assert "Logos-Investment-Group" in logos and "iKBR-Active-Trader" in logos
     assert "TripTrackertechnologies" in logos and "NCASS-INC" not in logos
+    # the example manifest carries exactly the allow-listed skill roots, all ro
+    assert set(m["skill_roots_ro"]) == set(ws.skill_roots_allowed(HOME))
+    argv = ws.build_bwrap_argv("logos", "p", HOME / ".hermes" / "profiles" / "p", "/tmp/ws", m,
+                               home=HOME, exists=lambda p: True)
+    for p in m["skill_roots_ro"]:
+        assert (p, p) in _binds(argv, "--ro-bind") and all(s != p for s, _ in _binds(argv, "--bind"))
 
 
 # ---------------------------------------------------------------- wrap() decisions
