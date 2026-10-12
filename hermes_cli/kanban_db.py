@@ -20141,6 +20141,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # Production ledger projection (post-commit, best-effort). Without this an
+    # archived card stayed Blocked/FAILED on the dashboard forever and kept
+    # tripping the hourly email-task Telegram watch (2026-10-12).
+    _sync_production_ledger(conn, task_id, status="archived", phase="archive")
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
@@ -20326,6 +20330,10 @@ def reconcile_overtaken_by_events(
     # just freed instead of waiting for the next dispatcher tick, exactly as
     # archive_task does.
     recompute_ready(conn)
+    _sync_production_ledger(
+        conn, task_id, status="archived", phase="overtaken_by_events",
+        run_id=run_id,
+    )
     return True, None
 
 
