@@ -116,6 +116,11 @@ LLM_SOURCE_CLAUDE_CODE = "claude_code"
 LLM_SOURCES = (LLM_SOURCE_CODEX, LLM_SOURCE_CLAUDE_CODE)
 ROOT_AUTH_STORE_REL = Path(".hermes") / "auth.json"
 LANE_CREDS_RELPATH = Path(".hermes") / "security" / "worker-sandbox" / "creds"
+# Append-only company records (vault Decisions/2026-10-11-company-daily-records-append-only.md):
+# with manifest ``vault_readonly: true`` a lane's vault paths are bound read-only and the
+# lane writes new records to its own submissions dir, which the company daily ledger
+# (outside the sandbox) files into the vault as new files, never overwriting.
+SUBMISSIONS_RELPATH = Path(".hermes") / "company-submissions"
 SANDBOX_NO_REFRESH_ENV = "HERMES_SANDBOX_NO_REFRESH"
 
 _warned_missing_manifest = False
@@ -336,6 +341,21 @@ def lane_llm_source(manifest: Dict[str, Any], lane: str) -> str:
     return raw
 
 
+def vault_readonly(manifest: Dict[str, Any]) -> bool:
+    """``vault_readonly`` must be absent/None or a bool (fail closed on anything else)."""
+    raw = manifest.get("vault_readonly")
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise SandboxConfigError(f"worker sandbox: vault_readonly must be true/false, got {raw!r}")
+    return raw
+
+
+def lane_submissions_dir(lane: str, home: Path) -> str:
+    """Host path where ``lane`` drops new records for the company daily ledger."""
+    return _norm(home / SUBMISSIONS_RELPATH / str(lane).strip().casefold())
+
+
 def lane_creds_file(lane: str, home: Path) -> str:
     """Host path of the gateway-materialised trimmed codex store for ``lane``."""
     return _norm(home / LANE_CREDS_RELPATH / str(lane).strip().casefold() / "auth.json")
@@ -438,10 +458,19 @@ def build_bwrap_argv(
         _check_allowed(kd, home)
         argv += ["--bind", kd, kd]
 
+    vault_ro = vault_readonly(manifest)
     for key in ("repos", "vault", "browser_profiles", "extra_rw"):
         for p in _lane_paths(manifest, lane, key):
             _check_allowed(p, home)
-            argv += ["--bind", p, p]
+            argv += ["--ro-bind" if (vault_ro and key == "vault") else "--bind", p, p]
+    if vault_ro:
+        sub = lane_submissions_dir(lane, home)
+        if not exists(sub):
+            raise SandboxConfigError(
+                f"worker sandbox: lane {lane!r} has vault_readonly but no submissions dir {sub}; refusing to spawn"
+            )
+        _check_allowed(sub, home)
+        argv += ["--bind", sub, sub]
     for p in _lane_paths(manifest, lane, "extra_ro"):
         _check_allowed(p, home)
         argv += ["--ro-bind", p, p]
@@ -599,8 +628,9 @@ def _manifest_bound_paths(manifest: Dict[str, Any], lane: str) -> Dict[str, List
     ro += [_norm(p) for p in _skill_roots_entries(manifest)]
     ro += _lane_paths(manifest, lane, "extra_ro")
     rw: List[str] = []
+    vault_ro = vault_readonly(manifest)
     for key in ("repos", "vault", "browser_profiles", "extra_rw"):
-        rw += _lane_paths(manifest, lane, key)
+        (ro if (vault_ro and key == "vault") else rw).extend(_lane_paths(manifest, lane, key))
     return {"ro": ro, "rw": rw}
 
 
@@ -715,6 +745,10 @@ def probe_checks(
     for n in _skill_roots(manifest, home, exists):
         label = os.path.relpath(n, _norm(home)).replace("/", "_").strip("._")
         add(f"skill_root_{label}_readonly", "readonly", n, file=(allowed_roots[n] == "file"))
+    if vault_readonly(manifest):
+        for p in _lane_paths(manifest, lane, "vault"):
+            label = Path(p).name.replace(".", "_")
+            add(f"own_vault_{label}_readonly", "readonly", p, file=p.endswith(".md"))
     if lane_llm_source(manifest, lane) == LLM_SOURCE_CODEX:
         add("trimmed_codex_store_readonly", "readonly", root_auth, file=True)
     else:
@@ -723,6 +757,8 @@ def probe_checks(
     # --- MUST WORK ------------------------------------------------------
     add("profile_dir_rw", "rw", profile_home_s)
     add("workspace_rw", "rw", workspace_s)
+    if vault_readonly(manifest):
+        add("submissions_dir_rw", "rw", lane_submissions_dir(lane, home))
     if kanban_db_dir:
         add("kanban_db_begin_immediate", "kanban_lock", _norm(kanban_db_dir))
     if network:

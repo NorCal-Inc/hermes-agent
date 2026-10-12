@@ -24700,6 +24700,105 @@ def _worker_profile_scope(profile_home: str):
         reset_secret_scope(token)
 
 
+_BWRAP_VERSION: Optional[str] = None
+
+
+def _bwrap_version() -> str:
+    global _BWRAP_VERSION
+    if _BWRAP_VERSION is None:
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["bwrap", "--version"], capture_output=True, text=True, timeout=5,
+            )
+            _BWRAP_VERSION = (out.stdout or out.stderr).strip() or "unknown"
+        except Exception:  # noqa: BLE001
+            _BWRAP_VERSION = "unknown"
+    return _BWRAP_VERSION
+
+
+_OPENROUTER_ENV = "OPENROUTER_API_KEY"
+
+
+def _shared_openrouter_key() -> Optional[str]:
+    """The platform OpenRouter key from the dispatcher env or the root .env."""
+    val = os.environ.get(_OPENROUTER_ENV)
+    if val:
+        return val
+    try:
+        from dotenv import dotenv_values
+        from hermes_constants import get_default_hermes_root
+        return dotenv_values(get_default_hermes_root() / ".env").get(_OPENROUTER_ENV) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _apply_worker_sandbox(
+    task: Task,
+    cmd: list[str],
+    *,
+    profile: str,
+    profile_home: Optional[str],
+    workspace: str,
+    env: dict[str, str],
+) -> list[str]:
+    """Wrap ``cmd`` in bubblewrap when the task's lane is enforced.
+
+    Not enforced (mode off, executor-lane task, shared profile, lane not
+    listed): ``cmd`` is returned unchanged and the manifest is never read, so
+    a broken manifest cannot affect those lanes. Enforced: any failure to
+    build the sandbox raises ``RuntimeError`` (fail closed), including a
+    missing manifest, which ``worker_sandbox.wrap`` alone would treat as
+    "run unsandboxed".
+    """
+    from hermes_cli import worker_sandbox as ws
+
+    try:
+        sc = ws.sandbox_config()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"worker sandbox: invalid kanban.worker_sandbox config, refusing to spawn: {exc}"
+        ) from exc
+    if sc["mode"] != ws.MODE_ENFORCE or getattr(task, "executor_lane", None):
+        return cmd
+    lane = ws.lane_for(profile)
+    if lane is None or lane not in sc["lanes"]:
+        return cmd
+    refuse = f"worker sandbox: refusing to spawn enforced lane {lane!r} unsandboxed"
+    if not profile_home:
+        raise RuntimeError(f"{refuse}: profile {profile!r} has no home directory")
+    try:
+        manifest = ws.load_manifest()
+        if manifest is None:
+            raise ws.SandboxConfigError(
+                f"manifest {ws.default_manifest_path()} is missing"
+            )
+        wrapped = ws.wrap(
+            cmd, task=task, profile=profile, profile_home=profile_home,
+            workspace=workspace, env=env, cfg=None, manifest=manifest,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"{refuse}: {exc}") from exc
+    if not wrapped or wrapped[0] != "bwrap":
+        raise RuntimeError(f"{refuse}: sandbox wrapper was not applied")
+    env[ws.SANDBOX_NO_REFRESH_ENV] = "1"
+    # Hermes agents reach models through OpenRouter (shared platform
+    # credential). The sandbox hides the root .env, so hand the key to the
+    # child through its environment; never through argv, which is world-
+    # readable in /proc/<pid>/cmdline.
+    if not env.get(_OPENROUTER_ENV):
+        key = _shared_openrouter_key()
+        if key:
+            env[_OPENROUTER_ENV] = key
+        else:
+            _log.warning("worker sandbox: %s not available for lane %s", _OPENROUTER_ENV, lane)
+    _log.info(
+        "kanban worker spawn task=%s lane=%s sandbox=1 bwrap=%s",
+        task.id, lane, _bwrap_version(),
+    )
+    return wrapped
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -24948,6 +25047,14 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    # Worker sandbox (C1.3): a no-op unless kanban.worker_sandbox.mode is
+    # enforce and this lane is opted in. An enforced lane whose sandbox
+    # cannot be built raises here, so it is recorded as spawn_failed and
+    # never runs unsandboxed.
+    cmd = _apply_worker_sandbox(
+        task, cmd, profile=profile_arg, profile_home=profile_home,
+        workspace=workspace, env=env,
+    )
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
