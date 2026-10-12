@@ -289,6 +289,23 @@ class GatewayKanbanWatchersMixin:
                         for profile in getattr(self, "_profile_adapters", {})
                         if str(profile).strip()
                     )
+                    # Delegated supervisor (Christopher, 2026-10-11). The
+                    # supervisory profile (Erika) runs no gateway of its own,
+                    # so subscriptions stamped with it were never claimed by
+                    # anyone: her "I'll report back" updates were silently
+                    # dropped from 2026-08-26. This gateway delivers them,
+                    # notify-only, through its own adapter, and ONLY to the
+                    # configured executive Telegram chat.
+                    delegated = None
+                    try:
+                        _route = _kb._supervisory_routing()
+                        _sup = str(_route.get("supervisor") or "").strip()
+                        _chat = str(_route.get("chat_id") or "").strip()
+                        if _sup and _chat and _sup not in notifier_profiles:
+                            delegated = (_sup, _chat)
+                            notifier_profiles.add(_sup)
+                    except Exception as exc:
+                        logger.debug("kanban notifier: supervisory routing unavailable: %s", exc)
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
@@ -413,6 +430,14 @@ class GatewayKanbanWatchersMixin:
                             for sub in subs:
                                 try:
                                     owner_profile = sub.get("notifier_profile") or None
+                                    if delegated and owner_profile == delegated[0]:
+                                        if (
+                                            (sub.get("platform") or "").lower() != "telegram"
+                                            or str(sub.get("chat_id") or "") != delegated[1]
+                                        ):
+                                            continue
+                                        sub = dict(sub, notifier_profile="", delivery_mode="notify")
+                                        owner_profile = None
                                     if owner_profile and owner_profile != notifier_profile:
                                         _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
                                         if not _owner_adapters:
