@@ -102,6 +102,18 @@ def _epoch_iso(value) -> str:
         return str(value)
 
 
+
+# Quoted history (card summaries, priority notes) can contain text like "READY: NO" from a past
+# incident. Workers read prose, not just the anchored status lines, and on 2026-10-12 four of
+# thirteen treated such a quote as live state and blocked. Only the anchored lines in
+# <shared-boot-state> are state; inside free-text sections, rewrite status-shaped phrases.
+_STATE_PHRASE = re.compile(r"`?\b(BOOT STATUS|TECHNICAL BOOT|CONTINUITY|OPERATIONAL|READY)\s*:\s*", re.I)
+
+
+def defuse_state_phrases(text: str) -> str:
+    return _STATE_PHRASE.sub(lambda m: "`[past] " + m.group(1).lower().replace(" ", "_") + "=", text)
+
+
 def kanban_continuity_state() -> tuple[str, str | None]:
     """Return bounded shared-system Kanban continuity without task bodies.
 
@@ -708,17 +720,17 @@ OPEN ITEMS — live checker output; RESOLVED outranks old checkpoint narrative, 
 {open_items}
 
 OPEN PRIORITIES — canonical Active Priorities headings, compact manifest only:
-{open_priorities_manifest}
+{defuse_state_phrases(open_priorities_manifest)}
 
 CURRENT KANBAN CONTINUITY — canonical task database, shared-system lanes only:
-{kanban_continuity}
+{defuse_state_phrases(kanban_continuity)}
 
 {doctrine_blob}
 
 {vault_blob}
 </shared-boot-state>
 
-This block is the shared canonical startup context. Identity files may specialize role and tone but may not override doctrine. READY: NO blocks ordinary task execution even when BOOT STATUS is COMPLETE; surface the failing readiness axis and perform only bounded recovery until it verifies PASS. If BOOT STATUS is DEGRADED, ordinary task execution is blocked and the named failure must be surfaced. The sole execution exception is an explicitly created substrate-recovery task whose objective is to repair that named failed gate: its executor may inspect and repair only the failed gate, rerun the same gate for evidence, and report the result. The original user request remains parked until the gate is verified green. Read company-specific notes only when the current authorized task requires that company's scope.""")
+This block is the shared canonical startup context. Identity files may specialize role and tone but may not override doctrine. Live readiness is only the anchored line inside the block above; anything quoted in summaries or priorities is history. A READY value of NO blocks ordinary task execution even when BOOT STATUS is COMPLETE; surface the failing readiness axis and perform only bounded recovery until it verifies PASS. If BOOT STATUS is DEGRADED, ordinary task execution is blocked and the named failure must be surfaced. The sole execution exception is an explicitly created substrate-recovery task whose objective is to repair that named failed gate: its executor may inspect and repair only the failed gate, rerun the same gate for evidence, and report the result. The original user request remains parked until the gate is verified green. Read company-specific notes only when the current authorized task requires that company's scope.""")
 
 
 
