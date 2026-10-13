@@ -7181,6 +7181,43 @@ _GAUNTLET_MUTATION_RE = re.compile(
     re.I,
 )
 
+#: Ordinary state changes. Not high-risk the way ``_GAUNTLET_MUTATION_RE`` is,
+#: but a card that deletes, files, writes, updates records, closes tasks or
+#: sends messages changes state, and must not be switched OFF verification by
+#: a look-only word it also happens to contain. Gauntlet defect A, t_c73a6b89
+#: (2026-10-12): "Inspect the named input" matched the investigation pattern,
+#: so a card that deleted a source file, wrote two vault notes, updated an
+#: index and moved a dashboard row to VERIFIED closed on its own report with
+#: zero task_verifications rows.
+#:
+#: Only an IMPERATIVE counts: the verb opens a clause (start of a line or
+#: sentence, a list marker, or a coordinator such as "then"/"and"/"to"/"must")
+#: and is followed by an object on the same line -- "Delete the named input",
+#: "3. Update dashboard row", "then remove the file". Never bare nouns, past
+#: participles, third-person description or prohibitions ("one controlled
+#: restart to load", "for the gateway restart", "verified, closed, filed",
+#: "Claude Code restarts them on PASS", "do not edit any file", "send no
+#: messages"): a card that *describes* or *forbids* a change is not a card
+#: that *makes* one. Three read-only Erika check cards would otherwise have
+#: flipped to governed on their own guard rails. "deploy"/"publish"/"ship"
+#: are deliberately absent -- see the note above ``_GAUNTLET_MUTATION_RE``.
+_GAUNTLET_STATE_CHANGE_RE = re.compile(
+    r"(?:^|[.;:!?]|\d+[.)]|[-*]"
+    r"|\b(?:then|and|or|please|also|must|should|may|will|can|shall|to|you))"
+    r"[ \t]*"
+    r"("
+    r"live[ _-]?execution"
+    r"|(?:delet|remov|writ|mov|updat)(?:e|ing)[ \t]+\w"
+    r"|(?:edit|install|uninstall|restart|commit|push|send)(?:ing|ting)?[ \t]+\w"
+    r"|filing\b|file[ \t]+(?:\w+[ \t]+){0,3}?(?:into|under)\b"
+    r"|close[ \t]+(?:out[ \t]+)?(?:the[ \t]+|this[ \t]+|a[ \t]+|every[ \t]+|all[ \t]+)?"
+    r"(?:task|tasks|card|cards|row|rows|ticket|tickets|incident|loop|loops)\b"
+    r"|mark(?:ing)?[ \t]+(?:it[ \t]+|them[ \t]+|the[ \t]+\w+[ \t]+|as[ \t]+)?"
+    r"(?:verified|closed|done|complete|completed|resolved)\b"
+    r")",
+    re.I | re.M,
+)
+
 #: Work that only LOOKS at the system. Bounded by the universal attempt ceiling
 #: like everything else, but it produces findings, not changes, so demanding an
 #: independent verifier turns every hard question into a verification chain.
@@ -7208,9 +7245,16 @@ def gauntlet_default_for_subject(
     and deploys is a deployment. That ordering is the whole point: classifying
     on topic would let "investigation" become the label everything wears to
     avoid verification.
+
+    Ordinary state changes (``_GAUNTLET_STATE_CHANGE_RE``) are tested next and
+    also win over investigation, for the same reason: a card that deletes,
+    files, writes, updates records or sends messages is a state change and is
+    Gauntlet-verified, whatever investigation words it also contains.
     """
     blob = f"{title or ''}\n{body or ''}"
     if _GAUNTLET_MUTATION_RE.search(blob):
+        return True
+    if _GAUNTLET_STATE_CHANGE_RE.search(blob):
         return True
     if _GAUNTLET_INVESTIGATION_RE.search(blob):
         return False

@@ -330,6 +330,133 @@ class TestSelectiveGauntletEnforcement:
             "Investigate the credential leak and rotate the credential"
         ) is True
 
+    # -- Gauntlet defect A (2026-10-12): a look-only word must not switch
+    #    verification off on a card that changes state. ------------------
+
+    _T_C73A6B89_TITLE = (
+        "Live execution: digest BidVantage transcript and verify dashboard closure"
+    )
+    _T_C73A6B89_BODY = (
+        "Execute the full bounded LifeWiki digest workflow authorized by Erika "
+        "for dashboard row TASK-20261004-003231876033-f8411e.\n\n"
+        "Exact input (and only input in whisper_output you may touch): "
+        "/home/chris/.hermes/video-intelligence/incoming/whisper_output/"
+        "bidvantage-7689492264346832158.txt (expected 1,231 bytes). Scope is "
+        "shared/internal LifeWiki intake only; no company-private data. Do not "
+        "touch any other whisper_output file.\n\n"
+        "Requirements:\n"
+        "1. Inspect the named input and complete canonical "
+        "filing/tagging/synthesis/indexing, using POST /api/ingest where "
+        "applicable. Delete the named input only after verified authoritative "
+        "filing.\n"
+        "2. Read back the resulting authoritative LifeWiki state and "
+        "dashboard/API row. Do not fabricate evidence or merely mark verified.\n"
+        "3. Update dashboard row TASK-20261004-003231876033-f8411e so it leaves "
+        "FAILED and becomes closed+VERIFIED with real values for: "
+        "filed_note_paths, entity_tags, synthesis_path, updated_index_paths, "
+        "deleted_media_count, reclaimed_bytes, ambiguous_items_flagged, "
+        "report_delivered_to, report_message_id.\n"
+        "4. Return exact artifact paths and authoritative dashboard/API "
+        "read-back evidence. Touch no other whisper_output file.\n"
+        "5. Trust-score restoration and Christopher notification remain "
+        "Erika/independent-monitor responsibilities.\n\n"
+        "Acceptance: row closed+VERIFIED with all required real evidence; input "
+        "deleted only after verified filing; exact artifact/read-back evidence "
+        "returned; other whisper files untouched. Block rather than invent "
+        "unavailable reporting values.\n\n"
+        "Coordination: report your result on this card and also comment the "
+        "complete evidence handoff onto orchestrator card t_83804c18 so it can "
+        "close with acceptance proof."
+    )
+
+    def test_defect_a_the_exact_t_c73a6b89_card_is_governed(self):
+        """The card that closed on self-report with zero task_verifications.
+
+        Its only investigation word is "Inspect"; it deletes a file, files
+        notes, updates a dashboard row and marks it verified.
+        """
+        assert kb._GAUNTLET_INVESTIGATION_RE.search(self._T_C73A6B89_BODY)
+        assert kb.gauntlet_default_for_subject(
+            self._T_C73A6B89_TITLE, self._T_C73A6B89_BODY
+        ) is True
+
+    def test_defect_a_stamps_gauntlet_enforced_against_a_permissive_board(
+        self, kanban_home, monkeypatch
+    ):
+        monkeypatch.setattr(kb, "gauntlet_enforcement_default", lambda: False)
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title=self._T_C73A6B89_TITLE, body=self._T_C73A6B89_BODY,
+                assignee="default", provenance=_human(),
+            )
+            assert conn.execute(
+                "SELECT gauntlet_enforced FROM tasks WHERE id=?", (tid,)
+            ).fetchone()["gauntlet_enforced"] == 1
+
+    @pytest.mark.parametrize("title, body", [
+        ("Inspect the intake folder and delete the stale inputs", None),
+        ("Investigate the digest stall", "Then update the dashboard row to VERIFIED."),
+        ("Diagnose the index drift", "Write the corrected notes and file them into the vault."),
+        ("Triage the notify backlog", "Send the report to Erika when done."),
+        ("Research the worktree layout", "Move the orphaned notes under Business/Operations."),
+        ("Root cause the failed import", "Close the task once the row is marked verified."),
+        ("Live execution: run the bounded digest", "Inspect the input first."),
+        ("Analysis of the gateway", "Restart the gateway and commit the config."),
+    ])
+    def test_state_changing_card_is_governed_despite_investigation_words(
+        self, title, body
+    ):
+        assert kb._GAUNTLET_INVESTIGATION_RE.search(f"{title}\n{body or ''}")
+        assert kb.gauntlet_default_for_subject(title, body) is True
+
+    @pytest.mark.parametrize("title, body", [
+        ("Investigate why the digest stalled",
+         "Investigate why X, report findings, change nothing."),
+        ("Root cause analysis for the gateway restart", None),
+        ("Diagnose the dashboard row that was moved to FAILED",
+         "Read-only: report which process updated it and when. Do not modify anything."),
+        ("Triage the backlog", "Inspect the source file and report on its state."),
+        # t_df2a1e7a / t_6384fb98: a prohibition is not an action, and
+        # third-person description of what another actor will do is not one
+        # either.
+        ("Erika check: Phase 1 inventory result before Phase 2/3 restart",
+         "Read-only. Reply CHECK: PASS or CHECK: FAIL. Then complete this card. "
+         "Do not edit any file. Never delete anything, don't send messages, "
+         "and do not merely mark verified. Claude Code restarts them on PASS."),
+    ])
+    def test_pure_investigation_stays_ungoverned(self, title, body):
+        assert kb.gauntlet_default_for_subject(title, body) is False
+
+    def test_describing_a_past_change_is_not_making_one(self):
+        """Nouns and past participles describe history; only imperatives act."""
+        assert kb.gauntlet_default_for_subject(
+            "Investigate the data that was deleted, moved and updated last night"
+        ) is False
+        assert kb.gauntlet_default_for_subject("verified, closed, filed") is None
+
+    def test_noun_use_of_a_listed_verb_is_not_an_imperative(self):
+        """The t_887d70e9-shaped fixture in test_kanban_overtaken_by_events:
+        "restart" is a noun here; the card is neither classified governed nor
+        ungoverned by subject, so board policy decides as before."""
+        assert kb.gauntlet_default_for_subject(
+            "load and validate",
+            "Post-verification live-load validation for commit deadbee.\n"
+            "1. Confirm the repository is clean and HEAD equals origin.\n"
+            "2. Confirm no unrelated active workers would be disrupted.\n"
+            "3. Perform exactly one controlled restart to load the commit.\n",
+        ) is None
+        assert kb.gauntlet_default_for_subject(
+            "Sandbox smoke test", "Do no company work, create no cards, send no messages."
+        ) is None
+
+    def test_title_ending_in_a_noun_does_not_borrow_the_body(self):
+        """t_df2a1e7a: "... before Phase 2/3 restart" + a body on the next line
+        read as "restart Erika" when the object could cross the newline."""
+        assert kb.gauntlet_default_for_subject(
+            "Erika check: Phase 1 inventory result before Phase 2/3 restart",
+            "Erika, review the inventory findings and report whether Phase 2 may start.",
+        ) is False
+
     def test_undecidable_subject_falls_through_to_board_config(self, monkeypatch):
         assert kb.gauntlet_default_for_subject("Tidy the notes") is None
         monkeypatch.setattr(kb, "gauntlet_enforcement_default", lambda: True)
