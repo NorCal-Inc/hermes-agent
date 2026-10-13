@@ -53,6 +53,7 @@ would move the card out of ``running`` before the gate had even run.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 from dataclasses import dataclass, replace
@@ -232,10 +233,69 @@ def _build_claude_task_prompt(task: kb.Task) -> str:
     ])
 
 
-def _build_codex_verifier_prompt(task: kb.Task) -> str:
+_HEALTH_LIVE_STATUSES = ("open", "escalated", "held")
+
+
+def _iso_ts(value) -> Optional[float]:
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(value)).timestamp()
+    except Exception:
+        return None
+
+
+def _verifier_recovery_scope(conn, task_id: str) -> str:
+    """Name a verifier as the recovery task when its subject caused the light finding.
+
+    Incident 2026-10-12: verifier t_303041ae refused as "not the recovery
+    task" while verifying t_0e17b647, the very card whose missing evidence had
+    escalated the light tier. The finding cleared when the verifier was
+    created, but the boot still read the older light heartbeat, so the worker
+    saw a not-ready boot and nothing said it was the recovery (boot
+    constraint 15). A finding counts while unresolved, or resolved after the
+    heartbeat the boot reads. Read-only; returns "" on any doubt.
+    """
+    try:
+        subjects = set(kb.relation_targets(conn, task_id, kb.RELATION_VERIFIES))
+        if not subjects:
+            return ""
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        state_dir = home / "state" / "system-health-controller"
+        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+        beat = json.loads((state_dir / "heartbeat-light.json").read_text(encoding="utf-8"))
+        beat_ts = float(beat.get("finished_ts") or 0)
+        hits = []
+        for rec in (state.get("fingerprints") or {}).values():
+            if not isinstance(rec, dict) or rec.get("tier") != "light":
+                continue
+            if rec.get("subject") not in subjects:
+                continue
+            if rec.get("status") in _HEALTH_LIVE_STATUSES:
+                live = True
+            else:
+                resolved = _iso_ts(rec.get("resolved_at"))
+                live = rec.get("status") == "resolved" and resolved is not None and resolved > beat_ts
+            if live:
+                hits.append(f"{rec.get('invariant')} ({rec.get('signature')}) on {rec.get('subject')}")
+        if not hits:
+            return ""
+    except Exception:
+        return ""
+    return (
+        "RECOVERY SCOPE (set by the Hermes launcher from health-controller state, not by the card): "
+        "the subject of this verification is the named cause of the light health finding "
+        + "; ".join(sorted(hits))
+        + ". Verifying it is the recovery of that failed readiness gate under boot constraint 14, "
+        "so a not-ready boot state caused by this finding does not block this verification. "
+        "Scope is unchanged: read-only, limited to this verdict."
+    )
+
+
+def _build_codex_verifier_prompt(task: kb.Task, recovery_scope: str = "") -> str:
     return "\n".join([
         "You are Atlas, the independent Codex verification executor for one Hermes Kanban task.",
         "This is a READ-ONLY verification lane. Do not edit files, commit, deploy, or mutate services/databases.",
+        *([recovery_scope] if recovery_scope else []),
         "Re-derive only the requested checks independently from the narrow evidence/sources named by the acceptance criteria and report falsifiable evidence.",
         "Do not trust an implementer's self-report when the task asks you to verify it.",
         "SCOPE GUARDRAIL — deny-by-default exploration:",
@@ -525,7 +585,8 @@ def run_codex_verifier(task_id: str) -> int:
         if not should_run:
             return 1
         attempt = _invoke_codex_verifier(
-            _build_codex_verifier_prompt(task), cwd, timeout, task_id=task_id,
+            _build_codex_verifier_prompt(task, _verifier_recovery_scope(conn, task_id)),
+            cwd, timeout, task_id=task_id,
         )
         if not attempt.ok:
             if attempt.revoked:
