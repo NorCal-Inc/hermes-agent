@@ -31,7 +31,11 @@ Board resolution order (highest precedence first, all optional):
   to the board their task lives on — workers cannot see other boards).
 * ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
   override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
+  is what the caller wants to force). One guard: a pin under the
+  platform-native root is ignored when the active kanban home resolves
+  outside that root, so an inherited dispatcher pin cannot drag a
+  deliberately re-homed process back to the live board (incident
+  2026-10-12; see :func:`_inherited_db_pin_is_foreign`).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
@@ -1517,6 +1521,92 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    """True when ``path`` resolves to ``root`` or somewhere beneath it.
+
+    Symlinks are followed on both sides (the live board is reached through a
+    ``kanban.db`` symlink on at least one install). Any resolution error
+    reads as "not within" so the caller falls back to its historical
+    behaviour rather than guessing.
+    """
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+        return True
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
+# (pin, HERMES_HOME, HERMES_KANBAN_HOME, native root) -> verdict. One-slot
+# memo: a worker's environment never changes, and ``kanban_db_path`` is on
+# the hot path of every ``connect()``.
+_FOREIGN_PIN_MEMO: Optional[tuple] = None
+_FOREIGN_PIN_WARNED: set = set()
+
+
+def _inherited_db_pin_is_foreign(pinned: Path) -> bool:
+    """True when ``HERMES_KANBAN_DB`` points back at the platform-native
+    Hermes root while the active kanban home has been pointed elsewhere.
+
+    Incident 2026-10-12 22:02 (card t_6cc051f2, audit EVT-PROBECLEAN-20261012):
+    a worker's probe script set ``HERMES_HOME`` to a temp folder and called
+    ``init_db()`` / ``create_task()``. The worker environment still carried the
+    dispatcher's ``HERMES_KANBAN_DB`` pin, which this module honoured ahead of
+    ``HERMES_HOME``, so five probe cards landed on the live board and were
+    dispatched. ``tests/conftest.py`` strips the pin for pytest; ad-hoc scripts
+    had no such protection.
+
+    The rule is deliberately narrow so the dispatcher→worker handoff is
+    untouched:
+
+    * A pin **outside** the native root (``~/.hermes`` on POSIX) is always
+      honoured — custom / Docker roots, and tests that pin a tempfile.
+    * A pin **inside** the native root is honoured whenever the active kanban
+      home also resolves inside it — the normal install, every
+      ``<root>/profiles/<name>`` worker, and an explicit
+      ``HERMES_KANBAN_HOME`` pointing at the root.
+    * Only a pin inside the native root combined with a kanban home **outside**
+      it is foreign: the process deliberately re-homed itself somewhere else
+      and the pin can only have been inherited. ``HERMES_KANBAN_HOME=<root>``
+      is the documented way to use the live board from such a process on
+      purpose.
+    """
+    global _FOREIGN_PIN_MEMO
+    from hermes_constants import _get_platform_default_hermes_home
+
+    native = _get_platform_default_hermes_home()
+    key = (
+        str(pinned),
+        os.environ.get("HERMES_HOME", ""),
+        os.environ.get("HERMES_KANBAN_HOME", ""),
+        str(native),
+    )
+    if _FOREIGN_PIN_MEMO is not None and _FOREIGN_PIN_MEMO[0] == key:
+        return _FOREIGN_PIN_MEMO[1]
+
+    if not _path_is_within(pinned, native):
+        verdict = False
+    else:
+        home = kanban_home()
+        verdict = not (_path_is_within(home, native) or _path_is_within(pinned, home))
+    _FOREIGN_PIN_MEMO = (key, verdict)
+    return verdict
+
+
+def _warn_foreign_db_pin_once(pinned: Path) -> None:
+    key = str(pinned)
+    if key in _FOREIGN_PIN_WARNED:
+        return
+    _FOREIGN_PIN_WARNED.add(key)
+    _log.warning(
+        "ignoring inherited HERMES_KANBAN_DB=%s: it names a board under the "
+        "platform Hermes root while HERMES_HOME resolves kanban paths to %s. "
+        "A re-homed process must not write to the live board through an "
+        "inherited dispatcher pin (incident 2026-10-12). Set "
+        "HERMES_KANBAN_HOME to that root to use the pinned board on purpose.",
+        pinned, kanban_home(),
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -1525,7 +1615,10 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
        back-compat and for the dispatcher→worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
+       immune to any path-resolution disagreement). **Exception:** a pin
+       under the platform-native Hermes root is ignored (with one warning)
+       when the active kanban home resolves outside that root — see
+       :func:`_inherited_db_pin_is_foreign`.
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
@@ -1533,7 +1626,10 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
-        return Path(override).expanduser()
+        pinned = Path(override).expanduser()
+        if not _inherited_db_pin_is_foreign(pinned):
+            return pinned
+        _warn_foreign_db_pin_once(pinned)
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
