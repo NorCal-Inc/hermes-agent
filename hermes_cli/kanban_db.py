@@ -18796,38 +18796,63 @@ def retire_lesson(
     actor: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Stop injecting a lesson without erasing that it once governed.
+    """Retire a lesson without erasing that it once existed or governed.
 
-    Flips ``active`` to 0 and stamps who/when/why. The row stays, the
-    ``lesson_promoted`` event stays, and a ``lesson_retired`` event is
-    appended to the source task — so the history reads "this rule bound work
-    between these two dates", which is the question a later reader actually
-    has. Idempotent: retiring an already-retired lesson is refused rather than
-    silently re-stamping the record.
+    Sets ``state`` to ``retired`` and ``active`` to 0, and stamps who/when/why.
+    The row stays, the ``lesson_promoted`` / ``lesson_candidate_recorded``
+    event stays, and a ``lesson_retired`` event is appended to the source
+    task — so the history reads "this rule bound work between these two
+    dates" (or "this candidate was considered and declined"), which is the
+    question a later reader actually has.
+
+    Both undecided states retire to the same final state:
+
+    * ``active`` — the rule stops binding future work.
+    * ``candidate`` — the operator declines it; it leaves the decision queue
+      (:func:`lesson_candidates`) without ever having bound anything.
+
+    Retirement is decided on ``state``, not on ``active``. A candidate is
+    ``active = 0`` from the moment it is recorded, so testing ``active`` alone
+    made every candidate look "already retired" and left the operator with no
+    supported way to clear the queue (2026-10-12, candidate rows 213-295).
+    Idempotent: a row that is already ``state = retired`` — or that already
+    carries a retirement stamp — is refused rather than silently re-stamped.
     """
     actor = _canonical_assignee(actor) if actor else None
     reason_text = str(redact_review_value(reason or "")).strip() or None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT id, source_task_id, active FROM task_lessons WHERE id = ?",
+            "SELECT id, source_task_id, active, state, retired_at "
+            "FROM task_lessons WHERE id = ?",
             (int(lesson_id),),
         ).fetchone()
         if row is None:
             return False, f"lesson {lesson_id} not found"
-        if not row["active"]:
+        prior_state = str(row["state"] or LESSON_STATE_ACTIVE)
+        if prior_state == LESSON_STATE_RETIRED or row["retired_at"] is not None:
             return False, f"lesson {lesson_id} is already retired"
         now = int(time.time())
-        conn.execute(
+        cur = conn.execute(
             "UPDATE task_lessons "
-            "SET active = 0, retired_at = ?, retired_by = ?, "
+            "SET state = ?, active = 0, retired_at = ?, retired_by = ?, "
             "    retired_reason = ? "
-            "WHERE id = ? AND active = 1",
-            (now, actor, reason_text, int(lesson_id)),
+            "WHERE id = ? AND state != ? AND retired_at IS NULL",
+            (
+                LESSON_STATE_RETIRED, now, actor, reason_text,
+                int(lesson_id), LESSON_STATE_RETIRED,
+            ),
         )
+        if cur.rowcount != 1:
+            # Lost the race to a concurrent retirement inside the same
+            # instant; the guard above already read a non-retired row, so
+            # this is the only way the UPDATE can miss.
+            return False, f"lesson {lesson_id} is already retired"
         _append_event(
             conn, row["source_task_id"], "lesson_retired",
             {
                 "lesson_id": int(lesson_id),
+                "from_state": prior_state,
+                "was_binding": bool(row["active"]),
                 "actor": actor,
                 "reason": reason_text,
             },

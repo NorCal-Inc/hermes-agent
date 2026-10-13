@@ -1399,3 +1399,198 @@ class TestLessonAccessorExposesLifecycle:
             assert len(due) == 1
             assert due[0]["state"] == kb.LESSON_STATE_ACTIVE
             assert due[0]["retire_condition"] == "the provider stops using 429"
+
+
+# ---------------------------------------------------------------------------
+# Retiring a candidate (t_a3e1232a, 2026-10-12)
+# ---------------------------------------------------------------------------
+
+class TestCandidateRetirement:
+    """``retire_lesson`` decides on ``state``, not ``active``.
+
+    A candidate is ``active = 0`` from the moment it is recorded, so the old
+    ``active``-only test refused every candidate as "already retired" and the
+    operator had no supported way to clear the decision queue (live rows
+    213-295). Both undecided states must retire to one final state:
+    ``state = retired, active = 0``, stamped, with a durable event.
+    """
+
+    BROAD = "Governance: escalate cross-company work to Erika."
+
+    def _candidate(self, conn, *, tenant="acme"):
+        tid = _verified(conn, tenant=tenant)
+        out = kb.extract_lesson(
+            conn, tid, lesson=self.BROAD,
+            applicability="assignee:coder", actor="operator",
+        )
+        assert out["state"] == kb.LESSON_STATE_CANDIDATE
+        return tid, out
+
+    @staticmethod
+    def _row(conn, lesson_id):
+        return conn.execute(
+            "SELECT state, active, retired_at, retired_by, retired_reason, "
+            "tenant, scope FROM task_lessons WHERE id = ?", (lesson_id,),
+        ).fetchone()
+
+    def test_candidate_retires_to_the_final_state(self, kanban_home):
+        with kb.connect_closing() as conn:
+            source, out = self._candidate(conn)
+            before = self._row(conn, out["id"])
+            assert (before["state"], before["active"]) == (
+                kb.LESSON_STATE_CANDIDATE, 0,
+            )
+            assert before["retired_at"] is None
+
+            ok, detail = kb.retire_lesson(
+                conn, out["id"], actor="erika", reason="not a durable rule",
+            )
+            assert (ok, detail) == (True, None)
+
+            after = self._row(conn, out["id"])
+            assert (after["state"], after["active"]) == (
+                kb.LESSON_STATE_RETIRED, 0,
+            )
+            assert after["retired_at"] is not None
+            assert after["retired_by"] == "erika"
+            assert after["retired_reason"] == "not a durable rule"
+            # Tenant boundary survives retirement untouched.
+            assert (after["tenant"], after["scope"]) == (
+                before["tenant"], before["scope"],
+            )
+
+            # Durable event, on the source task, naming where it came from.
+            events = _events(conn, source, kind="lesson_retired")
+            assert len(events) == 1
+            payload = events[0][1]
+            assert payload["lesson_id"] == out["id"]
+            assert payload["from_state"] == kb.LESSON_STATE_CANDIDATE
+            assert payload["was_binding"] is False
+            assert payload["actor"] == "erika"
+            assert payload["reason"] == "not a durable rule"
+            # The record that it was once a candidate is preserved.
+            assert len(_events(conn, source, kind="lesson_candidate_recorded")) == 1
+
+    def test_active_retires_to_the_same_final_state(self, kanban_home):
+        with kb.connect_closing() as conn:
+            source = _verified(conn, title="source")
+            lesson = _promote(conn, source, allow_global=True)
+            assert self._row(conn, lesson["id"])["state"] == kb.LESSON_STATE_ACTIVE
+
+            ok, detail = kb.retire_lesson(
+                conn, lesson["id"], actor="operator", reason="superseded",
+            )
+            assert (ok, detail) == (True, None)
+
+            after = self._row(conn, lesson["id"])
+            assert (after["state"], after["active"]) == (
+                kb.LESSON_STATE_RETIRED, 0,
+            )
+            assert after["retired_by"] == "operator"
+            assert after["retired_at"] is not None
+            payload = _events(conn, source, kind="lesson_retired")[0][1]
+            assert payload["from_state"] == kb.LESSON_STATE_ACTIVE
+            assert payload["was_binding"] is True
+
+    def test_retired_candidate_leaves_the_queue_and_approval(self, kanban_home):
+        with kb.connect_closing() as conn:
+            _, keep = self._candidate(conn)
+            _, gone = self._candidate(conn)
+            assert [c["id"] for c in kb.lesson_candidates(conn)] == [
+                keep["id"], gone["id"],
+            ]
+            assert kb.retire_lesson(conn, gone["id"], actor="erika")[0] is True
+
+            assert [c["id"] for c in kb.lesson_candidates(conn)] == [keep["id"]]
+            assert [
+                c["id"] for c in kb.lesson_candidates(conn, tenant="acme")
+            ] == [keep["id"]]
+            # It never binds and cannot be resurrected by approval.
+            assert kb.list_lessons(conn) == []
+            assert kb.approve_lesson(conn, gone["id"], approver="christopher") is False
+            # ...but history keeps it.
+            archived = {le["id"]: le for le in kb.list_lessons(conn, active_only=False)}
+            assert archived[gone["id"]]["state"] == kb.LESSON_STATE_RETIRED
+            assert archived[gone["id"]]["active"] is False
+
+    def test_retiring_a_retired_candidate_is_refused_without_restamping(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            source, out = self._candidate(conn)
+            assert kb.retire_lesson(
+                conn, out["id"], actor="erika", reason="first",
+            )[0] is True
+            first = self._row(conn, out["id"])
+
+            ok, detail = kb.retire_lesson(
+                conn, out["id"], actor="someone-else", reason="second",
+            )
+            assert ok is False
+            assert "already retired" in detail
+
+            again = self._row(conn, out["id"])
+            assert tuple(again) == tuple(first)
+            assert again["retired_by"] == "erika"
+            assert again["retired_reason"] == "first"
+            assert len(_events(conn, source, kind="lesson_retired")) == 1
+
+    def test_a_stamped_row_is_refused_whatever_its_label(self, kanban_home):
+        """A row already carrying a retirement stamp is retired, full stop.
+
+        Guards the legacy shape (``state`` label disagreeing with a stamped
+        ``retired_at``) so the repair can never re-stamp a historical row.
+        """
+        with kb.connect_closing() as conn:
+            source, out = self._candidate(conn)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_lessons SET retired_at = 1, retired_by = 'x' "
+                    "WHERE id = ?", (out["id"],),
+                )
+            ok, detail = kb.retire_lesson(conn, out["id"], actor="erika")
+            assert ok is False
+            assert "already retired" in detail
+            row = self._row(conn, out["id"])
+            assert (row["retired_at"], row["retired_by"]) == (1, "x")
+            assert _events(conn, source, kind="lesson_retired") == []
+
+    def test_cli_retires_a_candidate_and_reports_it(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        with kb.connect_closing() as conn:
+            _, out = self._candidate(conn)
+        lesson_id = out["id"]
+
+        listed = json.loads(kc.run_slash("lesson-candidates --json"))
+        assert [c["id"] for c in listed] == [lesson_id]
+        assert listed[0]["active"] is False
+
+        report = kc.run_slash(
+            f"lesson-retire {lesson_id} --actor erika --reason 'declined'"
+        )
+        assert f"Retired candidate lesson {lesson_id}" in report
+        assert "cannot retire" not in report
+
+        assert json.loads(kc.run_slash("lesson-candidates --json")) == []
+        assert "No candidate lessons" in kc.run_slash("lesson-candidates")
+        archived = json.loads(kc.run_slash("lessons --all --json"))
+        assert [le["id"] for le in archived] == [lesson_id]
+        assert archived[0]["state"] == kb.LESSON_STATE_RETIRED
+        assert archived[0]["active"] is False
+        assert archived[0]["retired_by"] == "erika"
+        assert archived[0]["retired_reason"] == "declined"
+
+        second = kc.run_slash(f"lesson-retire {lesson_id} --actor erika")
+        assert f"cannot retire lesson {lesson_id}" in second
+        assert "already retired" in second
+
+    def test_cli_report_for_an_active_rule_is_unchanged(self, kanban_home):
+        from hermes_cli import kanban as kc
+
+        with kb.connect_closing() as conn:
+            source = _verified(conn, title="source")
+            lesson = _promote(conn, source, allow_global=True)
+        report = kc.run_slash(f"lesson-retire {lesson['id']} --reason done")
+        assert f"Retired lesson {lesson['id']}" in report
+        assert "candidate" not in report

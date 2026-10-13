@@ -3380,19 +3380,31 @@ def _cmd_lesson_record_error(args: argparse.Namespace) -> int:
 
 
 def _cmd_lesson_retire(args: argparse.Namespace) -> int:
+    lesson_id = int(args.lesson_id)
     with kb.connect_closing() as conn:
+        # Read the state first so the confirmation says what was actually
+        # decided: declining a candidate that never bound anything is not the
+        # same report as un-binding an active rule.
+        was_candidate = lesson_id in {
+            c["id"] for c in kb.lesson_candidates(conn)
+        }
         ok, detail = kb.retire_lesson(
             conn,
-            args.lesson_id,
+            lesson_id,
             actor=getattr(args, "actor", None) or _profile_author(),
             reason=getattr(args, "reason", None),
         )
     if not ok:
-        print(f"cannot retire lesson {args.lesson_id}: {detail}",
-              file=sys.stderr)
+        print(f"cannot retire lesson {lesson_id}: {detail}", file=sys.stderr)
         return 1
+    if was_candidate:
+        print(
+            f"Retired candidate lesson {lesson_id} — it leaves the decision "
+            f"queue and never bound anything; the row and its history are kept"
+        )
+        return 0
     print(
-        f"Retired lesson {args.lesson_id} — it stops being injected; the row "
+        f"Retired lesson {lesson_id} — it stops being injected; the row "
         f"and its history are kept"
     )
     return 0
