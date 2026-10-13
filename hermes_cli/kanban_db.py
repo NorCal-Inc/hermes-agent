@@ -24171,6 +24171,23 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            from hermes_cli.skill_bridge import SkillProvisionRefused
+
+            if isinstance(exc, SkillProvisionRefused):
+                # A required skill could not be provisioned from an approved
+                # baseline (unregistered / drifted / cross-lane / diverged
+                # target). This is a capability gap, not a crash: block the
+                # card with the typed ``capability`` kind so it routes to
+                # Erika's provisioning path, keeps its assignee, and returns
+                # to the same worker on unblock. No bytes were copied for the
+                # refused skills (fail-closed).
+                _append_event(
+                    conn, claimed.id, "skill_provision_refused",
+                    exc.payload(), run_id=claimed.current_run_id,
+                )
+                if block_task(conn, claimed.id, reason=str(exc), kind="capability"):
+                    result.auto_blocked.append(claimed.id)
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -24961,6 +24978,26 @@ def _default_spawn(
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
         profile_home = None
+
+    # Need-based skill provisioning preflight (t_9c745fdc). A worker's
+    # HERMES_HOME is rebound to its profile, so it only ever sees skills that
+    # physically exist under ``profiles/<name>/skills``; a per-task ``skills``
+    # name missing there crashes the worker at startup (``Unknown skill(s)``)
+    # before it gets a turn. Resolve every required skill BEFORE spawning:
+    # copy only the exact bytes of an approved baseline (root tree pinned in
+    # the skill-trust registry, or an attested company-lane baseline for the
+    # profile's own lane), verify the hash, and fail closed otherwise. The
+    # refusal propagates to ``dispatch_once``, which records a typed
+    # ``capability`` block (Erika's provisioning path) instead of a
+    # spawn-failure retry loop. The root/default home is never provisioned
+    # into: it IS the baseline.
+    if task.skills and profile_home and profile_arg != "default":
+        from hermes_cli.skill_bridge import preflight_task_skills
+
+        preflight_task_skills(
+            list(task.skills), profile_arg,
+            task_id=task.id, task_tenant=task.tenant,
+        )
 
     # A worker for ANOTHER profile must not be built from the dispatcher's
     # environment. The dispatcher runs inside the gateway
