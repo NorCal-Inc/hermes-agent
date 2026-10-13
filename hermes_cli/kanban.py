@@ -3668,7 +3668,8 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             for tid in purge_ids:
                 if not kb.delete_archived_task(conn, tid):
                     failed.append(tid)
-                    print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
+                    print(f"cannot delete {tid} (must already be archived, with no "
+                          f"unresolved execution effects; see its events)", file=sys.stderr)
                 else:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1

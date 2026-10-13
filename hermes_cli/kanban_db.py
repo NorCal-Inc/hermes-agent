@@ -20600,7 +20600,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
-        return _purge_archived_task_locked(conn, task_id)
+        purged = _purge_archived_task_locked(conn, task_id)
+    if purged:
+        _purge_task_files(task_id)
+    return purged
 
 
 def _purge_archived_task_locked(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -20616,6 +20619,24 @@ def _purge_archived_task_locked(conn: sqlite3.Connection, task_id: str) -> bool:
     The status check is in the DELETE's WHERE clause, not a prior SELECT,
     so a card un-archived between the two cannot be purged by a stale read.
     """
+    # An unresolved execution effect (rollback_pending / conflict) is real
+    # work still owed outside the board; purging its record would hide it.
+    # Fail closed and say why on the card.
+    unresolved = conn.execute(
+        "SELECT COUNT(*) FROM execution_effects "
+        "WHERE task_id = ? AND state IN ('rollback_pending', 'conflict')",
+        (task_id,),
+    ).fetchone()[0]
+    if unresolved:
+        if conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'archived'", (task_id,),
+        ).fetchone() is not None:
+            _append_event(
+                conn, task_id, "history_delete_refused",
+                {"reason": "unresolved_execution_effects",
+                 "count": int(unresolved), "source": "purge"},
+            )
+        return False
     cur = conn.execute(
         "DELETE FROM tasks WHERE id = ? AND status = 'archived'",
         (task_id,),
@@ -20638,6 +20659,35 @@ def _purge_archived_task_locked(conn: sqlite3.Connection, task_id: str) -> bool:
     conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+    # Everything else keyed to the card (2026-10-13, t_6cc051f2): the purge
+    # printed "Deleted" and left 175 rows behind in these tables. Execution
+    # events go first because they are keyed by execution, not by card.
+    conn.execute(
+        "DELETE FROM execution_events WHERE execution_id IN "
+        "(SELECT id FROM executions WHERE task_id = ?)",
+        (task_id,),
+    )
+    conn.execute("DELETE FROM executions WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM execution_effects WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_attachments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_verifications WHERE task_id = ?", (task_id,))
+    # No current code creates this table (init_db does not); boards that ran
+    # the earlier timeout-checkpoint code still carry it, so clear it when
+    # present and never fail the purge on a board without it.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'task_timeout_checkpoints'"
+    ).fetchone() is not None:
+        conn.execute(
+            "DELETE FROM task_timeout_checkpoints WHERE task_id = ?", (task_id,),
+        )
+    # Only unpromoted candidates go with their card. An active or retired
+    # lesson is durable learning (verified lessons outlive their source) and
+    # keeps its source_task_id as provenance.
+    conn.execute(
+        "DELETE FROM task_lessons WHERE source_task_id = ? AND state = ?",
+        (task_id, LESSON_STATE_CANDIDATE),
+    )
     # Timers cascade AFTER the card row, not before it, because
     # ``trg_obs_timer_no_delete_while_task_lives`` refuses to let a timer be
     # deleted while its subject is still on the board.
@@ -20682,8 +20732,36 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
                     },
                 )
     if purged:
+        _purge_task_files(task_id)
         recompute_ready(conn)
     return purged
+
+
+def _purge_task_files(task_id: str) -> None:
+    """Remove a purged card's attachment folder and worker log.
+
+    Runs after the row cascade has committed, for the active board only (the
+    same resolution the connection used): ids are unique per board, not
+    across boards. A file that cannot be removed is logged, never raised;
+    the rows are already gone.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return
+    targets = []
+    try:
+        targets.append(task_attachments_dir(task_id))
+        targets.append(worker_log_path(task_id))
+    except Exception as exc:  # pragma: no cover - path resolution failure
+        _log.warning("purge %s: cannot resolve file paths: %s", task_id, exc)
+        return
+    for path in targets:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as exc:
+            _log.warning("purge %s: could not remove %s: %s", task_id, path, exc)
 
 
 # ---------------------------------------------------------------------------
