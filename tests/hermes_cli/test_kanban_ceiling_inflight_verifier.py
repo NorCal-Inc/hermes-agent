@@ -302,16 +302,21 @@ from tests.hermes_cli.test_t_b8d62378_lifecycle_replay import OPERATOR, _QuietLe
 
 @pytest.mark.parametrize("verdict", ["pass", "fail", "refused_pass"])
 def test_t_b8d62378_f6_cycle_through_the_dispatcher(kanban_home, verdict):
-    """Live 9/9 -> +2 grant -> F6 operator handoff -> dispatcher-claimed verifier (11/11) -> verdict."""
+    """Live 9/9 -> +1 grant -> F6 operator unblock -> dispatcher-claimed verifier (10/10) -> verdict.
+
+    Production granted +2 (event 158917) and spent one of them on the operator's request_review run.
+    Since 2026-10-13 (t_6cc051f2) the ceiling block preserves the review phase it was taken from, so
+    unblock resumes review with no handoff run; +1 keeps the verifier claim as the final attempt.
+    """
     summaries = {"pass": PASS_WITH_REGRESSION, "fail": FAIL, "refused_pass": REFUSED_PASS}
     with kb.connect_closing() as conn:
         board = Board(conn)
         tid = replay_live_history(conn, _QuietLedger())
         assert (board.attempts(tid), board.limit(tid), board.task(tid).status) == (9, 9, "blocked")
         history = board.run_ids()
-        kb.grant_objective_attempts(conn, tid, added_attempts=2, authorized_by="Christopher",
-                                    reason="replay of event 158917", env=OPERATOR)
-        assert (board.attempts(tid), board.limit(tid), board.task(tid).status) == (9, 11, "blocked")
+        kb.grant_objective_attempts(conn, tid, added_attempts=1, authorized_by="Christopher",
+                                    reason="replay of event 158917, less the removed handoff run", env=OPERATOR)
+        assert (board.attempts(tid), board.limit(tid), board.task(tid).status) == (9, 10, "blocked")
         # F6 handoff exactly as run in production (one operator process).
         kb.add_attachment(conn, tid, filename="t_b8d62378-F6-facts.json", stored_path=f"/tmp/{tid}/facts.json",
                           size=2048, uploaded_by="claude-code (operator relay for Christopher)")
@@ -319,15 +324,14 @@ def test_t_b8d62378_f6_cycle_through_the_dispatcher(kanban_home, verdict):
                           size=4096, uploaded_by="claude-code (operator relay for Christopher)")
         kb.add_comment(conn, tid, "claude-code (operator relay for Christopher)", "F6 final verification handoff")
         assert kb.unblock_task(conn, tid)
-        ok, reason = kb.request_review(conn, tid, summary="F6 evidence packet attached", with_reason=True,
-                                       metadata={"changed_files": ["norcal/health/system_health_controller.py"],
-                                                 "verification": "full gate"})
-        assert ok, reason
-        assert (board.attempts(tid), board.task(tid).status) == (10, "review")
+        assert (board.attempts(tid), board.task(tid).status) == (9, "review")
+        # Next dispatcher tick opens the fresh verifier for the resumed review phase; no run is spent.
+        assert board.tick() == []
+        assert board.attempts(tid) == 9
         child = kb._open_verifier_child(conn, tid)
         assert child is not None
         run = board.dispatcher_claims_verifier(tid, child)          # production tick 09:08:16
-        assert board.attempts(tid) == 11
+        assert board.attempts(tid) == 10
         assert board.task(tid).status == "review", "the claim tick must not block the subject"
         assert board.tick() == []                                    # verifier still running
         board.verifier_returns(child, run, summaries[verdict])      # production 09:09:18
@@ -338,7 +342,7 @@ def test_t_b8d62378_f6_cycle_through_the_dispatcher(kanban_home, verdict):
             assert board.tick() == [], "nothing may run beyond the ceiling"
         subject = board.task(tid)
         assert set(history) <= set(board.run_ids())
-        assert board.limit(tid) == 11
+        assert board.limit(tid) == 10
         assert board.running_verifiers(tid) == []
         if verdict == "pass":
             assert '"recorded": true' in returned
@@ -346,11 +350,11 @@ def test_t_b8d62378_f6_cycle_through_the_dispatcher(kanban_home, verdict):
         elif verdict == "fail":
             assert '"recorded": true' in returned
             assert subject.status == "blocked" and subject.block_kind == kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED
-            assert board.attempts(tid) == 11
+            assert board.attempts(tid) == 10
         else:
             assert subject.verification_state != kb.VERIFICATION_VERIFIED
             assert subject.status == "blocked" and subject.block_kind == kb.BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED
-            assert board.attempts(tid) == 11
+            assert board.attempts(tid) == 10
 
 
 # 4b ----------------------------------------------------------------------------------------------

@@ -105,9 +105,17 @@ def _implementation_cycle(conn, tid, ledger, n):
 def _operator_handoff(conn, tid, ledger, label):
     kb.add_comment(conn, tid, "claude-code (operator relay for Christopher)", "evidence packet attached")
     assert kb.unblock_task(conn, tid)
-    ledger.mark(conn, tid, f"{label}: operator unblock")
+    resumed = ledger.mark(conn, tid, f"{label}: operator unblock")
     kb.add_attachment(conn, tid, filename="PHASE-EVIDENCE-PACKET.md", stored_path=f"/tmp/{tid}/PHASE.md",
                       size=4096, uploaded_by="claude-code (operator relay for Christopher)")
+    if resumed["status"] == "review":
+        # A ceiling block taken out of ``review`` resumes the verification phase (2026-10-13,
+        # t_6cc051f2): the hand-off it was blocked on still stands, so nothing is re-requested
+        # and no run is spent. The dispatcher's next tick opens the fresh verifier child for the
+        # resumed review phase (resolve_stale_gauntlet_dispositions) without spending an attempt.
+        assert _spawned(conn) == []
+        return True, ledger.mark(conn, tid, f"{label}: review phase resumed (no handoff run)")
+    assert resumed["status"] == "ready", resumed
     ok = kb.request_review(conn, tid, summary="implementation complete; evidence packet attached",
                            metadata={"changed_files": ["norcal/health/system_health_controller.py"],
                                      "verification": "full gate + focused suite + mutation + injection"})
@@ -206,24 +214,24 @@ def test_one_verification_cycle_per_grant(kanban_home, grant, verdict):
         OUTCOMES[(grant, verdict)] = outcome
         print(f"[{label}] OUTCOME {outcome}")
 
-        # Observed on the deployed Kanban code and pinned (2026-09-15). From the live 9/9 state:
+        # Observed on the deployed Kanban code and pinned (2026-09-15); re-derived 2026-10-13 when the
+        # ceiling block began preserving the review phase (t_6cc051f2). The live 9/9 state was blocked
+        # out of review, so unblock now resumes review: the operator handoff no longer spends a run and
+        # every threshold below is one grant lower than on 2026-09-15.
         assert start["attempts"] == 9
-        assert handoff["attempts"] == 10                                  # the handoff itself is a counted row
-        if grant == 1:                                                    # handoff spends the only slot
-            assert not outcome["verifier_created"] and outcome["status_end"] == "blocked"
-            return
+        assert handoff["attempts"] == 9                                   # resumed review: no handoff run
         assert outcome["verifier_created"] and outcome["verifier_ran"]    # verifier claim is the next counted row
         if verdict == "pass":                                             # completion row is not gated
             assert outcome["subject_verified"] and outcome["status_end"] == "done"
-            assert outcome["attempts_end"] == 12
+            assert outcome["attempts_end"] == 11
         elif verdict == "fail":
-            # +2 stops at the ceiling for a decision; +3 and above let the dispatcher spend an automatic
+            # +1 stops at the ceiling for a decision; +2 and above let the dispatcher spend an automatic
             # rework run (the run 2829 pattern).
-            assert outcome["automatic_rework_run"] is (grant >= 3)
-            assert outcome["status_end"] == ("blocked" if grant == 2 else "running")
+            assert outcome["automatic_rework_run"] is (grant >= 2)
+            assert outcome["status_end"] == ("blocked" if grant == 1 else "running")
         else:
-            # +2 leaves the refused PASS at the ceiling; +3 and above make a second verifier claimable.
-            assert outcome["second_verifier_claimable"] is (grant >= 3)
+            # +1 leaves the refused PASS at the ceiling; +2 and above make a second verifier claimable.
+            assert outcome["second_verifier_claimable"] is (grant >= 2)
             assert not outcome["subject_verified"]
 
 

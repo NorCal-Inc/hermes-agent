@@ -10788,10 +10788,17 @@ def _block_objective_attempt_ceiling(conn: sqlite3.Connection, task_id: str) -> 
             "objective": root, "attempts": attempts, "limit": limit,
             "failure_basis": failure_basis,
         })
+        # Record the phase being left, as every other block does. Without it
+        # ``_resume_status_from_events`` resumes a subject blocked out of
+        # ``review`` (hand-off spent the last attempt, so the verifier spawn
+        # hit the ceiling) to ``ready``: after a grant the dispatcher claimed
+        # a redundant implementation run, which re-requested review and hit
+        # the ceiling again before any verifier ran (t_6cc051f2, 2026-10-13).
         _append_event(conn, tid, "blocked", {
             "reason": reason,
             "kind": BLOCK_KIND_ATTEMPT_BUDGET_EXHAUSTED,
             "source": "objective_attempt_ceiling",
+            "source_status": row["status"],
         })
 
 
