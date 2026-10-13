@@ -15180,6 +15180,35 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _production_board_path() -> Path:
+    """The live production board. Resolved from the account's real home
+    (not ``HOME``/``HERMES_HOME``), so a test that redirects either can never
+    resolve to it."""
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes" / "kanban.db"
+
+
+def _production_ledger_sync_allowed(conn: sqlite3.Connection) -> bool:
+    """Only the live production board may project into the live ledger.
+
+    Incident 2026-10-12: every test run created tasks on a temp board and
+    POSTed them to the live dashboard (127.0.0.1:5130). 69,750 open rows
+    for tasks that never existed on any real board drove Erika's trust
+    score to 0% from at least 2026-10-09. Fails closed: any doubt means no
+    projection.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    try:
+        db_file = next((row[2] for row in conn.execute("PRAGMA database_list")
+                        if row[1] == "main"), "")
+        if not db_file:
+            return False
+        return os.path.realpath(db_file) == os.path.realpath(_production_board_path())
+    except Exception:
+        return False
+
+
 def _sync_production_ledger(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15219,6 +15248,8 @@ def _sync_production_ledger(
     create/complete/block, leaving claim/request_review/request_changes/
     unblock unsynchronized, which is exactly the gap this closes).
     """
+    if not _production_ledger_sync_allowed(conn):
+        return
     try:
         task_row = get_task(conn, task_id)
     except Exception:
@@ -15829,6 +15860,8 @@ def complete_task(
     # result. A sync failure is recorded as a first-class audit event so it
     # is visible and reconcilable, instead of either silently dropped or
     # incorrectly surfaced as "completion failed".
+    if not _production_ledger_sync_allowed(conn):
+        return True
     try:
         import urllib.request as _urlreq
         _payload = json.dumps({
