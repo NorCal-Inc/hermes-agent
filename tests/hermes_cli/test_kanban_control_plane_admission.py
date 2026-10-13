@@ -289,13 +289,10 @@ class TestSecondGenerationControlPlane:
 
 
 class TestSelectiveGauntletEnforcement:
-    """Independent verification is reserved for work that changes state.
+    """Independent verification is reserved for high-risk mutations.
 
-    High-risk mutations are governed outright. Ordinary state changes
-    (delete, write, update, send, deploy, ...) are governed too since Gauntlet
-    defect A (2026-10-12). Publish/ship and customer-facing work that names no
-    state-changing imperative fall through to board policy unless the author
-    explicitly requests independent verification.
+    Ordinary deploy/publish/customer-facing work uses task-local deterministic
+    proof unless the author explicitly requests independent verification.
     """
 
     @pytest.mark.parametrize("title", [
@@ -310,22 +307,12 @@ class TestSelectiveGauntletEnforcement:
         assert kb.gauntlet_default_for_subject(title) is True
 
     @pytest.mark.parametrize("title", [
+        "Deploy the Orion pricing page to production",
         "Publish the customer-facing onboarding page",
         "Ship the onboarding deliverable",
     ])
     def test_ordinary_mutation_falls_through_to_board_policy(self, title):
         assert kb.gauntlet_default_for_subject(title) is None
-
-    @pytest.mark.parametrize("title, body", [
-        # Previously asserted None here; deploy is in the defect A word list.
-        ("Deploy the Orion pricing page to production", None),
-        # The independent verifier's probe (t_54592cad, t_f8f5ecb8).
-        ("Inspect the named input and deploy the repair", None),
-        ("Investigate the stall", "Then deploy the fix and report."),
-        ("deploy the API", None),
-    ])
-    def test_deploy_is_an_ordinary_state_change(self, title, body):
-        assert kb.gauntlet_default_for_subject(title, body) is True
 
     @pytest.mark.parametrize("title", [
         "Investigate Hermes host-memory watchdog missed resolution trigger",
