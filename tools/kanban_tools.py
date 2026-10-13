@@ -1915,19 +1915,165 @@ def _lesson_refusal(tool_name: str, exc: Exception) -> Optional[str]:
     )
 
 
-def _handle_retire_lesson(args: dict, **kw) -> str:
-    """Stop injecting a promoted lesson, keeping the row and its history.
+# ---------------------------------------------------------------------------
+# Operator authority for governed decisions made from a task session
+# ---------------------------------------------------------------------------
+#
+# Retiring a lesson and superseding a card are OPERATOR decisions: neither is
+# part of executing the worker's own task, and both change what binds or
+# gates other work. They used to be orchestrator-only (a session with the
+# kanban toolset and no HERMES_KANBAN_TASK), which left the named operator
+# with no supported path when the operator is itself dispatched as a task
+# (Erika's curation card t_f066606f, 2026-10-12): doctrine forbids a direct
+# SQLite write or shelling out to ``hermes kanban``, and the tool was not in
+# the session's catalog.
+#
+# The authority is therefore derived from facts the kernel already records
+# at admission, never from the worker's own assertion about itself:
+#
+#   * no HERMES_KANBAN_TASK ........ an orchestrator/operator session, as before.
+#   * worker whose own card carries ``control_plane_authority='operator:…'``
+#     ................................ a named human authorisation admitted it.
+#   * worker whose own card was admitted by a ``human_interactive`` actor
+#     ................................ a human relayed the card and named its
+#                                      executor; the delegation is the card.
+#   * worker whose actor is ``kanban.orchestrator_profile`` ... configured.
+#
+# In every worker case the actor must be the card's own assignee: a worker
+# acts as itself or not at all. A card admitted by governed automation grants
+# nothing — operator authority does not propagate down an automation chain,
+# which is the same rule control-plane admission applies to second-generation
+# work.
 
-    Orchestrator-only. A lesson is a constraint the kernel imposes on future
-    workers, so a worker that finds one inconvenient must say so in its
-    handoff rather than revoke it mid-run.
+_AUTHORITY_ORCHESTRATOR_SESSION = "orchestrator_session"
+_AUTHORITY_OPERATOR_ON_CARD = "operator_authority_on_card"
+_AUTHORITY_HUMAN_ADMITTED_CARD = "human_admitted_card"
+_AUTHORITY_CONFIGURED_ORCHESTRATOR = "configured_orchestrator_profile"
+_AUTHORITY_CARD_OWNER = "card_owner"
+
+
+def _default_actor(args: dict) -> Optional[str]:
+    """Explicit ``actor`` arg, else the acting profile from the env, else the
+    active profile. Mirrors the CLI's ``_profile_author`` so the two surfaces
+    stamp the same identity for the same session."""
+    explicit = _normalize_profile(args.get("actor"))
+    if explicit:
+        return explicit
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = _normalize_profile(os.environ.get(env))
+        if value:
+            return value
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return _normalize_profile(get_active_profile_name())
+    except Exception:
+        return None
+
+
+def _same_identity(kb, a: Optional[str], b: Optional[str]) -> bool:
+    """Two profile names denote the same identity after the kernel's own
+    canonicalisation (aliases, case, whitespace). Empty never matches."""
+    def norm(value: Optional[str]) -> str:
+        text = (value or "").strip()
+        if not text:
+            return ""
+        try:
+            text = kb._canonical_assignee(text) or text
+        except Exception:
+            pass
+        return text.strip().lower()
+
+    left = norm(a)
+    return bool(left) and left == norm(b)
+
+
+def _configured_orchestrator_profile() -> Optional[str]:
+    try:
+        cfg = load_config()
+        return _normalize_profile(cfg_get(cfg, "kanban", "orchestrator_profile", default=""))
+    except Exception:
+        return None
+
+
+def _operator_authority(
+    kb, conn, actor: Optional[str]
+) -> tuple[Optional[str], Optional[str], Optional[dict]]:
+    """Decide whether this session may make an operator decision as ``actor``.
+
+    Returns ``(basis, None, admission)`` when it may — ``basis`` names which
+    recorded fact grants it and is stamped into the result so the decision is
+    auditable — or ``(None, refusal, admission)`` when it may not.
+    ``admission`` is the worker's own card provenance (None outside a worker).
+    """
+    env_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not env_tid:
+        return _AUTHORITY_ORCHESTRATOR_SESSION, None, None
+    if not _is_dispatcher_owned_worker():
+        return None, (
+            "runs inside a worker process without owning its task (an "
+            "in-process cron job or delegated child); operator decisions are "
+            "not available from that context"
+        ), None
+    if not actor:
+        return None, (
+            "names no actor: a worker exercising operator authority must act "
+            "under its own profile (HERMES_PROFILE) or pass actor explicitly"
+        ), None
+    admission = kb.task_admission(conn, env_tid)
+    if admission is None:
+        return None, f"worker task {env_tid} is not on this board", None
+    if not _same_identity(kb, actor, admission.get("assignee")):
+        return None, (
+            f"actor {actor!r} is not the assignee of worker task {env_tid} "
+            f"({admission.get('assignee')!r}); a worker acts as itself or not "
+            f"at all"
+        ), admission
+    authority = str(admission.get("control_plane_authority") or "").strip()
+    if authority.startswith("operator:"):
+        return _AUTHORITY_OPERATOR_ON_CARD, None, admission
+    configured = _configured_orchestrator_profile()
+    if configured and _same_identity(kb, actor, configured):
+        return _AUTHORITY_CONFIGURED_ORCHESTRATOR, None, admission
+    if str(admission.get("actor_kind") or "") == "human_interactive":
+        return _AUTHORITY_HUMAN_ADMITTED_CARD, None, admission
+    return None, (
+        f"worker task {env_tid} was admitted by "
+        f"{admission.get('actor_kind') or 'unknown'} actor "
+        f"{admission.get('created_by')!r}, not by a human and not under named "
+        f"'operator:' authority; operator decisions are not delegated through "
+        f"an automation chain. Hand the decision to the operator in your "
+        f"handoff instead"
+    ), admission
+
+
+def _retire_event(kb, conn, source_task_id: str, lesson_id: int) -> Optional[dict]:
+    """The durable ``lesson_retired`` event for this lesson, for read-back."""
+    try:
+        events = kb.list_events(conn, str(source_task_id))
+    except Exception:
+        return None
+    for e in reversed(events):
+        if e.kind == "lesson_retired" and (e.payload or {}).get("lesson_id") == lesson_id:
+            return {"kind": e.kind, "payload": e.payload, "created_at": e.created_at}
+    return None
+
+
+def _handle_retire_lesson(args: dict, **kw) -> str:
+    """Stop a lesson binding future work, or decline a candidate — keeping
+    the row and its history — through the kernel's retirement path.
+
+    Authority is decided by :func:`_operator_authority`. A lesson is a
+    constraint the kernel imposes on future workers, so a worker that merely
+    finds one inconvenient still cannot revoke it: only a session that holds
+    operator authority (an orchestrator session, or a worker whose own card
+    delegates it) may retire, and the global / unbounded / governance class
+    that :func:`kanban_db.lesson_promotion_eligibility` reserves for an
+    operator additionally requires a named actor.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_retire_lesson")
     if delegated_err:
         return delegated_err
-    orchestrator_err = _require_orchestrator_tool("kanban_retire_lesson")
-    if orchestrator_err:
-        return orchestrator_err
     raw_id = args.get("lesson_id")
     try:
         lesson_id = int(raw_id)
@@ -1936,15 +2082,75 @@ def _handle_retire_lesson(args: dict, **kw) -> str:
             f"lesson_id must be the integer id of a promoted lesson, got "
             f"{raw_id!r} (list them with kanban_lessons)"
         )
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error(
+            "kanban_retire_lesson: reason is required — say why the lesson no "
+            "longer applies (or why the candidate is declined). It is recorded "
+            "on the row and in the source task's history. Nothing was written."
+        )
+    actor = _default_actor(args)
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
+            before = kb.get_lesson(conn, lesson_id)
+            if before is None:
+                return tool_error(
+                    f"kanban_retire_lesson: lesson {lesson_id} not found (list "
+                    f"them with kanban_lessons)"
+                )
+            if (
+                before.get("state") == kb.LESSON_STATE_RETIRED
+                or before.get("retired_at") is not None
+            ):
+                return tool_error(
+                    f"kanban_retire_lesson: lesson {lesson_id} is already "
+                    f"retired (by {before.get('retired_by')!r} at "
+                    f"{before.get('retired_at')}); it was not restamped and "
+                    f"the board is unchanged."
+                )
+            eligible, eligibility = kb.lesson_promotion_eligibility(
+                str(before.get("scope") or ""),
+                str(before.get("applicability") or ""),
+                str(before.get("lesson") or ""),
+            )
+            decision_class = "narrow" if eligible else "operator"
+            basis, refusal, admission = _operator_authority(kb, conn, actor)
+            if refusal:
+                return tool_error(
+                    f"kanban_retire_lesson refused: this session {refusal}. "
+                    f"Lesson {lesson_id} is unchanged."
+                )
+            if not eligible and not actor:
+                return tool_error(
+                    f"kanban_retire_lesson refused: lesson {lesson_id} is in "
+                    f"the operator class ({eligibility}) and retiring it must "
+                    f"carry a named operator; set HERMES_PROFILE or pass "
+                    f"actor. Nothing was written."
+                )
+            # Company lane: a worker never reaches across tenants. A global
+            # row has no lane to cross; a tenant row may be retired from an
+            # untenanted (shared-lane) session only under operator authority,
+            # which every worker path above already establishes.
+            lesson_tenant = _normalize_profile(before.get("tenant"))
+            worker_tenant = (
+                _normalize_profile(admission.get("tenant")) if admission else None
+            )
+            if lesson_tenant and worker_tenant and lesson_tenant != worker_tenant:
+                return tool_error(
+                    f"kanban_retire_lesson refused: lesson {lesson_id} belongs "
+                    f"to tenant {lesson_tenant!r}; this worker runs in tenant "
+                    f"{worker_tenant!r}. Company lanes are sealed; nothing was "
+                    f"written."
+                )
             ok, detail = kb.retire_lesson(
-                conn,
-                lesson_id,
-                actor=_normalize_profile(args.get("actor"))
-                or os.environ.get("HERMES_PROFILE"),
-                reason=args.get("reason"),
+                conn, lesson_id, actor=actor, reason=reason,
+            )
+            if not ok:
+                return tool_error(f"kanban_retire_lesson: {detail}")
+            after = kb.get_lesson(conn, lesson_id) or {}
+            event = _retire_event(
+                kb, conn, str(before.get("source_task_id") or ""), lesson_id
             )
         finally:
             conn.close()
@@ -1954,15 +2160,200 @@ def _handle_retire_lesson(args: dict, **kw) -> str:
             return refusal
         logger.exception("kanban_retire_lesson failed")
         return tool_error(f"kanban_retire_lesson: {e}")
-    if not ok:
-        return tool_error(f"kanban_retire_lesson: {detail}")
+    was_candidate = before.get("state") == kb.LESSON_STATE_CANDIDATE
     return _ok(
         lesson_id=lesson_id,
-        active=False,
+        source_task_id=before.get("source_task_id"),
+        from_state=before.get("state"),
+        state=after.get("state"),
+        active=bool(after.get("active")),
+        retired_at=after.get("retired_at"),
+        retired_by=after.get("retired_by"),
+        retired_reason=after.get("retired_reason"),
+        scope=after.get("scope"),
+        tenant=after.get("tenant"),
+        applicability=after.get("applicability"),
+        decision_class=decision_class,
+        eligibility=eligibility,
+        authority_basis=basis,
+        actor=actor,
+        event=event,
         note=(
+            "Declined. The candidate leaves the decision queue without ever "
+            "having bound anything; the row and its events are kept."
+            if was_candidate else
             "Retired. It stops being injected into new worker contexts; the "
             "row and its promotion/retirement events are kept, so the record "
             "that it once governed survives."
+        ),
+    )
+
+
+def _handle_supersede(args: dict, **kw) -> str:
+    """Terminally disposition an exhausted card as superseded by a card that
+    really did the work, without claiming this one executed anything.
+
+    Wraps the kernel's :func:`kanban_db.reconcile_overtaken_by_events` — the
+    already-governed path behind ``hermes kanban reconcile-overtaken`` — so
+    the disposition is ``overtaken_by_events`` with ``superseded_by`` naming
+    the replacement, ``executed: false`` in the event, and no ``result`` or
+    ``completed_at`` written. The replacement must itself record a real
+    completion (``done`` + ``completed``) or a VERIFIED head, on the same
+    tenant; anything less is returned as a precise blocker.
+
+    Authority: the card's owner (its creator, acting as itself) or a session
+    holding operator authority (:func:`_operator_authority`).
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_supersede")
+    if delegated_err:
+        return delegated_err
+    tid = str(args.get("task_id") or "").strip()
+    if not tid:
+        return tool_error("kanban_supersede: task_id is required")
+    rid = str(args.get("replacement_task_id") or "").strip()
+    if not rid:
+        return tool_error(
+            "kanban_supersede: replacement_task_id is required — the card that "
+            "actually completed this card's scope"
+        )
+    if rid == tid:
+        return tool_error(
+            f"kanban_supersede: a card cannot supersede itself ({tid})"
+        )
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error(
+            "kanban_supersede: reason is required — why this card's objective "
+            "is already satisfied by the replacement. Nothing was written."
+        )
+    extra_evidence = str(args.get("evidence") or "").strip()
+    actor = _default_actor(args)
+    if not actor:
+        return tool_error(
+            "kanban_supersede: names no actor; set HERMES_PROFILE or pass actor"
+        )
+    env_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if env_tid and env_tid == tid and _is_dispatcher_owned_worker():
+        return tool_error(
+            f"kanban_supersede refused: {tid} is this worker's own running "
+            f"card. Finish it with kanban_complete or kanban_block; a card is "
+            f"superseded by its owner or an operator, never by itself."
+        )
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            source = kb.get_task(conn, tid)
+            if source is None:
+                return tool_error(f"kanban_supersede: task {tid} not found")
+            replacement = kb.get_task(conn, rid)
+            if replacement is None:
+                return tool_error(
+                    f"kanban_supersede blocked: replacement task {rid} is not "
+                    f"on this board, so there is no replacement evidence to "
+                    f"record. {tid} is unchanged."
+                )
+            # Authority: owner first (the creator acting as itself), else
+            # operator. Both refusals are reported so the caller knows which
+            # fact is missing.
+            basis = None
+            op_basis, op_refusal, admission = _operator_authority(kb, conn, actor)
+            acting_as_self = admission is None or _same_identity(
+                kb, actor, admission.get("assignee")
+            )
+            if acting_as_self and _same_identity(kb, actor, source.created_by):
+                basis = _AUTHORITY_CARD_OWNER
+            elif op_basis:
+                basis = op_basis
+            if basis is None:
+                return tool_error(
+                    f"kanban_supersede refused: {actor!r} is not the owner of "
+                    f"{tid} (created by {source.created_by!r}) and this "
+                    f"session {op_refusal}. {tid} is unchanged."
+                )
+            # Replacement evidence: a real completion or a verified head.
+            completed = (
+                replacement.status == "done"
+                and replacement.terminal_disposition == kb.DISPOSITION_COMPLETED
+            )
+            verified = replacement.verification_state == kb.VERIFICATION_VERIFIED
+            if not (completed or verified):
+                return tool_error(
+                    f"kanban_supersede blocked: replacement {rid} is "
+                    f"{replacement.status!r} with terminal disposition "
+                    f"{replacement.terminal_disposition!r} and verification "
+                    f"state {replacement.verification_state!r}; it must record "
+                    f"a real completion (done + completed) or a VERIFIED head "
+                    f"before it can supersede {tid}. {tid} is unchanged."
+                )
+            if _normalize_profile(replacement.tenant) != _normalize_profile(source.tenant):
+                return tool_error(
+                    f"kanban_supersede refused: {tid} is in tenant "
+                    f"{source.tenant!r} but replacement {rid} is in tenant "
+                    f"{replacement.tenant!r}. Company lanes are sealed; nothing "
+                    f"was written."
+                )
+            replacement_evidence = (
+                f"replacement task {rid} ({replacement.title!r}) is "
+                f"{replacement.status} with terminal disposition "
+                f"{replacement.terminal_disposition}, completed_at="
+                f"{replacement.completed_at}, verification_state="
+                f"{replacement.verification_state}"
+            )
+            evidence = (
+                f"{replacement_evidence}; {extra_evidence}"
+                if extra_evidence else replacement_evidence
+            )
+            ok, err = kb.reconcile_overtaken_by_events(
+                conn, tid,
+                actor=actor, reason=reason, evidence=evidence,
+                superseded_by=[rid],
+            )
+            if not ok:
+                return tool_error(
+                    f"kanban_supersede blocked: {err}. {tid} is unchanged."
+                )
+            after = kb.get_task(conn, tid)
+            event = None
+            for e in reversed(kb.list_events(conn, tid)):
+                if e.kind == "reconciled_overtaken_by_events":
+                    event = {
+                        "kind": e.kind, "payload": e.payload,
+                        "created_at": e.created_at,
+                    }
+                    break
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_supersede: {e}")
+    except Exception as e:
+        logger.exception("kanban_supersede failed")
+        return tool_error(f"kanban_supersede: {e}")
+    return _ok(
+        task_id=tid,
+        prior_status=source.status,
+        status=after.status if after else None,
+        terminal_disposition=after.terminal_disposition if after else None,
+        disposition_at=after.disposition_at if after else None,
+        # Stated outright: this card's steps were NOT performed.
+        executed=False,
+        result_written=False,
+        completed_at=after.completed_at if after else None,
+        superseded_by=[rid],
+        replacement={
+            "task_id": rid,
+            "status": replacement.status,
+            "terminal_disposition": replacement.terminal_disposition,
+            "verification_state": replacement.verification_state,
+            "completed_at": replacement.completed_at,
+        },
+        authority_basis=basis,
+        actor=actor,
+        event=event,
+        note=(
+            f"Superseded. {tid} is terminal (overtaken_by_events, superseded "
+            f"by {rid}): it will not be redispatched and no longer gates "
+            f"dependents. Its title, body, runs, verdicts and comments are "
+            f"untouched, and no result or completion was written."
         ),
     )
 
@@ -2816,13 +3207,22 @@ KANBAN_PROMOTE_LESSON_SCHEMA = {
 KANBAN_RETIRE_LESSON_SCHEMA = {
     "name": "kanban_retire_lesson",
     "description": (
-        "Stop a promoted lesson from being injected into future work, "
-        "because it no longer holds (the constraint was superseded, the "
-        "system it described is gone, or it turned out to be wrong). The "
-        "row and its history are kept — a retired lesson still reads as one "
-        "that once governed, between the dates it did. Orchestrator-only: a "
-        "task worker that disagrees with a binding lesson says so in its "
-        "handoff instead of revoking it mid-run."
+        "Retire a lesson so it stops binding future work, or decline a "
+        "candidate lesson so it leaves the operator decision queue — because "
+        "it no longer holds, the system it described is gone, it turned out "
+        "to be wrong, or it was never a reusable rule (a status sentence "
+        "recorded as a candidate). The row and its history are kept: a "
+        "retired lesson still reads as one that once governed, between the "
+        "dates it did, and a declined candidate as one that was considered. "
+        "An already-retired lesson is refused without restamping. Operator "
+        "decision: available to an orchestrator session, or to a task session "
+        "whose own card delegates operator authority (admitted by a human or "
+        "under named 'operator:' authority) acting as its own assignee. A "
+        "worker that merely disagrees with a lesson binding it says so in its "
+        "handoff instead. Global, unbounded ('all') and governance-worded "
+        "lessons are the operator class and must carry a named actor. Returns "
+        "read-back evidence: the row's state before and after, who/when/why, "
+        "and the durable lesson_retired event."
     ),
     "parameters": {
         "type": "object",
@@ -2836,17 +3236,84 @@ KANBAN_RETIRE_LESSON_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "Why it no longer applies. Recorded on the row and in "
-                    "the source task's history."
+                    "Why it no longer applies (or why the candidate is "
+                    "declined). Required; recorded on the row and in the "
+                    "source task's history."
                 ),
             },
             "actor": {
                 "type": "string",
-                "description": "Who retired it. Defaults to your profile.",
+                "description": (
+                    "Who retired it. Defaults to the active profile. In a task "
+                    "session this must be your own assignee identity."
+                ),
             },
             "board": _board_schema_prop(),
         },
-        "required": ["lesson_id"],
+        "required": ["lesson_id", "reason"],
+    },
+}
+
+KANBAN_SUPERSEDE_SCHEMA = {
+    "name": "kanban_supersede",
+    "description": (
+        "Terminally disposition a card as superseded by another card that "
+        "really completed its scope, WITHOUT claiming this card executed "
+        "anything. Use it for an exhausted or stranded card (attempt budget "
+        "spent, parked forever) whose objective was satisfied by a "
+        "replacement. Records the governed overtaken_by_events disposition "
+        "with superseded_by naming the replacement and executed=false in the "
+        "event; the card becomes terminal (never redispatched, no longer "
+        "gates dependents) while its title, body, runs, verdicts, comments "
+        "and attachments stay untouched and no result or completion is "
+        "written. The replacement must be on the same board and tenant and "
+        "must itself record a real completion (done + completed) or a "
+        "VERIFIED head; otherwise a precise blocker is returned and nothing "
+        "changes. A running card, a done card, or one already terminally "
+        "disposed is refused. Authority: the card's owner (its creator, acting "
+        "as itself) or a session with operator authority (an orchestrator "
+        "session, or a task session whose own card was admitted by a human or "
+        "under named 'operator:' authority)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "The exhausted/stranded card to supersede.",
+            },
+            "replacement_task_id": {
+                "type": "string",
+                "description": (
+                    "The card that actually completed this card's scope. "
+                    "Must be done+completed or VERIFIED on the same tenant."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why this card's objective is already satisfied by the "
+                    "replacement. Required; recorded on the card."
+                ),
+            },
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "Optional extra evidence (dashboard read-back, commit, "
+                    "run id). The replacement's recorded state is captured "
+                    "automatically."
+                ),
+            },
+            "actor": {
+                "type": "string",
+                "description": (
+                    "Who is superseding it. Defaults to the active profile. "
+                    "In a task session this must be your own assignee identity."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "replacement_task_id", "reason"],
     },
 }
 
@@ -3037,8 +3504,21 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_RETIRE_LESSON_SCHEMA,
     handler=_handle_retire_lesson,
-    check_fn=_check_kanban_orchestrator_mode,
+    # Task sessions see it too (2026-10-13): the named operator may itself be
+    # dispatched as a task. Authority is decided per call by
+    # ``_operator_authority`` from the card's recorded admission, so exposure
+    # in the schema is not a grant.
+    check_fn=_check_kanban_mode,
     emoji="🎓",
+)
+
+registry.register(
+    name="kanban_supersede",
+    toolset="kanban",
+    schema=KANBAN_SUPERSEDE_SCHEMA,
+    handler=_handle_supersede,
+    check_fn=_check_kanban_mode,
+    emoji="⏭",
 )
 
 registry.register(

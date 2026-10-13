@@ -90,6 +90,7 @@ BOARD_MUTATING_KANBAN_TOOLS = frozenset(
         "kanban_attach_url",
         "kanban_promote_lesson",
         "kanban_retire_lesson",
+        "kanban_supersede",
     }
 )
 

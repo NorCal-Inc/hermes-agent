@@ -247,7 +247,10 @@ def test_kanban_heartbeat_cannot_rearm_expired_claim(conn, monkeypatch):
     env = _env_for(task)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task.id,))
-    for tool in ("kanban_heartbeat", "kanban_attach", "kanban_promote_lesson"):
+    for tool in (
+        "kanban_heartbeat", "kanban_attach", "kanban_promote_lesson",
+        "kanban_retire_lesson", "kanban_supersede",
+    ):
         reason = gate.task_contract_refusal(tool, environ=env)
         assert reason is not None and "expired" in reason, tool
 

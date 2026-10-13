@@ -6679,6 +6679,41 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def task_admission(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """How a card was admitted: who created it, as what kind of actor, and
+    under which named control-plane authority (if any).
+
+    Read-only. This is the provenance the tool surface consults when a
+    dispatcher-owned worker asks to exercise an *operator* decision (retiring
+    a global lesson, superseding another card): the kernel records at creation
+    whether a human relayed the card (``actor_kind``) and whether a named
+    ``operator:`` justification admitted it (``control_plane_authority``), and
+    those facts — not the worker's own claim about itself — decide whether the
+    authority was delegated. ``Task`` deliberately does not carry
+    ``control_plane_authority``, so it is read here instead of by callers
+    reaching into the row.
+    """
+    # ``SELECT *`` on purpose: like ``get_task``, this must open a legacy board
+    # that predates the provenance columns rather than fail on the read.
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    keys = set(row.keys())
+    return {
+        "task_id": row["id"],
+        "assignee": row["assignee"],
+        "created_by": row["created_by"] if "created_by" in keys else None,
+        "tenant": row["tenant"] if "tenant" in keys else None,
+        "actor_kind": row["actor_kind"] if "actor_kind" in keys else None,
+        "actor_id": row["actor_id"] if "actor_id" in keys else None,
+        "control_plane": bool(row["control_plane"]) if "control_plane" in keys else False,
+        "control_plane_authority": (
+            row["control_plane_authority"]
+            if "control_plane_authority" in keys else None
+        ),
+    }
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -18998,6 +19033,21 @@ def retire_lesson(
             },
         )
     return True, None
+
+
+def get_lesson(
+    conn: sqlite3.Connection, lesson_id: int
+) -> Optional[dict[str, Any]]:
+    """One lesson row by id in the same shape :func:`list_lessons` returns,
+    whatever its state (candidate, active or retired). ``None`` when absent.
+
+    Read-only. The tool surface reads a lesson before and after a retirement
+    so the caller gets read-back evidence rather than a bare ``ok``.
+    """
+    row = conn.execute(
+        "SELECT * FROM task_lessons WHERE id = ?", (int(lesson_id),)
+    ).fetchone()
+    return _lesson_row_to_dict(row) if row is not None else None
 
 
 def list_lessons(

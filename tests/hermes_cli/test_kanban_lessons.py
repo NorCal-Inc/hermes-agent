@@ -817,33 +817,356 @@ class TestToolSurface:
 # actually reachable through the registry.
 # ---------------------------------------------------------------------------
 
-class TestRetireToolAuthority:
-    def test_retire_tool_is_orchestrator_only(self, kanban_home, monkeypatch):
-        """A worker that finds a constraint inconvenient cannot revoke it.
+def _automation_card(conn, *, assignee, created_by="erika", tenant=None):
+    """A card admitted by governed automation (the way Erika creates work for
+    a Team Leader). Its worker holds no delegated operator authority."""
+    provenance = kb.resolve_actor_provenance(
+        kind=kb.ACTOR_KIND_GOVERNED_AUTOMATION, actor_id=created_by, env={},
+    )
+    return kb.create_task(
+        conn, title="automation-admitted", assignee=assignee,
+        created_by=created_by, tenant=tenant, provenance=provenance,
+    )
 
-        The whole value of a binding lesson is that the party it binds cannot
-        switch it off. Promotion is gated on evidence; retirement has to be
-        gated on authority, or the constraint is advisory in practice.
-        """
+
+def _human_card(conn, *, assignee, created_by="claude-code", tenant=None):
+    """A card relayed by a human through an interactive session (the way
+    t_f066606f reached Erika): ``actor_kind = human_interactive``."""
+    provenance = kb.resolve_actor_provenance(
+        kind=kb.ACTOR_KIND_HUMAN_INTERACTIVE, actor_id=created_by, env={},
+    )
+    return kb.create_task(
+        conn, title="human-admitted", assignee=assignee,
+        created_by=created_by, tenant=tenant, provenance=provenance,
+    )
+
+
+def _global_candidate(conn, source_task_id, *, lesson="Verification FAILED for task x"):
+    """A global/all candidate — the shape of every live candidate row."""
+    row = kb.record_error_lesson(
+        conn, error_text="ModuleNotFoundError: no module named sqlite3 cli",
+        lesson=lesson, source_task_id=source_task_id,
+        created_by="codex_verify:t_test",
+    )
+    stored = kb.get_lesson(conn, row["id"])
+    assert stored["state"] == kb.LESSON_STATE_CANDIDATE
+    assert (stored["scope"], stored["applicability"]) == (
+        kb.LESSON_SCOPE_GLOBAL, "all",
+    )
+    return stored
+
+
+class TestRetireToolAuthority:
+    """Who may retire. Promotion is gated on evidence; retirement is gated on
+    authority, or the constraint is advisory in practice.
+
+    The authority is read from facts the kernel recorded when the worker's
+    own card was admitted (``task_admission``), never from the worker's
+    claim about itself. 2026-10-13: the tool is exposed to task sessions so
+    the named operator can act when it is itself dispatched as a task
+    (t_f066606f), which is why these cases are pinned per basis.
+    """
+
+    def test_worker_on_automation_admitted_card_cannot_revoke_a_lesson(
+        self, kanban_home, monkeypatch
+    ):
+        """The party a lesson binds cannot switch it off: a worker whose card
+        came down an automation chain holds no operator authority."""
         from tools import kanban_tools as kt
 
         with kb.connect_closing() as conn:
             src = _verified(conn, tenant="acme")
             lesson = _promote(conn, src, lesson="x")
+            worker = _automation_card(conn, assignee="worker", tenant="acme")
 
-        monkeypatch.setenv("HERMES_KANBAN_TASK", src)
-        out = json.loads(kt._handle_retire_lesson({"lesson_id": lesson["id"]}))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", worker)
+        monkeypatch.setenv("HERMES_PROFILE", "worker")
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": lesson["id"], "reason": "inconvenient",
+        }))
         assert out.get("ok") is not True
-        assert "orchestrator-only" in json.dumps(out)
+        assert "automation chain" in out["error"]
+        with kb.connect_closing() as conn:
+            assert len(kb.list_lessons(conn)) == 1
+            assert _events(conn, src, kind="lesson_retired") == []
+
+    def test_worker_cannot_act_as_someone_else(self, kanban_home, monkeypatch):
+        """Passing ``actor='erika'`` from a card assigned to another profile
+        is impersonation, not delegation."""
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            lesson = _promote(conn, src, lesson="x", allow_global=True)
+            worker = _human_card(conn, assignee="worker")
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", worker)
+        monkeypatch.setenv("HERMES_PROFILE", "worker")
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": lesson["id"], "reason": "x", "actor": "erika",
+        }))
+        assert out.get("ok") is not True
+        assert "is not the assignee" in out["error"]
+        with kb.connect_closing() as conn:
+            assert len(kb.list_lessons(conn)) == 1
+
+    def test_delegated_child_is_refused(self, kanban_home, monkeypatch):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            lesson = _promote(conn, src, lesson="x", allow_global=True)
+        monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": lesson["id"], "reason": "x",
+        }))
+        assert out.get("ok") is not True
+        assert "delegate_task child" in out["error"]
+
+    def test_reason_is_required(self, kanban_home, monkeypatch):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            lesson = _promote(conn, src, lesson="x", allow_global=True)
+        for args in ({"lesson_id": lesson["id"]},
+                     {"lesson_id": lesson["id"], "reason": "   "}):
+            out = json.loads(kt._handle_retire_lesson(args))
+            assert out.get("ok") is not True
+            assert "reason is required" in out["error"]
         with kb.connect_closing() as conn:
             assert len(kb.list_lessons(conn)) == 1
 
     def test_retire_tool_rejects_a_non_integer_id(self, kanban_home):
         from tools import kanban_tools as kt
 
-        out = json.loads(kt._handle_retire_lesson({"lesson_id": "not-an-id"}))
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": "not-an-id", "reason": "x",
+        }))
         assert out.get("ok") is not True
         assert "lesson_id must be" in json.dumps(out)
+
+    def test_unknown_lesson_is_reported(self, kanban_home):
+        from tools import kanban_tools as kt
+
+        out = json.loads(kt._handle_retire_lesson({"lesson_id": 9999, "reason": "x"}))
+        assert out.get("ok") is not True
+        assert "not found" in out["error"]
+
+
+class TestRetireToolOperatorSurface:
+    """The named operator, dispatched as a task, retires through the tool.
+
+    Mirrors the live shape: Erika's curation card was relayed by a human
+    (``actor_kind = human_interactive``) and assigned to ``erika``; every
+    live candidate is ``scope=global, applicability=all`` — the operator
+    class ``lesson_promotion_eligibility`` reserves for a named operator.
+    """
+
+    def _erika_session(self, conn, monkeypatch, *, tenant=None):
+        card = _human_card(conn, assignee="erika", tenant=tenant)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", card)
+        monkeypatch.setenv("HERMES_PROFILE", "erika")
+        return card
+
+    def test_declines_a_global_candidate_with_read_back_evidence(
+        self, kanban_home, monkeypatch
+    ):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            cand = _global_candidate(conn, src)
+            self._erika_session(conn, monkeypatch)
+
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": cand["id"],
+            "reason": "status sentence, not a reusable rule",
+        }))
+        assert out.get("ok") is True, out
+        assert out["from_state"] == kb.LESSON_STATE_CANDIDATE
+        assert out["state"] == kb.LESSON_STATE_RETIRED
+        assert out["active"] is False
+        assert out["retired_by"] == "erika"
+        assert out["actor"] == "erika"
+        assert out["retired_reason"] == "status sentence, not a reusable rule"
+        assert out["retired_at"] is not None
+        assert out["decision_class"] == "operator"
+        assert out["eligibility"] == "global_scope_needs_operator"
+        assert out["authority_basis"] == "human_admitted_card"
+        assert (out["scope"], out["tenant"], out["applicability"]) == (
+            kb.LESSON_SCOPE_GLOBAL, None, "all",
+        )
+        assert out["source_task_id"] == src
+        assert out["event"]["kind"] == "lesson_retired"
+        assert out["event"]["payload"]["lesson_id"] == cand["id"]
+        assert out["event"]["payload"]["from_state"] == kb.LESSON_STATE_CANDIDATE
+        assert out["event"]["payload"]["was_binding"] is False
+        assert out["event"]["payload"]["actor"] == "erika"
+        assert "Declined" in out["note"]
+
+        with kb.connect_closing() as conn:
+            stored = kb.get_lesson(conn, cand["id"])
+            assert stored["state"] == kb.LESSON_STATE_RETIRED
+            assert stored["active"] is False
+            assert stored["retired_by"] == "erika"
+            # Tenant/scope untouched by the retirement.
+            assert (stored["scope"], stored["tenant"]) == (cand["scope"], cand["tenant"])
+            assert cand["id"] not in {c["id"] for c in kb.lesson_candidates(conn)}
+            assert len(_events(conn, src, kind="lesson_retired")) == 1
+
+    def test_already_retired_is_refused_without_restamping(
+        self, kanban_home, monkeypatch
+    ):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            cand = _global_candidate(conn, src)
+            self._erika_session(conn, monkeypatch)
+
+        first = json.loads(kt._handle_retire_lesson({
+            "lesson_id": cand["id"], "reason": "first",
+        }))
+        assert first.get("ok") is True
+        time.sleep(1.1)   # a restamp would move retired_at by >= 1s
+        second = json.loads(kt._handle_retire_lesson({
+            "lesson_id": cand["id"], "reason": "second",
+        }))
+        assert second.get("ok") is not True
+        assert "already retired" in second["error"]
+        assert "not restamped" in second["error"]
+        with kb.connect_closing() as conn:
+            stored = kb.get_lesson(conn, cand["id"])
+            assert stored["retired_at"] == first["retired_at"]
+            assert stored["retired_reason"] == "first"
+            assert len(_events(conn, src, kind="lesson_retired")) == 1
+
+    def test_retires_an_active_global_rule_too(self, kanban_home, monkeypatch):
+        """Same final state from ``active``; the kernel reports it as having
+        bound work."""
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            lesson = _promote(conn, src, lesson="old rule", allow_global=True)
+            self._erika_session(conn, monkeypatch)
+
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": lesson["id"], "reason": "superseded by doctrine v2.38",
+        }))
+        assert out.get("ok") is True, out
+        assert out["from_state"] == kb.LESSON_STATE_ACTIVE
+        assert out["state"] == kb.LESSON_STATE_RETIRED
+        assert out["event"]["payload"]["was_binding"] is True
+        assert "Retired" in out["note"]
+        with kb.connect_closing() as conn:
+            assert kb.list_lessons(conn) == []
+            assert kb.list_lessons(conn, active_only=False)[0]["retired_by"] == "erika"
+
+    def test_named_operator_authority_on_card_is_a_basis(
+        self, kanban_home, monkeypatch
+    ):
+        """A card admitted under explicit ``operator:<who>`` authority
+        delegates the decision even when automation created it."""
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            cand = _global_candidate(conn, src)
+            provenance = kb.resolve_actor_provenance(
+                kind=kb.ACTOR_KIND_GOVERNED_AUTOMATION, actor_id="erika", env={},
+            )
+            card = kb.create_task(
+                conn, title="operator-delegated", assignee="erika",
+                created_by="erika", provenance=provenance,
+                control_plane_authority="operator:christopher",
+            )
+            assert kb.task_admission(conn, card)["control_plane_authority"] == (
+                "operator:christopher"
+            )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", card)
+        monkeypatch.setenv("HERMES_PROFILE", "erika")
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": cand["id"], "reason": "declined",
+        }))
+        assert out.get("ok") is True, out
+        assert out["authority_basis"] == "operator_authority_on_card"
+
+    def test_configured_orchestrator_profile_is_a_basis(
+        self, kanban_home, monkeypatch
+    ):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            cand = _global_candidate(conn, src)
+            card = _automation_card(conn, assignee="erika")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", card)
+        monkeypatch.setenv("HERMES_PROFILE", "erika")
+        monkeypatch.setattr(kt, "_configured_orchestrator_profile", lambda: "erika")
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": cand["id"], "reason": "declined",
+        }))
+        assert out.get("ok") is True, out
+        assert out["authority_basis"] == "configured_orchestrator_profile"
+
+    def test_worker_never_reaches_across_tenants(self, kanban_home, monkeypatch):
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn, tenant="acme")
+            lesson = _promote(conn, src, lesson="acme rule")
+            assert lesson["tenant"] == "acme"
+            self._erika_session(conn, monkeypatch, tenant="globex")
+
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": lesson["id"], "reason": "x",
+        }))
+        assert out.get("ok") is not True
+        assert "Company lanes are sealed" in out["error"]
+        with kb.connect_closing() as conn:
+            assert len(kb.list_lessons(conn)) == 1
+
+    def test_orchestrator_session_keeps_its_authority(
+        self, kanban_home, monkeypatch
+    ):
+        """No HERMES_KANBAN_TASK: the pre-existing orchestrator path, now
+        reported with its basis and read-back."""
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn, assignee="coder", tenant="acme")
+            lesson = _promote(conn, src, lesson="narrow", applicability="assignee:coder")
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "operator")
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": lesson["id"], "reason": "x",
+        }))
+        assert out.get("ok") is True, out
+        assert out["authority_basis"] == "orchestrator_session"
+        assert out["decision_class"] == "narrow"
+        assert out["retired_by"] == "operator"
+
+    def test_cli_and_tool_share_the_kernel_path(self, kanban_home, monkeypatch):
+        """The tool retires through ``retire_lesson``; the CLI sees the same
+        row and refuses the same repeat, so neither surface can drift."""
+        from hermes_cli import kanban as kc
+        from tools import kanban_tools as kt
+
+        with kb.connect_closing() as conn:
+            src = _verified(conn)
+            cand = _global_candidate(conn, src)
+            self._erika_session(conn, monkeypatch)
+        out = json.loads(kt._handle_retire_lesson({
+            "lesson_id": cand["id"], "reason": "declined",
+        }))
+        assert out.get("ok") is True
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        assert "already retired" in kc.run_slash(
+            f"lesson-retire {cand['id']} --reason again"
+        )
+        assert json.loads(kc.run_slash("lesson-candidates --json")) == []
 
 
 class TestLedgerIsTheEvidence:
@@ -887,12 +1210,68 @@ class TestToolRegistration:
         from tools.registry import registry
 
         for name in (
-            "kanban_promote_lesson", "kanban_lessons", "kanban_retire_lesson"
+            "kanban_promote_lesson", "kanban_lessons", "kanban_retire_lesson",
+            "kanban_supersede",
         ):
             entry = registry.get_entry(name)
             assert entry is not None, f"{name} is not registered"
             assert entry.schema["name"] == name
             assert entry.toolset == "kanban"
+        retire = registry.get_entry("kanban_retire_lesson").schema
+        assert set(retire["parameters"]["required"]) == {"lesson_id", "reason"}
+        supersede = registry.get_entry("kanban_supersede").schema
+        assert set(supersede["parameters"]["required"]) == {
+            "task_id", "replacement_task_id", "reason",
+        }
+
+    def test_operator_tools_are_discoverable_in_a_task_session(
+        self, kanban_home, monkeypatch
+    ):
+        """A fresh dispatcher-spawned session (HERMES_KANBAN_TASK set) must
+        carry both operator tools in its schema and, since neither is a
+        waist tool, in the deferred tool_search catalog — that is how a task
+        session finds them. 2026-10-12: ``kanban_retire_lesson`` was
+        orchestrator-only and therefore absent from Erika's catalog, which
+        blocked t_f066606f.
+        """
+        from tools import kanban_tools  # noqa: F401 — ensure registered
+        from tools import tool_search
+        from tools.registry import invalidate_check_fn_cache, registry
+        from toolsets import resolve_toolset
+
+        with kb.connect_closing() as conn:
+            card = _human_card(conn, assignee="erika")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", card)
+        monkeypatch.setenv("HERMES_PROFILE", "erika")
+        invalidate_check_fn_cache()
+        defs = registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+        names = {d["function"]["name"] for d in defs if "function" in d}
+        assert {
+            "kanban_retire_lesson", "kanban_supersede",
+            "kanban_lessons", "kanban_promote_lesson",
+        } <= names, names
+
+        _visible, deferrable = tool_search.classify_tools(defs, eager_servers=())
+        catalog = tool_search.build_catalog(deferrable)
+        catalog_names = {entry.name for entry in catalog}
+        assert {"kanban_retire_lesson", "kanban_supersede"} <= catalog_names
+        assert "kanban_retire_lesson" in [
+            hit.name for hit in tool_search.search_catalog(
+                catalog, "retire or decline a candidate lesson", limit=5,
+            )
+        ]
+        assert "kanban_supersede" in [
+            hit.name for hit in tool_search.search_catalog(
+                catalog, "supersede an exhausted card with a replacement", limit=5,
+            )
+        ]
+
+        # ...and a plain chat session (no task, no kanban toolset) sees neither.
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        invalidate_check_fn_cache()
+        defs = registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+        plain = {d["function"]["name"] for d in defs if "function" in d}
+        assert not {"kanban_retire_lesson", "kanban_supersede"} & plain
 
 
 # ---------------------------------------------------------------------------
