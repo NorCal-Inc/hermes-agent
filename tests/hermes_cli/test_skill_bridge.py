@@ -517,6 +517,12 @@ def test_stage_pending_mirrors_every_home_once_and_maps_capability(vault, bridge
     assert len(vault.observe_bodies) == 3
     dry = sb.stage_pending_to_vault(dry_run=True)
     assert dry == []
+    # A bridge-staged projection (summary prefix) is never mirrored back as learning.
+    p = _stage_record(root, "dddd0004", "skill-a", "devops")
+    rec = json.loads(p.read_text())
+    rec["summary"] = sb.PROJECTION_SUMMARY_PREFIX + "obs_x (verification) into skill-a"
+    p.write_text(json.dumps(rec), encoding="utf-8")
+    assert sb.stage_pending_to_vault() == [] and len(vault.observe_bodies) == 3
 
 
 def test_materialize_refuses_when_gate_off_and_stages_when_on(vault, bridge_env, monkeypatch):

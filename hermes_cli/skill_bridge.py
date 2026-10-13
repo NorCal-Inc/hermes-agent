@@ -61,6 +61,10 @@ LEDGER_FILE = "ledger.jsonl"
 OBSERVATIONS_FILE = "observations.jsonl"
 COMPANY_BASELINES_FILE = "company-baselines.json"
 MATERIALIZE_REL_PATH = "references/vault-lessons.md"
+# Summary prefix on pending records the bridge itself stages (runtime
+# projections of already-promoted vault lessons). The mirror must skip these,
+# or a projection would be re-observed into the vault as new learning (loop).
+PROJECTION_SUMMARY_PREFIX = "vault-bridge projection of "
 
 DEFAULT_LIFEWIKI_URL = "http://127.0.0.1:5100"
 VERIFIER_TOKEN_ENV = "SKILL_VERIFIER_TOKEN"
@@ -986,6 +990,8 @@ def stage_pending_to_vault(*, capability: Optional[str] = None, task: Optional[s
             pid = rec.get("id")
             if not pid or (label, pid) in already:
                 continue
+            if str(rec.get("summary") or "").startswith(PROJECTION_SUMMARY_PREFIX):
+                continue  # bridge-staged projection of vault doctrine: not new learning
             payload = rec.get("payload") or {}
             cap = capability_for_payload(payload, capability)
             payload_sha = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -1053,7 +1059,7 @@ def materialize_lesson(
         # and trip the skill-trust boot gate. Say so in the review summary so
         # the operator routes it through the governed reseal path first.
         frozen = _registry_item_for(sdir, load_trust_registry()) is not None
-        summary = f"vault-bridge projection of {obs_id} ({capability}) into {sdir.name}"
+        summary = f"{PROJECTION_SUMMARY_PREFIX}{obs_id} ({capability}) into {sdir.name}"
         if frozen:
             summary += (" [FROZEN skill: approve only via the skill-integrity/skill-trust reseal "
                         "path; a plain approve would change attested bytes]")
