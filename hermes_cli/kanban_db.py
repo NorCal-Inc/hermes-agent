@@ -7199,8 +7199,10 @@ _GAUNTLET_MUTATION_RE = re.compile(
 #: "Claude Code restarts them on PASS", "do not edit any file", "send no
 #: messages"): a card that *describes* or *forbids* a change is not a card
 #: that *makes* one. Three read-only Erika check cards would otherwise have
-#: flipped to governed on their own guard rails. "deploy"/"publish"/"ship"
-#: are deliberately absent -- see the note above ``_GAUNTLET_MUTATION_RE``.
+#: flipped to governed on their own guard rails. "deploy" IS listed: it is an
+#: ordinary state change like push or restart, not a high-risk one, which is
+#: why it stays out of ``_GAUNTLET_MUTATION_RE`` (see the note there) but is
+#: governed here. "publish"/"ship" remain absent.
 _GAUNTLET_STATE_CHANGE_RE = re.compile(
     r"(?:^|[.;:!?]|\d+[.)]|[-*]"
     r"|\b(?:then|and|or|please|also|must|should|may|will|can|shall|to|you))"
@@ -7208,7 +7210,7 @@ _GAUNTLET_STATE_CHANGE_RE = re.compile(
     r"("
     r"live[ _-]?execution"
     r"|(?:delet|remov|writ|mov|updat)(?:e|ing)[ \t]+\w"
-    r"|(?:edit|install|uninstall|restart|commit|push|send)(?:ing|ting)?[ \t]+\w"
+    r"|(?:edit|install|uninstall|restart|commit|push|send|deploy)(?:ing|ting)?[ \t]+\w"
     r"|filing\b|file[ \t]+(?:\w+[ \t]+){0,3}?(?:into|under)\b"
     r"|close[ \t]+(?:out[ \t]+)?(?:the[ \t]+|this[ \t]+|a[ \t]+|every[ \t]+|all[ \t]+)?"
     r"(?:task|tasks|card|cards|row|rows|ticket|tickets|incident|loop|loops)\b"

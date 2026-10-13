@@ -231,7 +231,9 @@ def test_keyword_classification_uses_risk_not_generic_mutation(kanban_home):
             conn, title="investigate slow queries", assignee="default",
         )
         plain = kb.create_task(conn, title="rename a variable", assignee="default")
-        assert not _enforced(conn, deploy)
+        # Gauntlet defect A (2026-10-12): deploy is an ordinary state change
+        # and is governed by subject. It is still not a high-risk mutation.
+        assert _enforced(conn, deploy)
         assert _enforced(conn, credential)
         assert not _enforced(conn, investigate)
         assert not _enforced(conn, plain)
