@@ -11,29 +11,6 @@
     "revert": "Delete the state_model key (strict GREEN/DEGRADED semantics return; recovery_holds keep the Phase 3 cards frozen). Review and revert once the backlog and the historical incidents are resolved. No history is rewritten either way.",
     "entries": [
       {
-        "name": "phase3-hermes-cutover-freeze",
-        "kind": "recovery_hold",
-        "task_ids": [
-          "t_3883034a",
-          "t_992e8161",
-          "t_4d21959c",
-          "t_15d87799"
-        ],
-        "conditions": [
-          "subject_lane_relabelled|t_3883034a|subject_on_codex_verify_lane:triage",
-          "subject_review_regressed|t_3883034a|pending_subject_in_triage",
-          "verifier_child_deadlocked|t_4d21959c|verifier_child_gated:undeclared",
-          "verifier_route_open|t_15d87799|no_route:evidence_missing"
-        ],
-        "owner": "Christopher (official Hermes cutover / Phase 3 freeze)",
-        "reason": "Official Hermes cutover (Phase 3 overlay extraction) is frozen; these exact conditions on its cards are known and intentionally left unrepaired",
-        "authorized_by": "Christopher, 2026-09-14, in session (recovery hold option A; governed-exception state model)",
-        "created": "2026-09-14",
-        "review_condition": "Christopher releases the Phase 3 freeze: delete this entry and the recovery_holds entry together. Any other condition on these cards is not covered and reports DEGRADED.",
-        "expires_at": null,
-        "authorization_sha256": "c5316f3c3ca47fbc19018b6f2556fef053b275b58bab4de36dc16be7182041ad"
-      },
-      {
         "name": "preserved-false-verified-records",
         "kind": "preserved_condition",
         "conditions": [
@@ -50,20 +27,7 @@
       }
     ]
   },
-  "recovery_holds": [
-    {
-      "name": "phase3-hermes-cutover-freeze",
-      "task_ids": [
-        "t_3883034a",
-        "t_992e8161",
-        "t_4d21959c",
-        "t_15d87799"
-      ],
-      "reason": "Official Hermes cutover (Phase 3 overlay extraction) is frozen; its cards are detected and escalated, never auto-repaired, released, reassigned, promoted or dispatched",
-      "authorized_by": "Christopher, 2026-09-14 (t_b8d62378 Phase E, option A)",
-      "release": "Delete this entry only when Christopher separately releases the Phase 3 freeze"
-    }
-  ],
+  "recovery_holds": [],
   "critical_cron_jobs": {
     "life-wiki-github-sync": {
       "max_age_seconds": 2700
