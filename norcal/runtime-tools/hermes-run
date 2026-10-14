@@ -1,0 +1,108 @@
+#!/bin/sh
+# hermes-run — run a command WITH the Hermes environment loaded.
+#
+# WHY THIS EXISTS
+# ---------------
+# Every command that reaches this box as `ssh hermes-fast "..."` runs in a
+# NON-LOGIN shell. A non-login shell reads none of the profile, so it has no
+# PATH additions and none of the credentials in ~/.hermes/.env. The failure is
+# SILENT and reads like a broken system rather than a broken invocation. It has
+# now caused four separate incidents:
+#
+#   * `gh`        — no GH_TOKEN, so `gh pr list` fails and reads as "no open
+#                   PRs". Stranded draft PRs #1/#2 for six days (to 2026-08-06).
+#   * `op`        — not on PATH; 1Password lookups appear to be unavailable.
+#   * `node`/`npm`— not on PATH; compounded the 2026-08-19 life-wiki-api outage.
+#   * `git push`  — no GITHUB_PAT, so the credential helper emits an EMPTY
+#                   password. On 2026-08-19 this was misdiagnosed as a revoked
+#                   token and reported to Christopher as a dead credential. It
+#                   was not: the token was fine, the invocation was not.
+#
+# The rule this tool enforces is in operations.md ("Non-login shell execution")
+# and in the global CLAUDE.md: run credentialed or PATH-dependent work through
+# the sanctioned path, never by improvising an inline substitute.
+#
+# SECRETS: this sources credentials in order to USE them. It never prints them,
+# and it must never be given a command whose purpose is to render one.
+#
+# USAGE
+#   hermes-run <command> [args...]      # exec'd directly, no shell parsing
+#   hermes-run '<shell command line>'   # single argument -> run via sh -c
+#   hermes-run --company <name> <cmd>   # ALSO load that company's own 1Password
+#                                       # service account (least privilege, per
+#                                       # sovereignty.md / 1Password-Service-
+#                                       # Accounts.md). Never loads a broader
+#                                       # account than asked for.
+#
+# EXAMPLES
+#   hermes-run git -C ~/hermes/repos/NorCal_Hermes push
+#   hermes-run 'cd ~/hermes/repos/NorCal_Hermes && git status -sb'
+#   hermes-run --company triptracker op item list --vault "<vault>"
+
+set -u
+
+COMPANY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --company)
+            [ $# -ge 2 ] || { echo "hermes-run: --company needs a name" >&2; exit 2; }
+            COMPANY="$2"
+            shift 2
+            ;;
+        --company=*)
+            COMPANY="${1#--company=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    echo "usage: hermes-run [--company <name>] <command> [args...]" >&2
+    echo "       hermes-run [--company <name>] '<shell command line>'" >&2
+    exit 2
+fi
+
+# Shared environment. Redirected because an unquoted value in a .env can make
+# the shell emit noise (or worse) on source — see the 2026-08-09 Google App
+# Password incident. Failure to read it is not fatal: the command may not need it.
+set -a
+[ -r "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env" >/dev/null 2>&1
+# Executor-only GitHub token file (rule 6, 2026-10-10).
+[ -r /home/chris/.hermes/secrets/github-executor.env ] && . /home/chris/.hermes/secrets/github-executor.env >/dev/null 2>&1
+set +a
+
+# Per-company 1Password service account, only when explicitly asked for.
+# Each company's account writes to its own vault and reads only North Caledonia.
+if [ -n "$COMPANY" ]; then
+    OP_ENV="$HOME/.hermes/secrets/op-service-account-${COMPANY}_lead.env"
+    if [ -r "$OP_ENV" ]; then
+        set -a
+        . "$OP_ENV" >/dev/null 2>&1
+        set +a
+    elif [ -n "${HERMES_SANDBOX_NO_REFRESH:-}" ] && [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+        # Sandboxed company agent (2026-10-11): its own company's account was
+        # already loaded from its profile's .env; the secrets dir is hidden.
+        :
+    else
+        echo "hermes-run: no service account for company '$COMPANY'" >&2
+        echo "hermes-run: expected $OP_ENV" >&2
+        echo "hermes-run: see Business/Systems/1Password-Service-Accounts.md" >&2
+        exit 3
+    fi
+fi
+
+RUNTIME_HOME=$(dirname "$(dirname "$(dirname "$(readlink -f "$0")")")")
+PATH="$RUNTIME_HOME/.local/bin:$RUNTIME_HOME/.hermes/node/bin:/usr/local/bin:$PATH"
+export PATH
+
+if [ $# -eq 1 ]; then
+    exec sh -c "$1"
+fi
+exec "$@"

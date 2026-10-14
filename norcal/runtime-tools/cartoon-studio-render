@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Render a team's cartoon-Erika video (Christopher, 2026-10-13: "have the agents do the work and you run it
+# thru higgsfield and elevenlabs and hand it back in a shared folder").
+# The team writes script.txt, scenes.txt (and optional cast.json) in
+#   ~/.hermes/profiles/<lead>/video-studio/<video>/
+# inside its own sandbox; this privileged step makes the scene art (Higgsfield), voice (ElevenLabs) and the
+# video, and drops them back into that same folder. Keys stay out of company sandboxes.
+# Run:  ~/.local/bin/hermes-run "~/.local/bin/cartoon-studio-render <folder>"
+# Safe to re-run: never regenerates a scene image or voice that already exists.
+set -euo pipefail
+MAX_SCENES=8; MAX_CHARS=950
+RUNTIME_HOME=$(dirname "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")")
+P="$RUNTIME_HOME/.local/share/erika-puppet"
+D=$(readlink -f "${1:?usage: cartoon-studio-render <video-studio folder>}")
+if [ -n "${HERMES_HOME:-}" ] && [ "$HERMES_HOME" != "$RUNTIME_HOME/.hermes" ]; then
+  case "$D" in "$HERMES_HOME"/video-studio/*) ;; *) echo "refused: not this profile video-studio folder: $D"; exit 2;; esac
+else
+  case "$D" in "$RUNTIME_HOME"/.hermes/profiles/*/video-studio/*) ;; *) echo "refused: not a video-studio folder: $D"; exit 2;; esac
+fi
+for f in script.txt scenes.txt; do [ -s "$D/$f" ] || { echo "missing $D/$f"; exit 2; }; done
+[ -n "${HIGGSFIELD_API_KEY:-}" ] && [ -n "${ELEVENLABS_API_KEY:-}" ] || { echo "no keys loaded: run through hermes-run"; exit 2; }
+
+keys=$(grep -oE '\{scene:[A-Za-z0-9_-]+' "$D/script.txt" | cut -d: -f2)
+n=$(echo "$keys" | grep -c . || true)
+[ "$n" -ge 1 ] && [ "$n" -le $MAX_SCENES ] || { echo "scene count $n outside 1-$MAX_SCENES"; exit 2; }
+for k in $keys; do grep -q "^$k|" "$D/scenes.txt" || { echo "scenes.txt has no line for scene '$k'"; exit 2; }; done
+chars=$(sed -E 's/\{[^}]*\}//g' "$D/script.txt" | tr -s ' \n' ' ' | wc -c)
+[ "$chars" -le $MAX_CHARS ] || { echo "script is $chars spoken characters, limit $MAX_CHARS"; exit 2; }
+
+S=$(cat "$P/scene-style.txt")
+mkdir -p "$D/scenes" "$D/work"; cp "$P/work/rig.json" "$D/work/"
+made=0
+for k in $keys; do
+  [ -f "$D/scenes/$k.png" ] && continue
+  subj=$(grep "^$k|" "$D/scenes.txt" | head -1 | cut -d'|' -f2-)
+  # Filtered output only: raw hf output can carry signed URLs.
+  url=$("$RUNTIME_HOME/.local/bin/hf" generate create nano_banana_2 --prompt "$S $subj" --aspect_ratio 1:1 --wait 2>&1 \
+        | sed -E 's/\?[^ <"]*//g' | grep -oE 'https://[^ ]+\.(png|jpg|jpeg|webp)' | tail -1 || true)
+  if [ -n "$url" ]; then curl -s -o "$D/scenes/$k.png" "$url"; made=$((made+1)); echo "scene ok $k"
+  else echo "scene FAILED $k"; exit 1; fi
+done
+
+if [ ! -s "$D/voice.mp3" ]; then
+  "$P/venv/bin/python" "$P/video1/tts.py" "$D/script.txt" "$D"; voiced=$chars
+else voiced=0; fi
+
+out="$D/$(basename "$D").mp4"
+( cd "$P" && venv/bin/python video.py "$D" "$D/work" "$out" ) > "$D/work/render.log" 2>&1
+dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out")
+# 20 evenly spaced frames, so a short scene cannot fall between samples (Timothy, t_ca9776dd).
+ffmpeg -v error -y -i "$out" -vf "fps=20/$dur,scale=216:-1,tile=5x4" -frames:v 1 "$D/sheet.jpg"
+wh=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$out")
+{
+  echo "rendered: $(date '+%Y-%m-%d %H:%M %Z')"
+  echo "video: $out"
+  echo "duration_s: $dur"
+  echo "size: $wh"
+  echo "contact_sheet: $D/sheet.jpg"
+  echo "higgsfield_credits_this_run: $((made*2))"
+  echo "elevenlabs_characters_this_run: $voiced"
+} > "$D/RESULT.txt"
+cat "$D/RESULT.txt"
