@@ -32,6 +32,7 @@ import json
 import logging
 import os
 from typing import Any, Optional
+from pathlib import Path
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -1167,6 +1168,33 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+_ATTACH_SECRET_MARKERS = (".env", "secret", "token", "credential", "password", ".pem", "id_rsa", "id_ed25519")
+
+
+def _attach_path_roots() -> list[Path]:
+    """Directories a ``path`` attachment may come from: the worker's cwd (its
+    task workspace), the kanban workspaces root, and the Life Wiki vault."""
+    roots = [Path.cwd()]
+    ws_root = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+    if ws_root:
+        roots.append(Path(ws_root))
+    roots.append(Path(os.environ.get("LIFE_WIKI_VAULT", "").strip() or "/home/chris/services/life-wiki/vault"))
+    return [r.expanduser().resolve() for r in roots]
+
+
+def _attach_source_path(raw: str) -> Path:
+    """Resolve and vet a local file for ``kanban_attach``. Raises ValueError."""
+    p = Path(raw).expanduser().resolve()
+    if not p.is_file():
+        raise ValueError(f"path is not a regular file: {raw}")
+    if not any(p == r or r in p.parents for r in _attach_path_roots()):
+        raise ValueError("path must be inside the task workspace or the Life Wiki vault")
+    low = p.as_posix().lower()
+    if any(m in low for m in _ATTACH_SECRET_MARKERS):
+        raise ValueError("path looks like a credential file; refusing to attach it")
+    return p
+
+
 def _handle_attach(args: dict, **kw) -> str:
     """Attach an inline (base64) file to a task.
 
@@ -1189,17 +1217,27 @@ def _handle_attach(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     filename = args.get("filename")
-    if not filename or not str(filename).strip():
-        return tool_error("filename is required")
+    src_path = args.get("path")
     content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
-        return tool_error("content_base64 is required")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        return tool_error(f"content_base64 is not valid base64: {e}")
+    if src_path and str(src_path).strip():
+        try:
+            src = _attach_source_path(str(src_path))
+        except ValueError as e:
+            return tool_error(f"kanban_attach: {e}")
+        data = src.read_bytes()
+        if not filename or not str(filename).strip():
+            filename = src.name
+    else:
+        if not filename or not str(filename).strip():
+            return tool_error("filename is required")
+        if not content_b64 or not str(content_b64).strip():
+            return tool_error("path or content_base64 is required")
+        import base64
+        import binascii
+        try:
+            data = base64.b64decode(str(content_b64), validate=True)
+        except (binascii.Error, ValueError) as e:
+            return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -1488,6 +1526,9 @@ def _handle_create(args: dict, **kw) -> str:
     umbrella_task_id = args.get("umbrella_task_id")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    control_plane_authority = (
+        str(args.get("control_plane_authority") or "").strip() or None
+    )
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1510,6 +1551,18 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            if control_plane_authority:
+                # Naming authority is itself an operator decision: admitted
+                # only from recorded facts (_operator_authority), never from
+                # the worker's assertion. Without this gate any worker could
+                # reopen control-plane work by typing 'operator:me'.
+                basis, refusal, _adm = _operator_authority(
+                    kb, conn, _default_actor(args)
+                )
+                if basis is None:
+                    return tool_error(
+                        f"control_plane_authority refused: this session {refusal}"
+                    )
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1543,6 +1596,7 @@ def _handle_create(args: dict, **kw) -> str:
                 recovery_owner=recovery_owner,
                 repairs_task_id=repairs_task_id,
                 umbrella_task_id=umbrella_task_id,
+                control_plane_authority=control_plane_authority,
             )
             new_task = kb.get_task(conn, new_tid)
             # Postgres projection now happens inside kb.create_task() itself
@@ -2767,8 +2821,11 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
-        "Use for genuine file artifacts the next worker or a human should "
+        "Attach a file to a task. For a file that exists on disk, pass "
+        "``path``: it is copied byte-for-byte (use this for any text or "
+        "markdown file; hand-typed base64 truncates and corrupts files of a "
+        "few KB). Pass ``content_base64`` only for small generated bytes "
+        "with no file on disk. Use for genuine file artifacts the next worker or a human should "
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
@@ -2788,9 +2845,17 @@ KANBAN_ATTACH_SCHEMA = {
                     "Directory components are stripped; only the leaf is kept."
                 ),
             },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Local file to attach, inside the task workspace or the "
+                    "Life Wiki vault. Preferred over content_base64. "
+                    "filename defaults to its basename."
+                ),
+            },
             "content_base64": {
                 "type": "string",
-                "description": "The file contents, base64-encoded. Max 25 MB decoded.",
+                "description": "The file contents, base64-encoded. Max 25 MB decoded. Only when there is no file on disk.",
             },
             "content_type": {
                 "type": "string",
@@ -2798,7 +2863,7 @@ KANBAN_ATTACH_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": [],
     },
 }
 
@@ -3035,6 +3100,20 @@ KANBAN_CREATE_SCHEMA = {
                 ),
             },
             "board": _board_schema_prop(),
+            "control_plane_authority": {
+                "type": "string",
+                "description": (
+                    "Required only when the new card's subject is the control "
+                    "plane (Gauntlet, verifier, admission, health controller) "
+                    "and you are not a human session. Name the justification: "
+                    "'operator:<who and where they authorised it>', "
+                    "'regression:<id>', 'requirement:<id>' or "
+                    "'defect:<evidence>'. Accepted only when your own card "
+                    "grants operator authority (a human relayed it, it carries "
+                    "operator authority, or you are the configured "
+                    "orchestrator); otherwise refused. Omit for ordinary work."
+                ),
+            },
             "executor_lane": {
                 "type": "string",
                 "enum": ["claude", "codex_verify", "claude_recovery"],

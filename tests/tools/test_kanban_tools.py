@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -422,6 +423,59 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def _card_as(kb, conn, *, assignee, kind):
+    provenance = kb.resolve_actor_provenance(kind=kind, actor_id="claude-code", env={})
+    return kb.create_task(conn, title="relay", assignee=assignee,
+                          created_by="claude-code", provenance=provenance)
+
+
+def test_create_control_plane_authority_admitted_on_human_relayed_card(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        card = _card_as(kb, conn, assignee="erika", kind=kb.ACTOR_KIND_HUMAN_INTERACTIVE)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", card)
+    monkeypatch.setenv("HERMES_PROFILE", "erika")
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    d = json.loads(kt._handle_create({
+        "title": "Repair Gauntlet verifier routing",
+        "assignee": "peer",
+        "control_plane_authority": "operator:christopher via t_9d617ddb comment 2659",
+    }))
+    assert d.get("ok") is True, d
+    conn = kb.connect()
+    try:
+        adm = kb.task_admission(conn, d["task_id"])
+        assert adm["control_plane_authority"].startswith("operator:christopher")
+    finally:
+        conn.close()
+
+
+def test_create_control_plane_authority_refused_on_automation_card(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        card = _card_as(kb, conn, assignee="peer", kind=kb.ACTOR_KIND_GOVERNED_AUTOMATION)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", card)
+    monkeypatch.setenv("HERMES_PROFILE", "peer")
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    monkeypatch.setattr(kt, "_configured_orchestrator_profile", lambda: "erika")
+    d = json.loads(kt._handle_create({
+        "title": "Repair Gauntlet verifier routing",
+        "assignee": "peer",
+        "control_plane_authority": "operator:me",
+    }))
+    assert "error" in d and "control_plane_authority refused" in d["error"], d
 
 
 def test_link_happy_path(worker_env):
@@ -1049,6 +1103,39 @@ def allow_private_urls(monkeypatch):
     url_safety._reset_allow_private_cache()
     yield
     url_safety._reset_allow_private_cache()
+
+
+def test_attach_path_copies_file_byte_for_byte(worker_env, tmp_path, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.chdir(tmp_path)
+    payload = ("# digest\n" + "x" * 10_000 + "\u00e9\n").encode()
+    (tmp_path / "note.md").write_bytes(payload)
+    d = json.loads(kt._handle_attach({"path": str(tmp_path / "note.md")}))
+    assert d.get("ok") is True, d
+    assert d["size"] == len(payload)
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["note.md"]
+        assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("name", ["outside.md", ".env", "api-token.txt"])
+def test_attach_path_refuses_outside_roots_and_secrets(worker_env, tmp_path, monkeypatch, name):
+    from tools import kanban_tools as kt
+
+    inside = tmp_path / "ws"
+    inside.mkdir()
+    monkeypatch.chdir(inside)
+    monkeypatch.setenv("LIFE_WIKI_VAULT", str(tmp_path / "vault"))
+    target = (tmp_path / name) if name == "outside.md" else (inside / name)
+    target.write_text("v")
+    d = json.loads(kt._handle_attach({"path": str(target)}))
+    assert "error" in d
 
 
 def test_attach_url_rejects_non_http_scheme(worker_env):
