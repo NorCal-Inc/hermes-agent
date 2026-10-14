@@ -1071,11 +1071,10 @@ class TestRecoveryHold:
         with kb.connect_closing() as conn:
             assert kb.get_task(conn, subject).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
 
-    def test_repository_config_holds_the_phase3_cards(self):
+    def test_repository_config_phase3_freeze_released(self):
+        # Christopher released the Phase 3 freeze on 2026-10-14; its four cards no longer exist.
         config = json.loads((_CONTROLLER_PATH.parent / "health-controller.json").read_text())
-        (hold,) = shc.recovery_holds(config)
-        assert hold["task_ids"] == sorted(["t_3883034a", "t_992e8161", "t_4d21959c", "t_15d87799"])
-        assert "Christopher" in hold["authorized_by"] and hold["release"]
+        assert shc.recovery_holds(config) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1352,14 +1351,9 @@ class TestGovernedExceptionStateModel:
         assert block["temporary"] is True and "Christopher" in block["authorized_by"] and block["revert"]
         valid, invalid, frozen = shc.governed_exceptions(config, time.time())
         assert invalid == []
-        by_kind = {e["kind"]: e for e in valid}
-        hold = by_kind["recovery_hold"]
-        assert sorted(hold["task_ids"]) == sorted(PHASE3_IDS)
-        assert frozen == set(PHASE3_IDS)
-        (strict_hold,) = shc.recovery_holds(config)
-        assert hold["name"] == strict_hold["name"]      # same aggregate fingerprint and card
-        preserved = by_kind["preserved_condition"]["conditions"]
-        assert {c.split("|")[1] for c in preserved} == {"t_e48487e5", "t_29c7a57b"}
+        # 2026-10-14: Phase 3 freeze released by Christopher; preserved false-VERIFIED records
+        # closed by Erika's ruling on t_9d617ddb. No exceptions remain in force.
+        assert valid == [] and frozen == set()
 
 
 # ---------------------------------------------------------------------------

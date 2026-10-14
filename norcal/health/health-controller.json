@@ -9,23 +9,7 @@
     "authorized_by": "Christopher, 2026-09-14, in session (t_b8d62378: temporary governed-exception state model)",
     "purpose": "Temporary stabilization: intentionally frozen, owner-approved or historically preserved conditions stay observed and visible every pass but report GREEN_WITH_HOLDS instead of forcing DEGRADED",
     "revert": "Delete the state_model key (strict GREEN/DEGRADED semantics return; recovery_holds keep the Phase 3 cards frozen). Review and revert once the backlog and the historical incidents are resolved. No history is rewritten either way.",
-    "entries": [
-      {
-        "name": "preserved-false-verified-records",
-        "kind": "preserved_condition",
-        "conditions": [
-          "verified_closure_attributable|t_e48487e5|verified_by_bare_or_missing_identity",
-          "verified_closure_attributable|t_29c7a57b|verified_by_bare_or_missing_identity"
-        ],
-        "owner": "Erika (false-VERIFIED integrity incident adjudication)",
-        "reason": "Historical false-VERIFIED closures preserved as evidence; they must never be rewritten, so the condition cannot clear by repair",
-        "authorized_by": "Christopher, 2026-09-14, in session (governed-exception state model)",
-        "created": "2026-09-14",
-        "review_condition": "Erika rules on the t_e48487e5 / t_29c7a57b integrity incident, or the temporary governed-exception model is reverted",
-        "expires_at": null,
-        "authorization_sha256": "849b0248417ea26628a572c30371498d42200b82cd6743a24a4a090d0f7ee233"
-      }
-    ]
+    "entries": []
   },
   "recovery_holds": [],
   "critical_cron_jobs": {
