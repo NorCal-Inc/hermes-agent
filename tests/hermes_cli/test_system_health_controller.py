@@ -1351,9 +1351,11 @@ class TestGovernedExceptionStateModel:
         assert block["temporary"] is True and "Christopher" in block["authorized_by"] and block["revert"]
         valid, invalid, frozen = shc.governed_exceptions(config, time.time())
         assert invalid == []
-        # 2026-10-14: Phase 3 freeze released by Christopher; preserved false-VERIFIED records
-        # closed by Erika's ruling on t_9d617ddb. No exceptions remain in force.
-        assert valid == [] and frozen == set()
+        # 2026-10-14: Phase 3 freeze released by Christopher. The preserved false-VERIFIED
+        # records exception stays until the controller can honour Erika's ruling (t_9d617ddb).
+        assert [e["name"] for e in valid] == ["preserved-false-verified-records"] and frozen == set()
+        preserved = valid[0]["conditions"]
+        assert {c.split("|")[1] for c in preserved} == {"t_e48487e5", "t_29c7a57b"}
 
 
 # ---------------------------------------------------------------------------
