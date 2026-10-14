@@ -1351,11 +1351,10 @@ class TestGovernedExceptionStateModel:
         assert block["temporary"] is True and "Christopher" in block["authorized_by"] and block["revert"]
         valid, invalid, frozen = shc.governed_exceptions(config, time.time())
         assert invalid == []
-        # 2026-10-14: Phase 3 freeze released by Christopher. The preserved false-VERIFIED
-        # records exception stays until the controller can honour Erika's ruling (t_9d617ddb).
-        assert [e["name"] for e in valid] == ["preserved-false-verified-records"] and frozen == set()
-        preserved = valid[0]["conditions"]
-        assert {c.split("|")[1] for c in preserved} == {"t_e48487e5", "t_29c7a57b"}
+        # 2026-10-14: Phase 3 freeze released by Christopher; the false-VERIFIED records are
+        # closed by Erika's ruling (t_9d617ddb) and recorded as adjudicated incidents instead.
+        assert valid == [] and frozen == set()
+        assert {c.split("|")[1] for c in shc.adjudicated_conditions(config)} == {"t_e48487e5", "t_29c7a57b"}
 
 
 # ---------------------------------------------------------------------------
@@ -4064,3 +4063,52 @@ class TestMergedWorktreeRemoval:
         config = _hygiene_config(repo, trees)
         assert klass.matches(inside, spec, config)
         assert not klass.matches(outside, spec, config) and not klass.matches(main, spec, config)
+
+
+# ---------------------------------------------------------------------------
+# Adjudicated incidents (Christopher, 2026-10-14): a recorded governance ruling
+# closes one exact false-VERIFIED condition. History is never rewritten.
+# ---------------------------------------------------------------------------
+
+
+class TestAdjudicatedIncidents:
+    RULING = "Erika, t_test comment 1: adjudicated and closed"
+
+    def _adjudicated(self, *tids, ruling=RULING):
+        return {"adjudicated_incidents": [
+            {"condition": f"verified_closure_attributable|{t}|verified_by_bare_or_missing_identity",
+             "ruling": ruling} for t in tids]}
+
+    def test_adjudicated_record_is_green_and_history_preserved(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _bare_lane_verified_closure(conn)
+            events_before = _kinds(conn, tid)
+        alerts = Alerts()
+        result = shc.Controller(_ctx(kanban_home, alerts=alerts, config=self._adjudicated(tid)),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert result.status == shc.AGGREGATE_GREEN and not result.escalated and alerts.sent == []
+        with kb.connect_closing() as conn:
+            assert _kinds(conn, tid) == events_before
+            task = kb.get_task(conn, tid)
+            assert (task.status, task.verification_state) == ("done", kb.VERIFICATION_VERIFIED)
+
+    def test_new_false_verified_record_is_still_escalated(self, kanban_home):
+        with kb.connect_closing() as conn:
+            ruled = _bare_lane_verified_closure(conn)
+            fresh = _bare_lane_verified_closure(conn, title="new false closure")
+        result = shc.Controller(_ctx(kanban_home, config=self._adjudicated(ruled)),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert len(result.escalated) == 1   # only the fresh record; the ruled one is skipped
+
+    def test_entry_without_ruling_is_ignored_fail_closed(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _bare_lane_verified_closure(conn)
+        result = shc.Controller(_ctx(kanban_home, config=self._adjudicated(tid, ruling="")),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert len(result.escalated) == 1
+
+    def test_malformed_entries_are_ignored(self):
+        config = {"adjudicated_incidents": ["x", {"condition": "no-pipes", "ruling": "r"},
+                                            {"condition": "a|b|c", "ruling": "r"}]}
+        assert shc.adjudicated_conditions(config) == {"a|b|c"}
+        assert shc.adjudicated_conditions({}) == set()

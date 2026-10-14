@@ -1677,6 +1677,23 @@ class VerifierOfVerifier(Invariant):
         return out
 
 
+def adjudicated_conditions(config: dict) -> set[str]:
+    """Exact ``invariant|subject|signature`` conditions closed by a recorded governance ruling.
+
+    Only entries naming both the condition and the ruling count; anything malformed is
+    ignored, so the record stays flagged (fail closed). History is never touched.
+    """
+    out: set[str] = set()
+    for entry in config.get("adjudicated_incidents") or []:
+        if not isinstance(entry, dict):
+            continue
+        condition = str(entry.get("condition") or "").strip()
+        ruling = str(entry.get("ruling") or "").strip()
+        if condition.count("|") == 2 and ruling:
+            out.add(condition)
+    return out
+
+
 class VerifiedClosureAttributable(Invariant):
     """Every verified Gauntlet closure names an attributable independent verifier.
 
@@ -1694,6 +1711,7 @@ class VerifiedClosureAttributable(Invariant):
     def check(self, ctx: Context) -> list[Finding]:
         kb = _kb()
         lane_names = set(kb.VALID_EXECUTOR_LANES) | {"atlas"}
+        adjudicated = adjudicated_conditions(ctx.config)
         out: list[Finding] = []
         with ctx.kanban() as conn:
             rows = conn.execute(
@@ -1708,6 +1726,8 @@ class VerifiedClosureAttributable(Invariant):
                     payload = {}
                 verifier = str(payload.get("verifier") or "").strip().lower()
                 if not verifier or verifier in lane_names:
+                    if f"{self.name}|{row['task_id']}|verified_by_bare_or_missing_identity" in adjudicated:
+                        continue
                     out.append(Finding(self.name, row["task_id"],
                                        "verified_by_bare_or_missing_identity",
                                        {"verifier": verifier or None}))
@@ -1721,6 +1741,8 @@ class VerifiedClosureAttributable(Invariant):
                     continue
                 vt = payload.get("verifier_task")
                 if payload.get("recorded") and vt and kb._attested_codex_verifier_run(conn, vt) is None:
+                    if f"{self.name}|{row['task_id']}|verdict_returned_from_unattested_verifier" in adjudicated:
+                        continue
                     out.append(Finding(self.name, row["task_id"],
                                        "verdict_returned_from_unattested_verifier",
                                        {"verifier_task": vt}))
