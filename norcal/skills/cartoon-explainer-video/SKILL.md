@@ -19,7 +19,7 @@ Christopher, 2026-10-14: shared tools, skills and logins are for every agent. Us
 - **Your own channel's content only.** Facts come from a named public source you read the same day (a company's live site when the video is about a company). Never use company-private material (vault company folders, internal notes, credentials, customer data); a company video belongs to that company's Team Leader, not to you.
 - **Every claim must appear in the cited source.** No invented features, prices, numbers or testimonials. Erika speaks as a presenter, never from personal experience.
 - **Team avatars:** only use a team member's face (`cast.json` "face") once Christopher has approved that avatar in `~/.hermes/companies/entity-registry.md` § Avatars.
-- **Nothing is posted, uploaded or shared** without Christopher's yes on the finished video. The on-screen "AI PRESENTER" tag stays; captions open with "Erika is an AI presenter".
+- **No public posting or external distribution** without Christopher's yes on the finished video. Internal review attachments and delivery to his existing Videos folder are authorized. The on-screen "AI PRESENTER" tag stays; captions open with "Erika is an AI presenter".
 - **Limits:** at most 8 scenes; at most 950 spoken characters (about 35-60 seconds). The render refuses anything bigger.
 
 ## Part 1 — write it (your card)
@@ -37,3 +37,7 @@ The renderer writes `<folder>.mp4`, `sheet.jpg` (a contact sheet) and `RESULT.tx
 
 7. Look at `sheet.jpg`: every scene appears, no headline cut off, captions inside the frame, AI PRESENTER tag visible. Check the video against `claims.txt`.
 8. Comment on your card: pass or the exact fixes needed (script lines or scene descriptions to change), plus a proposed caption that opens with "Erika is an AI presenter". Christopher approves before any post.
+
+## Delivery
+
+Keep the finished mp4 in your own video-studio and deliver a copy through the existing approved transfer route to Christopher's laptop folder `C:\Users\morph\Videos\`. Verify the copied file checksum. Do not overwrite an approved cut with a different cut. If the laptop is offline, follow the existing Shared Drive service-account fallback in `Business/Operations/2026-10-05-cartoon-explainer-video-plan.md`; do not create My Drive copies. The current posting hold remains in force.
