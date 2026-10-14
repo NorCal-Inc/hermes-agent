@@ -380,6 +380,7 @@ def build_bwrap_argv(
     manifest: Dict[str, Any],
     *,
     kanban_db_dir: Optional[os.PathLike | str] = None,
+    attachments_dir: Optional[os.PathLike | str] = None,
     home: Optional[Path] = None,
     exists: Optional[Callable[[str], bool]] = None,
     bwrap_path: str = "bwrap",
@@ -457,6 +458,12 @@ def build_bwrap_argv(
         kd = _norm(kanban_db_dir)
         _check_allowed(kd, home)
         argv += ["--bind", kd, kd]
+    # The card's own attachment folder only; without it ``kanban attach``
+    # writes land on the $HOME tmpfs and vanish when the worker exits.
+    if attachments_dir:
+        ad = _norm(attachments_dir)
+        _check_allowed(ad, home)
+        argv += ["--bind", ad, ad]
 
     vault_ro = vault_readonly(manifest)
     for key in ("repos", "vault", "browser_profiles", "extra_rw"):
@@ -525,8 +532,16 @@ def wrap(
         return cmd
     db = (env or {}).get("HERMES_KANBAN_DB", "").strip()
     kanban_db_dir = str(Path(db).parent) if db else None
+    attachments_dir = None
+    task_id = getattr(task, "id", None)
+    if task_id:
+        from hermes_cli import kanban_db as kb
+        board = (env or {}).get("HERMES_KANBAN_BOARD", "").strip() or None
+        attachments_dir = kb.task_attachments_dir(str(task_id), board=board)
+        attachments_dir.mkdir(parents=True, exist_ok=True)
     prefix = build_bwrap_argv(
-        lane, profile, profile_home, workspace, manifest, kanban_db_dir=kanban_db_dir
+        lane, profile, profile_home, workspace, manifest,
+        kanban_db_dir=kanban_db_dir, attachments_dir=attachments_dir,
     )
     return prefix + ["--"] + cmd
 

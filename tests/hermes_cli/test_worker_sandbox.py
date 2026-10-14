@@ -459,6 +459,26 @@ CMD = ["hermes", "-p", "logos_covenant_lead", "chat", "-q", "x"]
 ENFORCE = {"worker_sandbox": {"mode": "enforce", "lanes": ["logos"]}}
 
 
+@pytest.fixture(autouse=True)
+def _attachments_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "att"))
+
+
+def test_wrap_binds_only_this_cards_attachment_dir_rw(tmp_path, monkeypatch):
+    monkeypatch.setattr(ws, "lane_for", lambda p: "logos")
+    out = _wrap(tmp_path)
+    own = tmp_path / "att" / "t_x"
+    assert own.is_dir()
+    rw = [s for s, _ in _binds(out, "--bind")]
+    assert str(own) in rw
+    assert str(tmp_path / "att") not in rw
+
+
+def test_attachment_dir_under_forbidden_root_is_refused(tmp_path):
+    with pytest.raises(ws.SandboxConfigError):
+        _build(tmp_path, attachments_dir=str(HOME / ".ssh" / "t_x"))
+
+
 def _wrap(tmp_path, *, cfg=ENFORCE, lane="logos", executor_lane=None, manifest="default", profile="logos_covenant_lead",
           **kw):
     if manifest == "default":
