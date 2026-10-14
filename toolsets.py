@@ -351,6 +351,8 @@ TOOLSETS = {
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "kanban_lessons", "kanban_promote_lesson", "kanban_retire_lesson",
+            "kanban_supersede",
         ],
         "includes": [],
     },
