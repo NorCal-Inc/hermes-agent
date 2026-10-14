@@ -291,7 +291,63 @@ def _verifier_recovery_scope(conn, task_id: str) -> str:
     )
 
 
-def _build_codex_verifier_prompt(task: kb.Task, recovery_scope: str = "") -> str:
+_SUBJECT_TEXT_CAP = 12000
+_SUBJECT_COMMENT_CAP = 2000
+_SUBJECT_COMMENTS = 6
+
+
+def _clip(text: str, cap: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= cap else f"{text[:cap]}\n[... truncated, {len(text) - cap} more characters]"
+
+
+def _verifier_subject_context(conn, task_id: str) -> str:
+    """The card(s) this verifier verifies, inlined into its prompt.
+
+    Incident 2026-10-14: verifiers t_c8171572, t_d794a8e8 and t_04544c5b were
+    told only the subject's id. The Codex sandbox has no kanban command, so
+    reading the subject depended on the verifier guessing a lookup: some
+    queried kanban.db directly and passed, these found nothing and returned
+    BLOCKER with the evidence already attached. The launcher now hands over
+    the subject's body, latest handoff, recent comments and the absolute
+    paths of its attachments -- the "subject task and its attached evidence"
+    the scope guardrail already authorizes. Read-only; returns "" on any doubt.
+    """
+    try:
+        blocks = []
+        for sid in kb.relation_targets(conn, task_id, kb.RELATION_VERIFIES):
+            subject = kb.get_task(conn, sid)
+            if subject is None:
+                continue
+            lines = [
+                f"--- SUBJECT {subject.id} ---",
+                f"Title: {subject.title}",
+                f"Status: {subject.status}; assignee: {subject.assignee or '-'}; "
+                f"tenant: {subject.tenant or 'shared / none'}",
+                "Body:",
+                _clip(subject.body or "(no body)", _SUBJECT_TEXT_CAP),
+                "Latest handoff summary (the implementer's own claim; verify it, do not trust it):",
+                _clip(kb.latest_summary(conn, sid) or "(none)", _SUBJECT_TEXT_CAP),
+            ]
+            comments = kb.list_comments(conn, sid)[-_SUBJECT_COMMENTS:]
+            if comments:
+                lines.append(f"Most recent comments ({len(comments)}):")
+                lines += [f"[{c.author}] {_clip(c.body, _SUBJECT_COMMENT_CAP)}" for c in comments]
+            attachments = kb.list_attachments(conn, sid)
+            lines.append("Attachments (read by absolute path):" if attachments else "Attachments: none")
+            lines += [f"- {a.stored_path} ({a.size} bytes)" for a in attachments]
+            blocks.append("\n".join(lines))
+    except Exception:
+        return ""
+    if not blocks:
+        return ""
+    return "\n\n".join([
+        "SUBJECT CONTEXT (supplied by the Hermes launcher from the live board, not by the card):",
+        *blocks,
+    ])
+
+
+def _build_codex_verifier_prompt(task: kb.Task, recovery_scope: str = "", subject_context: str = "") -> str:
     return "\n".join([
         "You are Atlas, the independent Codex verification executor for one Hermes Kanban task.",
         "This is a READ-ONLY verification lane. Do not edit files, commit, deploy, or mutate services/databases.",
@@ -313,6 +369,7 @@ def _build_codex_verifier_prompt(task: kb.Task, recovery_scope: str = "") -> str
         "",
         "Verification brief / acceptance criteria:",
         task.body or "(no body)",
+        *(["", subject_context] if subject_context else []),
         "",
         "End with a concise structured verdict: PASS/FAIL per requested item, evidence, and explicit GO/NO-GO when applicable.",
         "The FINAL line must be exactly one of: ATLAS_VERDICT: PASS or ATLAS_VERDICT: FAIL.",
@@ -585,7 +642,9 @@ def run_codex_verifier(task_id: str) -> int:
         if not should_run:
             return 1
         attempt = _invoke_codex_verifier(
-            _build_codex_verifier_prompt(task, _verifier_recovery_scope(conn, task_id)),
+            _build_codex_verifier_prompt(
+                task, _verifier_recovery_scope(conn, task_id), _verifier_subject_context(conn, task_id),
+            ),
             cwd, timeout, task_id=task_id,
         )
         if not attempt.ok:
