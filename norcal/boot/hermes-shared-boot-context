@@ -632,10 +632,10 @@ def pyproject_version(root: Path) -> str:
 
 target_v = pyproject_version(HERMES / "hermes-agent-next")
 
-# Operational readiness comes from the bounded light health-controller heartbeat. A stale,
-# missing, or degraded controller cannot be hidden by a technically successful boot.
+# Christopher admin directive 2026-10-15: operational health is advisory only.
+# Preserve its findings without blocking startup or ordinary task execution.
 health_path = HERMES / "state/system-health-controller/heartbeat-light.json"
-operational_health = "FAIL"
+operational_health = "WARN"
 operational_detail = "health heartbeat unavailable"
 try:
     health = json.loads(health_path.read_text(encoding="utf-8"))
@@ -648,10 +648,13 @@ try:
 except Exception as exc:
     operational_detail = f"unavailable: {type(exc).__name__}"
 
+if operational_health != "PASS":
+    warnings.append("Operational health advisory (non-blocking): " + operational_detail)
+
 fingerprint = hashlib.sha256("\n".join(source_hash_parts).encode()).hexdigest()
 boot_status = "DEGRADED — STOP BEFORE TASK EXECUTION" if blockers else "COMPLETE"
 technical_boot_health = "FAIL" if blockers else "PASS"
-ready = "YES" if technical_boot_health == "PASS" and continuity_health == "PASS" and operational_health == "PASS" else "NO"
+ready = "YES" if technical_boot_health == "PASS" and continuity_health == "PASS" else "NO"  # Christopher 2026-10-15: operational health is warning-only
 failure_text = "\n".join(f"- {x}" for x in blockers) if blockers else "(none)"
 warning_text = "\n".join(f"- {x}" for x in warnings) if warnings else "(none)"
 unranked_text = ", ".join(unranked) if unranked else "(none)"

@@ -15,5 +15,5 @@ These constraints bind every North Caledonia operating entry point: GPT/Codex, C
 11. Applicable verified lessons must mechanically constrain future work; do not rely on model memory alone.
 12. Critical work must not silently become stale or abandoned. Stale work and lost-controller executions require deterministic reconciliation.
 13. Company-private data remains sealed to its company lane. Cross-company uncertainty defaults FORBIDDEN.
-14. If a required boot gate is DEGRADED, ordinary task execution is blocked. Only narrowly scoped recovery of the named failed gate is permitted until the same gate is re-verified green.
+14. Christopher admin directive 2026-10-15: operational health-controller findings, including DEGRADED, ESCALATED, stale or missing health heartbeats, are advisory only. They must remain visible and must never set READY to NO, lock tools, or block ordinary task execution. Only a failed required technical boot or continuity gate blocks ordinary execution; narrowly scoped recovery remains permitted for that named failed gate.
 15. Every binding boot gate must fail closed for ordinary work and remain mechanically recoverable through a distinct recovery-only executor path. The recovery executor must not require the failed gate to be green before it can repair that same gate.
