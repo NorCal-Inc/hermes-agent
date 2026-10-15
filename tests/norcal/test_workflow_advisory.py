@@ -30,7 +30,7 @@ def test_health_and_missing_continuity_do_not_block_work(tmp_path, health_status
         heartbeat.parent.mkdir(parents=True)
         heartbeat.write_text(json.dumps({"status": health_status, "finished_ts": time.time()}))
     payload = boot.run(pin=None)
-    assert _state(payload, "CONTINUITY") == "FAIL"
+    assert _state(payload, "CONTINUITY") == "WARN"
     assert _state(payload, "OPERATIONAL").startswith("WARN")
     assert _state(payload, "BOOT STATUS") == "COMPLETE"
     assert _state(payload, "READY") == "YES"

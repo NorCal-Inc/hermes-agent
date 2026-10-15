@@ -556,7 +556,7 @@ if continuity_cp is not None:
 else:
     continuity_ts = None
     checkpoint_freshness = "STALE — no continuity checkpoint exists"
-    continuity_health = "FAIL"
+    continuity_health = "WARN"
 
 # Open-item reconciliation is intentionally on-demand. It is not a boot safety
 # gate and historically costs several seconds even when returning nonzero.
