@@ -1298,6 +1298,21 @@ def run_claude_first_recovery(task_id: str) -> int:
             pass
 
 
+def _attach_handoff_evidence(conn, task_id, *, summary, evidence) -> None:
+    """Attach the run's own evidence when the card carries none yet."""
+    try:
+        if kb.subject_has_evidence(conn, task_id):
+            return
+        body = f"# Handoff evidence for {task_id}\n\n{summary}\n\n{evidence}\n"
+        kb.store_attachment_bytes(
+            conn, task_id, "handoff-evidence.md", body.encode("utf-8"),
+            content_type="text/markdown", uploaded_by="executor-handoff",
+        )
+    except Exception:
+        # Never fail the handoff over this; the unroutable alarm still fires.
+        return
+
+
 def _handoff_for_verification(
     conn, task_id, *, summary, evidence, metadata, expected_run_id, author
 ) -> bool:
@@ -1308,7 +1323,15 @@ def _handoff_for_verification(
     Rather than fail the run, hand the work off as VERIFICATION_PENDING with
     the gate output attached — that is the one legal next step, and it keeps
     the evidence with the card for whoever records the verdict.
+
+    The verifier dispatch gate only counts an *attachment* as evidence
+    (``kb.subject_has_evidence``). A run that changed no workspace files (a
+    scratch drift repair, a read-only check) used to post its evidence only
+    as a comment, so the verifier route never opened and the card sat in
+    review forever: 6 claude-lane cards, 2026-10-01..15. The same evidence is
+    now attached first, before review is requested, so the gate sees it.
     """
+    _attach_handoff_evidence(conn, task_id, summary=summary, evidence=evidence)
     ok = kb.request_review(
         conn, task_id,
         summary=summary,
