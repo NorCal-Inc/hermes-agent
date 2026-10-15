@@ -79,6 +79,10 @@ def test_shipped_policy_routes_one_runnable_gauntlet_card_and_resolves_fresh_evi
 
     first = controller.run(shc.TIER_LIGHT)
     assert len(first.escalated) == 2
+    # Operational DEGRADED is advisory: the controller still routes the
+    # repair and the board keeps it runnable (READY), rather than turning the
+    # health signal into a boot/work lock.
+    assert first.status == shc.AGGREGATE_DEGRADED
     with kb.connect_closing() as conn:
         rows = conn.execute(
             "SELECT * FROM tasks WHERE idempotency_key = ?",
@@ -189,6 +193,84 @@ def test_explicit_adoption_requires_durable_manual_provenance_and_gauntlet(isola
         _ctx(isolated_home, config), finding, {"attempts": 0}, shc.ESCALATION_NOT_RECOVERABLE,
     )
     assert (adopted, created) == (existing, False)
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_shipped_policy_adopts_configured_real_card_id_by_durable_provenance(
+    isolated_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """Exercise the configured t_9f9e4769 identity without reading live state."""
+    config = json.loads(_CONFIG.read_text(encoding="utf-8"))
+    configured_id = config["health_repair_adoptions"][
+        "critical_cron_jobs_healthy:nuclear_backup"
+    ]
+    assert configured_id == "t_9f9e4769"
+    monkeypatch.setattr(kb, "_new_task_id", lambda: configured_id)
+    with kb.connect_closing() as conn:
+        existing = kb.create_task(
+            conn,
+            title="manual maintenance card; prose is deliberately irrelevant",
+            body="Durable provenance and lane fields are the adoption authority.",
+            assignee="default",
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+            gauntlet=True,
+            provenance=kb.ActorProvenance(
+                kind=kb.ACTOR_KIND_HUMAN_INTERACTIVE,
+                actor_id="interactive-relay",
+                cause=kb.CREATION_CAUSE_MANUAL_RELAY,
+            ),
+        )
+    assert existing == configured_id
+
+    finding = shc.Finding(
+        "critical_cron_jobs_healthy", "nuclear_backup", "last_status:error",
+    )
+    adopted, created = shc.kanban_repair_card(
+        _ctx(isolated_home, config), finding, {"attempts": 0},
+        shc.ESCALATION_NOT_RECOVERABLE,
+    )
+    assert (adopted, created) == (configured_id, False)
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_unsupported_shared_repair_class_gets_bounded_owned_diagnosis_not_triage(isolated_home):
+    """A routine fault with no built-in recovery still gets one owned diagnosis."""
+    config = {
+        "kanban_card_invariants": ["critical_cron_jobs_healthy"],
+        "automatic_shared_repair_invariants": ["critical_cron_jobs_healthy"],
+    }
+    finding = shc.Finding(
+        "critical_cron_jobs_healthy", "fixture-job", "unsupported_repair_class",
+        recoverable=False,
+    )
+    card_id, created = shc.kanban_repair_card(
+        _ctx(isolated_home, config), finding, {"attempts": 0},
+        shc.ESCALATION_NOT_RECOVERABLE,
+    )
+    assert created is True
+    with kb.connect_closing() as conn:
+        card = kb.get_task(conn, card_id)
+        assert card.status == "ready"
+        assert card.assignee == "default"
+        assert card.executor_lane == kb.EXECUTOR_LANE_CLAUDE
+        assert card.gauntlet_enforced is True
+        assert card.tenant is None
+        assert "Diagnose the current technical cause" in card.body
+        assert "do not request human input" in card.body
+        authority = conn.execute(
+            "SELECT control_plane_authority FROM tasks WHERE id = ?", (card_id,),
+        ).fetchone()[0]
+        assert authority == f"defect:critical_cron_jobs_healthy:{finding.fingerprint}"
+
+    # The bounded episode key prevents repeat observations from creating an
+    # identical diagnosis worker.
+    repeated, repeated_created = shc.kanban_repair_card(
+        _ctx(isolated_home, config), finding, {"attempts": 1},
+        shc.ESCALATION_NOT_RECOVERABLE,
+    )
+    assert (repeated, repeated_created) == (card_id, False)
     with kb.connect_closing() as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
 
