@@ -13634,19 +13634,38 @@ def _ensure_independent_verifier_child(
         "A PASS without that line is refused and the subject stays unverified."
         if regression_evidence_required(conn, subject_id) else ""
     )
+    # create_task classifies the card from its title+body, so this system
+    # boilerplate must not carry control-plane keywords for an ordinary
+    # subject: "Gauntlet"/"control-plane" here made the verifier of ordinary
+    # work look like new control-plane construction, admission refused it, and
+    # the subject could never complete (134 refusals, 69 subjects,
+    # 2026-10-04..15). The ACCEPTANCE instruction is kept exactly where the
+    # verdict return path enforces it: control_plane_subject() of the subject.
+    subject_row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (subject_id,)
+    ).fetchone()
+    subject_needs_acceptance = bool(
+        (subject_admission is not None and subject_admission["control_plane"])
+        or (subject_row is not None
+            and control_plane_subject(subject_row["title"], subject_row["body"]))
+    )
+    acceptance_brief = (
+        "For control-plane work, a PASS must include an anchored "
+        "`ACCEPTANCE: PASS` line confirming the stated acceptance criteria were "
+        "checked; missing acceptance confirmation fails closed. "
+        if subject_needs_acceptance else ""
+    )
     try:
         child_id = create_task(
             conn,
             title=f"Independent verification: {subject_id}",
             body=(
-                f"Independent Gauntlet verification of {subject_id}.\n\n"
+                f"Independent verification of {subject_id}.\n\n"
                 f"The implementer ({implementer or 'unknown'}) cannot verify "
                 f"its own work, so this card carries the verdict instead.\n\n"
                 f"Review the subject task body and its evidence against every explicit "
-                f"requirement / acceptance criterion. For control-plane work, a PASS must "
-                f"include an anchored `ACCEPTANCE: PASS` line confirming the stated "
-                f"acceptance criteria were checked; missing acceptance confirmation fails "
-                f"closed. Finish with `VERDICT: PASS`, `VERDICT: FAIL` or `VERDICT: BLOCKER` "
+                f"requirement / acceptance criterion. {acceptance_brief}"
+                f"Finish with `VERDICT: PASS`, `VERDICT: FAIL` or `VERDICT: BLOCKER` "
                 f"on its own anchored line; the verdict is returned automatically."
                 f"{regression_brief}"
             ),
