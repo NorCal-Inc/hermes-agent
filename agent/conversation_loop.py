@@ -37,7 +37,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import FailoverReason, build_quota_hold, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -670,6 +670,7 @@ def _billing_failure_result(
     base_url,
     model: str,
     guidance: Optional[str] = None,
+    error_context: Optional[dict] = None,
 ) -> dict:
     """Structured terminal result for a billing-classified failure.
 
@@ -697,6 +698,10 @@ def _billing_failure_result(
         "failed": True,
         "error": summary,
         "failure_reason": classified.reason.value,
+        "quota_hold": build_quota_hold(
+            classified, provider=provider, model=model,
+            error_context=error_context,
+        ),
         # The billing verdict may rest on an ambiguous body (#82154) — carry
         # that through the structured result, not just the prose.
         "billing_unverified": unverified,
@@ -6125,6 +6130,7 @@ def run_conversation(
                             provider=_provider,
                             base_url=_base,
                             model=_model,
+                            error_context=error_context,
                         )
                     return {
                         "final_response": _nonretryable_summary,
@@ -6350,6 +6356,10 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        "quota_hold": build_quota_hold(
+                            classified, provider=_provider, model=_model,
+                            error_context=error_context,
+                        ),
                         # True when the billing verdict rests on an ambiguous
                         # body (#82154) — may be a content-filter rejection.
                         "billing_unverified": _billing_unverified,

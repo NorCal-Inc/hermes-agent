@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -2008,3 +2010,78 @@ def _extract_upstream_provider_name(body: Any) -> Optional[str]:
     if isinstance(name, str) and name.strip():
         return name.strip()
     return None
+
+
+# Longest provider-supplied reset the dispatcher will honor as a hold. A
+# larger (or past / non-numeric) value is treated as invalid and the
+# dispatcher falls back to its fixed rate-limit cooldown.
+MAX_QUOTA_HOLD_SECONDS = 7 * 86400
+
+
+def coerce_quota_reset_epoch(value: Any, now: Optional[float] = None) -> Optional[int]:
+    """Return a future epoch-seconds reset time, or None if unusable.
+
+    Accepts epoch seconds (or milliseconds) and ISO-8601 strings. Missing,
+    malformed, stale (already past) and implausibly distant values -> None.
+    """
+    now = time.time() if now is None else now
+    epoch: Optional[float] = None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        epoch = float(value)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            epoch = float(text)
+        except ValueError:
+            try:
+                from datetime import datetime, timezone
+
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                epoch = dt.timestamp()
+            except ValueError:
+                return None
+    if epoch is None or not math.isfinite(epoch):
+        return None
+    if epoch > 1e11:  # milliseconds
+        epoch /= 1000.0
+    if epoch <= now or epoch - now > MAX_QUOTA_HOLD_SECONDS:
+        return None
+    return int(epoch)
+
+
+def build_quota_hold(
+    classified: "ClassifiedError",
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    error_context: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Describe a quota wall for the kanban dispatcher, or None.
+
+    ``kind`` is ``hard`` for a confirmed usage/credit exhaustion
+    (``usage_limit_reached`` / billing) and ``temporary`` for an ordinary
+    429 throttle. ``reset_at`` is only set when the provider supplied a
+    valid future reset time.
+    """
+    ctx = {**(classified.error_context or {}), **(error_context or {})}
+    code = str(ctx.get("reason") or "").lower()
+    if classified.reason == FailoverReason.billing or "usage_limit_reached" in code:
+        kind = "hard"
+    elif classified.reason in (
+        FailoverReason.rate_limit, FailoverReason.upstream_rate_limit,
+    ):
+        kind = "temporary"
+    else:
+        return None
+    return {
+        "kind": kind,
+        "reset_at": coerce_quota_reset_epoch(ctx.get("reset_at"), now),
+        "provider": provider or classified.provider,
+        "model": model or classified.model,
+        "code": code[:80] or None,
+    }

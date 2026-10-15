@@ -20850,7 +20850,11 @@ def main(
                                 try:
                                     from hermes_cli.kanban_db import (
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                                        write_worker_quota_hold as _write_hold,
                                     )
+                                    _hold = result.get("quota_hold")
+                                    if _hold:
+                                        _write_hold(_hold)
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
@@ -20890,7 +20894,10 @@ def main(
                     try:
                         from hermes_cli.kanban_db import (
                             KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                            write_worker_quota_hold as _write_hold,
                         )
+                        if _chat_result.get("quota_hold"):
+                            _write_hold(_chat_result["quota_hold"])
                     except Exception:
                         _RL_CODE = 1
                     raise SystemExit(_RL_CODE)

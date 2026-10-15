@@ -4160,6 +4160,12 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             if value not in {None, ""}:
                 context["reset_at"] = value
                 break
+        resets_in = payload.get("resets_in_seconds")
+        if resets_in not in {None, ""} and "reset_at" not in context:
+            try:
+                context["reset_at"] = time.time() + float(resets_in)
+            except (TypeError, ValueError):
+                pass
         retry_after = payload.get("retry_after")
         if retry_after not in {None, ""} and "reset_at" not in context:
             try:

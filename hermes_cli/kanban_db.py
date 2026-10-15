@@ -1209,6 +1209,62 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
 
+def _quota_hold_path(task_id: str) -> Path:
+    return worker_logs_dir() / f"{task_id}.quota_hold.json"
+
+
+def write_worker_quota_hold(hold: dict) -> bool:
+    """Worker side: record the provider's quota verdict for the dispatcher.
+
+    The exit code carries only "rate limited"; this sidecar (task + run
+    fenced, owner-only) carries the reset time/kind. Best-effort.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not run_id or not isinstance(hold, dict):
+        return False
+    try:
+        path = _quota_hold_path(task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"run_id": int(run_id), **hold}, fh)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _consume_worker_quota_hold(task_id: str, run_id: Optional[int]) -> Optional[dict]:
+    """Dispatcher side: read and delete the sidecar; None unless run matches."""
+    try:
+        path = _quota_hold_path(task_id)
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if not isinstance(data, dict) or run_id is None:
+        return None
+    if data.get("run_id") != int(run_id):
+        return None
+    kind = data.get("kind")
+    if kind not in ("hard", "temporary"):
+        return None
+    reset_at = data.get("reset_at")
+    if isinstance(reset_at, bool) or not isinstance(reset_at, (int, float)):
+        reset_at = None
+    return {
+        "kind": kind,
+        "reset_at": int(reset_at) if reset_at else None,
+        "provider": str(data.get("provider") or "")[:80] or None,
+        "model": str(data.get("model") or "")[:120] or None,
+    }
+
+
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
 
@@ -22830,6 +22886,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                _qrow = conn.execute(
+                    "SELECT current_run_id, assignee, provider_override, "
+                    "model_override FROM tasks WHERE id = ?", (row["id"],),
+                ).fetchone()
+                _hold = _consume_worker_quota_hold(
+                    row["id"], _qrow["current_run_id"] if _qrow else None,
+                )
+                if _hold is not None and _qrow is not None:
+                    # Route the hold was earned on: a later explicit change
+                    # of executor/provider/model must not inherit it.
+                    _hold["route"] = {
+                        "assignee": _qrow["assignee"],
+                        "provider_override": _qrow["provider_override"],
+                        "model_override": _qrow["model_override"],
+                    }
+                    event_payload["quota_hold"] = _hold
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -23525,15 +23597,45 @@ def check_respawn_guard(
     #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
     ):
+        # Provider-supplied hard-quota reset: hold the same exhausted route
+        # until the reset instead of probing on the fixed cooldown. Missing
+        # / invalid / elapsed reset data falls through to the cooldown.
+        try:
+            _meta = json.loads(latest_run["metadata"] or "{}")
+            _hold = _meta.get("quota_hold") if isinstance(_meta, dict) else None
+        except (TypeError, ValueError):
+            _hold = None
+        if isinstance(_hold, dict) and _hold.get("kind") == "hard":
+            _reset = _hold.get("reset_at")
+            _route = _hold.get("route") or {}
+            _trow = conn.execute(
+                "SELECT assignee, provider_override, model_override "
+                "FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            _same_route = _trow is not None and all(
+                _trow[k] == _route.get(k)
+                for k in ("assignee", "provider_override", "model_override")
+            )
+            if not _same_route:
+                # Explicit executor/provider change: do not inherit the hold
+                # (and skip the stamped quota text in the blocker regex).
+                return None
+            if (
+                isinstance(_reset, (int, float)) and not isinstance(_reset, bool)
+                and now < int(_reset)
+                and int(_reset) - int(latest_run["ended_at"] or now)
+                <= 7 * 86400
+            ):
+                return "quota_reset_hold"
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
             # blocker_auth regex so the stamped rate-limit text doesn't
