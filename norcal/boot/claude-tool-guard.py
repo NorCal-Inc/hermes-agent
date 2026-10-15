@@ -22,7 +22,20 @@ tool = str(hook.get('tool_name') or '').strip()
 inputs = hook.get('tool_input') or {}
 
 
+workflow_warnings = []
+
 def deny(reason: str):
+    # Non-security evidence conventions are advisory under Christopher's directive.
+    advisory_reasons = (
+        'retired predecessor-system reference', 'backup-suffixed path',
+        'archive-container path', 'search pattern explicitly targets',
+        'Bash command references a .bak artifact',
+        'Bash command references an archive container',
+    )
+    if any(marker in reason for marker in advisory_reasons):
+        workflow_warnings.append(reason)
+        return
+
     print(json.dumps({
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
@@ -55,15 +68,12 @@ if not state.get('complete'):
 # and Bash are blocked from reaching these paths. Recovery is performed outside Claude or
 # only after an explicit temporary guard change authorized by Christopher.
 FORBIDDEN_PREFIXES = (
-    '/home/chris/.hermes/hermes-agent/',
     '/home/chris/.hermes/backups/',
     '/home/chris/.hermes/secrets/',
     '/home/chris/.hermes/recovered/',
     '/home/chris/.hermes/secure/',
     '/home/chris/.ssh/',
     '/home/chris/.gnupg/',
-    '/home/chris/archive/',
-    '/home/chris/hermes/repos/NorCal_Hermes/hermes_profiles_backup/',
 )
 FORBIDDEN_EXACT = {
     '/home/chris/.hermes/.env',
@@ -85,6 +95,12 @@ def path_forbidden(value: str):
     v = value.strip()
     if not v:
         return None
+    # Preserve security for credential backups even while generic backups are advisory.
+    name = PurePosixPath(v).name.lower()
+    if name == '.env' or name.startswith('.env.') or name.startswith((
+        'auth.json.', 'google_token.json.', 'google_client_secret.json.', '.credentials.json.'
+    )):
+        return f'credential-bearing path {v}'
     # Normalize only obvious absolute filesystem strings. Keep original for pattern checks.
     if v in FORBIDDEN_EXACT:
         return f'credential-bearing path {v}'
@@ -129,8 +145,7 @@ if tool == 'Bash':
     cmd = str(inputs.get('command') or '')
     low = cmd.lower()
     hard_tokens = (
-        '/home/chris/.hermes/hermes-agent/',
-        '/home/chris/.hermes/backups/',
+            '/home/chris/.hermes/backups/',
         '/home/chris/.hermes/secrets/',
         '/home/chris/.hermes/recovered/',
         '/home/chris/.hermes/secure/',
@@ -141,11 +156,7 @@ if tool == 'Bash':
         '/home/chris/.hermes/google_client_secret.json',
         '/home/chris/.hermes/google_token.json',
         '/home/chris/.claude/.credentials.json',
-        '/home/chris/archive/',
-        '/home/chris/hermes/repos/norcal_hermes/hermes_profiles_backup/',
-        'norcal-ops',
-        'norcal_ops',
-    )
+        )
     if any(t in low for t in hard_tokens):
         deny('Blocked: Bash command references a retired or recovery-only path. Retired runtime, archive, and backup trees cannot be used as normal Claude evidence.')
     # Match path-like .bak references but do not block prose such as a commit message that
@@ -160,3 +171,6 @@ if tool == 'Bash':
         deny('Blocked: Bash command references an archive container. Archives are recovery/source artifacts and excluded from normal Claude evidence unless Christopher explicitly authorizes that artifact.')
 
 # No stdout means no objection. Existing permission policy continues normally.
+
+if workflow_warnings:
+    print(json.dumps({'systemMessage': 'ADVISORY ONLY. ' + ' | '.join(workflow_warnings)}))

@@ -333,7 +333,6 @@ today = now.date().isoformat()
 blockers: list[str] = []
 warnings: list[str] = []
 CRITICAL_DOCTRINE = {
-    "doctrine_precedence.md",
     "hierarchy.md",
     "sovereignty.md",
     "data-isolation.md",
@@ -358,8 +357,8 @@ doctrine_manifest = []
 source_hash_parts = []
 constraints_body, constraints_err = read_text(BOOT_CONSTRAINTS)
 if constraints_err or not (constraints_body or "").strip():
-    blockers.append(constraints_err or f"{BOOT_CONSTRAINTS}: empty canonical boot constraints")
-    constraints_body = "# NORTH CALEDONIA SHARED BOOT CONSTRAINTS\n\nBOOT CONSTRAINTS UNAVAILABLE — STOP BEFORE TASK EXECUTION."
+    warnings.append(constraints_err or f"{BOOT_CONSTRAINTS}: empty canonical boot constraints")
+    constraints_body = "# NORTH CALEDONIA SHARED BOOT CONSTRAINTS\n\nBOOT CONSTRAINTS UNAVAILABLE — ADVISORY. VPS security controls remain enforced."
 else:
     constraints_body = constraints_body.strip()
     source_hash_parts.append(f"{BOOT_CONSTRAINTS}:{sha(BOOT_CONSTRAINTS)}")
@@ -648,13 +647,16 @@ try:
 except Exception as exc:
     operational_detail = f"unavailable: {type(exc).__name__}"
 
+if continuity_health != "PASS":
+    warnings.append("Continuity advisory (non-blocking): " + checkpoint_freshness)
+
 if operational_health != "PASS":
     warnings.append("Operational health advisory (non-blocking): " + operational_detail)
 
 fingerprint = hashlib.sha256("\n".join(source_hash_parts).encode()).hexdigest()
 boot_status = "DEGRADED — STOP BEFORE TASK EXECUTION" if blockers else "COMPLETE"
 technical_boot_health = "FAIL" if blockers else "PASS"
-ready = "YES" if technical_boot_health == "PASS" and continuity_health == "PASS" else "NO"  # Christopher 2026-10-15: operational health is warning-only
+ready = "YES" if technical_boot_health == "PASS" else "NO"  # Christopher 2026-10-15: workflow health and continuity are advisory
 failure_text = "\n".join(f"- {x}" for x in blockers) if blockers else "(none)"
 warning_text = "\n".join(f"- {x}" for x in warnings) if warnings else "(none)"
 unranked_text = ", ".join(unranked) if unranked else "(none)"
