@@ -54,9 +54,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -645,6 +647,42 @@ def _register_attachment_dir_files(conn, task_id: str) -> list[str]:
     return registered
 
 
+_CODEX_RESET_RE = re.compile(
+    r"try again at\s+(?:(?P<date>[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})\s+)?"
+    r"(?P<time>\d{1,2}:\d{2}\s*[AP]M)",
+    re.IGNORECASE,
+)
+
+
+def _parse_codex_reset_at(text: str, now: Optional[float] = None) -> Optional[int]:
+    """Epoch seconds of Codex's "try again at ..." time, or None.
+
+    Codex prints host-local wall time, e.g. "try again at 7:16 PM." or
+    "try again at Oct 17th, 2026 3:00 PM.". A bare time already past means
+    tomorrow. Anything unparseable returns None so the caller keeps the
+    existing fixed cooldown.
+    """
+    m = _CODEX_RESET_RE.search(text or "")
+    if not m:
+        return None
+    now_dt = datetime.fromtimestamp(time.time() if now is None else now).astimezone()
+    try:
+        clock = datetime.strptime(re.sub(r"\s+", " ", m.group("time").upper()), "%I:%M %p")
+        if m.group("date"):
+            month, day, year = re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group("date")).replace(",", "").split()
+            date = datetime.strptime(f"{month[:3]} {day} {year}", "%b %d %Y")
+            target = date.replace(
+                hour=clock.hour, minute=clock.minute, tzinfo=now_dt.tzinfo,
+            )
+        else:
+            target = now_dt.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+            if target <= now_dt:
+                target += timedelta(days=1)
+    except ValueError:
+        return None
+    return int(target.timestamp())
+
+
 def run_codex_verifier(task_id: str) -> int:
     """Run one independent verifier with writable scratch, read-only target access."""
     conn = kb.connect()
@@ -701,9 +739,14 @@ def run_codex_verifier(task_id: str) -> int:
             ))
             if _capacity_exhausted:
                 reason = "Codex provider capacity exhausted; deferred without failure credit"
+                reset_at = _parse_codex_reset_at(_capacity_text)
+                if reset_at:
+                    reason += time.strftime(
+                        " (provider reset %Y-%m-%d %H:%M %Z)", time.localtime(reset_at),
+                    )
                 ok = kb.defer_rate_limited_task(
                     conn, task_id, reason=reason, expected_run_id=expected_run_id,
-                    execution_id=attempt.execution_id,
+                    execution_id=attempt.execution_id, reset_at=reset_at,
                 )
                 if ok:
                     kb.add_comment(

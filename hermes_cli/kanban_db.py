@@ -11712,8 +11712,15 @@ def defer_rate_limited_task(
     reason: str,
     expected_run_id: Optional[int] = None,
     execution_id: Optional[str] = None,
+    reset_at: Optional[int] = None,
 ) -> bool:
     """Neutral-return a live task whose provider capacity is exhausted.
+
+    ``reset_at`` (epoch seconds) is the provider's own "try again at" time
+    when it gave one. It is stored as a hard ``quota_hold`` on the run so
+    :func:`check_respawn_guard` waits for the reset instead of probing on the
+    fixed cooldown (2026-10-15: two Codex verifier cards probed every 5m20s
+    for 90+ minutes against a wall that said when it would lift).
 
     This is the in-process counterpart of the worker EX_TEMPFAIL reap path:
     preserve failure counters, close the active run as ``rate_limited``,
@@ -11735,6 +11742,22 @@ def defer_rate_limited_task(
         meta = {"retry_status": retry_status, "provider_capacity": True}
         if execution_id:
             meta["execution_id"] = execution_id
+        if isinstance(reset_at, int) and not isinstance(reset_at, bool) and reset_at > 0:
+            route = conn.execute(
+                "SELECT assignee, provider_override, model_override FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            meta["quota_hold"] = {
+                "kind": "hard",
+                "reset_at": int(reset_at),
+                "provider": "codex",
+                "model": None,
+                "route": {
+                    "assignee": route["assignee"],
+                    "provider_override": route["provider_override"],
+                    "model_override": route["model_override"],
+                },
+            }
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, last_failure_error = ? WHERE id = ? AND status = 'running'",
@@ -13423,6 +13446,66 @@ def _retire_unroutable_recheck(
 _VERIFIER_RESPAWN_GUARD_AUTHOR = "verifier-respawn-guard"
 _VERIFIER_NO_RESULT_KINDS = ("verification_blocker_returned", "verifier_verdict_unreadable")
 _VERIFIER_SYSTEM_AUTHORS = ("verifier-return-path", _VERIFIER_RESPAWN_GUARD_AUTHOR)
+# Consecutive FAIL verdicts after which the subject is held for a person.
+VERIFIER_REPEATED_FAIL_LIMIT = 2
+# Executor / automation authors whose comments do NOT release a repeated-FAIL
+# hold: the implementer restating its own work is what the loop was made of.
+_REPEATED_FAIL_NON_RELEASING_AUTHORS = frozenset({
+    *_VERIFIER_SYSTEM_AUTHORS, "atlas-codex-lane", "default", "worker", "codex",
+    "dispatcher", "recovery-lane", "orphan-verifier-watchdog", "queue-hygiene",
+    "system-health-controller",
+})
+
+
+def _repeated_fail_anchor(conn: sqlite3.Connection, subject_id: str) -> Optional[int]:
+    """Event id of the latest FAIL when the subject has failed independent
+    verification ``VERIFIER_REPEATED_FAIL_LIMIT`` times in a row, else None.
+
+    Christopher, 2026-10-15: no resource-draining loops. t_7b593c5f failed
+    verification nine times in 20 minutes on one missing workstation file;
+    each FAIL reopened a paid implementer run that could not produce it, then
+    a new verifier. A PASS, an unblock, or a comment from a non-executor
+    author (a person saying what changed) resets the count.
+
+    Only applies while ``objective_attempt_budget_mode`` is advisory (the live
+    board since 2026-10-15). In enforce mode the objective attempt ceiling is
+    already the brake and keeps its own, tested semantics.
+    """
+    if objective_attempt_budget_enforced():
+        return None
+    assignee_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (subject_id,)
+    ).fetchone()
+    assignee = assignee_row["assignee"] if assignee_row else None
+    fails = 0
+    anchor: Optional[int] = None
+    for ev in conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND kind IN "
+        "('verification_failed', 'verification_passed', 'commented', 'unblocked') "
+        "ORDER BY id DESC LIMIT 500",
+        (subject_id,),
+    ).fetchall():
+        kind = ev["kind"]
+        if kind == "verification_failed":
+            fails += 1
+            if anchor is None:
+                anchor = int(ev["id"])
+            continue
+        if kind in ("verification_passed", "unblocked"):
+            break
+        try:
+            author = json.loads(ev["payload"] or "{}").get("author")
+        except (ValueError, AttributeError):
+            author = None
+        author = str(author or "")
+        if (
+            author
+            and author not in _REPEATED_FAIL_NON_RELEASING_AUTHORS
+            and author != assignee
+            and not author.startswith("claude-lane")
+        ):
+            break
+    return anchor if fails >= VERIFIER_REPEATED_FAIL_LIMIT else None
 
 
 def _verifier_respawn_guard_anchor(
@@ -13437,6 +13520,9 @@ def _verifier_respawn_guard_anchor(
     (the dispatch path, which also records the refusal) answer from this one
     predicate so they can never disagree about whether the guard is holding.
     """
+    repeated_fail = _repeated_fail_anchor(conn, subject_id)
+    if repeated_fail is not None:
+        return repeated_fail
     last = conn.execute(
         "SELECT id FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
         "ORDER BY id DESC LIMIT 1",
@@ -13498,13 +13584,23 @@ def _verifier_respawn_unchanged(conn: sqlite3.Connection, subject_id: str) -> bo
                 conn, subject_id, "verifier_respawn_refused_unchanged",
                 {"last_no_result_event": anchor},
             )
-            add_comment(
-                conn, subject_id, _VERIFIER_RESPAWN_GUARD_AUTHOR,
-                "Re-verification refused: the last verifier returned no verdict "
-                "and nothing has changed since. Fix the blocker, then post a "
-                "comment saying what changed; that comment releases one new "
-                "verifier.",
-            )
+            if _repeated_fail_anchor(conn, subject_id) == anchor:
+                text = (
+                    f"Held: independent verification failed "
+                    f"{VERIFIER_REPEATED_FAIL_LIMIT} times in a row. No further "
+                    "rework run or verifier will start on its own. Read the latest "
+                    "verifier finding, fix what it names (often an outside input "
+                    "only a person can supply), then post a comment saying what "
+                    "changed; that comment releases one new attempt."
+                )
+            else:
+                text = (
+                    "Re-verification refused: the last verifier returned no verdict "
+                    "and nothing has changed since. Fix the blocker, then post a "
+                    "comment saying what changed; that comment releases one new "
+                    "verifier."
+                )
+            add_comment(conn, subject_id, _VERIFIER_RESPAWN_GUARD_AUTHOR, text)
     return True
 
 
@@ -18537,6 +18633,10 @@ def record_verification(
     )
     if not route_on_failure:
         # Verdict is durable; the task stays in review and stays non-complete.
+        return True, VERIFICATION_FAILED
+    # Repeated FAIL: hold in review for a person instead of reopening another
+    # paid rework run against the same finding. Records the hold once.
+    if _verifier_respawn_unchanged(conn, task_id) and _repeated_fail_anchor(conn, task_id):
         return True, VERIFICATION_FAILED
 
     # Route to repair/rework. Both helpers open their own write transaction,
