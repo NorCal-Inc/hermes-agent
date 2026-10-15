@@ -6141,6 +6141,26 @@ def run_conversation(
                         "error": _nonretryable_summary,
                     }
 
+                # A confirmed hard quota wall (usage_limit_reached / verified
+                # billing) cannot clear inside the retry window, so repeating
+                # the identical request only burns requests. Jump to the
+                # terminal/fallback handling below; temporary 429s keep the
+                # normal backoff retries, and a recoverable credential pool
+                # still gets its rotation.
+                if retry_count < max_retries and not classified.billing_unverified:
+                    _hard_hold = build_quota_hold(
+                        classified, provider=_provider, model=_model,
+                        error_context=error_context,
+                    )
+                    if (
+                        _hard_hold
+                        and _hard_hold["kind"] == "hard"
+                        and not _ra()._pool_may_recover_from_rate_limit(
+                            agent._credential_pool,
+                        )
+                    ):
+                        retry_count = max_retries
+
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
