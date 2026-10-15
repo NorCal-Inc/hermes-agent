@@ -24965,8 +24965,24 @@ def _worker_hermes_argv() -> list[str]:
     runs 2814/2816/2817 skipped the executor-lane bypass and ran as unscoped
     ``default`` agents. The running interpreter has already imported
     ``hermes_cli``, so the module form is always a working Hermes.
+
+    The worker runs with ``cwd`` set to the task workspace, and ``-m`` puts
+    the cwd first on ``sys.path``. A task checkout that carries its own
+    ``hermes_cli`` would therefore shadow the dispatcher's package and the
+    worker would run that stale launch/handoff/budget code instead of the
+    trusted runtime. The bootstrap drops the implicit cwd entry and pins
+    the dispatcher's own package root first; the workspace stays the
+    process cwd for tools (TERMINAL_CWD / HERMES_KANBAN_WORKSPACE).
     """
-    return _module_hermes_argv()
+    root = str(Path(__file__).resolve().parent.parent)
+    bootstrap = (
+        "import sys;"
+        "sys.path[:]=[p for p in sys.path if p!=''];"
+        f"sys.path.insert(0,{root!r});"
+        "sys.argv[0]='hermes_cli.main';"
+        "from hermes_cli.main import main;main()"
+    )
+    return [sys.executable, "-c", bootstrap]
 
 
 KANBAN_WORKER_QUERY_PREFIX = "work kanban task "

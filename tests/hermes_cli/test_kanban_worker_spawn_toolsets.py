@@ -305,7 +305,7 @@ def test_default_spawn_never_launches_worker_through_path_wrapper(monkeypatch, t
 
     captured = _spawn_capturing(monkeypatch, tmp_path, kb)
 
-    assert captured["cmd"][:3] == [sys.executable, "-m", "hermes_cli.main"]
+    assert captured["cmd"][:2] == [sys.executable, "-c"]
     assert str(wrapper) not in captured["cmd"]
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert captured["cmd"][-2:] == ["-q", "work kanban task t_spawn_tools"]
@@ -322,5 +322,5 @@ def test_default_spawn_ignores_hermes_bin_wrapper_for_workers(monkeypatch, tmp_p
 
     captured = _spawn_capturing(monkeypatch, tmp_path, kb)
 
-    assert captured["cmd"][:3] == [sys.executable, "-m", "hermes_cli.main"]
+    assert captured["cmd"][:2] == [sys.executable, "-c"]
     assert str(wrapper) not in captured["cmd"]
