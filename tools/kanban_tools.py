@@ -2645,9 +2645,11 @@ KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), 'approval_required' (Christopher must approve/deny), "
+        "Set ``kind`` to say which: 'dependency' (waiting on a LINKED parent "
+        "task that is still open — goes to todo and auto-resumes when that "
+        "task finishes, no human needed; if no linked parent is actually "
+        "open it is treated as a real blocker and counted by the loop "
+        "breaker), 'needs_input' (you need a human decision/answer), 'approval_required' (Christopher must approve/deny), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "

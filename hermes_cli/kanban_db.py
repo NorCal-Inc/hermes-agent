@@ -16783,6 +16783,18 @@ def block_task(
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
 
+      That park is only taken when the graph actually has an unsatisfied
+      parent, judged by the same :func:`_parents_satisfied` predicate
+      ``recompute_ready`` would use to release it. A ``dependency`` report
+      with no linked parent (or only done/archived ones) has nothing to wait
+      for: ``todo`` would be promoted on the very next tick and re-spawn a
+      paid worker with no changed prerequisite (t_4c41cdde, 2026-10-15: four
+      identical dependency waits ~1 min apart, thirteen attempts burned,
+      zero ``task_links`` rows). Such a report is routed like a truly-blocked
+      kind below — through the loop counter and, on repeat, to the existing
+      ``record_block_loop_repair`` gate — while still *holding* (not rolling
+      back) effects the run already applied, as every dependency wait does.
+
     * ``needs_input`` / ``approval_required`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
@@ -16830,11 +16842,22 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        # Dependency blocks backed by a real unsatisfied parent never enter
+        # the human ``blocked`` bucket — they wait in ``todo`` and let
+        # ``recompute_ready`` gate on parents. Routing here (rather than
+        # ``blocked``) is what keeps a cron from ever seeing a dependency-wait
+        # as something to "unblock".
+        #
+        # The predicate is read-only and evaluated BEFORE the fenced UPDATE,
+        # so a stale ``expected_run_id`` still changes nothing either way.
+        # When every parent is already satisfied (or there is none), the
+        # ``todo`` park would be undone by the next ``recompute_ready`` tick
+        # and the worker re-spawned with nothing changed, so the report falls
+        # through to the loop-accounted path below instead.
+        dependency_wait = (
+            kind == "dependency" and not _parents_satisfied(conn, task_id)
+        )
+        if dependency_wait:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -16892,6 +16915,12 @@ def block_task(
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
+        # A dependency report that reached this path has no unsatisfied parent
+        # to wait for. It is loop-accounted like any other blocker, but the
+        # run's already-applied effects are still held for the replacement run
+        # to adopt (never rolled back) — identical to a genuine dependency wait.
+        orphan_dependency = kind == "dependency"
+        dependency_effect_policy = "hold" if orphan_dependency else None
         # An infrastructure-class block (the control plane ended the executor —
         # timeout, stale, lost controller) is not the work re-blocking for the
         # same cause, and must never count toward the loop. On 2026-09-14 an
@@ -16924,21 +16953,23 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=reason, effect_policy=dependency_effect_policy,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
+            loop_payload = {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "limit": BLOCK_RECURRENCE_LIMIT,
+                "source_status": source_status,
+            }
+            if orphan_dependency:
+                loop_payload["unsatisfied_parents"] = 0
             _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "source_status": source_status,
-                },
+                conn, task_id, "block_loop_detected", loop_payload,
                 run_id=run_id,
             )
         else:
@@ -16978,7 +17009,7 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=reason, effect_policy=dependency_effect_policy,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -16994,6 +17025,8 @@ def block_task(
                 "recurrences": recurrences,
                 "source_status": source_status,
             }
+            if orphan_dependency:
+                blocked_payload["unsatisfied_parents"] = 0
             if event_payload_extra:
                 blocked_payload.update(event_payload_extra)
             _append_event(

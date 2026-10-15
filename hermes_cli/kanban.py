@@ -701,7 +701,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
+            "when linked parents finish, no human) only while a linked parent "
+            "is still open — otherwise it is a real blocker and counts toward "
+            "the loop breaker; 'needs_input'/'capability' go to "
             "blocked for a human; 'approval_required' means Christopher must approve/deny; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
@@ -2888,8 +2890,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                # Report where the task actually landed — dependency blocks go
-                # to todo, and a tripped unblock-loop breaker routes to triage.
+                # Report where the task actually landed — dependency blocks
+                # backed by an open parent go to todo (otherwise they land in
+                # blocked), and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
                 where = landed.status if landed else "blocked"
                 suffix = f": {reason}" if reason else ""

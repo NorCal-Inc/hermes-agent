@@ -76,6 +76,12 @@ def test_dependency_wait_holds_then_replacement_adopts_and_reclaim_rolls_back(co
     tid, run1 = _claimed(conn)
     path, _ = _applied_file_effect(conn, tmp_path, tid, run1)
 
+    # A genuine dependency wait: the parent is still open when the running
+    # child reports it (t_3e640c71 — a dependency report with no unsatisfied
+    # parent no longer parks in todo, so the wait must be backed by the graph).
+    parent = kb.create_task(conn, title="prerequisite", assignee="worker", gauntlet=False)
+    kb.link_tasks(conn, parent_id=parent, child_id=tid)
+
     assert kb.block_task(
         conn,
         tid,
@@ -87,7 +93,15 @@ def test_dependency_wait_holds_then_replacement_adopts_and_reclaim_rolls_back(co
     assert effect_states(conn, task_id=tid, run_id=run1) == ["held"]
     assert path.exists()
 
-    assert kb.recompute_ready(conn) == 1
+    # Parent still open: nothing to promote, and the effect stays held.
+    assert kb.recompute_ready(conn) == 0
+    assert effect_states(conn, task_id=tid, run_id=run1) == ["held"]
+
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+    assert kb.claim_task(conn, parent, claimer="worker") is not None
+    assert kb.complete_task(conn, parent, result="done")
+    assert kb.get_task(conn, tid).status == "ready"
     host = kb._claimer_id().split(":", 1)[0]
     task2 = kb.claim_task(conn, tid, claimer=f"{host}:replacement")
     assert task2 is not None and task2.current_run_id is not None
