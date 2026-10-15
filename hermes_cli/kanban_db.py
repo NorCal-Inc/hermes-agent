@@ -13961,6 +13961,10 @@ def _parse_verifier_verdict(*texts: Optional[str]) -> Optional[str]:
     return found.pop()
 
 
+#: Cap on the failed verifier's finding copied to the subject's thread.
+_VERIFIER_FAIL_DETAIL_CHARS = 6000
+
+
 def _return_verifier_verdict_to_subjects(
     conn: sqlite3.Connection,
     verifier_task_id: str,
@@ -14111,6 +14115,23 @@ def _return_verifier_verdict_to_subjects(
                             "regression_declared": bool(regression),
                         },
                     )
+                    if not passed:
+                        # record_verification keeps only the generic reason, so
+                        # the next worker would never see WHY it failed. Carry
+                        # the verifier's own bounded, redacted finding on the
+                        # subject's comment thread, which worker context reads.
+                        finding = redact_review_value((result or summary or "").strip())
+                        if finding:
+                            if len(finding) > _VERIFIER_FAIL_DETAIL_CHARS:
+                                finding = (
+                                    finding[:_VERIFIER_FAIL_DETAIL_CHARS]
+                                    + "… [truncated]"
+                                )
+                            add_comment(
+                                conn, subject_id, "verifier-return-path",
+                                f"Independent verifier {verifier_task_id} returned "
+                                f"FAIL. Verifier finding (verbatim, bounded):\n\n{finding}",
+                            )
                 # A successful independent PASS is the final authority needed
                 # by a parked Gauntlet subject. Finalize it immediately through
                 # the ordinary guarded completion path instead of requiring a

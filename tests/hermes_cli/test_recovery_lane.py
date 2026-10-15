@@ -1272,3 +1272,55 @@ def test_verifier_context_names_subject_workspace_as_readonly_target_distinct_fr
     assert str(source) in prompt
     assert str(scratch) != str(source)
     assert "verifier-scratch" not in ctx
+
+
+def test_real_failed_verifier_finding_reaches_next_direct_launch(kanban_home, monkeypatch):
+    """The detailed FAIL travels verifier child -> return hook -> next prompt.
+
+    Nothing is inserted into the subject's comments by the test: the finding
+    arrives only through the verifier child's completion and the real return
+    hook in ``complete_task``.
+    """
+    finding = "Profile matrix omits 5 of 32 profiles"
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="Matrix work", assignee="default", tenant="co-a",
+            body="ORIGINAL-BODY", gauntlet=True,
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+        )
+        other = kb.create_task(conn, title="UNRELATED-CARD-TITLE", assignee="default", tenant="co-b")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.add_attachment(
+            conn, tid, filename="EVIDENCE.md",
+            stored_path=f"/tmp/{tid}/EVIDENCE.md", size=10, uploaded_by="claude-lane",
+        )
+        assert kb.request_review(
+            conn, tid, summary="done", expected_run_id=claimed.current_run_id,
+        ) is True
+        child = kb._open_verifier_child(conn, tid)
+        assert child is not None
+        vrun = kb.claim_task(conn, child)
+        assert vrun is not None
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, child, "codex_verifier_started", {"executor": "codex"},
+                run_id=vrun.current_run_id,
+            )
+        long_tail = "X" * 20000
+        assert kb.complete_task(
+            conn, child,
+            summary=f"{finding}\nVERDICT: FAIL",
+            result=f"Detail: {finding}.\nVERDICT: FAIL\n{long_tail}",
+            expected_run_id=vrun.current_run_id,
+        ) is True
+        # The real hook routed the subject back to rework by itself.
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.claim_task(conn, tid)
+
+    prompt = _capture_direct_claude_prompt(monkeypatch, tid)["prompt"]
+    assert finding in prompt
+    assert "returned FAIL" in prompt
+    assert "UNRELATED-CARD-TITLE" not in prompt
+    assert len(prompt) < 120_000
+    assert long_tail not in prompt
