@@ -1,6 +1,10 @@
 {
   "alert_target": "telegram:-1003786882754",
-  "kanban_card_invariants": ["company_isolation"],
+  "kanban_card_invariants": ["company_isolation", "critical_cron_jobs_healthy"],
+  "automatic_shared_repair_invariants": ["critical_cron_jobs_healthy"],
+  "health_repair_adoptions": {
+    "critical_cron_jobs_healthy:nuclear_backup": "t_9f9e4769"
+  },
   "boot_gate_command": null,
   "gateway_heartbeat_max_age_seconds": 180,
   "state_model": "governed_exceptions",

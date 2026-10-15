@@ -24,7 +24,8 @@ Automatic recovery is limited to verifier-routing damage:
 | `verifier_route_open` | light | open the codex_verify child (`_ensure_independent_verifier_child`) for a subject in review whose evidence the gate accepts |
 | `subject_lane_relabelled` | light | `restore_relabelled_subject_lane` |
 | `verifier_child_deadlocked` | light | add the `verifies` relation to a card whose title is unambiguously a verification card and whose assignee is not the implementer |
-| `subject_review_regressed`, `gateway_heartbeat_fresh`, `critical_cron_jobs_healthy`, `controller_heartbeat_fresh_deep` | light | escalate only |
+| `subject_review_regressed`, `gateway_heartbeat_fresh`, `controller_heartbeat_fresh_deep` | light | escalate only |
+| `critical_cron_jobs_healthy` | light | bounded built-in recovery first; unresolved shared routine faults route to one runnable Gauntlet maintenance card per invariant+job episode |
 | `verifier_of_verifier`, `verified_closure_attributable`, `critical_timers_active`, `canonical_boot_complete`, `runtime_ceilings_match_doctrine`, `controller_heartbeat_fresh_light` | deep | escalate only |
 
 ### F1 detect-only invariants (Christopher, 2026-09-14)
@@ -64,6 +65,25 @@ escalated at once. Filenames are never recorded — card ids and counts only.
 
 `recovery_classes` in `health-controller.json` lists six bounded classes. Christopher authorized them live on 2026-09-19 under their existing allowlists, bounds and postconditions. Each class runs only when `enabled: true`, `authorized_by` is set and `authorization_sha256` equals `recovery_authorization_digest(name, spec)`; invalid authorization runs nothing and reports `recovery_class_authorization_valid` (DEGRADED). Recovery is attempted before escalation. Controller-created health cards automatically archive through the governed `overtaken_by_events` path after the underlying detector is verified clear. Telegram escalation is reserved for unresolved, refused, unsafe, or out-of-authority conditions. Print them with
 `venv/bin/python norcal/health/system_health_controller.py recoveries`.
+
+### Shared routine-maintenance routing (Christopher, 2026-10-15)
+
+`automatic_shared_repair_invariants` is a separate authorization allowlist from
+`kanban_card_invariants`; a detector becoming card-visible does not itself grant
+privileged execution. The initial authorized class is
+`critical_cron_jobs_healthy`. Its escalation key is invariant+subject, so two
+signatures for one job (for example `last_status:error` and `failure_streak`)
+share one assigned `claude`-lane Gauntlet card. Worker evidence must pass through
+the existing independent verifier return path; FAIL returns the same card for
+material repair. Fresh detector evidence, not a worker success assertion,
+resolves the finding.
+
+`health_repair_adoptions` is an explicit episode-to-task map for already-open
+manual repairs. Adoption additionally requires durable human-interactive/manual-
+relay provenance, a shared tenant, an assigned Claude maintenance lane, an
+active status, and Gauntlet enforcement. Titles and bodies are never searched.
+Company-route findings, accepted exceptions, and genuine human/MFA/security
+waits remain outside automatic dispatch.
 
 | Class | Detector condition | Mutation | Postcondition |
 |---|---|---|---|

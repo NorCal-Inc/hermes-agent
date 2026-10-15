@@ -19,9 +19,10 @@ detected condition to an actionable disposition::
   verifier child with the ``verifies`` relation.
 * REVALIDATE reruns exactly that invariant's check. The fingerprint must be gone.
 * GREEN is silent. A finding still present with budget left CONTINUES next cycle.
-* ESCALATE happens exactly once per fingerprint: one governed triage card
-  (stable idempotency key, system provenance, ``defect:`` authority, so nothing
-  dispatches automatically) and one delivery-checked alert. Automatic mutation
+* ESCALATE happens exactly once per fingerprint and sends one delivery-checked
+  alert. Explicitly authorized shared routine failures use one runnable
+  Gauntlet maintenance card per invariant+subject episode; all other carded
+  findings retain conservative triage behavior. Automatic controller mutation
   stops for that fingerprint until the condition clears.
 
 No LLM is involved. Alerts and cards carry identifiers, statuses and failure
@@ -1372,6 +1373,58 @@ def card_body(finding: Finding, rec: dict, reason: str) -> str:
         "records the condition clearing on its own; this card needs a "
         "governed decision.",
     ])
+
+
+def _automatic_shared_repair_invariants(ctx: Context) -> set[str]:
+    """Shared invariants explicitly authorized for runnable maintenance work.
+
+    This is deliberately separate from ``kanban_card_invariants``. The latter
+    is the legacy alert/triage allowlist; adding an invariant there must never
+    silently grant an automated privileged executor.
+    """
+    configured = ctx.config.get("automatic_shared_repair_invariants", [])
+    if isinstance(configured, str):
+        configured = [configured]
+    return {str(value) for value in (configured or [])}
+
+
+def _health_episode_key(finding: Finding) -> str:
+    """Stable repair episode key; sibling signatures share one worker."""
+    return f"health:{finding.invariant}:{finding.subject}"
+
+
+def _configured_health_adoption(ctx: Context, finding: Finding) -> Optional[str]:
+    """Return a safely pre-authorized active repair card for this episode.
+
+    Adoption is explicit configuration plus durable task provenance. We do not
+    search titles or bodies: prose similarity is not authority and can capture
+    a company-private or unrelated task.
+    """
+    adoptions = ctx.config.get("health_repair_adoptions", {})
+    if not isinstance(adoptions, dict):
+        return None
+    task_id = str(adoptions.get(f"{finding.invariant}:{finding.subject}") or "").strip()
+    if not task_id:
+        return None
+    kb = _kb()
+    with ctx.kanban() as conn:
+        row = conn.execute(
+            "SELECT id, status, tenant, assignee, executor_lane, gauntlet_enforced, "
+            "actor_kind, creation_cause FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        safe = (
+            row["status"] in {"ready", "running", "blocked", "review"}
+            and row["tenant"] is None
+            and bool(row["assignee"])
+            and row["executor_lane"] == kb.EXECUTOR_LANE_CLAUDE
+            and bool(row["gauntlet_enforced"])
+            and row["actor_kind"] == kb.ACTOR_KIND_HUMAN_INTERACTIVE
+            and row["creation_cause"] == kb.CREATION_CAUSE_MANUAL_RELAY
+        )
+        return row["id"] if safe else None
 
 
 # ---------------------------------------------------------------------------
@@ -4296,9 +4349,20 @@ def make_alert_sender(target: Optional[str]) -> Callable[[str, str], tuple[bool,
 def kanban_repair_card(
     ctx: Context, finding: Finding, rec: dict, reason: str,
 ) -> tuple[Optional[str], bool]:
-    """One governed triage card per fingerprint; never dispatched automatically."""
+    """Create one governed response per health episode.
+
+    Explicitly authorized shared routine failures become runnable Gauntlet
+    maintenance cards. Everything else retains the conservative historical
+    triage behavior. Episode identity is invariant+subject, not signature, so
+    sibling signatures for one cron job cannot spawn multiple workers.
+    """
     kb = _kb()
-    key = f"health:{finding.invariant}:{finding.fingerprint}"
+    automatic = finding.invariant in _automatic_shared_repair_invariants(ctx)
+    key = _health_episode_key(finding) if automatic else f"health:{finding.invariant}:{finding.fingerprint}"
+    if automatic:
+        adopted = _configured_health_adoption(ctx, finding)
+        if adopted:
+            return adopted, False
     with ctx.kanban() as conn:
         existing = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
@@ -4307,12 +4371,24 @@ def kanban_repair_card(
         ).fetchone()
         if existing is not None:
             return existing["id"], False
+        body = card_body(finding, rec, reason)
+        if automatic:
+            body += "\n\n" + "\n".join([
+                "Authorized shared routine-maintenance route.",
+                "Diagnose the current technical cause; do not request human input for a permission, configuration, tool, or environment fault.",
+                "Self-verify against fresh system evidence, then submit through the Gauntlet for independent verification.",
+                "A failed verdict returns concrete repair work to this same card; do not spawn an identical worker.",
+                "Company-private findings, real MFA/security authorization waits, and accepted exceptions are outside this route.",
+            ])
         card_id = kb.create_task(
             conn,
             title=f"Health controller: {finding.invariant} on {finding.subject}",
-            body=card_body(finding, rec, reason),
-            assignee=None,
-            triage=True,
+            body=body,
+            assignee="default" if automatic else None,
+            triage=not automatic,
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE if automatic else None,
+            gauntlet=True if automatic else None,
+            priority=200 if automatic else 0,
             created_by=CONTROLLER_ID,
             idempotency_key=key,
             provenance=kb.ActorProvenance(
