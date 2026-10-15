@@ -1146,3 +1146,129 @@ def test_recovery_executor_uses_distinct_supervisor_command_classes(monkeypatch)
     assert calls[0][1]["task_id"] == "t_recover"
     assert calls[1][0] == "codex.recovery"
     assert calls[1][1]["task_id"] == "t_recover"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-15 t_8d1e8152: direct executors get CURRENT card context
+# ---------------------------------------------------------------------------
+
+def _capture_direct_claude_prompt(monkeypatch, tid):
+    seen = {}
+
+    def fake_invoke(prompt, cwd, timeout, *, task_id=None):
+        seen["prompt"], seen["cwd"] = prompt, cwd
+        return recovery_lane.AttemptResult(
+            "claude", 0, '{"result":"done"}', "", execution_id="x_fake",
+            execution_status=recovery_lane.ex.STATUS_COMPLETED,
+        )
+
+    monkeypatch.setattr(recovery_lane, "_claim_direct_claude_attempt", lambda c, t, r: True)
+    monkeypatch.setattr(recovery_lane, "_invoke_claude", fake_invoke)
+    assert recovery_lane.run_claude_executor(tid) == 0
+    return seen
+
+
+def test_direct_executor_prompt_carries_current_board_context_across_fail_rework(
+    kanban_home, monkeypatch, tmp_path,
+):
+    source = tmp_path / "real-source"
+    source.mkdir()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="Resubmit quota work", assignee="default", tenant="co-a",
+            body="ORIGINAL-BODY: resubmit the unchanged patch 822fefa.",
+            workspace_kind="dir", workspace_path=str(source),
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+        )
+        other = kb.create_task(
+            conn, title="UNRELATED-CARD-TITLE", assignee="default", tenant="co-b",
+            body="OTHER-TENANT-BODY",
+        )
+        kb.add_comment(conn, other, "christopher", "OTHER-TENANT-DIRECTIVE")
+        kb.add_comment(conn, tid, "atlas", "REVIEWER-FAIL: evidence missing owner browser step")
+        kb.add_comment(conn, tid, "christopher", "NEW-DIRECTIVE: hard quota, ONE request only")
+        att = kb.task_attachments_dir(tid) / "evidence.txt"
+        att.parent.mkdir(parents=True, exist_ok=True)
+        att.write_text("x")
+        kb.add_attachment(
+            conn, tid, filename="evidence.txt", stored_path=str(att), size=1,
+        )
+        assert kb.claim_task(conn, tid)
+
+    first = _capture_direct_claude_prompt(monkeypatch, tid)["prompt"]
+    assert "ORIGINAL-BODY" in first
+    assert "NEW-DIRECTIVE: hard quota, ONE request only" in first
+    assert "REVIEWER-FAIL" in first
+    assert str(att) in first
+    assert str(source) in first
+    # newest directive outranks the original body in the rendered prompt
+    assert first.index("NEW-DIRECTIVE") < first.index("ORIGINAL-BODY")
+    for leaked in ("UNRELATED-CARD-TITLE", "OTHER-TENANT", "Recent work by"):
+        assert leaked not in first
+
+    # FAIL -> rework: a changed comment, a new attachment and a new workspace.
+    source2 = tmp_path / "reworked-source"
+    source2.mkdir()
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "christopher", "SECOND-DIRECTIVE: attach owner-browser proof")
+        att2 = kb.task_attachments_dir(tid) / "proof2.txt"
+        att2.write_text("y")
+        kb.add_attachment(conn, tid, filename="proof2.txt", stored_path=str(att2), size=1)
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(source2), tid))
+        conn.commit()
+        # The first launch already closed its run; record a handoff claim on
+        # it and send the card back to ready as a reviewer FAIL would.
+        conn.execute(
+            "UPDATE task_runs SET summary='PRIOR-HANDOFF-CLAIM' WHERE task_id=?", (tid,))
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.claim_task(conn, tid)
+
+    second = _capture_direct_claude_prompt(monkeypatch, tid)["prompt"]
+    assert "SECOND-DIRECTIVE: attach owner-browser proof" in second
+    assert second.index("SECOND-DIRECTIVE") < second.index("NEW-DIRECTIVE")
+    assert str(att2) in second and str(source2) in second
+    assert "PRIOR-HANDOFF-CLAIM" in second
+    assert "UNRELATED-CARD-TITLE" not in second
+
+
+def test_direct_executor_context_is_bounded(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="storm", assignee="default", body="B" * 100_000,
+            executor_lane=kb.EXECUTOR_LANE_CLAUDE,
+        )
+        for i in range(200):
+            kb.add_comment(conn, tid, "christopher", f"c{i} " + "z" * 50_000)
+        task = kb.get_task(conn, tid)
+        ctx = recovery_lane._task_context(conn, task)
+    assert 0 < len(ctx) < 120_000
+    assert len(recovery_lane._build_claude_task_prompt(task, ctx)) < 125_000
+
+
+def test_verifier_context_names_subject_workspace_as_readonly_target_distinct_from_scratch(
+    kanban_home, tmp_path,
+):
+    source = tmp_path / "subject-src"
+    source.mkdir()
+    scratch = tmp_path / "verifier-scratch"
+    scratch.mkdir()
+    with kb.connect_closing() as conn:
+        subj = kb.create_task(
+            conn, title="subject", assignee="default", body="impl",
+            workspace_kind="dir", workspace_path=str(source),
+        )
+        ver = kb.create_task(
+            conn, title="verify", assignee="atlas", body="verify it",
+            workspace_kind="dir", workspace_path=str(scratch), parents=[subj],
+        )
+        kb.add_task_relation(conn, ver, subj, kb.RELATION_VERIFIES)
+        ctx = recovery_lane._verifier_subject_context(conn, ver)
+        vtask = kb.get_task(conn, ver)
+    assert f"Subject workspace (the real source under verification): {source}" in ctx
+    assert "READ-ONLY" in ctx and "separate scratch" in ctx
+    prompt = recovery_lane._build_codex_verifier_prompt(vtask, "", ctx)
+    assert str(source) in prompt
+    assert str(scratch) != str(source)
+    assert "verifier-scratch" not in ctx

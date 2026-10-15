@@ -25731,7 +25731,9 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(
+    conn: sqlite3.Connection, task_id: str, *, isolated: bool = False,
+) -> str:
     """Return the full text a worker should read to understand its task.
 
     Order:
@@ -25755,6 +25757,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     All caps exist so worker prompts stay bounded even on pathological
     boards (retry-heavy tasks, comment storms). The per-field char cap
     prevents a single 1 MB summary from dominating context.
+
+    ``isolated=True`` omits the sections that reach beyond this card (the
+    assignee's cross-task role history and the lessons pointer) for
+    executors that must see only their own card's context.
     """
     task = get_task(conn, task_id)
     if not task:
@@ -25839,7 +25845,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # can inject the corpus, so approving lessons can never reintroduce bulk
     # loading -- which is the property the previous ``_CTX_MAX_LESSONS`` cap
     # did not have.
-    corpus_size = count_lessons(conn)
+    corpus_size = 0 if isolated else count_lessons(conn)
     if corpus_size:
         lines.append("## If you hit an error")
         lines.append(
@@ -25987,7 +25993,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
+    if task.assignee and not isolated:
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "

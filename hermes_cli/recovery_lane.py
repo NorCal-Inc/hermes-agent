@@ -207,7 +207,23 @@ def _build_repair_prompt(task: kb.Task, prior_evidence: Optional[str] = None) ->
     return "\n".join(lines)
 
 
-def _build_claude_task_prompt(task: kb.Task) -> str:
+def _task_context(conn, task: kb.Task) -> str:
+    """This card's current board context, bounded by build_worker_context.
+
+    Incident 2026-10-15: the prompt carried only the original body, so later
+    operator corrections, the reviewer's FAIL, the prior handoff and
+    attachments never reached the direct executor and it resubmitted the
+    same work. The existing worker-context renderer already orders operator
+    directives above the body and caps every field; reuse it, minus the
+    sections that reach into other cards.
+    """
+    try:
+        return kb.build_worker_context(conn, task.id, isolated=True).strip()
+    except Exception:
+        return ""
+
+
+def _build_claude_task_prompt(task: kb.Task, context: str = "") -> str:
     return "\n".join([
         "You are the direct Claude Code executor for one Hermes Kanban task.",
         "Do the task itself; do not create or manage Kanban cards. The wrapper",
@@ -217,8 +233,16 @@ def _build_claude_task_prompt(task: kb.Task) -> str:
         f"Task title: {task.title}",
         f"Tenant: {task.tenant or 'shared / none'}",
         "",
-        "Task body / acceptance criteria:",
-        task.body or "(no body)",
+        *(
+            [
+                "Current task context (supplied by the Hermes launcher from the live board; "
+                "newest operator directives and the latest reviewer verdict supersede the "
+                "original body; prior handoffs are claims, not proof):",
+                context,
+            ]
+            if context
+            else ["Task body / acceptance criteria:", task.body or "(no body)"]
+        ),
         "",
         "Execution rules:",
         "- Work only within the authority/scope stated in the task body.",
@@ -324,6 +348,16 @@ def _verifier_subject_context(conn, task_id: str) -> str:
                 f"Title: {subject.title}",
                 f"Status: {subject.status}; assignee: {subject.assignee or '-'}; "
                 f"tenant: {subject.tenant or 'shared / none'}",
+                *(
+                    [
+                        f"Subject workspace (the real source under verification): {subject.workspace_path}",
+                        "This path is an authorized READ-ONLY verification target: inspect and run "
+                        "read-only checks against it, but do not write to it. Your own working "
+                        "directory is separate scratch and is not the subject.",
+                    ]
+                    if subject.workspace_path
+                    else []
+                ),
                 "Body:",
                 _clip(subject.body or "(no body)", _SUBJECT_TEXT_CAP),
                 "Latest handoff summary (the implementer's own claim; verify it, do not trust it):",
@@ -767,7 +801,7 @@ def run_claude_executor(task_id: str) -> int:
         )
         before = _snapshot_workspace(str(harvest_root)) if track_files else {}
         attempt = _invoke_claude(
-            _build_claude_task_prompt(task), cwd, timeout, task_id=task_id,
+            _build_claude_task_prompt(task, _task_context(conn, task)), cwd, timeout, task_id=task_id,
         )
 
         # ``attempt.ok`` rather than ``returncode == 0``: the supervisor's
