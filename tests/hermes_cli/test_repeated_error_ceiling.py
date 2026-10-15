@@ -163,6 +163,22 @@ class TestItTellsTheAgentWhereToLook:
 
 
 class TestTheTwoBrakesAreIndependent:
+    def test_repeated_error_brake_remains_binding_in_attempt_advisory_mode(
+        self, conn, monkeypatch
+    ):
+        monkeypatch.setattr(
+            kb,
+            "_board_kanban_cfg",
+            lambda: {"objective_attempt_budget_mode": "advisory"},
+        )
+        tid = _ready_task(conn)
+        for i in range(kb.repeated_error_limit()):
+            _failed_run(conn, tid, SAME.format(n=i))
+        assert kb.claim_task(conn, tid) is None
+        assert conn.execute(
+            "SELECT block_kind FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["block_kind"] == kb.BLOCK_KIND_ERROR_RECURRED
+
     #: Genuinely different failures. An earlier version of this test used
     #: "distinct failure number {i}", which differs only by a digit — and
     #: digits are stripped before matching, so all of them normalised to one

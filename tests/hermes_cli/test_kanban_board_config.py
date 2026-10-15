@@ -33,3 +33,14 @@ def test_missing_board_config_is_harmless(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "nowhere"))
     assert kb._kanban_cfg(lambda: None) == {}
     assert kb._kanban_cfg(lambda: {"kanban": {"x": 1}}) == {"x": 1}
+
+
+def test_budget_authority_ignores_worker_profile_override(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    _write(root / "config.yaml", "kanban:\n  gauntlet_objective_attempt_limit: 12\n  objective_attempt_budget_mode: advisory\n")
+    prof = root / "profiles" / "operations_worker"
+    _write(prof / "config.yaml", "kanban:\n  gauntlet_objective_attempt_limit: 6\n  objective_attempt_budget_mode: enforce\n")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    assert kb.gauntlet_objective_attempt_limit() == 12
+    assert kb.objective_attempt_budget_mode() == "advisory"

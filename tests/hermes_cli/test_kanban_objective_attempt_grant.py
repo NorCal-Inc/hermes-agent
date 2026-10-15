@@ -124,6 +124,36 @@ def test_history_keeps_counting_and_a_second_exhaustion_blocks_again(kanban_home
         assert ceiling[-1]["attempts"] == 9 and ceiling[-1]["limit"] == 9
 
 
+def test_recorded_board_base_survives_unreadable_config(kanban_home, monkeypatch):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  gauntlet_objective_attempt_limit: 12\n", encoding="utf-8"
+    )
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="authorized fifteen", assignee="default")
+        payload = _grant(conn, tid)
+        assert payload["base_limit"] == 12
+        _spend(conn, tid, 14)
+        before = (kb.gauntlet_objective_attempts(conn, tid), _grant_events(conn, tid))
+        monkeypatch.setattr(kb, "_board_kanban_cfg", lambda: {})
+        assert kb.effective_objective_attempt_limit(conn, tid) == 15
+        assert kb.claim_task(conn, tid) is not None
+        assert before == (14, 1)
+
+
+def test_advisory_mode_preserves_accounting_but_does_not_block(kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  gauntlet_objective_attempt_limit: 2\n  objective_attempt_budget_mode: advisory\n",
+        encoding="utf-8",
+    )
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="advisory objective", assignee="default")
+        _spend(conn, tid, 2)
+        assert kb._objective_attempt_ceiling_reached(conn, tid)[:3] == (True, 2, 2)
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.gauntlet_objective_attempts(conn, tid) == 3
+        assert kb.get_task(conn, tid).block_kind is None
+
+
 # 5 ------------------------------------------------------------------------------
 @pytest.mark.parametrize("env, who", [
     ({**OPERATOR, "HERMES_KANBAN_TASK": "t_x"}, "Christopher"),

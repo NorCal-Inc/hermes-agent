@@ -1342,6 +1342,18 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
     return s
 
 
+def _board_kanban_cfg() -> dict:
+    """Read board-authoritative rules, independent of the active worker profile."""
+    try:
+        import yaml
+        cfg_path = kanban_home() / "config.yaml"
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        section = data.get("kanban") if isinstance(data, dict) else None
+        return dict(section) if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
 def _kanban_cfg(loader=None) -> dict:
     """The effective ``kanban:`` config section for board rules.
 
@@ -1351,17 +1363,7 @@ def _kanban_cfg(loader=None) -> dict:
     config has no ``kanban:`` section, so without the base they silently used code
     defaults (attempt limit 6 instead of the board's 12, 2026-10-05).
     """
-    base: dict = {}
-    try:
-        import yaml
-        cfg_path = kanban_home() / "config.yaml"
-        if cfg_path.exists():
-            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-            k = data.get("kanban") if isinstance(data, dict) else None
-            if isinstance(k, dict):
-                base = dict(k)
-    except Exception:
-        base = {}
+    base = _board_kanban_cfg()
     overlay: dict = {}
     try:
         if loader is None:
@@ -9934,19 +9936,30 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT = 6
+OBJECTIVE_ATTEMPT_BUDGET_MODE_ENFORCE = "enforce"
+OBJECTIVE_ATTEMPT_BUDGET_MODE_ADVISORY = "advisory"
 
 
 def gauntlet_objective_attempt_limit() -> int:
-    """Total implementation+review+verifier run ceiling for one Gauntlet objective."""
+    """Board-authoritative implementation+review+verifier run ceiling."""
     try:
-        from hermes_cli.config import load_config_readonly
-        raw = _kanban_cfg(load_config_readonly).get(
+        raw = _board_kanban_cfg().get(
             "gauntlet_objective_attempt_limit", GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
         )
         value = int(raw)
         return value if value >= 1 else GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
     except Exception:
         return GAUNTLET_OBJECTIVE_ATTEMPT_LIMIT_DEFAULT
+
+
+def objective_attempt_budget_mode() -> str:
+    """Board-scoped admission mode; worker profile config cannot override it."""
+    raw = str(_board_kanban_cfg().get(
+        "objective_attempt_budget_mode", OBJECTIVE_ATTEMPT_BUDGET_MODE_ENFORCE
+    )).strip().lower()
+    if raw == OBJECTIVE_ATTEMPT_BUDGET_MODE_ADVISORY:
+        return raw
+    return OBJECTIVE_ATTEMPT_BUDGET_MODE_ENFORCE
 
 
 #: Bound on lineage walks. A cycle is already impossible-by-construction here
@@ -10239,9 +10252,25 @@ def objective_attempt_grants(conn: sqlite3.Connection, task_id: str) -> list[dic
 
 def effective_objective_attempt_limit(conn: sqlite3.Connection, task_id: str) -> int:
     """Base board limit plus this objective's operator grants."""
-    return gauntlet_objective_attempt_limit() + sum(
-        g["added_attempts"] for g in objective_attempt_grants(conn, task_id)
-    )
+    grants = objective_attempt_grants(conn, task_id)
+    # A grant records the board base the human authorized. If a later worker
+    # cannot read board config, never reinterpret that durable authorization
+    # against the smaller code default.
+    authorized_bases: list[int] = []
+    for grant in grants:
+        recorded_base = grant.get("base_limit")
+        if (
+            isinstance(recorded_base, int)
+            and not isinstance(recorded_base, bool)
+            and recorded_base >= 1
+        ):
+            authorized_bases.append(recorded_base)
+    base = max([gauntlet_objective_attempt_limit(), *authorized_bases])
+    return base + sum(g["added_attempts"] for g in grants)
+
+
+def objective_attempt_budget_enforced() -> bool:
+    return objective_attempt_budget_mode() == OBJECTIVE_ATTEMPT_BUDGET_MODE_ENFORCE
 
 
 def _process_ancestry() -> list[int]:
@@ -11240,10 +11269,11 @@ def claim_task(
         except sqlite3.OperationalError as exc:
             if "execution_effects" not in str(exc):
                 raise
-        # Universal safety control -- deliberately NOT gated on
-        # ``_gauntlet_objective_scoped``. Every task gets brakes.
+        # Board policy may temporarily make this unproved non-security counter
+        # advisory. Accounting still advances and the repeated-error brake below
+        # remains binding.
         reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
-        if reached:
+        if reached and objective_attempt_budget_enforced():
             _block_objective_attempt_ceiling(conn, task_id)
             return None
         # Same error over and over is a wrong fix, not progress. Checked
@@ -11442,9 +11472,9 @@ def claim_review_task(
         except sqlite3.OperationalError as exc:
             if "execution_effects" not in str(exc):
                 raise
-        # Universal safety control -- see claim_task.
+        # Board-scoped mode is shared with ordinary worker admission.
         reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, task_id)
-        if reached:
+        if reached and objective_attempt_budget_enforced():
             _block_objective_attempt_ceiling(conn, task_id)
             return None
         # Same error over and over is a wrong fix, not progress. Checked
@@ -13462,11 +13492,10 @@ def _ensure_independent_verifier_child(
     durable evidence changes what "falsifiable" means for delegation cards,
     and that is a governance decision, not a code bypass.
     """
-    # Universal safety control -- see claim_task. Spawning another verifier is
-    # itself an attempt against the subject's objective, so the budget is
-    # checked before the spawn regardless of enforcement policy.
+    # Same board-scoped policy as worker and review admission. In advisory mode
+    # the count remains visible but does not prevent independent verification.
     reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, subject_id)
-    if reached:
+    if reached and objective_attempt_budget_enforced():
         with write_txn(conn):
             _block_objective_attempt_ceiling(conn, subject_id)
         return None

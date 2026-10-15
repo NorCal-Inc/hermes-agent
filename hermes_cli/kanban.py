@@ -2951,6 +2951,8 @@ def _cmd_attempt_budget(args: argparse.Namespace) -> int:
             "attempts": kb.gauntlet_objective_attempts(conn, root),
             "base_limit": kb.gauntlet_objective_attempt_limit(),
             "effective_limit": kb.effective_objective_attempt_limit(conn, root),
+            "mode": kb.objective_attempt_budget_mode(),
+            "enforced": kb.objective_attempt_budget_enforced(),
             "grants": kb.objective_attempt_grants(conn, root),
             "granted_now": granted,
             "failure_basis": kb._safe_objective_failure_basis(conn, root),
@@ -2960,7 +2962,7 @@ def _cmd_attempt_budget(args: argparse.Namespace) -> int:
     else:
         print(f"objective {root}: {report['attempts']} attempts, effective limit "
               f"{report['effective_limit']} (base {report['base_limit']} + "
-              f"{len(report['grants'])} grant(s))")
+              f"{len(report['grants'])} grant(s)); mode {report['mode']}")
         print(kb._describe_failure_basis(report["failure_basis"]))
         if granted:
             print(f"granted +{granted['added_attempts']} by {granted['authorized_by']}: "
