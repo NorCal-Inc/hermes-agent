@@ -20057,8 +20057,11 @@ class BlockLoopRepairRequired(ValueError):
     is diagnosed, repaired and re-run through the Gauntlet, never bounced
     back to the work pool unchanged. On t_4c41cdde a status-only specify
     sent the card back with the root cause unrepaired and four more runs
-    spent the attempt budget. Every triage exit for such a card now needs a
-    ``block_loop_repaired`` event newer than its latest loop detection.
+    spent the attempt budget. Every triage exit back to work (specify,
+    decompose, dashboard status moves) now needs a ``block_loop_repaired``
+    event newer than its latest loop detection. Archiving (closing the card)
+    and ``verification_lane_restored`` (a real verifier verdict sends the
+    card to review, not back to work) are deliberately not gated.
     """
 
 
@@ -20344,6 +20347,8 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        if block_loop_repair_pending(conn, task_id):
+            raise BlockLoopRepairRequired(_block_loop_refusal(task_id))
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree

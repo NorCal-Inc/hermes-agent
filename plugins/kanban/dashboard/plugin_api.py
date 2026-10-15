@@ -1633,6 +1633,15 @@ def _set_status_direct(
         if prev is None:
             return False
 
+        if (
+            prev["status"] == "triage"
+            and new_status != "triage"
+            and kanban_db.block_loop_repair_pending(conn, task_id)
+        ):
+            raise HTTPException(
+                status_code=409, detail=kanban_db._block_loop_refusal(task_id)
+            )
+
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(
                 conn, task_id, prev["current_run_id"]

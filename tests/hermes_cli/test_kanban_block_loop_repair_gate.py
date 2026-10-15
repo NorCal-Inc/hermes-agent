@@ -106,3 +106,27 @@ def test_repair_refused_when_no_loop(kanban_home):
         with pytest.raises(ValueError):
             _repair(conn, tid)
         assert kb.specify_triage_task(conn, tid, title="ok", body="b") is True
+
+
+def test_decompose_txn_refuses_block_loop_card(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _looped_task(conn)
+        with pytest.raises(kb.BlockLoopRepairRequired):
+            kb.decompose_triage_task(
+                conn, tid, root_assignee=None, children=[{"title": "c1", "body": "b"}], author="claude"
+            )
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_dashboard_drag_refuses_block_loop_card(kanban_home):
+    from fastapi import HTTPException
+    from plugins.kanban.dashboard import plugin_api
+    with kb.connect_closing() as conn:
+        tid = _looped_task(conn)
+        for target in ("ready", "todo", "scheduled"):
+            with pytest.raises(HTTPException) as exc:
+                plugin_api._set_status_direct(conn, tid, target)
+            assert exc.value.status_code == 409
+        assert kb.get_task(conn, tid).status == "triage"
+        _repair(conn, tid)
+        assert plugin_api._set_status_direct(conn, tid, "todo") is True
