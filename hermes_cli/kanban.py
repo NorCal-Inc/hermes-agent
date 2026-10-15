@@ -869,6 +869,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restore the classic lifecycle (the verification ledger is kept).",
     )
 
+    p_loop = sub.add_parser(
+        "loop-repair",
+        help="Record the repair of a block-loop triage card (required "
+             "before it can leave triage); also turns the Gauntlet on",
+    )
+    p_loop.add_argument("task_id")
+    p_loop.add_argument("--root-cause", required=True,
+                        help="Why the card kept blocking")
+    p_loop.add_argument("--change", required=True,
+                        help="What was changed to fix it")
+    p_loop.add_argument("--check", required=True,
+                        help="The check that proved the fix works")
+    p_loop.add_argument("--author", default=None)
+
     p_exec = sub.add_parser(
         "exec",
         help="Inspect and control governed executor processes",
@@ -1566,6 +1580,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reopen-review":  _cmd_reopen_review,
             "verify":   _cmd_verify,
             "gauntlet": _cmd_gauntlet,
+            "loop-repair": _cmd_loop_repair,
             "exec":     _dispatch_exec,
             "lesson-promote": _cmd_lesson_promote,
             "lesson-record-error": _cmd_lesson_record_error,
@@ -1650,6 +1665,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "notify-unsubscribe",
     "specify",
     "decompose",
+    "loop-repair",
     "gc",
 })
 
@@ -3135,6 +3151,25 @@ def _cmd_gauntlet(args: argparse.Namespace) -> int:
                 print(f"cannot set gauntlet enforcement for {tid} (unknown id)",
                       file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_loop_repair(args: argparse.Namespace) -> int:
+    author = getattr(args, "author", None) or _profile_author()
+    try:
+        with kb.connect_closing() as conn:
+            kb.record_block_loop_repair(
+                conn, args.task_id,
+                root_cause=args.root_cause, change=args.change,
+                check=args.check, author=author,
+            )
+    except ValueError as exc:
+        print(f"kanban: loop-repair refused: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Loop repair recorded for {args.task_id}; Gauntlet ON. "
+        f"It can now leave triage (hermes kanban specify {args.task_id})."
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------

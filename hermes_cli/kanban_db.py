@@ -20049,6 +20049,104 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+class BlockLoopRepairRequired(ValueError):
+    """A block-loop card tried to leave triage with no recorded repair.
+
+    ``block_task`` routes a task to triage after ``BLOCK_RECURRENCE_LIMIT``
+    same-cause blocks. Christopher's rule (2026-10-14): a twice-blocked card
+    is diagnosed, repaired and re-run through the Gauntlet, never bounced
+    back to the work pool unchanged. On t_4c41cdde a status-only specify
+    sent the card back with the root cause unrepaired and four more runs
+    spent the attempt budget. Every triage exit for such a card now needs a
+    ``block_loop_repaired`` event newer than its latest loop detection.
+    """
+
+
+def block_loop_repair_pending(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's latest ``block_loop_detected`` has no later
+    ``block_loop_repaired`` event."""
+    row = conn.execute(
+        "SELECT MAX(id) AS loop_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'block_loop_detected'",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["loop_id"] is None:
+        return False
+    repaired = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'block_loop_repaired' AND id > ? LIMIT 1",
+        (task_id, row["loop_id"]),
+    ).fetchone()
+    return repaired is None
+
+
+def _block_loop_refusal(task_id: str) -> str:
+    return (
+        f"{task_id} reached triage through the block loop and has no "
+        f"recorded repair. Diagnose the repeated blocker, fix it, check the "
+        f"fix, then run: hermes kanban loop-repair {task_id} --root-cause ... "
+        f"--change ... --check ..."
+    )
+
+
+def record_block_loop_repair(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    root_cause: str,
+    change: str,
+    check: str,
+    author: str,
+) -> None:
+    """Record the repair of a block-loop card and arm the Gauntlet on it.
+
+    Requires the task to sit in triage with an unrepaired loop detection and
+    all of root cause, change made, and the check that proved it. Does not
+    move the task: ``specify_triage_task`` remains the only exit, and it
+    now consults this record. Raises ``ValueError`` on any missing piece.
+    """
+    fields = {
+        "root_cause": (root_cause or "").strip(),
+        "change": (change or "").strip(),
+        "check": (check or "").strip(),
+    }
+    missing = [name for name, value in fields.items() if not value]
+    if missing:
+        raise ValueError("loop repair needs " + ", ".join(missing))
+    author = (author or "").strip()
+    if not author:
+        raise ValueError("loop repair needs an author")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        if row["status"] != "triage" or not block_loop_repair_pending(conn, task_id):
+            raise ValueError(
+                f"{task_id} has no unrepaired block loop in triage "
+                f"(status={row['status']!r})"
+            )
+        conn.execute(
+            "UPDATE tasks SET gauntlet_enforced = 1 WHERE id = ?", (task_id,)
+        )
+        _append_event(conn, task_id, "block_loop_repaired", {**fields, "author": author})
+        _append_event(conn, task_id, "gauntlet_enforcement", {"enabled": True})
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                author,
+                "Block-loop repair recorded.\n"
+                f"Root cause: {fields['root_cause']}\n"
+                f"Change: {fields['change']}\n"
+                f"Check: {fields['check']}",
+                int(time.time()),
+            ),
+        )
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -20073,6 +20171,9 @@ def specify_triage_task(
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
+
+    Raises ``BlockLoopRepairRequired`` for a block-loop card with no
+    recorded repair (see ``record_block_loop_repair``).
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -20084,6 +20185,8 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        if block_loop_repair_pending(conn, task_id):
+            raise BlockLoopRepairRequired(_block_loop_refusal(task_id))
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []

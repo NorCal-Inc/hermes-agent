@@ -283,12 +283,15 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        loop_pending = task is not None and kb.block_loop_repair_pending(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if loop_pending:
+        return DecomposeOutcome(task_id, False, kb._block_loop_refusal(task_id))
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
