@@ -1276,3 +1276,67 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_request_changes: standalone-review-card FAIL routes to a repair
+# ---------------------------------------------------------------------------
+
+
+def test_request_changes_tool_routes_standalone_review_to_repair(
+    monkeypatch, tmp_path,
+):
+    """A worker claimed on a STANDALONE review card (its run was never
+    claimed from the review lane) calls kanban_request_changes and gets
+    routed to a new repair task for the parent instead of a tool_error,
+    per doctrine operations.md 2a ("fix it, restart it, do not park it")."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        subject_id = kb.create_task(conn, title="implementation", assignee="worker")
+        kb.claim_task(conn, subject_id)
+        kb.complete_task(conn, subject_id, summary="done", result="done")
+
+        review_id = kb.create_task(
+            conn, title=f"Independent review: {subject_id}", assignee="reviewer",
+        )
+        kb.link_tasks(conn, subject_id, review_id)
+        claimed = kb.claim_task(conn, review_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review_id)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_request_changes({
+        "reason": "missing required field X in the deliverable",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d.get("status") == "todo"
+    repair_id = d.get("repair_id")
+    assert repair_id
+
+    conn = kb.connect()
+    try:
+        review_row = kb.get_task(conn, review_id)
+        assert review_row.status == "todo"
+        assert review_row.block_kind is None
+        assert repair_id in kb.parent_ids(conn, review_id)
+        relations = {
+            r["relation"]: r["to_task_id"]
+            for r in kb.task_relations(conn, repair_id)
+        }
+        assert relations.get(kb.RELATION_REPAIRS) == subject_id
+    finally:
+        conn.close()

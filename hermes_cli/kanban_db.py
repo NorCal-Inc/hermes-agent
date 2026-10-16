@@ -7954,6 +7954,271 @@ def create_repair_task(
     return task_id
 
 
+#: Fixed idempotency key for the one durable umbrella every auto-created
+#: repair is organised under. Deliberately a single well-known constant
+#: (not derived per-caller) so every repair route in the codebase --
+#: ordinary error/verification-FAIL repairs (t_5d7e889e) and standalone
+#: review-FAIL repairs (this module) alike -- converges on the SAME card
+#: instead of each minting its own "Operational Error Repairs" look-alike.
+OPERATIONAL_ERROR_REPAIRS_IDEMPOTENCY_KEY = "umbrella:operational-error-repairs"
+OPERATIONAL_ERROR_REPAIRS_TITLE = "Operational Error Repairs"
+
+
+def ensure_operational_error_repairs_umbrella(
+    conn: sqlite3.Connection,
+    *,
+    owner: str = "erika",
+) -> str:
+    """Return the id of the durable "Operational Error Repairs" umbrella.
+
+    Creates it on first use via ``create_task``'s ``idempotency_key``, which
+    already makes concurrent callers converge on one row rather than two
+    (see ``create_task``'s idempotency lookup, executed before the write
+    transaction). Every subsequent call -- from any repair-creating call
+    site, in this module or any sibling one -- returns the same id.
+
+    This is the ONE shared helper for the umbrella convention Christopher
+    settled on t_520b2cdc (owner='erika', one durable umbrella card, reused
+    for all auto repairs): do not let a second call site mint its own
+    idempotency key or its own "Operational Error Repairs"-shaped card, or
+    the two can drift (e.g. different umbrella_id values for logically the
+    same programme). If another caller already created this card under the
+    same key, this returns its existing id without creating a duplicate.
+
+    The umbrella card itself is deliberately NOT created with
+    ``recovery_owner``/``cause=recovery`` -- ``create_task``'s own repair-
+    linkage guard (the one ``create_repair_task`` relies on) requires
+    ``repairs_task_id`` AND ``umbrella_task_id`` on any card that declares
+    itself a repair (arms on recovery_owner, cause='recovery', or either
+    linkage id). The umbrella is the thing repairs point AT, not a repair
+    itself -- it has no subject and no umbrella of its own, so tagging it
+    as a repair would make this very call raise ``RecoveryLinkageError``.
+    ``owner`` is recorded in the body text for a human reader; the card's
+    structural ownership is plain ``created_by``/provenance, same as any
+    other non-repair card.
+    """
+    return create_task(
+        conn,
+        title=OPERATIONAL_ERROR_REPAIRS_TITLE,
+        body=(
+            "Durable umbrella for every auto-created repair card: ordinary "
+            "task errors, failing verification verdicts, and standalone "
+            "review-card FAILs routed back to their parent. One card, "
+            "reused indefinitely -- never archive this card while any "
+            "repair still points at it.\n\n"
+            f"Recovery owner convention for repairs under this umbrella: "
+            f"{owner or 'erika'}."
+        ),
+        idempotency_key=OPERATIONAL_ERROR_REPAIRS_IDEMPOTENCY_KEY,
+        provenance=ActorProvenance(
+            kind=ACTOR_KIND_SYSTEM,
+            actor_id="kanban:ensure_operational_error_repairs_umbrella",
+            lane=None,
+            run_id=None,
+            cause=CREATION_CAUSE_AUTOMATED,
+        ),
+    )
+
+
+class StandaloneReviewRoutingError(RuntimeError):
+    """A standalone review card's FAIL could not be routed to a repair.
+
+    Raised (never silently swallowed) when the review card's parent cannot
+    be resolved unambiguously, or when :func:`create_repair_task` itself
+    refuses (``RecoveryLinkageError``). Either way the review card's own
+    state is left exactly as it was -- no partial mutation -- so a caller
+    that catches this can report "the repair loop could NOT start" instead
+    of leaving the board in an ambiguous half-routed state.
+    """
+
+
+def route_standalone_review_fail(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    reason: str,
+    findings: Optional[str] = None,
+    owner: str = "erika",
+    provenance: Optional[ActorProvenance] = None,
+) -> tuple[bool, Optional[str]]:
+    """Route a FAIL on a STANDALONE review card to a repair of its parent.
+
+    The gap this closes: :func:`request_changes` is legal only for a run
+    claimed FROM the review lane (``claimed`` event payload
+    ``source_status='review'`` -- see that function's docstring). A
+    standalone review card -- an ordinary task whose job is reviewing its
+    PARENT's output, linked via a plain ``task_links`` edge rather than
+    having itself been parked in ``status='review'`` -- can never satisfy
+    that, so it has no legal route back and the only remaining move used to
+    be ``kanban_block(reason=needs_input)``, parking it for a human. Live
+    example: ``t_e54d47a7`` did exactly that and a human had to manually fix
+    the parent's content and unblock it. Christopher's standing directive
+    (operations.md 2a, "fix it, restart it, do not park it") forbids that
+    for a machine-fixable defect.
+
+    This is an ADDITIONAL route, not a change to :func:`request_changes` --
+    the in-place ``claimed from review`` path and its guard are completely
+    untouched by this function.
+
+    Steps, all inside one write transaction so a partial failure leaves the
+    review card exactly as it was:
+
+    1. Resolve the review card's single ``task_links`` parent (the subject
+       being reviewed). Zero or more-than-one parents is refused rather than
+       guessed -- a human should pick the right one, this is not that case
+       (see ``StandaloneReviewRoutingError``).
+    2. Resolve/create the durable "Operational Error Repairs" umbrella via
+       :func:`ensure_operational_error_repairs_umbrella`, in its own
+       transaction (``create_task`` manages that itself).
+    3. Create a repair card for the PARENT via :func:`create_repair_task`,
+       carrying the reviewer's exact findings/required-changes verbatim as
+       its body. This also runs in its own transaction -- ``create_repair_task``
+       already opens ``write_txn(conn)`` internally without
+       ``allow_nested=True``, so it must be called from OUTSIDE any
+       transaction this function holds open, not nested inside one (nesting
+       would raise ``RuntimeError: write_txn: already inside a
+       transaction``). If it raises ``RecoveryLinkageError`` no repair/link
+       was created (its own transaction already rolled that back) and this
+       function re-raises as :class:`StandaloneReviewRoutingError` before
+       touching the review card at all, so the review card's run/claim state
+       is provably untouched.
+    4. Link the repair -> review-card as a ``task_links`` dependency edge
+       (parent_id=repair, child_id=review_task_id): the SAME mechanism
+       ``_parents_satisfied``/``recompute_ready`` already use everywhere
+       else in this codebase for "don't run until this other task finishes,
+       then promote automatically". No second gating mechanism is invented.
+       ``link_tasks`` also manages its own transaction -- called here after
+       the repair exists, also outside any transaction this function holds.
+    5. Reset the review card's run/claim state (mirrors the pattern
+       :func:`request_changes` already uses at its own claim-reset: closes
+       the active run, clears ``claim_lock``/``claim_expires``/
+       ``worker_pid``) and set its status to ``'todo'`` so it is gated on
+       the repair rather than immediately re-runnable. ``_end_run`` and
+       ``_append_event`` do NOT manage their own transactions (both are
+       documented as "called from within an already-open txn"), so THIS is
+       the one step that legitimately needs this function's own
+       ``write_txn(conn)`` block -- grouping the run-close, status update,
+       and event emission as a single atomic commit.
+    6. Call :func:`recompute_ready` (outside the transaction, per that
+       function's contract) so the review card is correctly NOT ready until
+       the repair resolves.
+    7. Emit a durable ``standalone_review_fail_routed_to_repair`` event on
+       the review card (inside the same transaction as step 5).
+
+    Note on atomicity: steps 2-4 (umbrella, repair, link) and step 5 (review
+    card reset) are now THREE separate commits rather than one, because
+    ``create_repair_task`` and ``link_tasks`` are reused verbatim (unmodified,
+    so the kernel-sibling repair path -- t_5d7e889e -- converges on the exact
+    same primitives) and neither accepts ``allow_nested``. The repair card
+    existing without yet having gated the review card is a safe intermediate
+    state (worst case on a crash between steps 4 and 5: an extra repair card
+    points at the subject but the review card is still ``running`` with its
+    original claim -- recoverable, not a lost-state hazard), which is the
+    tradeoff accepted here rather than changing ``create_repair_task``/
+    ``link_tasks`` (both relied on elsewhere) to support nesting.
+
+    Never produces ``block_kind='needs_input'`` or any gave-up-to-human
+    state -- this stays entirely inside the no-cap repair loop.
+
+    Returns ``(True, repair_task_id)`` on success, or ``(False, detail)`` on
+    a refusal where nothing was mutated (e.g. ambiguous parent count).
+    """
+    reason_text = str(redact_review_value(reason or "")).strip()
+    if not reason_text:
+        return False, "reason is required"
+    findings_text = str(redact_review_value(findings or "")).strip()
+
+    review_row = conn.execute(
+        "SELECT id, title FROM tasks WHERE id = ?", (review_task_id,),
+    ).fetchone()
+    if review_row is None:
+        return False, "review task not found"
+
+    parents = parent_ids(conn, review_task_id)
+    if len(parents) != 1:
+        return False, (
+            f"review card {review_task_id!r} has {len(parents)} task_links "
+            f"parent(s); routing a standalone review FAIL requires exactly "
+            f"one unambiguous parent (the subject being reviewed)"
+        )
+    subject_id = parents[0]
+    subject_row = conn.execute(
+        "SELECT id, title FROM tasks WHERE id = ?", (subject_id,),
+    ).fetchone()
+    if subject_row is None:
+        return False, f"review parent {subject_id!r} not found"
+
+    body = (
+        f"Repair requested by independent review {review_task_id} "
+        f"(\"{review_row['title']}\") of this task's output.\n\n"
+        f"Reviewer finding (verbatim):\n{reason_text}"
+        + (f"\n\nRequired changes:\n{findings_text}" if findings_text else "")
+    )
+
+    # Steps 2-4 each manage their own transaction (create_task/
+    # create_repair_task/link_tasks all open write_txn(conn) internally
+    # without allow_nested=True) -- calling them from inside a second
+    # write_txn here would raise "already inside a transaction". Run them
+    # sequentially, outside any transaction this function holds open; see
+    # the "Note on atomicity" above for the accepted intermediate-state
+    # tradeoff.
+    umbrella_id = ensure_operational_error_repairs_umbrella(conn, owner=owner)
+    try:
+        repair_id = create_repair_task(
+            conn,
+            title=f"Repair: {subject_row['title']}",
+            subject_id=subject_id,
+            owner=owner,
+            umbrella_id=umbrella_id,
+            body=body,
+            evidence_ids=[review_task_id],
+            provenance=provenance,
+        )
+    except RecoveryLinkageError as exc:
+        # create_repair_task's own transaction already unwound (no orphan
+        # card), so the review card's state (run, claim, status) is provably
+        # unchanged -- nothing partial survives.
+        raise StandaloneReviewRoutingError(
+            f"could not create a repair for {subject_id!r}: {exc}"
+        ) from exc
+
+    # Gate the review card on the repair using the SAME dependency
+    # mechanism every other "wait for X, then auto-promote" relationship
+    # in this codebase already uses.
+    link_tasks(conn, repair_id, review_task_id)
+
+    # _end_run/_append_event do not manage their own transactions (both are
+    # documented as "called from within an already-open txn"), so this is
+    # the one block that legitimately needs this function's own write_txn.
+    with write_txn(conn):
+        run_id = _end_run(
+            conn,
+            review_task_id,
+            outcome="standalone_review_fail_routed",
+            status="todo",
+            summary=reason_text,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (review_task_id,),
+        )
+        _append_event(
+            conn,
+            review_task_id,
+            "standalone_review_fail_routed_to_repair",
+            {
+                "repair_id": repair_id,
+                "subject_id": subject_id,
+                "umbrella_id": umbrella_id,
+                "reason": reason_text,
+            },
+            run_id=run_id,
+        )
+    recompute_ready(conn)
+    return True, repair_id
+
+
 # ---------------------------------------------------------------------------
 # SESSION-INDEPENDENT OWNERSHIP
 # ---------------------------------------------------------------------------

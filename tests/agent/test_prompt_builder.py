@@ -34,6 +34,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    KANBAN_GUIDANCE,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -54,6 +55,25 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_kanban_guidance_block_step_matches_operations_2a(self):
+        """Doctrine operations.md 2a ("fix it, restart it, do not park it",
+        Christopher directive 2026-10-16) replaced the old "block on genuine
+        ambiguity" wording, which told a worker to block on a UX choice or
+        waiting on peer output — both now explicitly forbidden reasons to
+        block. The new step must carry that substance and the old permissive
+        phrasing must be gone."""
+        # Old permissive phrasing removed: it used to instruct blocking WHEN
+        # facing "UX choice" / "peer output you need first" ambiguity.
+        assert "UX choice, paywalled source, peer output you" not in KANBAN_GUIDANCE
+        assert "Block on genuine ambiguity" not in KANBAN_GUIDANCE
+        # New substance present: no attempt cap, search-first, standalone
+        # review routing, newest-decision-wins on conflicts.
+        assert "no attempt cap" in KANBAN_GUIDANCE
+        assert "standalone review" in KANBAN_GUIDANCE.lower()
+        assert "newest dated decision wins" in KANBAN_GUIDANCE
+        assert "Never block on UX choice" in KANBAN_GUIDANCE
+
 
 
 # =========================================================================

@@ -1054,6 +1054,46 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
+                # "active run was not claimed from review" is request_changes'
+                # refusal for a STANDALONE review card -- one that reviews a
+                # parent's output without itself having been claimed from the
+                # review lane (e.g. t_e54d47a7). That used to leave the
+                # reviewer no legal route except kanban_block(needs_input),
+                # parking it for a human on a machine-fixable defect
+                # (doctrine operations.md 2a, "fix it, restart it, do not
+                # park it"). Route it to a repair of the parent instead.
+                if detail and "not claimed from review" in str(detail):
+                    try:
+                        routed_ok, routed_detail = kb.route_standalone_review_fail(
+                            conn,
+                            tid,
+                            reason=reason,
+                            findings=None,
+                            owner="erika",
+                        )
+                    except kb.StandaloneReviewRoutingError as exc:
+                        return tool_error(
+                            f"kanban_request_changes: could not route "
+                            f"standalone review FAIL to a repair: {exc}"
+                        )
+                    if not routed_ok:
+                        return tool_error(
+                            f"kanban_request_changes: could not route "
+                            f"standalone review FAIL to a repair: "
+                            f"{routed_detail or 'unknown refusal'}"
+                        )
+                    landed = kb.get_task(conn, tid)
+                    return _ok(
+                        task_id=tid,
+                        repair_id=routed_detail,
+                        status=landed.status if landed else "todo",
+                        message=(
+                            "standalone review card routed to a new repair "
+                            f"task ({routed_detail}); this review will rerun "
+                            "automatically once that repair is done, "
+                            "verified and completed"
+                        ),
+                    )
                 return tool_error(
                     f"could not request changes for {tid}: {detail or 'invalid review state'}"
                 )
