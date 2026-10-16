@@ -7837,6 +7837,202 @@ def orphaned_repair_tasks(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
+_REPAIR_NEW_APPROACH_PREFIX = (
+    "Previous repair recorded no change or an identical change; "
+    "take a different approach."
+)
+
+
+def _start_verifier_fail_repair(
+    conn: sqlite3.Connection,
+    subject_id: str,
+    findings: str,
+    *,
+    prefix: Optional[str] = None,
+) -> Optional[str]:
+    """Open a governed repair card for a subject that keeps FAILING verification.
+
+    Kernel part 3 (t_6450901b). Same call shape as the breaker-trip repair in
+    ``_record_task_failure`` (part 1): ``create_repair_task`` on the
+    ``claude_recovery`` lane with the no-op gate, a ``task_links`` edge
+    repair -> subject, and a ``repair_started`` event. Never ``needs_input``.
+    Must be called outside any open write transaction. Returns the repair id
+    (an already-open repair is reused, never duplicated), or None when the
+    repair could not be linked (``repair_start_failed`` is recorded).
+    """
+    row = conn.execute(
+        "SELECT title, assignee FROM tasks WHERE id = ?", (subject_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    existing_repairs = task_relations(
+        conn, subject_id, relation=RELATION_REPAIRS, direction="to",
+    )
+    for rel in existing_repairs:
+        st = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (rel["from_task_id"],)
+        ).fetchone()
+        if st is not None and st["status"] not in ("done", "archived"):
+            return rel["from_task_id"]
+    owner = (row["assignee"] or "").strip() or "default"
+    umbrella = relation_targets(conn, subject_id, RELATION_UMBRELLA)
+    attempt = len(existing_repairs) + 1
+    finding_text = (findings or "").strip()[:4000] or "independent verification failed"
+    body = (
+        (f"{prefix}\n\n" if prefix else "")
+        + f"Independent verification of {subject_id} failed "
+        f"{VERIFIER_REPEATED_FAIL_LIMIT}+ times in a row. Verifier finding:\n\n"
+        f"{finding_text}\n\n"
+        "Auto-created by the verifier-FAIL auto-repair path (t_6450901b): fix "
+        "what the finding names, then complete this card with a summary that "
+        "states exactly what changed. A non-empty, new change releases one new "
+        "independent verifier on the subject; an empty or repeated change "
+        "starts another repair instead. Never parked for a human."
+    )
+    try:
+        repair_id = create_repair_task(
+            conn,
+            title=f"Repair: {(row['title'] or subject_id)[:80]}",
+            subject_id=subject_id,
+            owner=owner,
+            umbrella_id=umbrella[0] if umbrella else subject_id,
+            body=body,
+            assignee=owner,
+            executor_lane=EXECUTOR_LANE_CLAUDE_RECOVERY,
+            recovery_gate_cmd="true",
+        )
+    except RecoveryLinkageError as exc:
+        with write_txn(conn):
+            _append_event(
+                conn, subject_id, "repair_start_failed",
+                {
+                    "subject_id": subject_id,
+                    "error": str(exc)[:500],
+                    "trigger": "verification_failed",
+                },
+            )
+        return None
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', block_kind = NULL "
+            "WHERE id = ? AND status = 'blocked'",
+            (subject_id,),
+        )
+    link_tasks(conn, repair_id, subject_id)
+    with write_txn(conn):
+        _append_event(
+            conn, subject_id, "repair_started",
+            {
+                "repair_id": repair_id,
+                "subject_id": subject_id,
+                "attempt": attempt,
+                "cause": finding_text[:500],
+                "trigger": "verification_failed",
+            },
+        )
+    return repair_id
+
+
+def _release_verifier_after_repair(
+    conn: sqlite3.Connection,
+    subject_id: str,
+    *,
+    repair_id: str,
+    change_text: str,
+) -> Optional[str]:
+    """After a repair completes, release one verifier only if it changed something.
+
+    Kernel part 3 (t_6450901b). Applies only to a subject whose verification
+    head is ``failed``. The repair's completion text is fingerprinted and
+    compared with the previous repair's (``repair_change_recorded``). A
+    non-empty new change sets the subject back to ``pending`` with a pending
+    verdict row -- both required by ``_EVIDENCE_READY_PARENT_SQL`` or the
+    verifier could never claim -- and opens one independent verifier. An
+    empty or identical change starts the next repair instead. Returns the
+    verifier id when one was released.
+    """
+    row = conn.execute(
+        "SELECT assignee, verification_state FROM tasks WHERE id = ?",
+        (subject_id,),
+    ).fetchone()
+    if row is None or row["verification_state"] != VERIFICATION_FAILED:
+        return None
+    text = (change_text or "").strip()
+    if not text:
+        try:
+            run_row = conn.execute(
+                "SELECT summary FROM task_runs WHERE task_id = ? "
+                "AND summary IS NOT NULL AND TRIM(summary) != '' "
+                "ORDER BY id DESC LIMIT 1",
+                (repair_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            run_row = None
+        text = (run_row["summary"] or "").strip() if run_row else ""
+    fingerprint = (
+        hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] if text else ""
+    )
+    prior = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'repair_change_recorded' ORDER BY id DESC LIMIT 1",
+        (subject_id,),
+    ).fetchone()
+    try:
+        prior_fp = json.loads(prior["payload"] or "{}").get("fingerprint") if prior else None
+    except (ValueError, AttributeError):
+        prior_fp = None
+    released = bool(text) and fingerprint != prior_fp
+    with write_txn(conn):
+        _append_event(
+            conn, subject_id, "repair_change_recorded",
+            {"repair_id": repair_id, "fingerprint": fingerprint, "empty": not text},
+        )
+        if released:
+            _record_verification_row(
+                conn, subject_id,
+                state=VERIFICATION_PENDING,
+                verifier="repair-release",
+                evidence={
+                    "repair_id": repair_id,
+                    "change_fingerprint": fingerprint,
+                    "change": text[:2000],
+                },
+                reason="repair completed with a recorded change; one new "
+                       "independent verification released",
+            )
+            _append_event(
+                conn, subject_id, "verifier_released_after_repair",
+                {
+                    "subject_id": subject_id,
+                    "repair_id": repair_id,
+                    "fingerprint": fingerprint,
+                },
+            )
+        else:
+            _append_event(
+                conn, subject_id, "repair_needs_new_approach",
+                {"subject_id": subject_id, "repair_id": repair_id},
+            )
+    if released:
+        verifier_id = _ensure_independent_verifier_child(
+            conn, subject_id, implementer=row["assignee"],
+        )
+        if recompute_ready(conn):
+            signal_dispatcher_wake()
+        return verifier_id
+    last = conn.execute(
+        "SELECT reason FROM task_verifications WHERE task_id = ? AND kind = ? "
+        "AND state = ? ORDER BY id DESC LIMIT 1",
+        (subject_id, LEDGER_KIND_VERDICT, VERIFICATION_FAILED),
+    ).fetchone()
+    _start_verifier_fail_repair(
+        conn, subject_id,
+        (last["reason"] if last and last["reason"] else "") or "independent verification failed",
+        prefix=_REPAIR_NEW_APPROACH_PREFIX,
+    )
+    return None
+
+
 def create_repair_task(
     conn: sqlite3.Connection,
     *,
@@ -13769,7 +13965,8 @@ def _repeated_fail_anchor(conn: sqlite3.Connection, subject_id: str) -> Optional
     anchor: Optional[int] = None
     for ev in conn.execute(
         "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND kind IN "
-        "('verification_failed', 'verification_passed', 'commented', 'unblocked') "
+        "('verification_failed', 'verification_passed', 'commented', 'unblocked', "
+        "'verifier_released_after_repair') "
         "ORDER BY id DESC LIMIT 500",
         (subject_id,),
     ).fetchall():
@@ -13779,7 +13976,9 @@ def _repeated_fail_anchor(conn: sqlite3.Connection, subject_id: str) -> Optional
             if anchor is None:
                 anchor = int(ev["id"])
             continue
-        if kind in ("verification_passed", "unblocked"):
+        if kind in (
+            "verification_passed", "unblocked", "verifier_released_after_repair",
+        ):
             break
         try:
             author = json.loads(ev["payload"] or "{}").get("author")
@@ -13875,11 +14074,11 @@ def _verifier_respawn_unchanged(conn: sqlite3.Connection, subject_id: str) -> bo
             if _repeated_fail_anchor(conn, subject_id) == anchor:
                 text = (
                     f"Held: independent verification failed "
-                    f"{VERIFIER_REPEATED_FAIL_LIMIT} times in a row. No further "
-                    "rework run or verifier will start on its own. Read the latest "
-                    "verifier finding, fix what it names (often an outside input "
-                    "only a person can supply), then post a comment saying what "
-                    "changed; that comment releases one new attempt."
+                    f"{VERIFIER_REPEATED_FAIL_LIMIT} times in a row. No unchanged "
+                    "rework run or verifier will start. A repair card is opened "
+                    "against the verifier's finding; when it completes with a "
+                    "recorded change, one new verifier is released automatically. "
+                    "A comment saying what changed also releases one new attempt."
                 )
             else:
                 text = (
@@ -16586,6 +16785,14 @@ def complete_task(
                     "resumed_status": _resumed_status,
                 },
             )
+    # Kernel part 3 (t_6450901b): a repair of a subject that FAILED
+    # verification releases one new verifier when it records a change, or
+    # starts the next repair when it recorded none / the same one.
+    for _subj_id in _repaired_subjects:
+        _release_verifier_after_repair(
+            conn, _subj_id, repair_id=task_id,
+            change_text=summary or result or "",
+        )
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -18983,6 +19190,33 @@ def record_verification(
     # Repeated FAIL: hold in review for a person instead of reopening another
     # paid rework run against the same finding. Records the hold once.
     if _verifier_respawn_unchanged(conn, task_id) and _repeated_fail_anchor(conn, task_id):
+        # Kernel part 3 (t_6450901b): the held subject gets a governed
+        # repair card built from the verifier's finding instead of waiting
+        # on a person. Never needs_input; the subject stays in review.
+        _findings = reason_text or "independent verification failed"
+        _vtask = (evidence or {}).get("verifier_task") if isinstance(evidence, dict) else None
+        if _vtask:
+            # The finding itself is the verifier card's own output.
+            _vrow = conn.execute(
+                "SELECT summary FROM task_runs WHERE task_id = ? "
+                "AND summary IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (_vtask,),
+            ).fetchone()
+            _vres = conn.execute(
+                "SELECT result FROM tasks WHERE id = ?", (_vtask,)
+            ).fetchone()
+            _vtext = ((_vrow["summary"] if _vrow else None)
+                      or (_vres["result"] if _vres else None) or "").strip()
+            if _vtext:
+                _findings += "\n\n" + _vtext[:3000]
+        if evidence:
+            try:
+                _findings += "\n\nVerifier evidence: " + json.dumps(
+                    redact_review_value(evidence)
+                )[:2000]
+            except (TypeError, ValueError):
+                pass
+        _start_verifier_fail_repair(conn, task_id, _findings)
         return True, VERIFICATION_FAILED
 
     # Route to repair/rework. Both helpers open their own write transaction,

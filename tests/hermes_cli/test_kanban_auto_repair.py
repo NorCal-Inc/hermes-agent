@@ -252,3 +252,155 @@ class TestRepairCompletionResumesSubject:
             # force-promoted, and no false "resumed" notice should fire.
             assert subject_after.status == "todo"
             assert _events(conn, tid, "repair_completed_subject_resumed") == []
+
+
+# ---------------------------------------------------------------------------
+# Part 3/3 (t_6450901b): repeated verifier FAIL creates a repair card, and a
+# repair that records a change releases exactly one new verifier.
+# ---------------------------------------------------------------------------
+
+from tests.hermes_cli.test_kanban_self_review_recovery import (  # noqa: E402
+    _repair_and_hand_off,
+    _run_verifier,
+    _subject_awaiting_verification,
+)
+
+_FAIL = "Workstation evidence file missing.\n\nVERDICT: FAIL"
+
+
+def _open_verifiers(conn, tid):
+    return [
+        r["id"] for r in conn.execute(
+            "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
+            "WHERE l.parent_id = ? AND c.executor_lane = ? "
+            "AND c.status NOT IN ('done', 'archived')",
+            (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+        ).fetchall()
+    ]
+
+
+def _open_repair(conn, tid):
+    for rel in kb.task_relations(
+        conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+    ):
+        if kb.get_task(conn, rel["from_task_id"]).status not in ("done", "archived"):
+            return rel["from_task_id"]
+    return None
+
+
+def _no_needs_input(conn, *ids):
+    for i in ids:
+        assert kb.get_task(conn, i).block_kind != "needs_input"
+
+
+@pytest.fixture
+def _advisory_budget(monkeypatch):
+    monkeypatch.setattr(kb, "objective_attempt_budget_enforced", lambda: False)
+
+
+def _subject_failed_twice(conn):
+    tid = _subject_awaiting_verification(conn)
+    _run_verifier(conn, tid, _FAIL)
+    _repair_and_hand_off(conn, tid)
+    _run_verifier(conn, tid, _FAIL)
+    return tid
+
+
+@pytest.mark.usefixtures("_advisory_budget")
+class TestVerifierFailCreatesRepair:
+    """Part 3/3 (t_6450901b)."""
+
+    def test_two_fails_create_linked_repair_not_needs_input(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_failed_twice(conn)
+            repair = _open_repair(conn, tid)
+            assert repair is not None
+            assert tid in kb.relation_targets(conn, repair, kb.RELATION_REPAIRS)
+            assert repair in kb.parent_ids(conn, tid)
+            started = _events(conn, tid, "repair_started")
+            assert len(started) == 1
+            assert started[0].payload["repair_id"] == repair
+            assert started[0].payload["trigger"] == "verification_failed"
+            assert "Workstation evidence file missing" in kb.get_task(conn, repair).body
+            assert kb.get_task(conn, tid).status == "review"
+            # More ticks never duplicate the repair.
+            for _ in range(5):
+                kb._ensure_independent_verifier_child(conn, tid, implementer="default")
+            assert len(kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            )) == 1
+            _no_needs_input(conn, tid, repair)
+
+    def test_repair_with_change_releases_one_claimable_verifier(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_failed_twice(conn)
+            repair = _open_repair(conn, tid)
+            assert _open_verifiers(conn, tid) == []
+            TestRepairCompletionResumesSubject._drive_repair_to_done(conn, repair)
+
+            task = kb.get_task(conn, tid)
+            assert task.verification_state == kb.VERIFICATION_PENDING
+            released = _events(conn, tid, "verifier_released_after_repair")
+            assert len(released) == 1
+            assert released[0].payload["repair_id"] == repair
+            verifiers = _open_verifiers(conn, tid)
+            assert len(verifiers) == 1
+            assert kb._repeated_fail_anchor(conn, tid) is None
+            # Claimable: the dependency gate lets it through.
+            assert kb.get_task(conn, verifiers[0]).status == "ready"
+            claimed = kb.claim_task(conn, verifiers[0])
+            assert claimed is not None and claimed.status == "running"
+            _no_needs_input(conn, tid, repair)
+
+    def test_identical_change_starts_new_repair_not_verifier(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_failed_twice(conn)
+            first = _open_repair(conn, tid)
+            TestRepairCompletionResumesSubject._drive_repair_to_done(conn, first)
+            # The released verifier fails again, twice -> next repair.
+            _run_verifier(conn, tid, _FAIL)
+            _repair_and_hand_off(conn, tid)
+            _run_verifier(conn, tid, _FAIL)
+            second = _open_repair(conn, tid)
+            assert second is not None and second != first
+            # Same summary text as the first repair -> identical change.
+            TestRepairCompletionResumesSubject._drive_repair_to_done(conn, second)
+
+            assert len(_events(conn, tid, "verifier_released_after_repair")) == 1
+            assert len(_events(conn, tid, "repair_needs_new_approach")) == 1
+            assert _open_verifiers(conn, tid) == []
+            third = _open_repair(conn, tid)
+            assert third is not None and third not in (first, second)
+            assert kb.get_task(conn, third).body.startswith(
+                kb._REPAIR_NEW_APPROACH_PREFIX
+            )
+            _no_needs_input(conn, tid, first, second, third)
+
+    def test_empty_change_starts_new_repair_not_verifier(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_failed_twice(conn)
+            repair = _open_repair(conn, tid)
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "repair_change_recorded", {"fingerprint": "x"})
+            assert kb._release_verifier_after_repair(
+                conn, tid, repair_id=repair, change_text="   ",
+            ) is None
+            assert _events(conn, tid, "verifier_released_after_repair") == []
+            assert len(_events(conn, tid, "repair_needs_new_approach")) == 1
+            assert kb.get_task(conn, tid).verification_state == kb.VERIFICATION_FAILED
+            assert _open_verifiers(conn, tid) == []
+            _no_needs_input(conn, tid)
+
+    def test_repair_link_failure_records_event_not_needs_input(
+        self, kanban_home, monkeypatch
+    ):
+        def _boom(*a, **k):
+            raise kb.RecoveryLinkageError("forced link failure")
+
+        monkeypatch.setattr(kb, "create_repair_task", _boom)
+        with kb.connect_closing() as conn:
+            tid = _subject_failed_twice(conn)
+            assert _open_repair(conn, tid) is None
+            failed = _events(conn, tid, "repair_start_failed")
+            assert len(failed) == 1 and failed[0].payload["trigger"] == "verification_failed"
+            _no_needs_input(conn, tid)
