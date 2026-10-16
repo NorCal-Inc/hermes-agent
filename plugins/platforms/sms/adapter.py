@@ -435,17 +435,11 @@ class SmsAdapter(BasePlatformAdapter):
 
 
 def _strip_markdown_for_sms(message: str) -> str:
-    """Strip markdown — SMS renders it as literal characters."""
-    message = re.sub(r"\*\*(.+?)\*\*", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"\*(.+?)\*", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"__(.+?)__", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"_(.+?)_", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"```[a-z]*\n?", "", message)
-    message = re.sub(r"`(.+?)`", r"\1", message)
-    message = re.sub(r"^#{1,6}\s+", "", message, flags=re.MULTILINE)
-    message = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", message)
-    message = re.sub(r"\n{3,}", "\n\n", message)
-    return message.strip()
+    """Strip markdown — SMS renders it as literal characters.
+
+    Delegates to the shared helper: its word-boundary underscore rule keeps
+    URLs such as Stripe invoice links (acct_..., live_...) intact."""
+    return strip_markdown(message)
 
 
 async def _standalone_send(
