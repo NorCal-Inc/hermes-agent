@@ -157,3 +157,98 @@ class TestRecoveryLinkageFailureLeavesSubjectUntouched:
             assert failed[0].payload["subject_id"] == tid
             assert "forced" in failed[0].payload["error"]
             assert _events(conn, tid, "repair_started") == []
+
+
+class TestRepairCompletionResumesSubject:
+    """Part 2/3 (t_7b99f87c): completing the repair resumes the subject."""
+
+    @staticmethod
+    def _drive_repair_to_done(conn, repair_id):
+        """Full Gauntlet chain: claim -> request_review -> independent PASS.
+
+        ``create_repair_task`` always sets ``gauntlet_enforced=True`` on a
+        governed repair card (the ``declares_repair`` branch in
+        ``create_task``), so a bare ``complete_task`` is refused until the
+        card has gone through review and collected a VERIFIED verdict from
+        an identity independent of its own assignee/implementer.
+        """
+        claimed = kb.claim_task(conn, repair_id)
+        assert claimed is not None and claimed.status == "running"
+        ok = kb.request_review(
+            conn, repair_id, summary="Repair complete: fixed the subject.",
+            reviewer="independent-reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert ok is True
+        ok, detail = kb.record_verification(
+            conn, repair_id, passed=True, verifier="independent-reviewer",
+            evidence={"command": "pytest -q", "exit_code": 0},
+        )
+        assert (ok, detail) == (True, kb.VERIFICATION_VERIFIED)
+        ok = kb.complete_task(
+            conn, repair_id, summary="Repair complete: fixed the subject.",
+        )
+        assert ok is True
+
+    def test_completing_repair_moves_subject_todo_to_ready_and_emits_notice(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+
+            blocked = kb._record_task_failure(
+                conn, tid, "boom: subprocess exited 1",
+                outcome="crashed", failure_limit=1,
+            )
+            assert blocked is True
+
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "todo"
+
+            incoming_repairs = kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            )
+            assert len(incoming_repairs) == 1
+            repair_id = incoming_repairs[0]["from_task_id"]
+
+            self._drive_repair_to_done(conn, repair_id)
+
+            subject_after = kb.get_task(conn, tid)
+            assert subject_after.status == "ready"
+
+            resumed = _events(conn, tid, "repair_completed_subject_resumed")
+            assert len(resumed) == 1
+            payload = resumed[0].payload
+            assert payload["repair_id"] == repair_id
+            assert payload["subject_id"] == tid
+            assert payload["resumed_status"] == "ready"
+
+    def test_completing_repair_when_subject_still_gated_emits_no_notice(
+        self, kanban_home
+    ):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+
+            kb._record_task_failure(
+                conn, tid, "boom: subprocess exited 1",
+                outcome="crashed", failure_limit=1,
+            )
+            incoming_repairs = kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            )
+            repair_id = incoming_repairs[0]["from_task_id"]
+
+            # Add a second, unrelated parent dependency that is NOT done, so
+            # the subject stays gated even after the repair completes.
+            other_parent = kb.create_task(
+                conn, title="unrelated blocking dependency", assignee="default",
+            )
+            kb.link_tasks(conn, other_parent, tid)
+
+            self._drive_repair_to_done(conn, repair_id)
+
+            subject_after = kb.get_task(conn, tid)
+            # Still gated by the other undone parent -- must not have been
+            # force-promoted, and no false "resumed" notice should fire.
+            assert subject_after.status == "todo"
+            assert _events(conn, tid, "repair_completed_subject_resumed") == []

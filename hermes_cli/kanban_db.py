@@ -16543,12 +16543,49 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    # If this completed task itself ``repairs`` one or more subjects (minted
+    # by create_repair_task — t_bf453ced), capture each subject's pre-recompute
+    # status so we can tell, after the shared recompute below runs, whether
+    # THIS completion is what resumed it. No separate scheduler: the subject
+    # resumes through the exact same recompute_ready() every other dependent
+    # uses; this only narrates the outcome it already produced.
+    _repaired_subjects = relation_targets(conn, task_id, RELATION_REPAIRS)
+    _repair_pre_status: dict[str, str] = {}
+    for _subj_id in _repaired_subjects:
+        _subj_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (_subj_id,),
+        ).fetchone()
+        if _subj_row is not None:
+            _repair_pre_status[_subj_id] = _subj_row["status"]
     # Recompute ready status for dependents (separate txn so children see done).
     # If this completion released work, wake the gateway dispatcher immediately
     # instead of making the child wait up to dispatch_interval_seconds.
     promoted_dependents = recompute_ready(conn)
     if promoted_dependents:
         signal_dispatcher_wake()
+    # Narrate a resumed subject: only when recompute_ready just moved it off
+    # its gated wait (todo/blocked -> ready/review). A subject with another
+    # unresolved parent/gate stays put and gets no notice — nothing resumed.
+    for _subj_id, _prior_status in _repair_pre_status.items():
+        if _prior_status not in ("todo", "blocked"):
+            continue
+        _subj_row_after = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (_subj_id,),
+        ).fetchone()
+        if _subj_row_after is None:
+            continue
+        _resumed_status = _subj_row_after["status"]
+        if _resumed_status == _prior_status:
+            continue
+        with write_txn(conn):
+            _append_event(
+                conn, _subj_id, "repair_completed_subject_resumed",
+                {
+                    "repair_id": task_id,
+                    "subject_id": _subj_id,
+                    "resumed_status": _resumed_status,
+                },
+            )
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
