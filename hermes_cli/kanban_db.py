@@ -7843,63 +7843,302 @@ _REPAIR_NEW_APPROACH_PREFIX = (
 )
 
 
-def _start_verifier_fail_repair(
-    conn: sqlite3.Connection,
-    subject_id: str,
-    findings: str,
-    *,
-    prefix: Optional[str] = None,
-) -> Optional[str]:
-    """Open a governed repair card for a subject that keeps FAILING verification.
+AUTO_REPAIR_OWNER = "erika"
+AUTO_REPAIR_CREATED_BY = "auto-repair"
+AUTO_REPAIR_UMBRELLA_TITLE = "Operational Error Repairs"
+AUTO_REPAIR_UMBRELLA_KEY = "auto-repair:umbrella:operational-error-repairs"
+AUTO_REPAIR_RECORDED_EVENT = "repair_recorded"
 
-    Kernel part 3 (t_6450901b). Same call shape as the breaker-trip repair in
-    ``_record_task_failure`` (part 1): ``create_repair_task`` on the
-    ``claude_recovery`` lane with the no-op gate, a ``task_links`` edge
-    repair -> subject, and a ``repair_started`` event. Never ``needs_input``.
-    Must be called outside any open write transaction. Returns the repair id
-    (an already-open repair is reused, never duplicated), or None when the
-    repair could not be linked (``repair_start_failed`` is recorded).
+
+def ensure_operational_repairs_umbrella(conn: sqlite3.Connection) -> str:
+    """Return the ONE durable "Operational Error Repairs" umbrella, creating it once.
+
+    Decision B (t_5d7e889e). The lookup and the insert share one write
+    transaction (BEGIN IMMEDIATE), so concurrent callers cannot mint two; the
+    idempotency key is the durable identity. The card is a container, not
+    work: it is closed in the same transaction that creates it, so it is never
+    dispatched and never counts as an open task. Must be called outside any
+    open write transaction.
     """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "ORDER BY created_at, id LIMIT 1",
+            (AUTO_REPAIR_UMBRELLA_KEY,),
+        ).fetchone()
+        if row is not None:
+            return row["id"]
+        umbrella_id = create_task(
+            conn,
+            title=AUTO_REPAIR_UMBRELLA_TITLE,
+            body=(
+                "Container for the automatic repair cards opened when an "
+                "ordinary task error or a repeated failed check happens. It "
+                "holds no work itself; each repair card links here."
+            ),
+            created_by=AUTO_REPAIR_CREATED_BY,
+            idempotency_key=AUTO_REPAIR_UMBRELLA_KEY,
+            initial_status="blocked",
+            gauntlet=False,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', block_kind = NULL, "
+            "completed_at = ?, result = ? WHERE id = ?",
+            (
+                int(time.time()),
+                "Umbrella container for automatic repair cards; no work.",
+                umbrella_id,
+            ),
+        )
+        _append_event(
+            conn, umbrella_id, "umbrella_created",
+            {"title": AUTO_REPAIR_UMBRELLA_TITLE},
+        )
+    return umbrella_id
+
+
+def _auto_repair_gate_cmd(subject_id: str) -> str:
+    """The repair card's gate: a real recorded repair, checked by the kernel."""
+    return f"{sys.executable} -m hermes_cli.main kanban repair-gate {subject_id}"
+
+
+def _repair_ids_for_subject(conn: sqlite3.Connection, subject_id: str) -> list:
+    """Every repair card ever linked to ``subject_id``, oldest first."""
+    rows = conn.execute(
+        "SELECT r.from_task_id AS id FROM task_relations r "
+        "JOIN tasks t ON t.id = r.from_task_id "
+        "WHERE r.to_task_id = ? AND r.relation = ? "
+        "ORDER BY t.created_at, t.id",
+        (subject_id, RELATION_REPAIRS),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def open_repair_for_subject(
+    conn: sqlite3.Connection, subject_id: str, *, exclude: Iterable[str] = (),
+) -> Optional[str]:
+    """The subject's repair card that is still open (not done/archived)."""
+    skip = set(exclude)
+    for repair_id in reversed(_repair_ids_for_subject(conn, subject_id)):
+        if repair_id in skip:
+            continue
+        st = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (repair_id,),
+        ).fetchone()
+        if st is not None and st["status"] not in ("done", "archived"):
+            return repair_id
+    return None
+
+
+def _latest_event_payload(
+    conn: sqlite3.Connection, task_id: str, kind: str,
+) -> Optional[dict]:
     row = conn.execute(
-        "SELECT title, assignee FROM tasks WHERE id = ?", (subject_id,)
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
     ).fetchone()
     if row is None:
         return None
-    existing_repairs = task_relations(
-        conn, subject_id, relation=RELATION_REPAIRS, direction="to",
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _latest_repair_record(conn: sqlite3.Connection, repair_id: str) -> Optional[dict]:
+    return _latest_event_payload(conn, repair_id, AUTO_REPAIR_RECORDED_EVENT)
+
+
+def _norm_change(text: Optional[str]) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _previous_recorded_change(
+    conn: sqlite3.Connection, subject_id: str, repair_id: str,
+) -> Optional[tuple]:
+    """(repair_id, change) of the newest OTHER repair that recorded one."""
+    for prev in reversed(_repair_ids_for_subject(conn, subject_id)):
+        if prev == repair_id:
+            continue
+        rec = _latest_repair_record(conn, prev)
+        if rec and (rec.get("change") or "").strip():
+            return prev, rec["change"]
+    return None
+
+
+def resolve_repair_card(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """``task_id`` itself when it is a repair card, else its open repair."""
+    if relation_targets(conn, task_id, RELATION_REPAIRS):
+        return task_id
+    return open_repair_for_subject(conn, task_id)
+
+
+def record_auto_repair(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    root_cause: str,
+    change: str,
+    check: str,
+    author: Optional[str] = None,
+) -> str:
+    """Record what a repair actually did. ``task_id`` is the repair or its subject.
+
+    This is what the repair card's gate reads: no recorded root cause, change
+    and check means the gate stays red and the card cannot close.
+    """
+    repair_id = resolve_repair_card(conn, task_id)
+    if repair_id is None:
+        raise ValueError(
+            f"{task_id} is not a repair card and has no open repair card"
+        )
+    fields = {
+        "root_cause": (root_cause or "").strip()[:2000],
+        "change": (change or "").strip()[:2000],
+        "check": (check or "").strip()[:2000],
+    }
+    missing = [k for k, v in fields.items() if not v]
+    if missing:
+        raise ValueError(f"empty {', '.join(missing)}")
+    with write_txn(conn):
+        _append_event(
+            conn, repair_id, AUTO_REPAIR_RECORDED_EVENT,
+            {**fields, "author": author},
+        )
+        add_comment(
+            conn, repair_id, author or "repair-worker",
+            f"Repair recorded.\nRoot cause: {fields['root_cause']}\n"
+            f"Change: {fields['change']}\nCheck: {fields['check']}",
+        )
+    return repair_id
+
+
+def auto_repair_gate(conn: sqlite3.Connection, subject_id: str) -> tuple:
+    """(ok, reason) for the open repair of ``subject_id``.
+
+    Decision D (t_5d7e889e). Green only when the open repair recorded a root
+    cause, a change and a check, and the change is not the same as the
+    previous repair's. The subject is gated on this card, so its own rerun
+    cannot run before the card closes; that rerun plus its independent
+    verifier is the acceptance downstream, and a further failure opens the
+    next repair card automatically (no cap).
+    """
+    subj = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (subject_id,),
+    ).fetchone()
+    if subj is None:
+        return False, f"subject {subject_id} not found"
+    if subj["status"] == "archived":
+        return False, f"subject {subject_id} is archived; nothing to resume"
+    repair_id = open_repair_for_subject(conn, subject_id)
+    if repair_id is None:
+        return False, f"no open repair card for {subject_id}"
+    rec = _latest_repair_record(conn, repair_id)
+    if not rec or not all(
+        (rec.get(k) or "").strip() for k in ("root_cause", "change", "check")
+    ):
+        return False, (
+            f"{repair_id}: no repair recorded yet. Fix it, then run: hermes "
+            f"kanban repair-record {subject_id} --root-cause '...' "
+            "--change '...' --check '...'"
+        )
+    prev = _previous_recorded_change(conn, subject_id, repair_id)
+    if prev and _norm_change(prev[1]) == _norm_change(rec["change"]):
+        return False, (
+            f"{repair_id}: the recorded change is the same as previous repair "
+            f"{prev[0]}; take a different approach"
+        )
+    return True, (
+        f"{repair_id}: root cause, change and check recorded. {subject_id} "
+        "now reruns and must pass its own check and independent "
+        "verification; a further failure opens the next repair."
     )
-    for rel in existing_repairs:
-        st = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (rel["from_task_id"],)
-        ).fetchone()
-        if st is not None and st["status"] not in ("done", "archived"):
-            return rel["from_task_id"]
-    owner = (row["assignee"] or "").strip() or "default"
-    umbrella = relation_targets(conn, subject_id, RELATION_UMBRELLA)
-    attempt = len(existing_repairs) + 1
-    finding_text = (findings or "").strip()[:4000] or "independent verification failed"
-    body = (
-        (f"{prefix}\n\n" if prefix else "")
-        + f"Independent verification of {subject_id} failed "
-        f"{VERIFIER_REPEATED_FAIL_LIMIT}+ times in a row. Verifier finding:\n\n"
-        f"{finding_text}\n\n"
-        "Auto-created by the verifier-FAIL auto-repair path (t_6450901b): fix "
-        "what the finding names, then complete this card with a summary that "
-        "states exactly what changed. A non-empty, new change releases one new "
-        "independent verifier on the subject; an empty or repeated change "
-        "starts another repair instead. Never parked for a human."
+
+
+def _open_auto_repair(
+    conn: sqlite3.Connection,
+    subject_id: str,
+    *,
+    cause: str,
+    trigger: str,
+    evidence: Optional[str] = None,
+    prefix: Optional[str] = None,
+    exclude: Iterable[str] = (),
+) -> Optional[str]:
+    """Open the next repair card for ``subject_id`` (shared by every auto-repair path).
+
+    Decisions A-D (t_5d7e889e): ``create_repair_task`` on the
+    ``claude_recovery`` lane, owner ``erika``, under the durable "Operational
+    Error Repairs" umbrella, gated by ``hermes kanban repair-gate``; the
+    subject is parked behind it (``task_links`` repair -> subject) and a
+    ``repair_started`` event fires. When the failure's fingerprint matches the
+    previous repair's, the body says so and demands a different approach. An
+    already-open repair is reused, never duplicated. Must be called outside
+    any open write transaction. Returns the repair id, or None when the repair
+    could not be linked (``repair_start_failed`` is recorded).
+    """
+    row = conn.execute(
+        "SELECT title, assignee FROM tasks WHERE id = ?", (subject_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    existing = open_repair_for_subject(conn, subject_id, exclude=exclude)
+    if existing is not None:
+        return existing
+    attempt = len(_repair_ids_for_subject(conn, subject_id)) + 1
+    cause_text = (cause or "").strip()[:4000] or "task failed"
+    fingerprint = _error_fingerprint(cause_text)
+    prev_start = _latest_event_payload(conn, subject_id, "repair_started")
+    same_error = bool(
+        prev_start and prev_start.get("fingerprint") == fingerprint
     )
+    parts = []
+    if prefix:
+        parts.append(prefix)
+    if same_error:
+        parts.append(
+            f"SAME ERROR AGAIN: this failure has the same fingerprint "
+            f"({fingerprint}) as the one repair {prev_start.get('repair_id')} "
+            "handled, so that repair did not fix it. Change the approach or "
+            "the executor; do not repeat the previous change."
+        )
+    prev_change = _previous_recorded_change(conn, subject_id, "")
+    if prev_change:
+        parts.append(
+            f"Previous repair {prev_change[0]} recorded this change: "
+            f"{prev_change[1][:1000]}"
+        )
+    parts.append(evidence or cause_text)
+    parts.append(f"Error fingerprint: {fingerprint}")
+    parts.append(
+        f"Repair attempt {attempt} for {subject_id} (no attempt cap). Find "
+        "the root cause and fix it. When the fix is in place, record it: "
+        f"hermes kanban repair-record {subject_id} --root-cause '<why it "
+        "failed>' --change '<what you changed>' --check '<how you checked "
+        f"it>'. This card's gate (hermes kanban repair-gate {subject_id}) "
+        "passes only once a root cause, change and check are recorded and "
+        "the change differs from the previous repair's. When this card "
+        f"closes, {subject_id} reruns for real and must pass its own check "
+        "and independent verification; if it fails again a new repair card "
+        "opens automatically. Never parked for a human: block only for a "
+        "decision only Christopher can make."
+    )
+    body = "\n\n".join(parts)
+    umbrella_id = ensure_operational_repairs_umbrella(conn)
     try:
         repair_id = create_repair_task(
             conn,
             title=f"Repair: {(row['title'] or subject_id)[:80]}",
             subject_id=subject_id,
-            owner=owner,
-            umbrella_id=umbrella[0] if umbrella else subject_id,
+            owner=AUTO_REPAIR_OWNER,
+            umbrella_id=umbrella_id,
             body=body,
-            assignee=owner,
+            assignee=(row["assignee"] or "").strip() or "default",
+            created_by=AUTO_REPAIR_CREATED_BY,
             executor_lane=EXECUTOR_LANE_CLAUDE_RECOVERY,
-            recovery_gate_cmd="true",
+            recovery_gate_cmd=_auto_repair_gate_cmd(subject_id),
         )
     except RecoveryLinkageError as exc:
         with write_txn(conn):
@@ -7908,7 +8147,7 @@ def _start_verifier_fail_repair(
                 {
                     "subject_id": subject_id,
                     "error": str(exc)[:500],
-                    "trigger": "verification_failed",
+                    "trigger": trigger,
                 },
             )
         return None
@@ -7918,6 +8157,8 @@ def _start_verifier_fail_repair(
             "WHERE id = ? AND status = 'blocked'",
             (subject_id,),
         )
+    # Dependency edge (repair -> subject), separate from the non-gating
+    # RELATION_REPAIRS governance relation: this is what parks the subject.
     link_tasks(conn, repair_id, subject_id)
     with write_txn(conn):
         _append_event(
@@ -7926,11 +8167,91 @@ def _start_verifier_fail_repair(
                 "repair_id": repair_id,
                 "subject_id": subject_id,
                 "attempt": attempt,
-                "cause": finding_text[:500],
-                "trigger": "verification_failed",
+                "cause": cause_text[:500],
+                "trigger": trigger,
+                "fingerprint": fingerprint,
+                "same_error_as_previous": same_error,
             },
         )
     return repair_id
+
+
+def supersede_auto_repair(
+    conn: sqlite3.Connection, repair_id: str, *, reason: str,
+) -> Optional[str]:
+    """Replace an auto-repair card whose gate stayed red with the next one.
+
+    Decision C: no exhausted-to-human state for this failure class. The next
+    repair is opened and linked to the subject BEFORE the old one is unlinked
+    and archived, so the subject is never released in between. Returns the
+    new repair id, or None when ``repair_id`` is not an auto-repair card or
+    the next one could not be opened (the caller keeps its old escalation).
+    """
+    row = conn.execute(
+        "SELECT created_by FROM tasks WHERE id = ?", (repair_id,),
+    ).fetchone()
+    if row is None or row["created_by"] != AUTO_REPAIR_CREATED_BY:
+        return None
+    targets = relation_targets(conn, repair_id, RELATION_REPAIRS)
+    if not targets:
+        return None
+    subject_id = targets[0]
+    new_id = _open_auto_repair(
+        conn, subject_id,
+        cause=(
+            f"Previous repair {repair_id} could not turn its gate green. "
+            f"{(reason or '').strip()[:3000]}"
+        ),
+        trigger="repair_gate_red",
+        prefix=_REPAIR_NEW_APPROACH_PREFIX,
+        exclude=(repair_id,),
+    )
+    if new_id is None:
+        return None
+    with contextlib.suppress(Exception):
+        unlink_tasks(conn, repair_id, subject_id)
+    with write_txn(conn):
+        _append_event(
+            conn, repair_id, "repair_superseded",
+            {"next_repair_id": new_id, "subject_id": subject_id},
+        )
+        add_comment(
+            conn, repair_id, "recovery-lane",
+            f"Gate still red after the bounded attempts; superseded by the "
+            f"next repair {new_id} (no attempt cap).",
+        )
+    archive_task(conn, repair_id)
+    return new_id
+
+
+def _start_verifier_fail_repair(
+    conn: sqlite3.Connection,
+    subject_id: str,
+    findings: str,
+    *,
+    prefix: Optional[str] = None,
+) -> Optional[str]:
+    """Open a governed repair card for a subject that keeps FAILING verification.
+
+    Kernel part 3 (t_6450901b), via the shared :func:`_open_auto_repair`.
+    Never ``needs_input``. Must be called outside any open write transaction.
+    """
+    finding_text = (findings or "").strip()[:4000] or "independent verification failed"
+    evidence = (
+        f"Independent verification of {subject_id} failed "
+        f"{VERIFIER_REPEATED_FAIL_LIMIT}+ times in a row. Verifier finding:\n\n"
+        f"{finding_text}\n\n"
+        "Fix what the finding names. A non-empty, new recorded change "
+        "releases one new independent verifier on the subject; an empty or "
+        "repeated change starts another repair instead."
+    )
+    return _open_auto_repair(
+        conn, subject_id,
+        cause=finding_text,
+        trigger="verification_failed",
+        evidence=evidence,
+        prefix=prefix,
+    )
 
 
 def _release_verifier_after_repair(
@@ -7957,7 +8278,8 @@ def _release_verifier_after_repair(
     ).fetchone()
     if row is None or row["verification_state"] != VERIFICATION_FAILED:
         return None
-    text = (change_text or "").strip()
+    recorded = _latest_repair_record(conn, repair_id)
+    text = ((recorded or {}).get("change") or change_text or "").strip()
     if not text:
         try:
             run_row = conn.execute(
@@ -23927,9 +24249,11 @@ def _record_task_failure(
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
+                # Decision C: no gave_up state for an ordinary failure; the
+                # run ends with its real outcome and a repair card opens.
                 run_id = _end_run(
                     conn, task_id,
-                    outcome="gave_up", status="gave_up",
+                    outcome=outcome, status=outcome,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -23950,121 +24274,24 @@ def _record_task_failure(
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
+                conn, task_id, "failure_routed_to_repair", payload,
+                run_id=run_id,
             )
-            # Retry exhaustion must not silently orphan the task in the
-            # undifferentiated ``blocked`` bucket. Mark it durably as
-            # needing a human decision (reusing the recovery lane's own
-            # "block once with evidence" idiom — ``needs_input`` is
-            # already a VALID_BLOCK_KINDS member), record the evidence as
-            # a comment, and fan the failure out to every linked task:
-            # provenance parents (e.g. a governance task whose spawned
-            # implementation gave up) and dependents gated on this task
-            # (e.g. a task parked in ``dependency_wait`` on this one) —
-            # both were previously stuck with no signal at all once this
-            # task stopped retrying.
             # Ordinary failures auto-repair instead of parking for a human
-            # decision (t_bf453ced: Christopher's no-attempt-cap, never-a-
-            # human-hold-for-ordinary-failures directive). The repair card
-            # itself is created AFTER this transaction commits --
-            # ``create_repair_task``/``link_tasks`` each open their own
-            # top-level ``write_txn`` and would raise on nested composition
-            # if invoked from inside this one. Everything the repair needs
-            # is captured here, while the subject row and its existing
-            # relations are still consistent under THIS transaction's lock.
-            subject_row = conn.execute(
-                "SELECT title FROM tasks WHERE id = ?", (task_id,),
-            ).fetchone()
-            subject_title = (
-                subject_row["title"] if subject_row and subject_row["title"] else task_id
-            )
-            existing_umbrella = relation_targets(conn, task_id, RELATION_UMBRELLA)
-            existing_repairs = task_relations(
-                conn, task_id, relation=RELATION_REPAIRS, direction="to",
-            )
-            evidence = (
-                f"Retry exhaustion (gave_up): {failures} consecutive "
-                f"failures reached the effective limit ({effective_limit}, "
-                f"source={limit_source}). Trigger: {outcome}. Last error: "
-                f"{error[:500]}."
-            )
+            # decision (Decision C, t_5d7e889e: no attempt cap, no
+            # gave_up/needs_input hold, no "needs a human decision" fan-out).
+            # The repair card is opened AFTER this transaction commits --
+            # create_repair_task/link_tasks open their own top-level write_txn.
             _trip_repair_ctx = {
                 "subject_id": task_id,
-                "subject_title": subject_title,
-                "owner": (row["assignee"] or "").strip() or "default",
-                "umbrella_id": (
-                    existing_umbrella[0] if existing_umbrella else task_id
-                ),
-                "attempt": len(existing_repairs) + 1,
                 "error": error[:500],
-                "fingerprint": _error_fingerprint(error),
-                "evidence": evidence,
+                "trigger": outcome,
+                "evidence": (
+                    f"{failures} consecutive failures reached the limit "
+                    f"({effective_limit}, source={limit_source}). Trigger: "
+                    f"{outcome}. Last error: {error[:500]}"
+                ),
             }
-            linked = [
-                (pid, "parent") for pid in parent_ids(conn, task_id)
-            ] + [
-                (cid, "dependent") for cid in child_ids(conn, task_id)
-            ]
-            for related_id, relation in linked:
-                _append_event(
-                    conn, related_id, "linked_task_gave_up",
-                    {
-                        "task_id": task_id,
-                        "relation": relation,
-                        "error": error[:500],
-                        "failures": failures,
-                    },
-                )
-                add_comment(
-                    conn, related_id, "dispatcher",
-                    f"Linked task {task_id} ({relation}) gave up after "
-                    f"{failures} consecutive failures and needs a human "
-                    f"decision: {error[:500]}",
-                )
-                # Notifying a card that cannot run is not notification. A
-                # dependent parked in ``todo`` behind this now-dead dependency
-                # is gated by ``_parents_satisfied``, so ``recompute_ready``
-                # will never promote it, no dispatcher will ever claim it, and
-                # the event + comment above land somewhere nothing can act on.
-                # That is exactly what happened to t_db0af7e0: it took
-                # ``linked_task_gave_up`` (event 9886) while sitting in 'todo'
-                # with block_kind='dependency', and became ungovernable — Erika
-                # owned a recovery decision she had no mechanical route to make.
-                #
-                # Move it into the same governable state this function just
-                # gave the failing task itself: blocked/needs_input, which is a
-                # real human-decision bucket with ``unblock_task`` as its exit.
-                # Only cards that are genuinely parked move — a dependent that
-                # is running, in review, already terminal, claimed, or
-                # irreversibly disposed is left completely alone.
-                rel_row = conn.execute(
-                    "SELECT status, block_kind FROM tasks WHERE id = ?",
-                    (related_id,),
-                ).fetchone()
-                woken = conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "block_kind = 'needs_input' "
-                    "WHERE id = ? AND status IN ('todo', 'ready', 'blocked') "
-                    "AND claim_lock IS NULL "
-                    "AND " + _not_irreversibly_disposed_sql(),
-                    (related_id,),
-                )
-                if woken.rowcount == 1:
-                    _append_event(
-                        conn, related_id, "dependency_failure_needs_decision",
-                        {
-                            "task_id": task_id,
-                            "relation": relation,
-                            "from_status": (
-                                rel_row["status"] if rel_row else None
-                            ),
-                            "from_block_kind": (
-                                rel_row["block_kind"] if rel_row else None
-                            ),
-                            "status": "blocked",
-                            "block_kind": "needs_input",
-                        },
-                    )
             blocked = True
         else:
             # Below threshold.
@@ -24152,70 +24379,16 @@ def _record_task_failure(
                         ),
                     },
                 )
-    # Ordinary breaker trip: mint (or fail to mint) the repair card now that
-    # the trip transaction above is durably committed. create_repair_task /
-    # link_tasks each open their own top-level write_txn, so this must run
-    # outside the block above.
+    # Ordinary breaker trip: open (or fail to open) the repair card now that
+    # the trip transaction above is durably committed.
     if _trip_repair_ctx is not None:
         ctx = _trip_repair_ctx
-        try:
-            repair_id = create_repair_task(
-                conn,
-                title=f"Repair: {ctx['subject_title'][:80]}",
-                subject_id=ctx["subject_id"],
-                owner=ctx["owner"],
-                umbrella_id=ctx["umbrella_id"],
-                body=(
-                    f"{ctx['evidence']}\n\nFingerprint: {ctx['fingerprint']}\n\n"
-                    "Auto-created by the breaker-trip auto-repair path "
-                    "(t_bf453ced): an ORDINARY task failure creates a repair "
-                    "card instead of parking the subject blocked/needs_input "
-                    "for a human (Christopher's directive: no attempt cap, "
-                    "never hand ordinary failures to a human). "
-                    "recovery_gate_cmd is deliberately the no-op 'true': no "
-                    "generic per-task mechanical acceptance check exists for "
-                    "an arbitrary subject, so Claude's one bounded attempt "
-                    "always reaches the gate's green branch and the card "
-                    "proceeds into the normal Gauntlet independent-"
-                    "verification pipeline when gauntlet_enforced (or "
-                    "completes directly otherwise) exactly like any other "
-                    "repair -- it never falls into claude_recovery's own "
-                    "two-attempt-then-block escalation. Recorded as a "
-                    "comment on t_bf453ced per its own ambiguity-resolution "
-                    "instruction."
-                ),
-                assignee=ctx["owner"],
-                executor_lane=EXECUTOR_LANE_CLAUDE_RECOVERY,
-                recovery_gate_cmd="true",
-            )
-        except RecoveryLinkageError as exc:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "repair_start_failed",
-                    {"subject_id": task_id, "error": str(exc)[:500]},
-                )
-        else:
-            with write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET status = 'todo', block_kind = NULL "
-                    "WHERE id = ? AND status = 'blocked'",
-                    (task_id,),
-                )
-            # Dependency edge (repair -> subject), separate from the
-            # non-gating RELATION_REPAIRS governance relation create_repair_task
-            # already established: this is what actually parks the subject in
-            # 'todo' until the repair finishes.
-            link_tasks(conn, repair_id, task_id)
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "repair_started",
-                    {
-                        "repair_id": repair_id,
-                        "subject_id": task_id,
-                        "attempt": ctx["attempt"],
-                        "cause": ctx["error"],
-                    },
-                )
+        _open_auto_repair(
+            conn, ctx["subject_id"],
+            cause=ctx["error"],
+            trigger=ctx["trigger"],
+            evidence=ctx["evidence"],
+        )
     return blocked
 
 

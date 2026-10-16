@@ -69,7 +69,16 @@ class TestBreakerTripCreatesRepair:
 
             repair = kb.get_task(conn, repair_id)
             assert repair.executor_lane == kb.EXECUTOR_LANE_CLAUDE_RECOVERY
-            assert repair.recovery_owner == "default"
+            # Decision B: every auto-repair is Erika's, under the ONE durable
+            # "Operational Error Repairs" umbrella.
+            assert repair.recovery_owner == "erika"
+            [umbrella_id] = kb.relation_targets(conn, repair_id, kb.RELATION_UMBRELLA)
+            umbrella = kb.get_task(conn, umbrella_id)
+            assert umbrella.title == "Operational Error Repairs"
+            assert umbrella.status == "done"
+            # Decision D: a real gate, not the no-op 'true'.
+            assert repair.recovery_gate_cmd != "true"
+            assert repair.recovery_gate_cmd.endswith(f"kanban repair-gate {tid}")
             assert kb.missing_repair_relations(conn, repair_id) == []
             assert kb.relation_targets(conn, repair_id, kb.RELATION_REPAIRS) == [tid]
 
@@ -84,8 +93,9 @@ class TestBreakerTripCreatesRepair:
             assert payload["attempt"] == 1
             assert "boom" in payload["cause"]
 
-            # History is preserved: gave_up still fires exactly as before.
-            assert len(_events(conn, tid, "gave_up")) == 1
+            # Decision C: no gave_up event/state for an ordinary failure.
+            assert _events(conn, tid, "gave_up") == []
+            assert len(_events(conn, tid, "failure_routed_to_repair")) == 1
             # But the human-decision comment is gone.
             comments = kb.list_comments(conn, tid)
             assert not any("human decision" in c.body for c in comments)
@@ -93,36 +103,143 @@ class TestBreakerTripCreatesRepair:
                 e.kind == "repair_start_failed" for e in _events(conn, tid)
             )
 
-    def test_second_trip_on_same_subject_increments_attempt(self, kanban_home):
+    def test_second_and_third_trips_each_open_a_fresh_repair(self, kanban_home):
         with kb.connect_closing() as conn:
             tid = _running_task(conn)
-            kb._record_task_failure(
-                conn, tid, "first failure",
-                outcome="crashed", failure_limit=1,
-            )
-            first_repairs = kb.task_relations(
-                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
-            )
-            assert len(first_repairs) == 1
-
-            # Simulate the subject tripping again (e.g. requeued and failed
-            # once more) -- no attempt cap per Christopher's directive.
-            with kb.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET status='running' WHERE id=?", (tid,)
+            repair_ids = []
+            for error in ("first failure", "second failure", "second failure"):
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='running' WHERE id=?", (tid,)
+                    )
+                kb._record_task_failure(
+                    conn, tid, error, outcome="crashed", failure_limit=1,
                 )
-            kb._record_task_failure(
-                conn, tid, "second failure",
-                outcome="crashed", failure_limit=1,
-            )
+                [repair_id] = [
+                    r for r in kb._repair_ids_for_subject(conn, tid)
+                    if r not in repair_ids
+                ]
+                repair_ids.append(repair_id)
+                # The repair ran and closed; the subject reran and failed again.
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='done' WHERE id=?", (repair_id,)
+                    )
 
-            second_repairs = kb.task_relations(
-                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
-            )
-            assert len(second_repairs) == 2
-
+            assert len(set(repair_ids)) == 3
             started = _events(conn, tid, "repair_started")
-            assert [s.payload["attempt"] for s in started] == [1, 2]
+            assert [s.payload["attempt"] for s in started] == [1, 2, 3]
+            assert [s.payload["same_error_as_previous"] for s in started] == [
+                False, False, True,
+            ]
+            umbrellas = {
+                kb.relation_targets(conn, r, kb.RELATION_UMBRELLA)[0]
+                for r in repair_ids
+            }
+            assert len(umbrellas) == 1
+            # The repeated fingerprint is flagged; the fresh one is not.
+            assert "SAME ERROR AGAIN" in kb.get_task(conn, repair_ids[2]).body
+            assert "SAME ERROR AGAIN" not in kb.get_task(conn, repair_ids[1]).body
+            assert _events(conn, tid, "gave_up") == []
+            assert kb.get_task(conn, tid).block_kind != "needs_input"
+
+    def test_trip_does_not_push_dependents_to_needs_input(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+            dep = kb.create_task(
+                conn, title="waits on the failing task", assignee="default",
+                parents=[tid],
+            )
+            kb._record_task_failure(
+                conn, tid, "boom", outcome="crashed", failure_limit=1,
+            )
+            dep_task = kb.get_task(conn, dep)
+            assert dep_task.status == "todo"
+            assert dep_task.block_kind != "needs_input"
+            assert _events(conn, dep, "linked_task_gave_up") == []
+            assert not any(
+                "human decision" in c.body for c in kb.list_comments(conn, dep)
+            )
+
+
+class TestOperationalUmbrella:
+    def test_umbrella_is_created_once(self, kanban_home):
+        with kb.connect_closing() as conn:
+            first = kb.ensure_operational_repairs_umbrella(conn)
+            second = kb.ensure_operational_repairs_umbrella(conn)
+            assert first == second
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE title = ?",
+                ("Operational Error Repairs",),
+            ).fetchone()[0]
+            assert rows == 1
+
+
+class TestRepairGate:
+    def _tripped(self, conn, error="boom"):
+        tid = _running_task(conn)
+        kb._record_task_failure(conn, tid, error, outcome="crashed", failure_limit=1)
+        return tid, kb.open_repair_for_subject(conn, tid)
+
+    def test_gate_red_until_a_repair_is_recorded(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, repair_id = self._tripped(conn)
+            ok, reason = kb.auto_repair_gate(conn, tid)
+            assert not ok and "no repair recorded" in reason
+            with pytest.raises(ValueError):
+                kb.record_auto_repair(conn, tid, root_cause="x", change="", check="y")
+            assert kb.record_auto_repair(
+                conn, tid, root_cause="stale lock", change="clear lock on start",
+                check="reran the job",
+            ) == repair_id
+            ok, reason = kb.auto_repair_gate(conn, tid)
+            assert ok, reason
+
+    def test_gate_red_when_change_repeats_previous_repair(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            kb.record_auto_repair(
+                conn, first, root_cause="a", change="Clear the lock", check="c",
+            )
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (first,))
+                conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+            kb._record_task_failure(conn, tid, "boom", outcome="crashed", failure_limit=1)
+            second = kb.open_repair_for_subject(conn, tid)
+            assert second and second != first
+            assert "Clear the lock" in kb.get_task(conn, second).body
+            kb.record_auto_repair(
+                conn, second, root_cause="a", change="clear  the LOCK", check="c",
+            )
+            ok, reason = kb.auto_repair_gate(conn, tid)
+            assert not ok and "same as previous repair" in reason
+            kb.record_auto_repair(
+                conn, second, root_cause="lock never released",
+                change="release the lock in the finally block", check="c",
+            )
+            ok, _ = kb.auto_repair_gate(conn, tid)
+            assert ok
+
+    def test_red_gate_after_both_attempts_opens_next_repair_not_human(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            nxt = kb.supersede_auto_repair(conn, first, reason="gate still red")
+            assert nxt and nxt != first
+            assert kb.get_task(conn, first).status == "archived"
+            subject = kb.get_task(conn, tid)
+            # Never released in between: still parked, now behind the new card.
+            assert subject.status == "todo"
+            assert nxt in kb.parent_ids(conn, tid)
+            assert first not in kb.parent_ids(conn, tid)
+            assert kb.get_task(conn, nxt).block_kind != "needs_input"
+            started = _events(conn, tid, "repair_started")
+            assert [e.payload["attempt"] for e in started] == [1, 2]
+            assert kb._REPAIR_NEW_APPROACH_PREFIX in kb.get_task(conn, nxt).body
+
+    def test_supersede_ignores_cards_that_are_not_auto_repairs(self, kanban_home):
+        with kb.connect_closing() as conn:
+            other = kb.create_task(conn, title="plain card", assignee="default")
+            assert kb.supersede_auto_repair(conn, other, reason="x") is None
 
 
 class TestRecoveryLinkageFailureLeavesSubjectUntouched:

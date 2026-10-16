@@ -1427,6 +1427,13 @@ def _escalate(conn, task_id, *, attempts, gates, expected_run_id) -> bool:
     evidence = "\n\n".join(
         f"{a.evidence}\n\n{g.evidence}" for a, g in zip(attempts, gates)
     )
+    # Auto-repair cards (t_5d7e889e Decision C) never park for a human: the
+    # next repair card replaces this one, carrying this evidence.
+    try:
+        if kb.supersede_auto_repair(conn, task_id, reason=evidence[:3000]):
+            return True
+    except Exception:
+        pass
     ok = kb.block_task(
         conn, task_id,
         reason=(

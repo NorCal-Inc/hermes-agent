@@ -885,6 +885,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="The check that proved the fix works")
     p_loop.add_argument("--author", default=None)
 
+    p_rrec = sub.add_parser(
+        "repair-record",
+        help="Record what an automatic repair card changed (its gate reads this)",
+    )
+    p_rrec.add_argument("task_id", help="The repair card, or the task it repairs")
+    p_rrec.add_argument("--root-cause", required=True, help="Why it failed")
+    p_rrec.add_argument("--change", required=True, help="What was changed")
+    p_rrec.add_argument("--check", required=True, help="How the fix was checked")
+    p_rrec.add_argument("--author", default=None)
+
+    p_rgate = sub.add_parser(
+        "repair-gate",
+        help="Exit 0 only when the open repair of a task recorded a real, new change",
+    )
+    p_rgate.add_argument("subject_id")
+
     p_exec = sub.add_parser(
         "exec",
         help="Inspect and control governed executor processes",
@@ -1583,6 +1599,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "verify":   _cmd_verify,
             "gauntlet": _cmd_gauntlet,
             "loop-repair": _cmd_loop_repair,
+            "repair-record": _cmd_repair_record,
+            "repair-gate": _cmd_repair_gate,
             "exec":     _dispatch_exec,
             "lesson-promote": _cmd_lesson_promote,
             "lesson-record-error": _cmd_lesson_record_error,
@@ -3175,6 +3193,29 @@ def _cmd_loop_repair(args: argparse.Namespace) -> int:
         f"It can now leave triage (hermes kanban specify {args.task_id})."
     )
     return 0
+
+
+def _cmd_repair_record(args: argparse.Namespace) -> int:
+    author = getattr(args, "author", None) or _profile_author()
+    try:
+        with kb.connect_closing() as conn:
+            repair_id = kb.record_auto_repair(
+                conn, args.task_id,
+                root_cause=args.root_cause, change=args.change,
+                check=args.check, author=author,
+            )
+    except ValueError as exc:
+        print(f"kanban: repair-record refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"Repair recorded on {repair_id}.")
+    return 0
+
+
+def _cmd_repair_gate(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, reason = kb.auto_repair_gate(conn, args.subject_id)
+    print(("PASS: " if ok else "FAIL: ") + reason)
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------
