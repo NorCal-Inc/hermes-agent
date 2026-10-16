@@ -464,6 +464,17 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    superseded: set[int] = set()
+                                    for _ev in events:
+                                        if _ev.kind not in _kb.KANBAN_REPAIR_SUPERSEDED_EVENT_KINDS:
+                                            continue
+                                        if conn.execute(
+                                            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+                                            "AND kind IN (?, ?) LIMIT 1",
+                                            (_ev.task_id, _ev.id,
+                                             *_kb.KANBAN_REPAIR_LOOP_START_EVENT_KINDS),
+                                        ).fetchone():
+                                            superseded.add(_ev.id)
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -475,6 +486,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "superseded": superseded,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -547,6 +559,10 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        if ev.id in d.get("superseded", ()):
+                            # The repair-loop notice for this same error
+                            # replaces it (t_2bc18772): one message per error.
+                            continue
                         is_task_approval = False
                         approval_reason = ""
                         # Identity prefix: attribute terminal pings to the
@@ -770,6 +786,45 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind in ("repair_started", "standalone_review_fail_routed_to_repair"):
+                            p = ev.payload or {}
+                            repair_id = str(p.get("repair_id") or "").strip()
+                            subject_id = str(p.get("subject_id") or sub["task_id"]).strip()
+                            cause = str(p.get("cause") or p.get("reason") or "").strip()
+                            cause = cause.splitlines()[0][:200] if cause else ""
+                            attempt = p.get("attempt")
+                            attempt_text = f" (attempt {attempt})" if attempt else ""
+                            wake_handoff = (
+                                f"Error caught on {subject_id}; repair {repair_id} started"
+                                + (f": {cause}" if cause else "")
+                            )
+                            msg = (
+                                f"🔧 {board_tag}{tag}Kanban {subject_id} error caught, "
+                                f"beginning repair loop — {title}"
+                                + (f": {cause}" if cause else "")
+                                + f"\nRepair task {repair_id}{attempt_text}."
+                            )
+                        elif kind == "repair_start_failed":
+                            p = ev.payload or {}
+                            err_text = str(p.get("error") or "").strip()[:200]
+                            wake_handoff = (
+                                "Error caught; repair loop could NOT start"
+                                + (f": {err_text}" if err_text else "")
+                            )
+                            msg = (
+                                f"⚠ {board_tag}{tag}Kanban {sub['task_id']} error caught; "
+                                f"repair loop could NOT start — {title}"
+                                + (f": {err_text}" if err_text else "")
+                                + ". Needs you."
+                            )
+                        elif kind == "repair_completed_subject_resumed":
+                            p = ev.payload or {}
+                            repair_id = str(p.get("repair_id") or "").strip()
+                            wake_handoff = f"Repaired by {repair_id}; restarted/passed"
+                            msg = (
+                                f"✅ {board_tag}{tag}Kanban {sub['task_id']} repaired, "
+                                f"restarted/passed — {title}\nRepair task {repair_id}."
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -975,6 +1030,7 @@ class GatewayKanbanWatchersMixin:
                             if "verification_failed" in _wake_kinds: _parts.append("verification failed; repair required")
                             if "notification_delivery_failed" in _wake_kinds: _parts.append("notification return path failed; delivery route lost")
                             if "verification_acceptance_missing" in _wake_kinds: _parts.append("verifier PASS refused; acceptance proof missing")
+                            if "repair_start_failed" in _wake_kinds: _parts.append("repair loop could not start; needs attention")
                             if any(k in _wake_kinds for k in _kb.KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS): _parts.append("verification return needs attention")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(

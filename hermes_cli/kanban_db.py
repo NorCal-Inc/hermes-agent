@@ -126,13 +126,24 @@ KANBAN_NOTIFY_EVENT_KINDS = (
     "status", "archived", "unblocked", "block_loop_detected",
     "review_requested", "linked_task_gave_up", "verification_failed",
     "notification_delivery_failed", "verification_acceptance_missing",
-) + KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS
+) + KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS + (
+    # Repair loop (t_2bc18772): one "error caught, beginning repair loop"
+    # notice when a repair card exists, one "repaired" notice when the
+    # subject resumes, and a needs-you notice if the repair could not start.
+    "repair_started", "repair_start_failed",
+    "repair_completed_subject_resumed",
+    "standalone_review_fail_routed_to_repair",
+)
 KANBAN_ACTIVE_WAKE_EVENT_KINDS = frozenset({
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "block_loop_detected", "review_requested", "linked_task_gave_up",
     "verification_failed", "notification_delivery_failed",
-    "verification_acceptance_missing",
+    "verification_acceptance_missing", "repair_start_failed",
 }) | frozenset(KANBAN_VERIFIER_RETURN_ATTENTION_EVENT_KINDS)
+# Raw failure kinds whose notice is replaced by the repair-loop notice once
+# a repair has been opened (or failed to open) for the same task.
+KANBAN_REPAIR_SUPERSEDED_EVENT_KINDS = frozenset({"verification_failed", "gave_up"})
+KANBAN_REPAIR_LOOP_START_EVENT_KINDS = ("repair_started", "repair_start_failed")
 assert KANBAN_ACTIVE_WAKE_EVENT_KINDS.issubset(KANBAN_NOTIFY_EVENT_KINDS)
 
 # ---------------------------------------------------------------------------
