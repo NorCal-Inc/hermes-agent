@@ -2,8 +2,14 @@
 """drift_flow.py -- shared alert / repair / close engine for drift monitors.
 
 Implements ~/.hermes/doctrine/synchronization.md "Drift repair -- alert, repair,
-close" (doctrine 2.37): one alert per drift, an automatic governed repair hand-off, one reminder after 24 hours, then exactly one closing message --
-"resolved" (when the monitor's own check comes back clean) or "human needed".
+close" (doctrine 2.37) with Christopher's 2026-10-16 #alerts rules (t_38093000):
+one "drift found, repair started" message per drift, then one "Drift repaired:
+<what> now matches." message when the monitor's own check comes back clean.
+No reminders and no reposts while the same drift stays open. There is no
+attempt cap: if a repair card ends and the drift is still there, a new repair
+card is opened silently, carrying the previous attempt so it must change
+approach. "Needs you" is posted only when no repair card could be opened, or
+when the repair worker records a decision only Christopher can make.
 
 A monitor pipes its findings into `process` as tab-separated lines:
     F<TAB>kind<TAB>subject<TAB>detail     one line per finding
@@ -24,7 +30,9 @@ STATE_DIR = Path(os.environ.get("DRIFT_FLOW_STATE_DIR", Path.home() / ".hermes/s
 STATE = STATE_DIR / "state.json"
 LEDGER = STATE_DIR / "ledger.jsonl"
 HERMES = os.environ.get("DRIFT_FLOW_HERMES", "/home/chris/.local/bin/hermes")
-REMIND_AFTER = 24 * 3600
+KANBAN_DB = os.environ.get("HERMES_KANBAN_DB", str(Path.home() / ".hermes/kanban.db"))
+# Repair card states that mean the repair finished without the drift clearing.
+REPAIR_ENDED = {"done", "archived"}
 VAULT_DIRTY_SUBJECT = "services/life-wiki/vault"
 VAULT_DIRTY_GRACE_SECONDS = 20 * 60
 
@@ -94,12 +102,37 @@ def duration(start):
     return f"{h}h {m}m" if h else f"{m}m"
 
 
+def task_status(task_id):
+    """Status of a repair card, read-only; None when unknown."""
+    if not task_id:
+        return None
+    try:
+        import sqlite3
+        c = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        finally:
+            c.close()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
 def handoff(fp, rec, rerun):
     """Route vault maintenance to the existing OpenAI Hermes worker; retain other lanes."""
     if os.environ.get("DRIFT_FLOW_NO_HANDOFF"):
         return None, "hand-off disabled (DRIFT_FLOW_NO_HANDOFF)"
     me = os.path.abspath(__file__)
-    body = (
+    attempt = rec.get("attempt", 1)
+    retry = ""
+    if attempt > 1:
+        retry = (
+            f"REPAIR ATTEMPT {attempt}: the previous repair card {rec.get('prev_task') or 'unknown'} ended "
+            "but the monitor still sees this drift. Previous note: "
+            f"{rec.get('note') or 'none recorded'}. Diagnose why that did not work and use a different "
+            "approach; do not repeat the same change.\n\n"
+        )
+    body = retry + (
         f"Drift repair under ~/.hermes/doctrine/synchronization.md, section \"Drift repair -- alert, repair, close\" "
         f"(standing authorization from Christopher, doctrine 2.37). Read that section first, including the step 3 limits.\n\n"
         f"Monitor: {rec['monitor']}\nSubject: {rec['subject']}\nKind: {rec['kind']} ({LABEL.get(rec['kind'], rec['kind'])})\n"
@@ -109,15 +142,18 @@ def handoff(fp, rec, rerun):
         "2. Repair it if it is within the standing authorization. Company repos: move existing commits and repair access "
         "with that company's own credential only; do not edit or read company product code or private content.\n"
         f"3. Record what you did: python3 {me} note --fp '{fp}' --text '<what was done>'\n"
-        f"4. If you cannot resolve it, or a step 3 limit applies: python3 {me} human-needed --fp '{fp}' "
-        "--text '<what is wrong; what you checked; decision needed; your recommendation>'\n"
+        f"4. Only if a step 3 limit applies (a decision only Christopher can make): python3 {me} human-needed --fp '{fp}' "
+        "--text '<what is wrong; what you checked; decision needed; your recommendation>'. "
+        "Otherwise keep diagnosing and repairing; there is no attempt cap.\n"
         f"5. Rerun the monitor so it confirms or delivers the message: {rerun}\n"
         "Do not send Telegram messages yourself; the monitor sends the resolved or human-needed message. "
         "Never print credentials."
     )
-    key = f"drift:{fp}:{rec['alerted_at']}"
+    key = f"drift:{fp}:{rec['alerted_at']}" + (f":{attempt}" if attempt > 1 else "")
     title = f"Repair drift: {name(rec['subject'])} ({LABEL.get(rec['kind'], rec['kind'])})"
-    env = dict(os.environ, HOME=str(Path.home()), PATH=f"{Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin")
+    env = dict(os.environ, HOME=str(Path.home()), PATH=f"{Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+               # A timer, not Christopher: record the card as system-created.
+               HERMES_ACTOR_KIND="system", HERMES_ACTOR_ID="drift-flow")
     try:
         lane_args = [] if rec["subject"] == VAULT_DIRTY_SUBJECT else ["--executor-lane", "claude"]
         p = subprocess.run([HERMES, "kanban", "create", title, "--body", body, "--assignee", "default",
@@ -165,28 +201,47 @@ def process(monitor, rerun, lines):
             if age < VAULT_DIRTY_GRACE_SECONDS or rec["observations"] < 2:
                 ledger("settling", fp, rec, age_seconds=age)
                 continue
-        if rec and rec["kind"] == f["kind"] and not rec.get("pending"):
+        if rec and not rec.get("pending"):
+            # Same drift still open: never repost (t_38093000).
+            if rec["kind"] != f["kind"]:
+                ledger("changed", fp, rec, new_kind=f["kind"], new_detail=f["detail"])
+                rec["kind"] = f["kind"]
             rec["detail"] = f["detail"]
-            if not rec.get("reminded") and not rec.get("human_needed") and \
-                    (t - parse(rec["alerted_at"])).total_seconds() >= REMIND_AFTER:
-                rec["reminded"] = True
-                ledger("reminder", fp, rec)
-                out.append(f"⏰ Drift still open after {duration(rec['first_seen'])}: {name(f['subject'])}\n"
-                           f"{LABEL.get(f['kind'], f['kind'])}. {f['detail']}\n"
-                           f"Repair worker task: {rec.get('task') or 'none'}")
+            if rec.get("human_needed"):
+                continue
+            if not rec.get("task"):
+                # Earlier hand-off failed (Needs-you already posted): retry.
+                task, err = handoff(fp, rec, rerun)
+                if task:
+                    rec["task"] = task
+                    ledger("repair_started", fp, rec, task=task)
+                    out.append(f"🔧 Drift repair started: {name(f['subject'])}\n"
+                               f"{LABEL.get(rec['kind'], rec['kind'])}. {f['detail']}\n"
+                               f"Repair task {task}.")
+                continue
+            if task_status(rec["task"]) in REPAIR_ENDED:
+                # Repair finished but the drift is still here: next repair,
+                # silently, carrying the previous attempt (no cap).
+                rec["prev_task"] = rec["task"]
+                rec["attempt"] = rec.get("attempt", 1) + 1
+                task, err = handoff(fp, rec, rerun)
+                rec["task"] = task
+                ledger("repair_restarted", fp, rec, task=task, prev_task=rec["prev_task"],
+                       attempt=rec["attempt"], handoff_error=err)
+                if not task:
+                    out.append(f"⚠️ Drift repair could NOT restart: {name(f['subject'])}\n"
+                               f"{LABEL.get(rec['kind'], rec['kind'])}. {err}. Needs you.")
             continue
         first_seen = rec["first_seen"] if rec else iso(t)
-        changed = rec is not None and not rec.get("pending")
         rec = {"monitor": monitor, "subject": f["subject"], "kind": f["kind"], "detail": f["detail"],
-               "first_seen": first_seen, "alerted_at": iso(t)}
+               "first_seen": first_seen, "alerted_at": iso(t), "attempt": 1}
         task, err = handoff(fp, rec, rerun)
         rec["task"] = task
         state[fp] = rec
-        ledger("changed" if changed else "detected", fp, rec, task=task, handoff_error=err)
-        head = "⚠️ Drift changed" if changed else "⚠️ Drift found"
-        tail = f"The repair worker has been notified to repair it (task {task})." if task else \
-            f"The repair worker could NOT be notified: {err}. Human needed."
-        out.append(f"{head}: {name(f['subject'])}\n{LABEL.get(f['kind'], f['kind'])}. {f['detail']}\n{tail}")
+        ledger("detected", fp, rec, task=task, handoff_error=err)
+        tail = f"Repair started (task {task})." if task else \
+            f"Repair could NOT start: {err}. Needs you."
+        out.append(f"⚠️ Drift found: {name(f['subject'])}\n{LABEL.get(f['kind'], f['kind'])}. {f['detail']}\n{tail}")
 
     for fp in list(state):
         rec = state[fp]
@@ -197,8 +252,8 @@ def process(monitor, rerun, lines):
             del state[fp]
             continue
         ledger("resolved", fp, rec, duration=duration(rec["first_seen"]))
-        msg = (f"✅ Drift resolved: {name(rec['subject'])}\n"
-               f"Was: {LABEL.get(rec['kind'], rec['kind'])}. Open {duration(rec['first_seen'])}. The check is clean now.")
+        msg = (f"✅ Drift repaired: {name(rec['subject'])} now matches.\n"
+               f"Was: {LABEL.get(rec['kind'], rec['kind'])}. Open {duration(rec['first_seen'])}.")
         if rec.get("note"):
             msg += f"\nWhat was done: {rec['note']}"
         out.append(msg)
@@ -209,7 +264,7 @@ def process(monitor, rerun, lines):
         if hn and not hn.get("delivered"):
             hn["delivered"] = iso(t)
             ledger("human_needed_delivered", fp, rec)
-            out.append(f"🙋 Human needed: {name(rec['subject'])}\n{LABEL.get(rec['kind'], rec['kind'])}. {hn['text']}")
+            out.append(f"🙋 Needs you: {name(rec['subject'])}\n{LABEL.get(rec['kind'], rec['kind'])}. {hn['text']}")
 
     save(state)
     if out:
