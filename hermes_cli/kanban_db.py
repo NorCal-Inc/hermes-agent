@@ -317,6 +317,29 @@ GAUNTLET_STALE_EVENT = "gauntlet_stale"
 #
 # This is a denylist rather than an allowlist on purpose: a new lifecycle event
 # added later should count as progress by default (a false negative merely
+#: A respawn guard repeating the same reason on the same card is recorded at
+#: most once per this many seconds (2026-10-15: 1,572 identical rows in three
+#: days on three quota-walled cards). The skip itself still happens every tick.
+RESPAWN_GUARD_EVENT_REPEAT_SECONDS = 1800
+
+
+def _record_respawn_guarded(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    last = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = 'respawn_guarded' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and int(time.time()) - int(last["created_at"] or 0) < RESPAWN_GUARD_EVENT_REPEAT_SECONDS:
+        try:
+            previous = json.loads(last["payload"] or "{}").get("reason")
+        except (ValueError, AttributeError):
+            previous = None
+        if previous == reason:
+            return
+    with write_txn(conn):
+        _append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+
+
 # delays an alert), whereas a new kind silently omitted from an allowlist would
 # make every card look permanently stale. The members are the per-tick
 # dispatcher chatter and the refusal records — a spawn the guard skipped again,
@@ -13772,6 +13795,15 @@ def _ensure_independent_verifier_child(
             verifier_control_plane_authority = (
                 f"operator:human-interactive-parent:{subject_id}"
             )
+        elif inherited_authority and inherited_authority.startswith(
+            CONTROL_PLANE_AUTHORITY_PREFIXES
+        ):
+            # Admitted under a named defect/regression/requirement: the
+            # verifier is that admission's own mandatory check, not new
+            # construction. Never operator:, so it delegates no operator power.
+            verifier_control_plane_authority = (
+                f"requirement:independent-verification:{subject_id}"
+            )
 
     # A subject on a repair leg owes regression proof with its next PASS, and
     # only the verifier that re-ran the checks can hand it over (the return
@@ -13824,6 +13856,18 @@ def _ensure_independent_verifier_child(
             assignee="atlas",
             parents=[subject_id],
             created_by="kanban:request_review",
+            # The verification gate creates this card, never a person. The env
+            # fallback recorded it as human_interactive whenever the caller had
+            # no governed-run env (the gateway dispatcher), which
+            # is_human_relayed()/task_admission() read as delegated operator
+            # authority (2026-10-15: 221 such cards in 21 days).
+            provenance=ActorProvenance(
+                kind=ACTOR_KIND_SYSTEM,
+                actor_id="kanban:request_review",
+                lane=None,
+                run_id=None,
+                cause=CREATION_CAUSE_AUTOMATED,
+            ),
             max_runtime_seconds=(
                 MANDATORY_OBSERVATION_INTERVAL_SECONDS
                 if gauntlet_required(conn, subject_id)
@@ -24734,11 +24778,7 @@ def _dispatch_once_locked(
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                _record_respawn_guarded(conn, row["id"], guard_reason)
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -24897,11 +24937,7 @@ def _dispatch_once_locked(
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                _record_respawn_guarded(conn, row["id"], guard_reason)
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
