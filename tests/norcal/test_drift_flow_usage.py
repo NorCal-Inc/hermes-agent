@@ -134,3 +134,21 @@ class TestDriftFlowUsage(unittest.TestCase):
         body = self.argv()[self.argv().index("--body")+1]
         self.assertNotIn("If you cannot resolve it", body)
         self.assertIn("no attempt cap", body)
+    def mark(self, fp, field, text, seconds):
+        buf = io.StringIO()
+        with patch.object(self.mod, "now", return_value=self.clock+dt.timedelta(seconds=seconds)), contextlib.redirect_stdout(buf):
+            self.mod.mark(fp, field, text)
+        return buf.getvalue()
+    def test_note_after_resolution_records_without_reopening(self):
+        subject = "company/checkout"
+        fp = f"sync:{subject}"
+        self.assertIn("t_test", self.process([f"F\tahead\t{subject}\tdrift detail\n", f"C\t{subject}\n"]))
+        self.assertIn("Drift repaired", self.process([f"C\t{subject}\n"], 60))
+        self.assertEqual(self.mod.load(), {})
+        out = self.mark(fp, "note", "repair complete, see evidence", 90)
+        self.assertIn(f"recorded note for {fp}", out)
+        self.assertEqual(self.mod.load(), {})
+        rows = [json.loads(l) for l in self.mod.LEDGER.read_text().splitlines()]
+        self.assertEqual(rows[-1]["event"], "note")
+        self.assertTrue(rows[-1].get("post_resolution"))
+        self.assertEqual(rows[-1]["fp"], fp)

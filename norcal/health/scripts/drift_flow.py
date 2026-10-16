@@ -271,19 +271,59 @@ def process(monitor, rerun, lines):
         print("\n\n".join(out))
 
 
+def last_closed_episode(fp):
+    """The ledger's last closure (resolved/settled) for fp, if it hasn't been reopened since.
+
+    Scans the immutable ledger backwards (never touches `state`, so it can't
+    reopen or fabricate a drift). A worker's `note` call can legitimately land
+    after the monitor's own check already closed the episode -- the repair and
+    the next clean observation race independently, and the delay between them
+    is not bounded. Returns None once a newer non-closure event for the same
+    fp (a fresh detection/change) shows it was reopened; a run of trailing
+    post-resolution notes on top of the closure is skipped over so repeated
+    `note` calls keep finding the same closure.
+    """
+    try:
+        lines = LEDGER.read_text().splitlines()
+    except FileNotFoundError:
+        return None
+    for raw in reversed(lines):
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if row.get("fp") != fp:
+            continue
+        event = row.get("event")
+        if event in ("resolved", "settled"):
+            return {"monitor": row.get("monitor"), "subject": row.get("subject"),
+                    "kind": row.get("kind"), "detail": row.get("detail"), "at": row.get("at")}
+        if event == "note" and row.get("post_resolution"):
+            continue  # an earlier post-resolution note; keep looking for the closure itself
+        return None  # most recent event for this fp is something else (e.g. still open/reopened)
+    return None
+
+
 def mark(fp, field, text):
     state = load()
     rec = state.get(fp)
-    if not rec:
-        sys.exit(f"no open drift with fingerprint {fp!r}; open: {', '.join(state) or 'none'}")
-    if field == "human_needed":
-        rec["human_needed"] = {"text": text, "at": iso(now())}
-        ledger("human_needed", fp, rec, text=text)
-    else:
-        rec["note"] = text
-        ledger("note", fp, rec, text=text)
-    save(state)
-    print(f"recorded {field} for {fp}")
+    if rec:
+        if field == "human_needed":
+            rec["human_needed"] = {"text": text, "at": iso(now())}
+            ledger("human_needed", fp, rec, text=text)
+        else:
+            rec["note"] = text
+            ledger("note", fp, rec, text=text)
+        save(state)
+        print(f"recorded {field} for {fp}")
+        return
+    if field == "note":
+        closed = last_closed_episode(fp)
+        if closed:
+            ledger("note", fp, closed, text=text, post_resolution=True)
+            print(f"recorded note for {fp} (resolved {duration(closed['at'])} ago)")
+            return
+    sys.exit(f"no open drift with fingerprint {fp!r}; open: {', '.join(state) or 'none'}")
 
 
 def main():
