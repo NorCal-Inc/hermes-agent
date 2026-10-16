@@ -23556,10 +23556,15 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    # Populated inside the trip branch below and consumed AFTER the write_txn
+    # block commits -- create_repair_task/link_tasks open their own top-level
+    # write_txn and would raise on nested composition if called from inside
+    # this one (write_txn(conn) default is allow_nested=False).
+    _trip_repair_ctx: Optional[dict] = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "assignee FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
@@ -23687,18 +23692,43 @@ def _record_task_failure(
             # (e.g. a task parked in ``dependency_wait`` on this one) —
             # both were previously stuck with no signal at all once this
             # task stopped retrying.
-            conn.execute(
-                "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?",
-                (task_id,),
+            # Ordinary failures auto-repair instead of parking for a human
+            # decision (t_bf453ced: Christopher's no-attempt-cap, never-a-
+            # human-hold-for-ordinary-failures directive). The repair card
+            # itself is created AFTER this transaction commits --
+            # ``create_repair_task``/``link_tasks`` each open their own
+            # top-level ``write_txn`` and would raise on nested composition
+            # if invoked from inside this one. Everything the repair needs
+            # is captured here, while the subject row and its existing
+            # relations are still consistent under THIS transaction's lock.
+            subject_row = conn.execute(
+                "SELECT title FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            subject_title = (
+                subject_row["title"] if subject_row and subject_row["title"] else task_id
+            )
+            existing_umbrella = relation_targets(conn, task_id, RELATION_UMBRELLA)
+            existing_repairs = task_relations(
+                conn, task_id, relation=RELATION_REPAIRS, direction="to",
             )
             evidence = (
                 f"Retry exhaustion (gave_up): {failures} consecutive "
                 f"failures reached the effective limit ({effective_limit}, "
                 f"source={limit_source}). Trigger: {outcome}. Last error: "
-                f"{error[:500]}. Needs a human decision or an approved "
-                f"recovery lane before `unblock` is safe to run."
+                f"{error[:500]}."
             )
-            add_comment(conn, task_id, "dispatcher", evidence)
+            _trip_repair_ctx = {
+                "subject_id": task_id,
+                "subject_title": subject_title,
+                "owner": (row["assignee"] or "").strip() or "default",
+                "umbrella_id": (
+                    existing_umbrella[0] if existing_umbrella else task_id
+                ),
+                "attempt": len(existing_repairs) + 1,
+                "error": error[:500],
+                "fingerprint": _error_fingerprint(error),
+                "evidence": evidence,
+            }
             linked = [
                 (pid, "parent") for pid in parent_ids(conn, task_id)
             ] + [
@@ -23849,6 +23879,70 @@ def _record_task_failure(
                         "refused_identities": sorted(
                             _self_review_refused_implementers(conn, task_id)
                         ),
+                    },
+                )
+    # Ordinary breaker trip: mint (or fail to mint) the repair card now that
+    # the trip transaction above is durably committed. create_repair_task /
+    # link_tasks each open their own top-level write_txn, so this must run
+    # outside the block above.
+    if _trip_repair_ctx is not None:
+        ctx = _trip_repair_ctx
+        try:
+            repair_id = create_repair_task(
+                conn,
+                title=f"Repair: {ctx['subject_title'][:80]}",
+                subject_id=ctx["subject_id"],
+                owner=ctx["owner"],
+                umbrella_id=ctx["umbrella_id"],
+                body=(
+                    f"{ctx['evidence']}\n\nFingerprint: {ctx['fingerprint']}\n\n"
+                    "Auto-created by the breaker-trip auto-repair path "
+                    "(t_bf453ced): an ORDINARY task failure creates a repair "
+                    "card instead of parking the subject blocked/needs_input "
+                    "for a human (Christopher's directive: no attempt cap, "
+                    "never hand ordinary failures to a human). "
+                    "recovery_gate_cmd is deliberately the no-op 'true': no "
+                    "generic per-task mechanical acceptance check exists for "
+                    "an arbitrary subject, so Claude's one bounded attempt "
+                    "always reaches the gate's green branch and the card "
+                    "proceeds into the normal Gauntlet independent-"
+                    "verification pipeline when gauntlet_enforced (or "
+                    "completes directly otherwise) exactly like any other "
+                    "repair -- it never falls into claude_recovery's own "
+                    "two-attempt-then-block escalation. Recorded as a "
+                    "comment on t_bf453ced per its own ambiguity-resolution "
+                    "instruction."
+                ),
+                assignee=ctx["owner"],
+                executor_lane=EXECUTOR_LANE_CLAUDE_RECOVERY,
+                recovery_gate_cmd="true",
+            )
+        except RecoveryLinkageError as exc:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "repair_start_failed",
+                    {"subject_id": task_id, "error": str(exc)[:500]},
+                )
+        else:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo', block_kind = NULL "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (task_id,),
+                )
+            # Dependency edge (repair -> subject), separate from the
+            # non-gating RELATION_REPAIRS governance relation create_repair_task
+            # already established: this is what actually parks the subject in
+            # 'todo' until the repair finishes.
+            link_tasks(conn, repair_id, task_id)
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "repair_started",
+                    {
+                        "repair_id": repair_id,
+                        "subject_id": task_id,
+                        "attempt": ctx["attempt"],
+                        "cause": ctx["error"],
                     },
                 )
     return blocked

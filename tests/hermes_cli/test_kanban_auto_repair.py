@@ -1,0 +1,159 @@
+"""Breaker trip creates a repair card instead of a human hold (t_bf453ced).
+
+Part 1/3 of the t_5d7e889e kernel decomposition. Christopher's directive is
+explicit and has no attempt cap: an ORDINARY task failure that trips the
+circuit breaker in ``_record_task_failure`` must create a governed repair
+card (via ``create_repair_task``, on the ``claude_recovery`` executor lane so
+the existing recovery lane in ``hermes_cli.recovery_lane`` runs it) and park
+the subject in ``todo`` behind it -- never ``blocked``/``needs_input`` for a
+human to triage.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+
+pytestmark = pytest.mark.usefixtures("all_assignees_spawnable")
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def _events(conn, task_id, kind=None):
+    rows = kb.list_events(conn, task_id)
+    if kind is None:
+        return rows
+    return [r for r in rows if r.kind == kind]
+
+
+def _running_task(conn, assignee="default"):
+    tid = kb.create_task(conn, title="ordinary work that keeps failing", assignee=assignee)
+    claimed = kb.claim_task(conn, tid, claimer=assignee)
+    assert claimed is not None
+    return tid
+
+
+class TestBreakerTripCreatesRepair:
+    def test_trip_creates_linked_repair_not_needs_input(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+
+            blocked = kb._record_task_failure(
+                conn, tid, "boom: subprocess exited 1",
+                outcome="crashed", failure_limit=1,
+            )
+            assert blocked is True
+
+            task = kb.get_task(conn, tid)
+            # Never a human hold for an ordinary failure.
+            assert task.block_kind != "needs_input"
+            # Parked in todo, gated on the repair, not left 'blocked'.
+            assert task.status == "todo"
+
+            incoming_repairs = kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            )
+            assert len(incoming_repairs) == 1
+            repair_id = incoming_repairs[0]["from_task_id"]
+
+            repair = kb.get_task(conn, repair_id)
+            assert repair.executor_lane == kb.EXECUTOR_LANE_CLAUDE_RECOVERY
+            assert repair.recovery_owner == "default"
+            assert kb.missing_repair_relations(conn, repair_id) == []
+            assert kb.relation_targets(conn, repair_id, kb.RELATION_REPAIRS) == [tid]
+
+            # Dependency edge actually gates the subject on the repair.
+            assert repair_id in kb.parent_ids(conn, tid)
+
+            started = _events(conn, tid, "repair_started")
+            assert len(started) == 1
+            payload = started[0].payload
+            assert payload["repair_id"] == repair_id
+            assert payload["subject_id"] == tid
+            assert payload["attempt"] == 1
+            assert "boom" in payload["cause"]
+
+            # History is preserved: gave_up still fires exactly as before.
+            assert len(_events(conn, tid, "gave_up")) == 1
+            # But the human-decision comment is gone.
+            comments = kb.list_comments(conn, tid)
+            assert not any("human decision" in c.body for c in comments)
+            assert not any(
+                e.kind == "repair_start_failed" for e in _events(conn, tid)
+            )
+
+    def test_second_trip_on_same_subject_increments_attempt(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+            kb._record_task_failure(
+                conn, tid, "first failure",
+                outcome="crashed", failure_limit=1,
+            )
+            first_repairs = kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            )
+            assert len(first_repairs) == 1
+
+            # Simulate the subject tripping again (e.g. requeued and failed
+            # once more) -- no attempt cap per Christopher's directive.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='running' WHERE id=?", (tid,)
+                )
+            kb._record_task_failure(
+                conn, tid, "second failure",
+                outcome="crashed", failure_limit=1,
+            )
+
+            second_repairs = kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            )
+            assert len(second_repairs) == 2
+
+            started = _events(conn, tid, "repair_started")
+            assert [s.payload["attempt"] for s in started] == [1, 2]
+
+
+class TestRecoveryLinkageFailureLeavesSubjectUntouched:
+    def test_linkage_error_emits_repair_start_failed_and_preserves_state(
+        self, kanban_home, monkeypatch
+    ):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+
+            def _boom(*a, **k):
+                raise kb.RecoveryLinkageError("forced: subject vanished mid-link")
+
+            monkeypatch.setattr(kb, "create_repair_task", _boom)
+
+            blocked = kb._record_task_failure(
+                conn, tid, "boom again",
+                outcome="crashed", failure_limit=1,
+            )
+            assert blocked is True
+
+            task = kb.get_task(conn, tid)
+            # Prior state (set by the trip branch itself) is left exactly as
+            # it was -- no repair, no needs_input human hold either.
+            assert task.status == "blocked"
+            assert task.block_kind != "needs_input"
+            assert kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            ) == []
+
+            failed = _events(conn, tid, "repair_start_failed")
+            assert len(failed) == 1
+            assert failed[0].payload["subject_id"] == tid
+            assert "forced" in failed[0].payload["error"]
+            assert _events(conn, tid, "repair_started") == []
