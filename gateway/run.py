@@ -17218,6 +17218,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check for commands
         command = event.get_command()
 
+        # Deterministic Erika command reference (Discord): answer "list
+        # commands" and equivalents from live source/config, not model memory.
+        if (
+            not command
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and not getattr(event, "media_urls", None)
+        ):
+            from gateway.erika_reference import commands_reference, is_commands_request
+
+            if is_commands_request(event.text):
+                return commands_reference()
+
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
             is_gateway_known_command,
