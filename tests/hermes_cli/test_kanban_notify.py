@@ -355,10 +355,21 @@ async def test_notifier_notify_plus_wake_wakes_on_review_requested(kanban_home):
 
 @pytest.mark.asyncio
 async def test_notifier_notify_plus_wake_wakes_on_linked_task_gave_up(kanban_home):
-    """A linked dependency exhausting retries is an executive decision event.
+    """Superseded by Decision C (t_5d7e889e, 2026-10-16): a linked
+    dependency exhausting its retries used to be an executive decision
+    event that flipped the governance owner into blocked/needs_input and
+    woke a subscribed origin.
 
-    The subscribed origin must wake, not merely receive a passive text ping,
-    because the related governance card is moved to needs_input.
+    Decision C removed the entire gave_up -> blocked/needs_input terminal
+    path for ordinary failures: the dependency opens (or reuses) a repair
+    card instead and stays parked in 'todo' gated on it, resuming on its
+    own once the repair completes. There is no more terminal failure for
+    the owner to be woken about, so this asserts the opposite of the old
+    behavior: the owner is left exactly where ``block_task`` put it, and
+    the notifier does not wake anyone for a decision that no longer
+    exists. Propagating a live "a repair is in progress" notice to linked
+    tasks is the companion notifier card's job (t_2bc18772), not this
+    kernel card's.
     """
     from gateway.run import GatewayRunner
     from gateway.config import Platform
@@ -381,8 +392,8 @@ async def test_notifier_notify_plus_wake_wakes_on_linked_task_gave_up(kanban_hom
             failure_limit=1, release_claim=True, end_run=True,
         )
         landed = kb.get_task(conn, owner)
-        assert landed.status == "blocked"
-        assert landed.block_kind == "needs_input"
+        assert landed.status == "todo"
+        assert landed.block_kind == "dependency"
     finally:
         conn.close()
 
@@ -412,12 +423,7 @@ async def test_notifier_notify_plus_wake_wakes_on_linked_task_gave_up(kanban_hom
             timeout=10.0,
         )
 
-    assert fake_adapter.send.await_count >= 1
-    wake_mock.assert_awaited_once()
-    wake_text = wake_mock.await_args.kwargs["text"]
-    assert owner in wake_text
-    assert dep in wake_text
-    assert "worker died" in wake_text
+    wake_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

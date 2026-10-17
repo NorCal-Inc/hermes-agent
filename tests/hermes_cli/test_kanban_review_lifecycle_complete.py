@@ -391,6 +391,12 @@ def test_interrupted_review_runs_retry_in_review_phase(
 
 
 def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
+    """Decision C (t_5d7e889e, 2026-10-16) replaced the gave_up ->
+    blocked/needs_input terminal path for ordinary failures: the breaker
+    still trips (the counter still reaches its limit), but the subject is
+    now parked in 'todo' gated on a freshly-opened repair card instead of
+    being blocked for a human. No gave_up event fires any more.
+    """
     task_id, _review = _claimed_review(conn, "Reviewer repeatedly fails")
     assert kb._record_spawn_failure(
         conn,
@@ -398,16 +404,20 @@ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
         "reviewer cannot start",
         failure_limit=1,
     )
-    blocked = kb.get_task(conn, task_id)
-    assert blocked is not None
-    assert blocked.status == "blocked"
-    gave_up = _event(kb.list_events(conn, task_id), "gave_up")
-    assert gave_up.payload is not None
-    assert gave_up.payload["retry_status"] == "review"
-    assert kb.unblock_task(conn, task_id)
-    unblocked = kb.get_task(conn, task_id)
-    assert unblocked is not None
-    assert unblocked.status == "review"
+    routed = kb.get_task(conn, task_id)
+    assert routed is not None
+    assert routed.status == "todo"
+    assert routed.block_kind is None
+    assert not any(
+        e.kind == "gave_up" for e in kb.list_events(conn, task_id)
+    ), "Decision C: no gave_up event for this failure class"
+    repair_event = _event(kb.list_events(conn, task_id), "repair_started")
+    assert repair_event.payload is not None
+    assert repair_event.payload["trigger"] == "spawn_failed"
+    repair_id = repair_event.payload["repair_id"]
+    repair = kb.get_task(conn, repair_id)
+    assert repair is not None
+    assert repair.recovery_owner == "erika"
 
 
 def test_review_escalation_unblocks_back_to_review(conn) -> None:
@@ -704,13 +714,18 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
 
     # A crash now increments 1 -> 2 and trips a failure_limit=2 breaker —
     # the counter accumulated across the review cycle instead of being
-    # amnesia-reset back to 0.
+    # amnesia-reset back to 0. Decision C (t_5d7e889e, 2026-10-16): tripping
+    # routes to a repair card, not blocked/needs_input -- it still proves
+    # the counter kept its weight across the review cycle.
     tripped = kb._record_task_failure(
         conn, task_id, "worker crashed", outcome="crashed", failure_limit=2,
     )
     assert tripped is True
     assert _failures(conn, task_id) == 2
-    assert kb.get_task(conn, task_id).status == "blocked"
+    routed = kb.get_task(conn, task_id)
+    assert routed is not None
+    assert routed.status == "todo"
+    assert routed.block_kind is None
 
     # Sanity: complete_task's success path still clears the counter.
     ok_id = kb.create_task(conn, title="healthy", assignee="builder")

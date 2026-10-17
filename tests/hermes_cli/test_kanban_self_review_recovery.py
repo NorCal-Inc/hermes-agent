@@ -519,12 +519,24 @@ class TestSelfReviewRefusalRetryBudget:
 
 class TestBlockedDependencyNotifiesGovernableParent:
     def test_dependent_parked_in_todo_becomes_governable(self, kanban_home):
-        """The t_db0af7e0 shape.
+        """The t_db0af7e0 shape, superseded by Decision C (t_5d7e889e,
+        2026-10-16).
 
-        The governance card was linked as the CHILD of its execution card and
-        sat in 'todo' behind an unsatisfiable dependency. ``linked_task_gave_up``
-        landed on a card ``recompute_ready`` would never promote and no
-        dispatcher would ever claim.
+        Originally: the governance card was linked as the CHILD of its
+        execution card and sat in 'todo' behind an unsatisfiable
+        dependency. ``linked_task_gave_up`` landed on a card
+        ``recompute_ready`` would never promote and no dispatcher would
+        ever claim, so the fix woke it into blocked/needs_input.
+
+        Decision C removed the entire gave_up -> blocked/needs_input
+        terminal path for ordinary failures: the execution half no longer
+        "gives up" at all. It opens (or reuses) a repair card and stays
+        parked in 'todo' gated on that repair, which resumes it
+        automatically on completion. The dependency is no longer
+        unsatisfiable-forever, so there is nothing ungovernable to rescue
+        the owner into -- it is left exactly where ``block_task`` put it,
+        still governable the normal way (``unblock_task``), and no
+        needs_input escalation fires on its behalf.
         """
         with kb.connect_closing() as conn:
             # Live ordering (t_db0af7e0 events 9837-9845): the governance card
@@ -550,22 +562,26 @@ class TestBlockedDependencyNotifiesGovernableParent:
                 failure_limit=1, release_claim=True, end_run=True,
             ) is True
 
-            # Still notified, exactly as before...
-            assert _events(conn, owner, "linked_task_gave_up")
-            # ...but now on a card its owner can actually act on.
-            woken = kb.get_task(conn, owner)
-            assert woken.status == "blocked"
-            assert woken.block_kind == "needs_input"
+            # The execution half opened a repair instead of giving up.
+            dep_task = kb.get_task(conn, dep)
+            assert dep_task.status == "todo"
+            assert dep_task.block_kind is None
+            assert any(
+                kind == "repair_started" for kind, _payload in _events(conn, dep)
+            )
 
-            evt = _events(conn, owner, "dependency_failure_needs_decision")
-            assert len(evt) == 1
-            assert evt[0][1]["task_id"] == dep
-            assert evt[0][1]["from_status"] == "todo"
-            assert evt[0][1]["from_block_kind"] == "dependency"
-
-            # ``unblock`` is a real exit from that state — the governor has a
-            # mechanical route to a recovery decision.
-            assert kb.unblock_task(conn, owner) is True
+            # No gave_up/linked-task escalation fires any more, and the
+            # owner is left exactly where block_task put it -- status
+            # 'todo'/block_kind 'dependency', never force-woken into
+            # blocked/needs_input for a decision that no longer exists.
+            # unblock_task is a no-op here (it only acts on status=
+            # 'blocked'), which is correct: nothing escalated.
+            assert _events(conn, owner, "linked_task_gave_up") == []
+            assert _events(conn, owner, "dependency_failure_needs_decision") == []
+            still = kb.get_task(conn, owner)
+            assert still.status == "todo"
+            assert still.block_kind == "dependency"
+            assert kb.unblock_task(conn, owner) is False
 
     def test_running_dependent_is_not_disturbed(self, kanban_home):
         """The wake only touches cards that are genuinely parked."""

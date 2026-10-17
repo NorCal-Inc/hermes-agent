@@ -1377,14 +1377,29 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
                 "below-budget violations must not tick the unified counter"
             )
 
-        # Third consecutive violation: streak hits the bound — blocked.
+        # Third consecutive violation: streak hits the bound. Decision C
+        # (t_5d7e889e) replaced the gave_up -> blocked/needs_input terminal
+        # path for ordinary failures: the subject is parked in 'todo' gated
+        # on a freshly-opened repair card, never blocked for a human.
         _drive_protocol_violation(conn, tid, 991003)
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "todo"
+        assert task.block_kind is None
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
-        assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
+        assert len(gave_up) == 0, "Decision C: no gave_up event for this failure class"
+        routed = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "failure_routed_to_repair"
+        ]
+        assert len(routed) == 1
+        assert (routed[0].payload or {}).get("protocol_violations") == \
             _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+        started = [e for e in kb.list_events(conn, tid) if e.kind == "repair_started"]
+        assert len(started) == 1
+        repair_id = started[0].payload["repair_id"]
+        repair = kb.get_task(conn, repair_id)
+        assert repair is not None
+        assert repair.recovery_owner == "erika"
     finally:
         conn.close()
 
@@ -1392,19 +1407,23 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 def test_gave_up_creates_durable_escalation_and_notifies_linked_tasks(
     kanban_home,
 ):
-    """Regression for t_f2d639a3 defect #1: retry exhaustion used to just
-    flip status to 'blocked' with a 'gave_up' event and stop there — no
-    durable marker distinguishing it from an ordinary block, no evidence
-    comment, and nothing told a provenance parent or a dependent waiting
-    on this exact task that it had stopped retrying (real instances:
-    t_500a3503's parent t_7311348b never heard it gave up; t_d40a8c70's
-    dependent t_aba8b8d8 was left waiting on it forever with no signal).
+    """Regression for t_f2d639a3 defect #1, superseded by Decision C
+    (t_5d7e889e, 2026-10-16): retry exhaustion used to just flip status to
+    'blocked' with a 'gave_up' event and stop there. Decision C replaced
+    that entire gave_up -> blocked/needs_input terminal path for ordinary
+    failures (crash/timeout/spawn-fail/judge-error): there is no attempt
+    cap and no human hold for this failure class any more. The subject now
+    opens (or reuses) a repair card via create_repair_task (owner 'erika',
+    under the durable "Operational Error Repairs" umbrella), is parked in
+    'todo' gated on that repair, and the board records
+    'failure_routed_to_repair' plus 'repair_started' on the subject itself.
 
-    This does NOT change the pinned status='blocked' outcome asserted by
-    test_protocol_violation_budget_not_consumed_by_other_failures above,
-    or by test_review_retry_still_trips_the_failure_breaker in
-    test_kanban_review_lifecycle_complete.py — it only adds durable,
-    additive escalation state alongside it.
+    This test now asserts that routing. The original defect's parent/
+    dependent 'linked_task_gave_up' notification cannot fire any more
+    because there is no 'gave_up' event left to notify about; propagating
+    a 'repair_started' notice to linked tasks is explicitly out of scope
+    for this kernel card (t_5d7e889e) and is the companion notifier card's
+    job (t_2bc18772), not asserted here.
     """
     conn = kb.connect()
     try:
@@ -1423,23 +1442,29 @@ def test_gave_up_creates_durable_escalation_and_notifies_linked_tasks(
         ) is True
 
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        assert task.block_kind == "needs_input"
+        assert task.status == "todo"
+        assert task.block_kind is None
+        assert not any(
+            e.kind == "gave_up" for e in kb.list_events(conn, tid)
+        ), "Decision C: no gave_up event for this failure class"
 
-        own_comments = [c.body for c in kb.list_comments(conn, tid)]
-        assert any("Retry exhaustion" in b and "worker crashed" in b
-                    for b in own_comments)
+        routed = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "failure_routed_to_repair"
+        ]
+        assert len(routed) == 1
+        assert routed[0].payload.get("error") and "worker crashed" in routed[0].payload["error"]
 
-        for related_id, relation in ((parent, "parent"), (dependent, "dependent")):
-            linked = [
-                e for e in kb.list_events(conn, related_id)
-                if e.kind == "linked_task_gave_up"
-            ]
-            assert len(linked) == 1, f"{relation} got {len(linked)} events"
-            assert linked[0].payload["task_id"] == tid
-            assert linked[0].payload["relation"] == relation
-            related_comments = [c.body for c in kb.list_comments(conn, related_id)]
-            assert any(tid in b and relation in b for b in related_comments)
+        started = [e for e in kb.list_events(conn, tid) if e.kind == "repair_started"]
+        assert len(started) == 1
+        repair_id = started[0].payload["repair_id"]
+        repair = kb.get_task(conn, repair_id)
+        assert repair is not None
+        assert repair.recovery_owner == "erika"
+
+        # Subject is gated on the repair, not left floating -- the same
+        # dependency mechanism recompute_ready already uses.
+        assert kb.get_task(conn, repair_id).status in ("ready", "todo")
     finally:
         conn.close()
 
