@@ -1091,7 +1091,14 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     than auto-detecting Claude's first-party managed key.
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
+
+    This is the only reader of the borrowed login, so ``auth.adopt_external_logins: false`` is
+    enforced here: every resolver, pool seed/sync and 401 refresher then sees "no Claude Code
+    login" and never touches the file. Default (True) keeps the historical behavior.
     """
+    from agent.credential_sources import adopt_external_logins_enabled
+    if not adopt_external_logins_enabled():
+        return None
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 

@@ -2351,6 +2351,15 @@ DEFAULT_CONFIG = {
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
     "personalities": {},
 
+    # Login policy (credentials themselves live in auth.json / .env).
+    # Borrow and refresh the Codex CLI (~/.codex/auth.json) and Claude Code
+    # (~/.claude/.credentials.json) logins automatically when Hermes has no
+    # usable login of its own. Default True preserves historical behavior.
+    # Set false to make Hermes use only its own logins.
+    "auth": {
+        "adopt_external_logins": True,
+    },
+
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)

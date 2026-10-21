@@ -240,11 +240,20 @@ def _coerce_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+# "pair" DMs a pairing code, "ignore" drops silently, "decline" sends one polite
+# refusal then goes silent toward that sender for
+# gateway.pairing.DECLINE_DEDUPE_SECONDS (upstream #88028). Default stays "pair".
+UNAUTHORIZED_DM_BEHAVIORS = {"pair", "ignore", "decline"}
+DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE = (
+    "Hi! I'm a personal assistant and can only chat with my owner, so I can't help you directly. Sorry!"
+)
+
+
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"pair", "ignore"}:
+        if normalized in UNAUTHORIZED_DM_BEHAVIORS:
             return normalized
     return default
 
@@ -986,7 +995,9 @@ class GatewayConfig:
     loop_watchdog: bool = True
 
     # Unauthorized DM policy
-    unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    unauthorized_dm_behavior: str = "pair"  # one of UNAUTHORIZED_DM_BEHAVIORS
+    # "decline" reply text; empty -> DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE
+    unauthorized_dm_decline_message: str = ""
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -1125,6 +1136,7 @@ class GatewayConfig:
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
+            "unauthorized_dm_decline_message": self.unauthorized_dm_decline_message,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -1271,6 +1283,9 @@ class GatewayConfig:
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
+            unauthorized_dm_decline_message=str(
+                data.get("unauthorized_dm_decline_message") or ""
+            ).strip(),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
@@ -1488,6 +1503,15 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
                     gateway_section.get("unauthorized_dm_behavior"),
                     "pair",
+                )
+
+            if "unauthorized_dm_decline_message" in yaml_cfg:
+                gw_data["unauthorized_dm_decline_message"] = yaml_cfg.get(
+                    "unauthorized_dm_decline_message"
+                )
+            elif isinstance(gateway_section, dict) and "unauthorized_dm_decline_message" in gateway_section:
+                gw_data["unauthorized_dm_decline_message"] = gateway_section.get(
+                    "unauthorized_dm_decline_message"
                 )
 
             # Merge platform config into gw_data so runtime-only settings under

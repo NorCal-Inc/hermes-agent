@@ -16608,15 +16608,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if (
-                source.chat_type == "dm"
-                and self._get_unauthorized_dm_behavior(
-                    source.platform,
-                    profile=source.profile,
-                )
-                == "pair"
-            ):
+            # In DMs: offer pairing code (or a one-time decline when
+            # configured). In groups: silently ignore.
+            _unauth_dm_behavior = (
+                self._get_unauthorized_dm_behavior(source.platform, profile=source.profile)
+                if source.chat_type == "dm"
+                else "ignore"
+            )
+            if _unauth_dm_behavior == "decline":
+                await self._send_unauthorized_decline(source)
+            elif _unauth_dm_behavior == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 pairing_store = self._pairing_store_for(source)
                 if pairing_store is None:

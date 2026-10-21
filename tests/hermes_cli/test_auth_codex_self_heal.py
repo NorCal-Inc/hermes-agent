@@ -92,3 +92,49 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert tokens["refresh_token"] == "fresh-refresh"
 
 
+def test_opt_out_never_adopts_codex_cli_login(tmp_path, monkeypatch):
+    """``auth.adopt_external_logins: false`` (upstream 6c7f693473): the Codex CLI pair is a
+    single-use refresh-token family the user did not hand to Hermes. Both automatic recovery paths
+    must leave it (and Hermes' own auth.json) untouched and surface the real error instead."""
+    from agent import credential_sources
+
+    monkeypatch.setattr(credential_sources, "_notice_logged", False, raising=False)
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "config.yaml").write_text("auth:\n  adopt_external_logins: false\n")
+    hermes_auth = {"version": 1, "providers": {"openai-codex": {
+        "tokens": {"refresh_token": "stale-refresh"}, "auth_mode": "chatgpt"}}}
+    (hermes_home / "auth.json").write_text(json.dumps(hermes_auth))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": "fresh-access", "refresh_token": "fresh-refresh"}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with pytest.raises(AuthError):
+        resolve_codex_runtime_credentials()
+
+    def _rejected(*_a, **_k):
+        raise AuthError("bad", provider="openai-codex", code="invalid_grant", relogin_required=True)
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
+    with pytest.raises(AuthError) as info:
+        _refresh_codex_auth_tokens(dict(STALE), 5.0)
+    assert info.value.relogin_required  # surfaced, not papered over with the CLI pair
+    assert json.loads((hermes_home / "auth.json").read_text()) == hermes_auth
+
+
+def test_default_still_adopts_codex_cli_login(tmp_path, monkeypatch):
+    """No ``auth`` section (and an explicit ``true``) keeps today's adoption behavior, which
+    production routing relies on."""
+    from agent import credential_sources
+
+    for body in ("", "auth:\n  adopt_external_logins: true\n"):
+        hermes_home = tmp_path / f"hermes{len(body)}"
+        hermes_home.mkdir()
+        if body:
+            (hermes_home / "config.yaml").write_text(body)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        assert credential_sources.adopt_external_logins_enabled() is True
+
