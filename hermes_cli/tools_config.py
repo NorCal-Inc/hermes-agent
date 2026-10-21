@@ -2400,6 +2400,18 @@ def _enable_recently_shipped_toolsets(
         enabled_toolsets.add(ts_key)
 
 
+def _platform_toolsets_explicitly_saved(config: dict, platform: str) -> bool:
+    """True when ``platform_toolsets.<platform>`` holds an explicitly saved LIST (even ``[]``).
+
+    Mirrors ``_get_platform_tools``'s ``explicitly_configured`` flag without re-running the
+    resolver: an unset key or a non-list value falls back to the platform default. Callers
+    use this to tell an explicit zero-tool selection (fail closed, #82010) from an absent one
+    ("no restriction").
+    """
+    platform_toolsets = config.get("platform_toolsets") or {}
+    return isinstance(platform_toolsets.get(platform), list)
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,

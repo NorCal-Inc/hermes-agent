@@ -4692,7 +4692,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
 
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import _get_platform_tools, _platform_toolsets_explicitly_saved
 
         cfg = cfg if cfg is not None else load_config()
 
@@ -4706,6 +4706,13 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         if fallback_notice is not None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
+            # An explicitly saved list that resolves to nothing (``platform_toolsets.cli: []``
+            # with no enabled MCP servers) is an explicit zero-tool state, not "no filter":
+            # fail closed with [] instead of None (#82010). The client-surface fold-in must not
+            # resurrect tools the user explicitly switched off, so [] is returned bare. Only an
+            # ABSENT/unset key keeps the None = "no restriction" default.
+            if _platform_toolsets_explicitly_saved(cfg, "cli"):
+                return []
             return None
         # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other
         # platform would carry their schema for nothing), so the platform

@@ -1692,6 +1692,17 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
+    """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
+    persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
+    or None stays None (the unrestricted default); a non-list raises before anything is stored."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("enabled_toolsets must be a list of toolset names (or [] for none).")
+    return [str(j).strip() for j in value if str(j).strip()]
+
+
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Validate a per-job reasoning effort against the canonical grammar.
 
@@ -1927,8 +1938,8 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
-    normalized_toolsets = normalized_toolsets or None
+    # [] is an explicit zero-tool allowlist and must persist as [] (#82010).
+    normalized_toolsets = _normalize_enabled_toolsets(enabled_toolsets)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -2143,6 +2154,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            # [] is an explicit zero-tool allowlist and must survive the
+            # update path as [] too (#82010).
+            if "enabled_toolsets" in updates:
+                updates["enabled_toolsets"] = _normalize_enabled_toolsets(updates["enabled_toolsets"])
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).
