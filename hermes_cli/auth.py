@@ -3856,7 +3856,14 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
-    """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
+    """Adopt a valid Codex CLI token pair into Hermes auth, if available.
+
+    Automatic adoption only; the interactive import offer in the Codex login flow
+    asks first and is not subject to ``auth.adopt_external_logins`` (default True).
+    """
+    from agent.credential_sources import adopt_external_logins_enabled
+    if not adopt_external_logins_enabled():
+        return None
     imported = _import_codex_cli_tokens()
     # Require BOTH tokens before adopting: persisting a payload without a
     # usable refresh_token would only break the next refresh cycle.

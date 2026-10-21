@@ -434,6 +434,17 @@ def auth_add_command(args) -> None:
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
 
 
+# Providers whose sibling CLI login Hermes may borrow (``auth.adopt_external_logins``).
+EXTERNAL_LOGIN_PROVIDERS = {"anthropic", "openai-codex"}
+
+
+def _print_external_login_notice() -> None:
+    """One line telling the user why no Codex CLI / Claude Code login shows up when adoption is off."""
+    from agent.credential_sources import EXTERNAL_LOGINS_NOT_ADOPTED_NOTICE, adopt_external_logins_enabled
+    if not adopt_external_logins_enabled():
+        print(EXTERNAL_LOGINS_NOT_ADOPTED_NOTICE)
+
+
 def auth_list_command(args) -> None:
     provider_filter = _normalize_provider(getattr(args, "provider", "") or "")
     if provider_filter:
@@ -459,6 +470,8 @@ def auth_list_command(args) -> None:
             source = _display_source(entry.source)
             print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
         print()
+    if not provider_filter or provider_filter in EXTERNAL_LOGIN_PROVIDERS:
+        _print_external_login_notice()
 
 
 def auth_remove_command(args) -> None:
@@ -517,6 +530,8 @@ def auth_status_command(args) -> None:
             print(f"{provider}: logged out ({reason})")
         else:
             print(f"{provider}: logged out")
+        if provider in EXTERNAL_LOGIN_PROVIDERS:
+            _print_external_login_notice()
         return
 
     print(f"{provider}: logged in")
