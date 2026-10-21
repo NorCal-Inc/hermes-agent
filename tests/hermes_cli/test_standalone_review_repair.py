@@ -129,6 +129,10 @@ def test_standalone_review_fail_creates_repair_and_gates_review(
         umbrella_id = relations[kb.RELATION_UMBRELLA]
         umbrella = kb.get_task(conn, umbrella_id)
         assert umbrella.title == kb.OPERATIONAL_ERROR_REPAIRS_TITLE
+        # Same card the kernel auto-repair routes use (one umbrella, closed
+        # container, never an open dispatchable card).
+        assert umbrella_id == kb.ensure_operational_repairs_umbrella(conn)
+        assert umbrella.status == "done"
 
         # The review card is back to 'todo', gated on the repair via the
         # SAME task_links dependency mechanism _parents_satisfied/

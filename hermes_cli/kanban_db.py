@@ -8483,70 +8483,29 @@ def create_repair_task(
     return task_id
 
 
-#: Fixed idempotency key for the one durable umbrella every auto-created
-#: repair is organised under. Deliberately a single well-known constant
-#: (not derived per-caller) so every repair route in the codebase --
-#: ordinary error/verification-FAIL repairs (t_5d7e889e) and standalone
-#: review-FAIL repairs (this module) alike -- converges on the SAME card
-#: instead of each minting its own "Operational Error Repairs" look-alike.
-OPERATIONAL_ERROR_REPAIRS_IDEMPOTENCY_KEY = "umbrella:operational-error-repairs"
-OPERATIONAL_ERROR_REPAIRS_TITLE = "Operational Error Repairs"
+#: The standalone-review route (t_3f4a2103) and the kernel auto-repair route
+#: (t_5d7e889e) must converge on the SAME "Operational Error Repairs" umbrella
+#: (Decision B: one durable card). Both names below are aliases of the
+#: kernel's constants so there is exactly one idempotency key and one card.
+OPERATIONAL_ERROR_REPAIRS_IDEMPOTENCY_KEY = AUTO_REPAIR_UMBRELLA_KEY
+OPERATIONAL_ERROR_REPAIRS_TITLE = AUTO_REPAIR_UMBRELLA_TITLE
 
 
 def ensure_operational_error_repairs_umbrella(
     conn: sqlite3.Connection,
     *,
-    owner: str = "erika",
+    owner: str = AUTO_REPAIR_OWNER,
 ) -> str:
-    """Return the id of the durable "Operational Error Repairs" umbrella.
+    """Return the id of the one durable "Operational Error Repairs" umbrella.
 
-    Creates it on first use via ``create_task``'s ``idempotency_key``, which
-    already makes concurrent callers converge on one row rather than two
-    (see ``create_task``'s idempotency lookup, executed before the write
-    transaction). Every subsequent call -- from any repair-creating call
-    site, in this module or any sibling one -- returns the same id.
-
-    This is the ONE shared helper for the umbrella convention Christopher
-    settled on t_520b2cdc (owner='erika', one durable umbrella card, reused
-    for all auto repairs): do not let a second call site mint its own
-    idempotency key or its own "Operational Error Repairs"-shaped card, or
-    the two can drift (e.g. different umbrella_id values for logically the
-    same programme). If another caller already created this card under the
-    same key, this returns its existing id without creating a duplicate.
-
-    The umbrella card itself is deliberately NOT created with
-    ``recovery_owner``/``cause=recovery`` -- ``create_task``'s own repair-
-    linkage guard (the one ``create_repair_task`` relies on) requires
-    ``repairs_task_id`` AND ``umbrella_task_id`` on any card that declares
-    itself a repair (arms on recovery_owner, cause='recovery', or either
-    linkage id). The umbrella is the thing repairs point AT, not a repair
-    itself -- it has no subject and no umbrella of its own, so tagging it
-    as a repair would make this very call raise ``RecoveryLinkageError``.
-    ``owner`` is recorded in the body text for a human reader; the card's
-    structural ownership is plain ``created_by``/provenance, same as any
-    other non-repair card.
+    Thin alias of :func:`ensure_operational_repairs_umbrella` so the
+    standalone-review FAIL route and every kernel auto-repair route share one
+    closed container card (never an open, dispatchable look-alike). ``owner``
+    is kept for call-site compatibility; repairs carry the owner themselves.
+    Must be called outside any open write transaction.
     """
-    return create_task(
-        conn,
-        title=OPERATIONAL_ERROR_REPAIRS_TITLE,
-        body=(
-            "Durable umbrella for every auto-created repair card: ordinary "
-            "task errors, failing verification verdicts, and standalone "
-            "review-card FAILs routed back to their parent. One card, "
-            "reused indefinitely -- never archive this card while any "
-            "repair still points at it.\n\n"
-            f"Recovery owner convention for repairs under this umbrella: "
-            f"{owner or 'erika'}."
-        ),
-        idempotency_key=OPERATIONAL_ERROR_REPAIRS_IDEMPOTENCY_KEY,
-        provenance=ActorProvenance(
-            kind=ACTOR_KIND_SYSTEM,
-            actor_id="kanban:ensure_operational_error_repairs_umbrella",
-            lane=None,
-            run_id=None,
-            cause=CREATION_CAUSE_AUTOMATED,
-        ),
-    )
+    del owner
+    return ensure_operational_repairs_umbrella(conn)
 
 
 class StandaloneReviewRoutingError(RuntimeError):
