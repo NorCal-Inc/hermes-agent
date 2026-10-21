@@ -87,9 +87,12 @@ def _path_is_public(path: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """ASGI peer address for rate limits, native pending caps, and auth audit.
+
+    Never parse client-supplied ``X-Forwarded-For`` here: direct clients can
+    spoof it. Trusted proxy normalization belongs upstream, where the server
+    may rewrite ``request.client`` only for operator-configured trusted peers.
+    """
     return request.client.host if request.client else ""
 
 

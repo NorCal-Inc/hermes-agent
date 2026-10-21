@@ -23,7 +23,7 @@ from typing import Any, Deque, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from hermes_cli.dashboard_auth import (
     get_provider,
@@ -106,9 +106,12 @@ def _redirect_uri(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """ASGI peer address for rate limits, native pending caps, and auth audit.
+
+    Never parse client-supplied ``X-Forwarded-For`` here: direct clients can
+    spoof it. Trusted proxy normalization belongs upstream, where the server
+    may rewrite ``request.client`` only for operator-configured trusted peers.
+    """
     return request.client.host if request.client else ""
 
 
@@ -264,18 +267,37 @@ def _validate_loopback_redirect_uri(raw: str) -> str:
     into an open redirect that leaks a live authorization code to an
     arbitrary origin — so this check is a security boundary, not ergonomics.
     """
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, urlunparse
+
+    def _bad(detail: str) -> HTTPException:
+        return HTTPException(status_code=400, detail=detail)
 
     if not raw:
         raise HTTPException(status_code=400, detail="redirect_uri required")
-    parsed = urlparse(raw)
+    # Server parser and system browser must see the same authority: reject
+    # userinfo, backslashes, fragments, controls and non-canonical host/port.
+    if not raw.isascii() or "\\" in raw or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise _bad("native redirect_uri must use a canonical loopback URL")
+    try:
+        parsed = urlparse(raw)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise _bad("native redirect_uri must use a canonical loopback URL")
     if parsed.scheme != "http":
         raise HTTPException(
             status_code=400,
             detail="native redirect_uri must be http:// on the loopback interface",
         )
-    host = (parsed.hostname or "").lower()
-    if host not in ("127.0.0.1", "::1"):
+    if "#" in raw:
+        raise _bad("native redirect_uri must not contain a fragment")
+    if parsed.username is not None or parsed.password is not None:
+        raise _bad("native redirect_uri must not contain userinfo")
+    if hostname == "127.0.0.1":
+        canonical_host = "127.0.0.1"
+    elif hostname == "::1":
+        canonical_host = "[::1]"
+    else:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -283,7 +305,11 @@ def _validate_loopback_redirect_uri(raw: str) -> str:
                 "(127.0.0.1 / ::1)"
             ),
         )
-    return raw
+    canonical_netloc = canonical_host + (f":{port}" if port is not None else "")
+    if parsed.netloc != canonical_netloc:
+        raise _bad("native redirect_uri must use a canonical loopback authority")
+    return urlunparse(parsed._replace(scheme="http", netloc=canonical_netloc,
+                                      path=parsed.path or "/", fragment=""))
 
 
 @router.get("/auth/native/authorize", name="auth_native_authorize")
@@ -322,7 +348,7 @@ async def auth_native_authorize(
         )
     if not code_challenge:
         raise HTTPException(status_code=400, detail="code_challenge required")
-    _validate_loopback_redirect_uri(redirect_uri)
+    redirect_uri = _validate_loopback_redirect_uri(redirect_uri)
 
     # Resolve the provider. With exactly one brokerable session provider
     # registered (the common hosted case) an empty ``provider`` selects it,
@@ -688,7 +714,8 @@ def _reset_password_rate_limit() -> None:
 
 
 class _PasswordLoginBody(BaseModel):
-    provider: str
+    # Providers use short stable IDs, not display names or URLs.
+    provider: str = Field(max_length=128)
     username: str
     password: str
     next: str = ""

@@ -33,7 +33,7 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formatdate, parseaddr
 from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -343,11 +343,16 @@ def _strip_html(html: str) -> str:
 
 
 def _extract_email_address(raw: str) -> str:
-    """Extract bare email address from 'Name <addr>' format."""
-    match = re.search(r"<([^>]+)>", raw)
-    if match:
-        return match.group(1).strip().lower()
-    return raw.strip().lower()
+    """Bare address from a From: value, via the stdlib address parser.
+
+    A first ``<...>`` regex reads ``"Victim <victim@example.com>" <attacker@evil.test>``
+    as the victim, so allowlist and session identity would use an address the
+    sender does not control. ``parseaddr`` returns the real addr-spec. RFC 5322
+    folding is unfolded first so a folded display name is not taken as the mailbox.
+    """
+    value = re.sub(r"\r?\n[ \t]+", " ", str(raw or ""))
+    _, addr = parseaddr(value)
+    return addr.strip().lower()
 
 
 def _domain_of(address: str) -> str:

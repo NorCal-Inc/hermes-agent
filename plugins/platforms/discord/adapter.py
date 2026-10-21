@@ -5713,6 +5713,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         print(f"[{self.name}] Resolving {len(to_resolve)} username(s): {', '.join(to_resolve)}")
         resolved_count = 0
+        display_only = set()
 
         for guild in self._client.guilds:
             # Fetch full member list (requires members intent)
@@ -5725,26 +5726,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
 
             for member in members:
+                # Only the unique account username is matched: a display name or
+                # server nickname is member-chosen and can copy an allowlisted name.
                 name_lower = member.name.lower()
-                display_lower = member.display_name.lower()
-                global_lower = (member.global_name or "").lower()
-
-                matched = name_lower in to_resolve or display_lower in to_resolve or global_lower in to_resolve
-                if matched:
+                if name_lower in to_resolve:
                     uid = str(member.id)
                     numeric_ids.add(uid)
                     resolved_count += 1
-                    matched_name = name_lower if name_lower in to_resolve else (
-                        display_lower if display_lower in to_resolve else global_lower
-                    )
-                    to_resolve.discard(matched_name)
-                    print(f"[{self.name}] Resolved '{matched_name}' -> {uid} ({member.name}#{member.discriminator})")
+                    to_resolve.discard(name_lower)
+                    print(f"[{self.name}] Resolved '{name_lower}' -> {uid} ({member.name}#{member.discriminator})")
+                    continue
+                for shown in (member.display_name, member.global_name):
+                    if shown and shown.lower() in to_resolve:
+                        display_only.add(shown.lower())
 
             if not to_resolve:
                 break
 
         if to_resolve:
             print(f"[{self.name}] Could not resolve usernames: {', '.join(to_resolve)}")
+            for entry in sorted(to_resolve & display_only):
+                print(
+                    f"[{self.name}] '{entry}' matches only a display name or server nickname, which any member "
+                    "can set; allowlist that member's username or numeric user ID instead"
+                )
 
         # Update the internal set. Keep the resolved IDs adapter-local first:
         # under multiplex_profiles, writing os.environ here would clobber

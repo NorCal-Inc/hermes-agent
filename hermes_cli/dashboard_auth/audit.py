@@ -22,6 +22,13 @@ from typing import Any
 
 _log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
+_MAX_FIELD_LENGTH = 256
+_TRUNCATION_MARKER = "...[truncated]"
+
+# Size-based rotation matching hermes_logging's agent.log convention (5MB, 3
+# backups, ``.1``/``.2``/``.3``). Stdlib only to keep this module import-light.
+_MAX_BYTES = 5 * 1024 * 1024
+_BACKUP_COUNT = 3
 
 # Field names that must never appear in the log raw. Any kwarg matching
 # these is silently dropped.
@@ -68,6 +75,39 @@ def _resolve_log_path() -> Path:
     return get_hermes_home() / "logs" / "dashboard-auth.log"
 
 
+def _bounded_value(value: Any) -> Any:
+    """Bound strings, including nested values and non-JSON object representations."""
+    if isinstance(value, dict):
+        return {k: _bounded_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bounded_value(v) for v in value]
+    if not isinstance(value, (str, int, float, bool, type(None))):
+        value = repr(value)
+    if isinstance(value, str) and len(value) > _MAX_FIELD_LENGTH:
+        return value[:_MAX_FIELD_LENGTH - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+    return value
+
+
+def _rotate_if_needed(path: Path, pending_bytes: int) -> None:
+    """Rotate once appending *pending_bytes* would reach ``_MAX_BYTES``.
+
+    Must be called with ``_write_lock`` held. Rotation errors never break the write.
+    """
+    try:
+        if path.stat().st_size + pending_bytes < _MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for i in range(_BACKUP_COUNT - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                os.replace(src, path.with_name(f"{path.name}.{i + 1}"))
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    except OSError:
+        pass
+
+
 def audit_log(event: AuditEvent, **fields: Any) -> None:
     """Append one event to the audit log.
 
@@ -76,7 +116,7 @@ def audit_log(event: AuditEvent, **fields: Any) -> None:
     fail because the audit logger broke.
     """
     safe_fields = {
-        k: v for k, v in fields.items()
+        k: _bounded_value(v) for k, v in fields.items()
         if k not in _REDACTED_FIELDS
     }
     entry = {
@@ -89,6 +129,7 @@ def audit_log(event: AuditEvent, **fields: Any) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _write_lock:
+            _rotate_if_needed(path, len(line.encode("utf-8")))
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception as e:
