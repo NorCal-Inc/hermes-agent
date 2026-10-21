@@ -123,6 +123,12 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
+        # overloaded/529, connect/read timeouts) with nothing delivered yet, wait and retry this many
+        # more cycles (jittered 15/30/60/60/60s; a provider Retry-After wins up to 120s) with a
+        # visible "retrying automatically" countdown instead of ending the turn. Esc/interrupt stops
+        # the wait; auth/format/billing/policy errors never enter. 0 disables.
+        "auto_recovery_cycles": 5,
         # Empty-response retry guard (NS-503).  The empty-retry loop
         # re-sends the full conversation input at full price on every
         # attempt; these settings stop it from re-billing *deterministic*
@@ -267,6 +273,14 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Transcript-sanitiser repeated-heal escalation threshold (#96870).
+        # After this many pre-send heal passes within a 10-minute session
+        # window, log one ERROR (session id + heal pattern) and queue a
+        # ONE-TIME out-of-band user notice pointing at /debug share or
+        # `hermes doctor`. Delivered via the status channel only —
+        # conversation context / prompt caching untouched. 0 = disable
+        # escalation (per-window WARNINGs still fire).
+        "sanitizer_heal_escalation_threshold": 3,
         # Long-lived reconnect-loop escalation (seconds). A platform that has
         # been continuously failing/reconnecting for this long gets
         # needs_attention flagged in gateway runtime status (visible in

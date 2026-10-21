@@ -2255,13 +2255,31 @@ def _truncate_content(
     tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
     head = content[:head_chars]
     tail = content[-tail_chars:]
+    omitted = _omitted_headings(content, head_chars, len(content) - tail_chars)
+    sections = f" Omitted sections: {'; '.join(omitted)}." if omitted else ""
     marker = (
         f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of "
-        f"{len(content)} chars. The middle is omitted — if you need the full "
-        f"instructions, read the complete file with the read_file tool: "
-        f"{target}]\n\n"
+        f"{len(content)} chars. The middle is omitted.{sections} If you need "
+        f"the full instructions, read the complete file with the read_file "
+        f"tool: {target}]\n\n"
     )
     return head + marker + tail
+
+
+def _omitted_headings(content: str, start: int, end: int, limit: int = 15) -> list:
+    """Markdown headings whose line starts inside ``content[start:end]``, so a truncation marker tells
+    the agent what it lost; ``#`` lines inside fenced code blocks are comments, not headings."""
+    import re
+
+    headings, offset, fenced = [], 0, False
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and start <= offset < end and re.match(r"#{1,6} \S", stripped):
+            headings.append(stripped.lstrip("#").strip())
+        offset += len(line)
+    return headings[:limit] + (["..."] if len(headings) > limit else [])
 
 
 def load_soul_md(

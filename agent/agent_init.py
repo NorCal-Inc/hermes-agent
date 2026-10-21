@@ -1972,6 +1972,12 @@ def init_agent(
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+    # Bounded post-exhaustion auto-recovery cycles once retries AND the fallback chain are spent
+    # on a transient outage (agent/turn_recovery_autorecover.py). 0 disables the ladder.
+    try:
+        agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
+    except (TypeError, ValueError):
+        agent._auto_recovery_cycles = 5
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
@@ -2812,6 +2818,12 @@ def init_agent(
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).
     agent._is_user_initiated_turn = False
+
+    # Usage-anchored context accounting (agent/model_metadata.py): the last
+    # main-loop provider response's exact usage + transcript snapshot. None
+    # until the first response with usage; invalidated on compaction and
+    # session switches so stale anchors can never suppress compression.
+    agent._usage_anchor = None
 
     # Cumulative token usage for the session
     agent.session_prompt_tokens = 0

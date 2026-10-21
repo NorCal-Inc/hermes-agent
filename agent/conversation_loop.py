@@ -67,6 +67,8 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
+    anchored_context_tokens,
+    capture_usage_anchor,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
@@ -2365,6 +2367,24 @@ def run_conversation(
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
 
+        # One-time repeated-heal escalation notice (#96870): if the sanitizer
+        # above just crossed the per-session heal threshold, deliver the
+        # queued notice through the status/warning callback — the normal
+        # out-of-band delivery channel (gateway status message / CLI print).
+        # NEVER appended to messages/api_messages: conversation context and
+        # the cached prompt prefix stay byte-identical.
+        try:
+            from agent.agent_runtime_helpers import (
+                consume_pending_sanitizer_heal_notice,
+            )
+
+            _heal_notice = consume_pending_sanitizer_heal_notice()
+            if _heal_notice:
+                agent._emit_warning(_heal_notice)
+        except Exception:
+            # A notice hiccup must never break the send path.
+            logger.debug("sanitizer heal notice delivery failed", exc_info=True)
+
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
         # left behind. Prevents Anthropic 400s ("The final block in an
@@ -2476,6 +2496,18 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
+        # Usage-anchored override: when the last provider response's exact
+        # usage is still valid for the durable transcript, replace the
+        # whole-history heuristic with anchor + delta-estimate. The anchor's
+        # prompt_tokens already includes system prompt AND tool schemas as
+        # the provider counted them, so no tools add-on is needed. Falls
+        # back to the rough figures above when the anchor is stale/missing
+        # (first request, post-compaction, usage-less providers).
+        _anchored_pressure = anchored_context_tokens(
+            messages, getattr(agent, "_usage_anchor", None)
+        )
+        if _anchored_pressure is not None:
+            request_pressure_tokens = _anchored_pressure
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
@@ -4031,6 +4063,25 @@ def run_conversation(
                         )
                     )
                     agent.context_compressor.update_from_response(usage_dict)
+                    # Usage-anchored context accounting: snapshot this
+                    # response's exact provider-reported usage against the
+                    # durable transcript. Later context-size checks anchor on
+                    # this and estimate only the messages appended since,
+                    # instead of re-estimating the whole history with
+                    # heuristics. Main-loop responses ONLY — MoA advisor and
+                    # auxiliary calls never reach this site, so they cannot
+                    # pollute the anchor. A usage-less response leaves the
+                    # previous anchor in place (still valid for its base).
+                    # MoA note: use the pre-fold aggregator usage — the folded
+                    # canonical figure adds advisor fan-out tokens that were
+                    # never part of THIS conversation's prompt.
+                    _new_anchor = capture_usage_anchor(
+                        aggregator_usage.prompt_tokens,
+                        aggregator_usage.output_tokens,
+                        messages,
+                    )
+                    if _new_anchor is not None:
+                        agent._usage_anchor = _new_anchor
                     _compression_threshold = int(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
@@ -6190,6 +6241,45 @@ def run_conversation(
                         _retry.primary_recovery_attempted = False
                         _retry.restart_with_rebuilt_messages = True
                         break
+                    # Fallback first (above); only with nothing left to move to
+                    # does the bounded auto-recovery ladder park the turn on a
+                    # transient outage instead of ending it (#85426, #107307).
+                    from agent.turn_recovery_autorecover import start_recovery_cycle
+                    _ladder = start_recovery_cycle(agent, api_error, classified, _retry)
+                    if _ladder is not None:
+                        _ladder_cycle = f"{_ladder['cycle']}/{_ladder['total']}"
+                        _ladder_end = time.time() + _ladder["wait_s"]
+                        _ladder_touch = 0
+                        while time.time() < _ladder_end:
+                            if agent._interrupt_requested:
+                                # Same preserve-redirect rule as the retry
+                                # waits: a steering correction survives.
+                                if agent.clear_interrupt(preserve_redirect=True):
+                                    _retry.restart_with_redirected_messages = True
+                                    break
+                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during automatic recovery wait, aborting.", force=True)
+                                _interrupt_text = f"Operation interrupted: waiting for the provider to recover (cycle {_ladder_cycle})."
+                                close_interrupted_tool_sequence(messages, _interrupt_text)
+                                agent._persist_session(messages, conversation_history)
+                                agent.clear_interrupt()
+                                return {
+                                    "final_response": _interrupt_text,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                }
+                            time.sleep(0.2)
+                            _ladder_touch += 1
+                            if _ladder_touch % 150 == 0:  # ~30s
+                                agent._touch_activity(
+                                    f"auto-recovery wait ({_ladder_cycle}), "
+                                    f"{int(_ladder_end - time.time())}s remaining"
+                                )
+                        if _retry.restart_with_redirected_messages:
+                            break
+                        retry_count = 0
+                        continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)

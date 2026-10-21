@@ -967,6 +967,16 @@ agent:
   # the turn (see gateway_timeout). 0 = disable. Default 300.
   # session_stall_timeout: 300
 
+  # Transcript-sanitiser repeated-heal escalation (#96870). The pre-send
+  # sanitiser silently repairs empty non-final turns on the wire copy; after
+  # this many heal passes within a 10-minute session window Hermes logs one
+  # ERROR (with session id + heal pattern) and sends a ONE-TIME out-of-band
+  # notice to the user suggesting /debug share or `hermes doctor`. The notice
+  # goes through the status channel only — conversation context and prompt
+  # caching are untouched. Set 0 to disable escalation (per-window WARNINGs
+  # still fire). Default 3.
+  # sanitizer_heal_escalation_threshold: 3
+
   # Related in-agent compression timeouts (they live under the top-level
   # compression: block, shown here for discoverability next to the stall
   # watchdog they complement — a hung compression is a common stall cause):
@@ -1009,6 +1019,15 @@ agent:
   # primaries (default 3). The OpenAI SDK does its own low-level retries
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
+
+  # Once api_max_retries AND the fallback chain are spent on a transient outage
+  # (5xx, overloaded/529, connect/read timeouts) and nothing has been delivered
+  # yet, Hermes waits and retries this many more cycles (jittered 15/30/60/60/60s;
+  # a provider Retry-After wins, up to 120s) showing "Provider temporarily
+  # unavailable — retrying automatically in Ns (cycle k/5); press Esc to stop"
+  # instead of ending the turn. Auth/format/billing/policy errors never enter.
+  # Set 0 to disable (default 5).
+  # auto_recovery_cycles: 5
 
   # After the agent edits code without fresh passing verification, nudge it to
   # verify before finishing. The default "auto" enables it on interactive
