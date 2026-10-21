@@ -2430,6 +2430,7 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
         # pattern). Off by default: the cronjob toolset is policy-denied in

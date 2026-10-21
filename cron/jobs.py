@@ -1692,6 +1692,17 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
+    """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
+    persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
+    or None stays None (the unrestricted default); a non-list raises before anything is stored."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("enabled_toolsets must be a list of toolset names (or [] for none).")
+    return [str(j).strip() for j in value if str(j).strip()]
+
+
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Validate a per-job reasoning effort against the canonical grammar.
 
@@ -1833,6 +1844,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    failure_deliver: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1927,12 +1939,22 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
-    normalized_toolsets = normalized_toolsets or None
+    # [] is an explicit zero-tool allowlist and must persist as [] (#82010).
+    normalized_toolsets = _normalize_enabled_toolsets(enabled_toolsets)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    # failure_deliver shares deliver's grammar and normalization exactly —
+    # same helper, no parallel validation path (NS-788).
+    normalized_failure_deliver = (
+        str(failure_deliver).strip() if isinstance(failure_deliver, str) else None
+    )
+    if isinstance(failure_deliver, (list, tuple)):
+        normalized_failure_deliver = ",".join(
+            str(p).strip() for p in failure_deliver if str(p).strip()
+        )
+    normalized_failure_deliver = normalized_failure_deliver or None
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2046,6 +2068,10 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Conditional-persist for failure_deliver too: absent key = failures
+    # follow deliver, byte-identical to pre-feature jobs (NS-788).
+    if normalized_failure_deliver is not None:
+        job["failure_deliver"] = normalized_failure_deliver
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2143,6 +2169,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            # [] is an explicit zero-tool allowlist and must survive the
+            # update path as [] too (#82010).
+            if "enabled_toolsets" in updates:
+                updates["enabled_toolsets"] = _normalize_enabled_toolsets(updates["enabled_toolsets"])
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).
@@ -2358,7 +2389,15 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    model_unreachable: bool = False,
 ) -> bool:
+    """Mark a job as run (see ``_mark_job_run_locked``).
+
+    ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
+    zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
+    earlier per ``cron.unreachable_retry.RETRY_DELAYS_SECONDS`` — instead of waiting a full period
+    (Cowork-style; see cron/unreachable_retry.py).
+    """
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -2369,6 +2408,7 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            model_unreachable=model_unreachable,
         )
 
 
@@ -2463,6 +2503,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    model_unreachable: bool = False,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -2597,6 +2638,14 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
+
+                from cron.unreachable_retry import clear_state, plan_retry
+
+                if not success and model_unreachable and job.get("next_run_at") is not None:
+                    plan_retry(job)
+                else:
+                    # Any run that reached the model (either outcome) resets the re-run ladder.
+                    clear_state(job)
 
                 save_jobs(jobs)
                 return True
@@ -2961,6 +3010,21 @@ def _claim_job_for_fire_locked(
 # delivery error stay inspectable via `cronjob list`) instead of being deleted
 # at completion, then pruned by _sweep_completed_oneshots once they age out.
 COMPLETED_ONESHOT_RETENTION_DAYS = 7
+
+
+def _cron_catch_up_missed() -> bool:
+    """``cron.catch_up_missed`` (default True). False = after planned downtime, recurring
+    misses past the grace window are skipped (re-anchored to the next occurrence) instead of
+    firing once now. Only an explicit ``false`` disables; unreadable config keeps the default."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(cron_cfg, dict):
+            return True
+        return cron_cfg.get("catch_up_missed", True) is not False
+    except Exception:
+        return True
 
 
 def _completed_oneshot_retention_days() -> float:
@@ -3415,6 +3479,24 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).
                     new_next = compute_next_run(schedule, now.isoformat())
+                    if new_next and not _cron_catch_up_missed():
+                        # Planned downtime: cron.catch_up_missed=false skips the
+                        # missed occurrence entirely — re-anchor and do not fire.
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                            "Skipping missed occurrence because cron.catch_up_missed "
+                            "is false; next run: %s",
+                            job.get("name", job.get("id", "?")),
+                            next_run,
+                            grace,
+                            new_next,
+                        )
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = new_next
+                                needs_save = True
+                                break
+                        continue
                     if new_next:
                         logger.info(
                             "Job '%s' missed its scheduled time (%s, grace=%ds). "

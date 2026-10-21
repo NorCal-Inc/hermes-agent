@@ -114,3 +114,56 @@ class TestResolverPlumbing:
         no_desktop_env.setenv("HERMES_TUI_TOOLSETS", "web,memory")
 
         assert server._load_enabled_toolsets("desktop") == ["web", "memory"]
+
+
+class TestExplicitEmptySelection:
+    """#82010: an explicitly saved empty platform_toolsets list is a zero-tool state.
+
+    ``platform_toolsets.cli: []`` used to fall open — the resolver returned an empty set and
+    the gateway converted it to None, which downstream means 'no restriction' (every
+    toolset). Only an ABSENT key means that; the explicit empty list must return [].
+    """
+
+    @staticmethod
+    def _config(no_desktop_env, platform_toolsets):
+        import agent.coding_context as cc
+        import hermes_cli.config as config_mod
+
+        no_desktop_env.setattr(cc, "coding_selection", lambda **_: None)
+        no_desktop_env.setattr(
+            config_mod, "load_config", lambda: {"platform_toolsets": platform_toolsets}
+        )
+
+    def test_explicit_empty_list_yields_no_toolsets(self, no_desktop_env):
+        # Fork note: the NorCal fork's non-configurable ``executive`` toolset is recovered
+        # by _get_platform_tools even for ``cli: []``, so pin the resolver to the upstream
+        # zero-set result to exercise the gateway's fail-closed branch directly.
+        import hermes_cli.tools_config as tools_config
+
+        self._config(no_desktop_env, {"cli": []})
+        no_desktop_env.setattr(tools_config, "_get_platform_tools", lambda *a, **k: set())
+
+        assert server._load_enabled_toolsets("desktop") == []
+        assert server._load_enabled_toolsets("tui") == []
+
+    def test_explicit_empty_list_never_falls_open(self, no_desktop_env):
+        # With the real resolver, ``cli: []`` must still be a restriction (never None = all).
+        self._config(no_desktop_env, {"cli": []})
+
+        result = server._load_enabled_toolsets("tui")
+        assert result is not None
+        assert "terminal" not in result
+
+    def test_absent_key_keeps_the_default_selection(self, no_desktop_env):
+        self._config(no_desktop_env, {})
+
+        result = server._load_enabled_toolsets("tui")
+        assert result  # the platform default applies — not the zero state, not None-as-all
+
+    def test_named_selection_is_honored(self, no_desktop_env):
+        self._config(no_desktop_env, {"cli": ["memory"]})
+
+        result = server._load_enabled_toolsets("tui")
+        assert result is not None
+        assert "memory" in result
+        assert "terminal" not in result

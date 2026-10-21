@@ -393,6 +393,61 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return message
 
 
+def _upsert_incident_for_failure(
+    job: dict, error: str, *, output_file: Optional[Any] = None
+) -> tuple[bool, Optional[str]]:
+    """Record a durable failure incident for this run.
+
+    The incident store groups "same job + same error signature" across runs so
+    an operator-acked failure stops re-pinging every run. Returns
+    ``(acked, incident_id)``: ``acked`` is True when the incident for this
+    exact signature is already ``closed`` (acked) — the per-run failure ping
+    should be suppressed. ``incident_id`` lets the caller mark the incident
+    ``alerted`` after the ping actually goes out. The streak nudge and
+    ``_summarize_cron_failure_for_delivery`` text stay intact for un-acked
+    failures.
+
+    Best-effort: an incident-store error must never break the cron run or the
+    delivery path — failures are logged at debug and the caller delivers as if
+    no incident existed.
+    """
+    try:
+        from cron.incidents import get_incident, upsert_incident
+
+        incident_id, _is_new = upsert_incident(
+            job["id"],
+            str(error or ""),
+            job_name=job.get("name"),
+            output_file=output_file,
+        )
+        incident = get_incident(incident_id)
+        acked = bool(incident and incident.get("state") == "closed")
+        return acked, incident_id
+    except Exception as exc:
+        logger.debug(
+            "Incident store unavailable for job %s (delivery unaffected): %s",
+            job["id"], exc,
+        )
+        return False, None
+
+
+def _mark_incident_alerted(incident_id: Optional[str]) -> None:
+    """Record that a failure ping for this incident reached delivery.
+
+    Best-effort like the upsert: bookkeeping never breaks the cron run.
+    ``set_incident_state`` is a no-op for closed incidents, so this can
+    never resurrect an acked signature.
+    """
+    if not incident_id:
+        return
+    try:
+        from cron.incidents import set_incident_state
+
+        set_incident_state(incident_id, "alerted")
+    except Exception as exc:
+        logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -481,6 +536,10 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
        Keeps the agent's job-scoped toolset override intact — #6130. Enabled
        MCP servers are layered on per ``_merge_mcp_into_per_job_toolsets`` so a
        native-toolset allowlist does not silently strip MCP tools.
+       An explicitly-set EMPTY list is a zero-toolset allowlist, not a clear
+       to the platform default — it is falsy, so it must be compared with
+       ``is not None``, else it fell through to the config default and widened
+       an unattended job back to every toolset (#82010).
     2. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
        so users can gate cron toolsets globally without recreating every job.
@@ -493,7 +552,11 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     surprise $4.63 run).
     """
     per_job = job.get("enabled_toolsets")
-    if per_job:
+    if per_job is not None:
+        if not per_job:
+            # Explicit zero: no toolsets at all — no MCP merge either, else every enabled server
+            # would ride back in and widen the allowlist the operator just emptied (#82010).
+            return []
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
@@ -2386,7 +2449,7 @@ def _expand_routing_tokens(part: str) -> List[str]:
     return expanded
 
 
-def _resolve_delivery_targets(job: dict) -> List[dict]:
+def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[dict]:
     """Resolve all concrete auto-delivery targets for a cron job.
 
     Accepts the legacy comma-separated ``deliver`` string plus the
@@ -2395,8 +2458,21 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     targets: ``origin,all`` and ``all,telegram:-100:17`` both work.
     Duplicate (platform, chat_id, thread_id) tuples are collapsed by the
     existing dedup pass.
+
+    ``for_failure=True`` resolves failure-category engine notices
+    (failure summaries, interrupted-run notices, drift/preflight
+    alerts): when the job carries a ``failure_deliver`` value, targets
+    resolve from it INSTEAD of ``deliver`` — ``failure_deliver: local``
+    is the structural opt-out for shared channels (NS-788, Coatue).
+    Absent ``failure_deliver``, failure delivery follows ``deliver``
+    exactly as before.
     """
-    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    deliver_raw = job.get("deliver", "local")
+    if for_failure:
+        failure_deliver = job.get("failure_deliver")
+        if failure_deliver is not None and str(failure_deliver).strip():
+            deliver_raw = failure_deliver
+    deliver = _normalize_deliver_value(deliver_raw)
     if deliver == "local":
         return []
 
@@ -2600,7 +2676,9 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2609,11 +2687,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
+    ``for_failure=True`` routes failure-category engine notices through the
+    job's ``failure_deliver`` override when present (NS-788).
+
     Returns None on success, or an error string on failure.
     """
-    targets = _resolve_delivery_targets(job)
+    targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
-        deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
+        deliver_raw = job.get("deliver", "local")
+        if for_failure and str(job.get("failure_deliver") or "").strip():
+            deliver_raw = job.get("failure_deliver")
+        deliver_value = _normalize_deliver_value(deliver_raw)
         if deliver_value == "local":
             return None  # local-only jobs don't deliver — not a failure
         # deliver=origin with no resolvable origin and no configured home
@@ -5939,6 +6023,15 @@ def run_job(
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
+        # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+        # tail can schedule a bounded automatic re-run instead of waiting a full period.
+        try:
+            from cron.unreachable_retry import is_model_unreachable_failure
+            if is_model_unreachable_failure(e, agent):
+                job["_model_unreachable"] = True
+        except Exception:  # classification must never mask the real failure
+            logger.debug("Job '%s': unreachable-failure classification failed", job_id)
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
         # with a None check so the audit write itself never raises.
@@ -6336,6 +6429,11 @@ def _run_one_job_body(
         execution_id = create_execution(job["id"], source="direct")["id"]
     delivery_attempted = False
     delivery_error = None
+    # Durable failure-incident bookkeeping for this run (see cron.incidents):
+    # set on the failure paths below; consumed by the delivery_outcome
+    # computation and the post-delivery "alerted" transition.
+    incident_acked = False
+    failure_incident_id = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -6511,15 +6609,35 @@ def _run_one_job_body(
                     "the configuration is fixed."
                 )
             else:
-                deliver_content = final_response if success else (
-                    _summarize_cron_failure_for_delivery(job, error)
-                    + _failure_streak_nudge(job)
-                )
+                if success:
+                    deliver_content = final_response
+                else:
+                    # Durable failure incident: record this job+error
+                    # signature once and, when the operator already acked it,
+                    # suppress the per-run failure ping (the streak nudge and
+                    # the failure summarizer stay intact for un-acked
+                    # failures). Best-effort — an incident-store error never
+                    # breaks the delivery path (see _upsert_incident_for_failure).
+                    incident_acked, failure_incident_id = _upsert_incident_for_failure(
+                        job, error or "", output_file=output_file
+                    )
+                    if incident_acked and not drift_skip:
+                        deliver_content = ""
+                    else:
+                        deliver_content = (
+                            _summarize_cron_failure_for_delivery(job, error)
+                            + _failure_streak_nudge(job)
+                        )
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
                     # command) and strip the internal marker — deliver the
                     # guard's own actionable message intact.
+                    # Deliberately NOT gated on incident ack: a drift skip
+                    # means the run was never attempted and the message
+                    # carries the remediation command — acking the failure
+                    # signature silences failure pings, not drift alerts
+                    # (which already alert once via the drift_alerted marker).
                     _drift_text = re.sub(
                         r"\[drift_skip[^\]]*\]\s*", "", str(error)
                     ).strip()
@@ -6533,6 +6651,16 @@ def _run_one_job_body(
             should_deliver = bool(deliver_content.strip())
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
+            if should_deliver and not success and job.get("_model_unreachable"):
+                # The model was never reached and a bounded automatic re-run will be scheduled
+                # (cron/unreachable_retry.py): hold the failure notice — the re-run either
+                # delivers the real result or, once the ladder is exhausted, the next failure
+                # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
+                from cron.unreachable_retry import will_retry
+                if will_retry(job):
+                    should_deliver = False
+                    logger.info(
+                        "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
@@ -6566,6 +6694,10 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            # Failure summaries (and drift/blocked-config alerts
+                            # composed into deliver_content on the failure path)
+                            # honor the job's failure_deliver override (NS-788).
+                            for_failure=not success,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -6641,6 +6773,10 @@ def _run_one_job_body(
             return True
 
         mark_kwargs = {"delivery_error": delivery_error}
+        if not success and job.pop("_model_unreachable", False):
+            # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
+            # (cron/unreachable_retry.py) inside the same fenced store write.
+            mark_kwargs["model_unreachable"] = True
         if fire_owner is not None:
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
@@ -6660,8 +6796,18 @@ def _run_one_job_body(
             delivery_outcome = "not_configured"
         elif should_deliver and normalized_deliver != "local":
             delivery_outcome = "delivered"
+        elif incident_acked and not success:
+            # Distinct from plain "suppressed" (silence marker / local jobs):
+            # the failure ping was withheld because the operator acked this
+            # exact signature via `hermes cron incidents ack`.
+            delivery_outcome = "suppressed_acked"
         else:
             delivery_outcome = "suppressed"
+        if delivery_outcome in ("delivered", "not_configured") and not success:
+            # The failure ping left the process (or was composed for a
+            # configured target) — record it on the incident so the CLI
+            # distinguishes "failure seen" from "operator was pinged".
+            _mark_incident_alerted(failure_incident_id)
         finish_execution(
             execution_id,
             success=success,
@@ -6698,27 +6844,39 @@ def _run_one_job_body(
                 job.get("deliver", "local")
             )
             unresolved_origin = False
-            try:
-                delivery_attempted = True
-                delivery_error = _deliver_result(
-                    job,
-                    _summarize_cron_failure_for_delivery(job, _err_text),
-                    adapters=adapters,
-                    loop=loop,
-                )
-            except Exception as delivery_exc:
-                delivery_error = str(delivery_exc)
-                logger.error(
-                    "Delivery failed for job %s: %s", job["id"], delivery_exc
-                )
-            if not delivery_error and normalized_deliver == "origin":
-                unresolved_origin = not _resolve_delivery_targets(job)
-            if delivery_error:
-                delivery_outcome = "failed"
-            elif unresolved_origin:
-                delivery_outcome = "not_configured"
-            elif normalized_deliver != "local":
-                delivery_outcome = "delivered"
+            # Durable failure incident: same ack gate as the normal failure
+            # delivery above — an acked signature stays silent on this path
+            # too, so the retry-path alert cannot re-ping after acknowledgment.
+            incident_acked, failure_incident_id = _upsert_incident_for_failure(
+                job, _err_text
+            )
+            if incident_acked:
+                delivery_outcome = "suppressed_acked"
+            else:
+                try:
+                    delivery_attempted = True
+                    delivery_error = _deliver_result(
+                        job,
+                        _summarize_cron_failure_for_delivery(job, _err_text),
+                        adapters=adapters,
+                        loop=loop,
+                        for_failure=True,
+                    )
+                except Exception as delivery_exc:
+                    delivery_error = str(delivery_exc)
+                    logger.error(
+                        "Delivery failed for job %s: %s", job["id"], delivery_exc
+                    )
+                if not delivery_error and normalized_deliver == "origin":
+                    unresolved_origin = not _resolve_delivery_targets(job)
+                if delivery_error:
+                    delivery_outcome = "failed"
+                elif unresolved_origin:
+                    delivery_outcome = "not_configured"
+                elif normalized_deliver != "local":
+                    delivery_outcome = "delivered"
+                if delivery_outcome in ("delivered", "not_configured"):
+                    _mark_incident_alerted(failure_incident_id)
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}

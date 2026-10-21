@@ -38,6 +38,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--deliver",
         help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id",
     )
+    cron_create.add_argument(
+        "--failure-deliver",
+        dest="failure_deliver",
+        help=(
+            "Override target for FAILURE notices only (same grammar as "
+            "--deliver). 'local' suppresses failure notices entirely; run "
+            "state stays visible in `hermes cron list`. Omit = failures "
+            "follow --deliver."
+        ),
+    )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument(
         "--skill",
@@ -138,6 +148,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--prompt", help="New prompt/task instruction")
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
+    cron_edit.add_argument(
+        "--failure-deliver",
+        dest="failure_deliver",
+        help=(
+            "Override target for failure notices (same grammar as --deliver; "
+            "'local' suppresses; '' clears the override)"
+        ),
+    )
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     cron_edit.add_argument(
         "--skill",
@@ -277,6 +295,26 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
+
+    # cron incidents — durable failure incidents (list/ack)
+    cron_incidents = cron_subparsers.add_parser(
+        "incidents", help="List or acknowledge durable cron failure incidents"
+    )
+    cron_incidents.add_argument(
+        "--state",
+        choices=["detected", "alerted", "closed"],
+        help="Filter incidents by lifecycle state",
+    )
+    cron_incidents.add_argument(
+        "incident_action",
+        nargs="?",
+        default="list",
+        choices=["list", "ack"],
+        help="Action (default: list)",
+    )
+    cron_incidents.add_argument(
+        "incident_id", nargs="?", help="Incident ID to acknowledge (ack)"
+    )
 
     # cron notepad — per-job durable KV scratchpad (injected into the job
     # prompt each run; the running agent writes it via this CLI).
