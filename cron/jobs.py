@@ -2997,6 +2997,21 @@ def _claim_job_for_fire_locked(
 COMPLETED_ONESHOT_RETENTION_DAYS = 7
 
 
+def _cron_catch_up_missed() -> bool:
+    """``cron.catch_up_missed`` (default True). False = after planned downtime, recurring
+    misses past the grace window are skipped (re-anchored to the next occurrence) instead of
+    firing once now. Only an explicit ``false`` disables; unreadable config keeps the default."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(cron_cfg, dict):
+            return True
+        return cron_cfg.get("catch_up_missed", True) is not False
+    except Exception:
+        return True
+
+
 def _completed_oneshot_retention_days() -> float:
     """Resolve the completed one-shot retention window from config.
 
@@ -3449,6 +3464,24 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).
                     new_next = compute_next_run(schedule, now.isoformat())
+                    if new_next and not _cron_catch_up_missed():
+                        # Planned downtime: cron.catch_up_missed=false skips the
+                        # missed occurrence entirely — re-anchor and do not fire.
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                            "Skipping missed occurrence because cron.catch_up_missed "
+                            "is false; next run: %s",
+                            job.get("name", job.get("id", "?")),
+                            next_run,
+                            grace,
+                            new_next,
+                        )
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = new_next
+                                needs_save = True
+                                break
+                        continue
                     if new_next:
                         logger.info(
                             "Job '%s' missed its scheduled time (%s, grace=%ds). "
