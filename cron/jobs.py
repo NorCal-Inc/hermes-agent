@@ -2374,7 +2374,15 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    model_unreachable: bool = False,
 ) -> bool:
+    """Mark a job as run (see ``_mark_job_run_locked``).
+
+    ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
+    zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
+    earlier per ``cron.unreachable_retry.RETRY_DELAYS_SECONDS`` — instead of waiting a full period
+    (Cowork-style; see cron/unreachable_retry.py).
+    """
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -2385,6 +2393,7 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            model_unreachable=model_unreachable,
         )
 
 
@@ -2479,6 +2488,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    model_unreachable: bool = False,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -2613,6 +2623,14 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
+
+                from cron.unreachable_retry import clear_state, plan_retry
+
+                if not success and model_unreachable and job.get("next_run_at") is not None:
+                    plan_retry(job)
+                else:
+                    # Any run that reached the model (either outcome) resets the re-run ladder.
+                    clear_state(job)
 
                 save_jobs(jobs)
                 return True
