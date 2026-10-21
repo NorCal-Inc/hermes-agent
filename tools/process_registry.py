@@ -2753,14 +2753,35 @@ def _format_async_delegation(evt: dict) -> str:
     if evt.get("is_batch") or isinstance(batch_results, list):
         results = batch_results or []
         goals = evt.get("goals") or []
-        n = len(results) if results else len(goals)
+        # ``goals`` is the whole delegate_task call (task_index indexes it);
+        # ``results`` is this unit's subset (one group / one ungrouped task).
+        n = len(goals) or len(results)
+        n_unit = len(results) or len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
+        group = evt.get("group")
+        if n_unit < n or group is not None:
+            unit = (
+                f"group '{group}' ({n_unit} subagent(s))" if group is not None
+                else f"{n_unit} subagent(s)"
+            )
+            intro = (
+                f"A background fan-out unit you dispatched earlier — {unit} — "
+                "has finished; its consolidated results are below. Other units "
+                "from the same delegate_task call (other groups / ungrouped "
+                "tasks) report separately as they finish. You may have moved on "
+                "since dispatching — act on these or re-dispatch if things have "
+                "changed."
+            )
+        else:
+            intro = (
+                f"A background fan-out of {n} subagent(s) you dispatched earlier "
+                "has finished. All ran in parallel and waited on each other; their "
+                "consolidated results are below. You may have moved on since "
+                "dispatching — act on these or re-dispatch if things have changed."
+            )
         lines = [
             f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-            f"A background fan-out of {n} subagent(s) you dispatched earlier "
-            "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
+            intro,
             "",
         ]
         if isinstance(dispatched_at, (int, float)):

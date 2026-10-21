@@ -1839,6 +1839,11 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # compression_threshold_tokens: absolute context cap for subagents, applied as the lower of
+        # this and the child's ratio threshold. A brief-driven, disposable worker on a 1M-window
+        # model otherwise compresses at threshold x window (850K at 0.85) and re-sends a huge
+        # prefix on every call. Independent of the parent's own threshold. 0 = no subagent cap.
+        "compression_threshold_tokens": 200000,
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
