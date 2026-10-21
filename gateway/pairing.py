@@ -55,6 +55,7 @@ LOCKOUT_SECONDS = 3600              # Lockout duration after too many failures
 # Limits
 MAX_PENDING_PER_PLATFORM = 3        # Max pending codes per platform
 MAX_FAILED_ATTEMPTS = 5             # Failed approvals before lockout
+DECLINE_DEDUPE_SECONDS = 24 * 3600  # One polite decline per (platform, sender) per window (upstream #88028)
 
 PAIRING_DIR = get_hermes_dir("platforms/pairing", "pairing")
 
@@ -464,6 +465,9 @@ class PairingStore:
     def _rate_limit_path(self) -> Path:
         return self._dir / "_rate_limits.json"
 
+    def _decline_stamp_path(self) -> Path:
+        return self._dir / "_declined.json"
+
     def _load_json(self, path: Path) -> dict:
         if path.exists():
             try:
@@ -831,6 +835,32 @@ class PairingStore:
             key = f"{platform}:{alias}"
             limits[key] = now
         self._save_json(self._rate_limit_path(), limits)
+
+    # ----- "decline" unauthorized-DM behavior (upstream #88028) -----
+
+    def has_recent_decline(self, platform: str, user_id: str) -> bool:
+        """Whether this sender (under any alias) was sent a polite decline within DECLINE_DEDUPE_SECONDS."""
+        stamps = self._load_json(self._decline_stamp_path())
+        now = time.time()
+        for alias in self._user_id_aliases(platform, user_id):
+            stamped = stamps.get(f"{platform}:{alias}")
+            if isinstance(stamped, (int, float)) and (now - stamped) < DECLINE_DEDUPE_SECONDS:
+                return True
+        return False
+
+    def record_decline(self, platform: str, user_id: str) -> None:
+        """Stamp the sender (all aliases) and prune expired stamps. Callers stamp BEFORE sending so a
+        delivery failure cannot become a decline storm on the sender's next message."""
+        with self._lock:
+            now = time.time()
+            stamps = {
+                key: value
+                for key, value in self._load_json(self._decline_stamp_path()).items()
+                if isinstance(value, (int, float)) and (now - value) < DECLINE_DEDUPE_SECONDS
+            }
+            for alias in self._user_id_aliases(platform, user_id):
+                stamps[f"{platform}:{alias}"] = now
+            self._save_json(self._decline_stamp_path(), stamps)
 
     def _is_locked_out(self, platform: str) -> bool:
         """Check if a platform is in lockout due to failed approval attempts."""
