@@ -6241,6 +6241,45 @@ def run_conversation(
                         _retry.primary_recovery_attempted = False
                         _retry.restart_with_rebuilt_messages = True
                         break
+                    # Fallback first (above); only with nothing left to move to
+                    # does the bounded auto-recovery ladder park the turn on a
+                    # transient outage instead of ending it (#85426, #107307).
+                    from agent.turn_recovery_autorecover import start_recovery_cycle
+                    _ladder = start_recovery_cycle(agent, api_error, classified, _retry)
+                    if _ladder is not None:
+                        _ladder_cycle = f"{_ladder['cycle']}/{_ladder['total']}"
+                        _ladder_end = time.time() + _ladder["wait_s"]
+                        _ladder_touch = 0
+                        while time.time() < _ladder_end:
+                            if agent._interrupt_requested:
+                                # Same preserve-redirect rule as the retry
+                                # waits: a steering correction survives.
+                                if agent.clear_interrupt(preserve_redirect=True):
+                                    _retry.restart_with_redirected_messages = True
+                                    break
+                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during automatic recovery wait, aborting.", force=True)
+                                _interrupt_text = f"Operation interrupted: waiting for the provider to recover (cycle {_ladder_cycle})."
+                                close_interrupted_tool_sequence(messages, _interrupt_text)
+                                agent._persist_session(messages, conversation_history)
+                                agent.clear_interrupt()
+                                return {
+                                    "final_response": _interrupt_text,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                }
+                            time.sleep(0.2)
+                            _ladder_touch += 1
+                            if _ladder_touch % 150 == 0:  # ~30s
+                                agent._touch_activity(
+                                    f"auto-recovery wait ({_ladder_cycle}), "
+                                    f"{int(_ladder_end - time.time())}s remaining"
+                                )
+                        if _retry.restart_with_redirected_messages:
+                            break
+                        retry_count = 0
+                        continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)

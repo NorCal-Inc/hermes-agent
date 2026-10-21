@@ -123,6 +123,12 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
+        # overloaded/529, connect/read timeouts) with nothing delivered yet, wait and retry this many
+        # more cycles (jittered 15/30/60/60/60s; a provider Retry-After wins up to 120s) with a
+        # visible "retrying automatically" countdown instead of ending the turn. Esc/interrupt stops
+        # the wait; auth/format/billing/policy errors never enter. 0 disables.
+        "auto_recovery_cycles": 5,
         # Empty-response retry guard (NS-503).  The empty-retry loop
         # re-sends the full conversation input at full price on every
         # attempt; these settings stop it from re-billing *deterministic*
