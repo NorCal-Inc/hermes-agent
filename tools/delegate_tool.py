@@ -3909,8 +3909,13 @@ def delegate_task(
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
 
-    def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
-        """Run all built children (1 or N), join on them, aggregate results,
+    def _execute_and_aggregate(
+        *,
+        honor_parent_interrupt: bool = True,
+        unit: Optional[List[tuple]] = None,
+        group: Optional[str] = None,
+    ) -> dict:
+        """Run the built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
         dict. Used by BOTH the synchronous path and the background runner. In
         the background case this whole function runs on the daemon executor, so
@@ -3918,10 +3923,17 @@ def delegate_task(
         here (all children must finish) before producing ONE consolidated
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
+
+        ``unit`` (background only) is a subset of ``children`` — one task
+        ``group`` or one ungrouped task — so each completion unit joins only on
+        itself and re-enters the conversation as soon as IT finishes.
         """
-        if n_tasks == 1:
+        unit_children = children if unit is None else unit
+        n_here = len(unit_children)  # ``n_tasks`` keeps the call-wide i/N label
+        results: List[Dict[str, Any]] = []
+        if n_here == 1:
             # Single task -- run directly (no thread pool overhead)
-            _i, _t, child = children[0]
+            _i, _t, child = unit_children[0]
             result = _run_single_child(
                 _i,
                 _t["goal"],
@@ -3943,7 +3955,7 @@ def delegate_task(
             from tools.daemon_pool import DaemonThreadPoolExecutor
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
+                for i, t, child in unit_children:
                     child_context = contextvars.copy_context()
                     future = executor.submit(
                         child_context.run,
@@ -3965,7 +3977,7 @@ def delegate_task(
                 # when the parent is interrupted.
                 # Map task_index -> child agent, so fabricated entries for
                 # still-pending futures can carry the correct _delegate_role.
-                _child_by_index = {i: child for (i, _, child) in children}
+                _child_by_index = {i: child for (i, _, child) in unit_children}
 
                 pending = set(futures.keys())
                 while pending:
@@ -4041,7 +4053,7 @@ def delegate_task(
                         dur = entry.get("duration_seconds", 0)
                         status = entry.get("status", "?")
                         icon = "✓" if status == "completed" else "✗"
-                        remaining = n_tasks - completed_count
+                        remaining = n_here - completed_count
                         completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
                         if spinner_ref:
                             try:
@@ -4067,7 +4079,7 @@ def delegate_task(
         # headroom (split across the batch) before they enter the parent's
         # conversation. Full text is spilled to disk so nothing is lost.
         # Covers both the single-task and batch paths. See PR #9126.
-        _finalize_child_results(results, task_list, children, parent_agent)
+        _finalize_child_results(results, task_list, unit_children, parent_agent)
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
@@ -4095,8 +4107,13 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
-        if live_paths:
-            combined["live_transcripts"] = list(live_paths)
+        _unit_paths = [
+            live_paths[i] for (i, _, _) in unit_children if i < len(live_paths)
+        ]
+        if _unit_paths:
+            combined["live_transcripts"] = _unit_paths
+        if group is not None:
+            combined["group"] = group
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -4216,13 +4233,8 @@ def delegate_task(
                 except ValueError:
                     pass
 
-        def _batch_runner():
-            # This batch is detached from the foreground turn. Its lifecycle is
-            # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(honor_parent_interrupt=False)
-
-        def _batch_interrupt():
-            for _c in _child_agents:
+        def _batch_interrupt(_unit_agents):
+            for _c in _unit_agents:
                 try:
                     interrupted = request_hard_interrupt(_c, "Async delegation cancelled")
                     if not interrupted and hasattr(_c, "_interrupt_requested"):
@@ -4230,7 +4242,7 @@ def delegate_task(
                 except Exception:
                     pass
 
-        def _batch_progress():
+        def _batch_progress(_unit_agents):
             # Progress token for the async registry's stale monitor: the
             # combined (api_call_count, current_tool, last_activity_ts) of
             # every child. last_activity_ts is ticked by _touch_activity on
@@ -4246,7 +4258,7 @@ def delegate_task(
             # sync-path heartbeat monitor.
             parts = []
             in_tool = False
-            for _c in _child_agents:
+            for _c in _unit_agents:
                 try:
                     _summary = _c.get_activity_summary()
                     _tool = _summary.get("current_tool")
@@ -4263,28 +4275,85 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
-        dispatch = dispatch_async_delegation_batch(
-            goals=_goals,
-            context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
-            role=top_role,
-            model=creds["model"],
-            session_key=_session_key,
-            origin_ui_session_id=_origin_ui_session_id,
-            origin_session_id=_wake_sid,
-            parent_session_id=_parent_session_id,
-            runner=_batch_runner,
-            interrupt_fn=_batch_interrupt,
-            max_async_children=_get_max_async_children(),
-            # Reuse the live-transcript directory's id (when created) so the
-            # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
-            progress_fn=_batch_progress,
-        )
 
-        if dispatch.get("status") == "dispatched":
+        # Completion units: one per distinct task ``group`` (first-appearance
+        # order) and one per ungrouped task, so a finished independent task
+        # does not wait for its slowest sibling. Tasks that must be compared
+        # or merged share a group and still return together.
+        _unit_members: Dict[Any, List[tuple]] = {}
+        for _i, _t, _c in children:
+            _g = _t.get("group")
+            _key = ("g", str(_g)) if _g not in (None, "") else ("i", _i)
+            _unit_members.setdefault(_key, []).append((_i, _t, _c))
+        _units = [
+            (_members, _key[1] if _key[0] == "g" else None)
+            for _key, _members in _unit_members.items()
+        ]
+
+        def _dispatch_unit(_members, _group, _unit_id, _slot_key):
+            _unit_agents = [c for (_, _, c) in _members]
+            return dispatch_async_delegation_batch(
+                # Call-wide goals: completion formatting indexes them by task_index.
+                goals=_goals,
+                context=context,
+                # Metadata for the completion block only; subagents inherit the
+                # parent's toolsets (no model-facing toolsets arg).
+                toolsets=None,
+                role=top_role,
+                model=creds["model"],
+                session_key=_session_key,
+                origin_ui_session_id=_origin_ui_session_id,
+                origin_session_id=_wake_sid,
+                parent_session_id=_parent_session_id,
+                # Detached from the foreground turn: lifecycle is owned by the
+                # async registry and cancelled only via _batch_interrupt.
+                runner=lambda: _execute_and_aggregate(
+                    honor_parent_interrupt=False, unit=_members, group=_group,
+                ),
+                interrupt_fn=lambda: _batch_interrupt(_unit_agents),
+                max_async_children=_get_max_async_children(),
+                delegation_id=_unit_id,
+                progress_fn=lambda: _batch_progress(_unit_agents),
+                slot_key=_slot_key,
+                task_indexes=(
+                    [i for (i, _, _) in _members]
+                    if len(_members) < len(children) else None
+                ),
+            )
+
+        _dispatched: List[tuple] = []
+        _inline_results: List[Dict[str, Any]] = []
+        _slot_key: Optional[str] = None
+        dispatch: Dict[str, Any] = {}
+        for _k, (_members, _group) in enumerate(_units):
+            # One unit reuses the live-transcript directory's id so the
+            # returned delegation_id matches cache/delegation/live/<id>/;
+            # several units suffix it (-1, -2, ...) and the call keeps the bare id.
+            if len(_units) == 1:
+                _unit_id = live_deleg_id
+            else:
+                _unit_id = f"{live_deleg_id}-{_k + 1}" if live_deleg_id else None
+            dispatch = _dispatch_unit(_members, _group, _unit_id, _slot_key)
+            if dispatch.get("status") == "dispatched":
+                _slot_key = _slot_key or dispatch["delegation_id"]
+                _dispatched.append((_members, _group, dispatch["delegation_id"]))
+                continue
+            if not _dispatched:
+                break  # first unit rejected: whole call falls back to sync below
+            # Later units share the admitted call's slot and cannot be
+            # capacity-rejected; a scheduler failure runs the unit inline so
+            # no task is silently dropped.
+            logger.warning(
+                "delegate_task: unit %d/%d not accepted (%s); running it inline.",
+                _k + 1, len(_units), dispatch.get("error"),
+            )
+            _inline_results.extend(
+                _execute_and_aggregate(
+                    honor_parent_interrupt=False, unit=_members, group=_group,
+                ).get("results") or []
+            )
+
+        if _dispatched:
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -4292,20 +4361,33 @@ def delegate_task(
                 "new message when it finishes. Do not wait or poll — just "
                 "continue."
                 if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
+                f"{n} subagents are running in parallel in the background as "
+                f"{len(_dispatched)} independent unit(s). You and the user can "
+                f"keep working; each unit's results re-enter the conversation as "
+                f"their own message as soon as THAT unit finishes (tasks sharing "
+                f"a `group` finish together; ungrouped tasks report "
+                f"individually), so act on each as it lands. Do not wait or "
+                f"poll — just continue."
             )
             payload = {
                 "status": "dispatched",
                 "mode": "background",
                 "count": n,
-                "delegation_id": dispatch["delegation_id"],
+                "delegation_id": live_deleg_id or _dispatched[0][2],
                 "goals": _goals,
                 "note": note,
             }
+            if len(_dispatched) > 1 or _inline_results:
+                payload["units"] = [
+                    {
+                        "delegation_id": _uid,
+                        "group": _grp,
+                        "task_indexes": [i for (i, _, _) in _mem],
+                    }
+                    for (_mem, _grp, _uid) in _dispatched
+                ]
+            if _inline_results:
+                payload["inline_results"] = _inline_results
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]
@@ -4639,9 +4721,9 @@ def _build_top_level_description() -> str:
         "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
         "(limits and nesting rules are in the parameter descriptions).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
+        "transcript paths; each ungrouped task re-enters the conversation as "
+        "it finishes, tasks sharing a group together. Do NOT wait or poll; "
+        "continue other work.\n\n"
         "LIVE ORCHESTRATION: while children run, this tool also controls "
         "them — action='list' (live children + ids), action='steer' "
         "(subagent_id + message, redirect without stopping), action='stop' "
@@ -4809,6 +4891,19 @@ DELEGATE_TASK_SCHEMA = {
                                 "gains schema_valid (and schema_errors on "
                                 "final failure). Keep schemas forgiving: "
                                 "require only fields you will actually read."
+                            ),
+                        },
+                        "group": {
+                            "type": "string",
+                            "description": (
+                                "Optional completion group. Tasks sharing a "
+                                "group wait for each other and return as ONE "
+                                "message (use when you must compare or merge "
+                                "their results); a task without a group "
+                                "returns on its own the moment it finishes. "
+                                "Independent work (separate PR reviews, "
+                                "unrelated fixes) should stay ungrouped so "
+                                "nothing waits for the slowest sibling."
                             ),
                         },
                     },

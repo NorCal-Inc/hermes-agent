@@ -608,6 +608,20 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
         return _executor
 
 
+def _active_slots_locked() -> set:
+    """Distinct pool slots held by live units. Caller holds ``_records_lock``.
+
+    Every unit of one ``delegate_task`` call shares the first unit's
+    ``slot_key`` so splitting a call into per-group completion units never
+    consumes more of ``delegation.max_concurrent_children`` than the call did.
+    """
+    return {
+        r.get("slot_key") or r.get("delegation_id")
+        for r in _records.values()
+        if r.get("status") in ("running", "stalling")
+    }
+
+
 def active_count() -> int:
     """Number of async delegation UNITS currently running.
 
@@ -655,7 +669,12 @@ def active_task_count() -> int:
                 continue
             if r.get("is_batch"):
                 goals = r.get("goals")
-                total += len(goals) if isinstance(goals, (list, tuple)) and goals else 1
+                # A per-group unit runs only its own ``task_indexes`` of the call's goals.
+                unit = r.get("task_indexes")
+                if isinstance(unit, (list, tuple)) and unit:
+                    total += len(unit)
+                else:
+                    total += len(goals) if isinstance(goals, (list, tuple)) and goals else 1
             else:
                 total += 1
         return total
@@ -836,11 +855,7 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
-        )
-        if running >= max_async_children:
+        if len(_active_slots_locked()) >= max_async_children:
             return {
                 "status": "rejected",
                 "error": (
@@ -1028,8 +1043,17 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    slot_key: Optional[str] = None,
+    task_indexes: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
-    """Dispatch a WHOLE fan-out batch as ONE background unit.
+    """Dispatch a fan-out unit (a WHOLE batch, or one ``group`` of a
+    delegate_task call) as ONE background unit.
+
+    ``goals`` is always the whole call (result ``task_index`` indexes it);
+    ``task_indexes`` names the subset this unit runs (None = all of them).
+    ``slot_key`` names the pool slot the unit occupies (default: its own id);
+    the units of one call share the first unit's id so a split call never
+    consumes more capacity than the call did.
 
     Unlike ``dispatch_async_delegation`` (which backs a single subagent),
     ``runner`` here runs the entire batch — it builds and joins on every child
@@ -1051,10 +1075,14 @@ def dispatch_async_delegation_batch(
     """
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
-    n = len(goals)
+    unit_goals = (
+        [goals[i] for i in task_indexes] if task_indexes is not None else list(goals)
+    )
+    n = len(unit_goals)
     # A combined goal label for status listings / the completion header.
     combined_goal = (
-        goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
+        unit_goals[0] if n == 1
+        else f"{n} parallel subagents: " + "; ".join(g[:40] for g in unit_goals)
     )
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -1075,16 +1103,15 @@ def dispatch_async_delegation_batch(
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
         "progress_fn": progress_fn,
+        "slot_key": slot_key or delegation_id,
+        **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
     with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
-        )
-        if running >= max_async_children:
+        active_slots = _active_slots_locked()
+        if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
             return {
                 "status": "rejected",
                 "error": (
@@ -1198,6 +1225,7 @@ def _push_batch_completion_event(
         "live_transcripts": combined.get("live_transcripts"),
         "error": combined.get("error"),
         "total_duration_seconds": combined.get("total_duration_seconds"),
+        **({"group": combined["group"]} if combined.get("group") is not None else {}),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
