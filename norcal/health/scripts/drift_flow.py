@@ -14,6 +14,7 @@ when the repair worker records a decision only Christopher can make.
 A monitor pipes its findings into `process` as tab-separated lines:
     F<TAB>kind<TAB>subject<TAB>detail     one line per finding
     C<TAB>subject                         one line per subject it checked
+    H<TAB>kind<TAB>subject<TAB>detail     the monitor fixed this itself (ledger only, no message)
 Kinds: ahead, behind, diverged, dirty, check_failed, missing, mismatch.
 `process` prints the Telegram text to stdout (empty when there is nothing new),
 so a no_agent cron job delivers it through its normal channel.
@@ -38,7 +39,7 @@ VAULT_DIRTY_GRACE_SECONDS = 20 * 60
 
 # Kinds that describe the same sync relationship share one fingerprint, so a
 # change of direction (ahead -> diverged) reads as "changed", never "resolved".
-GROUP = {"ahead": "sync", "behind": "sync", "diverged": "sync",
+GROUP = {"ahead": "sync", "behind": "sync", "diverged": "sync", "wrong_branch": "sync",
          "dirty": "dirty", "check_failed": "check", "missing": "missing", "mismatch": "mismatch",
          "ledger_mismatch": "ledger_mismatch", "trust_low": "trust_low",
          "failed_verification": "failed_verification", "verified_unchecked": "failed_verification"}
@@ -46,6 +47,7 @@ LABEL = {
     "ahead": "VPS ahead of GitHub",
     "behind": "VPS behind GitHub",
     "diverged": "VPS and GitHub have diverged",
+    "wrong_branch": "Live checkout is on a side branch",
     "dirty": "Uncommitted changes on the VPS",
     "check_failed": "Check failed, state unknown",
     "missing": "Checkout missing",
@@ -164,11 +166,21 @@ def handoff(fp, rec, rerun):
         return None, f"hand-off failed: {type(e).__name__}"
     if p.returncode != 0:
         return None, f"hand-off failed: {(p.stderr or p.stdout).strip().splitlines()[-1:] or ['exit ' + str(p.returncode)]}"
+    # `kanban create --json` pretty-prints one object over many lines; parse the
+    # whole reply first, then fall back to a trailing single-line JSON object.
+    try:
+        task = json.loads(p.stdout).get("id")
+        if task:
+            return task, None
+    except (ValueError, AttributeError):
+        pass
     for line in reversed(p.stdout.strip().splitlines()):
         try:
-            return json.loads(line).get("id"), None
-        except ValueError:
+            task = json.loads(line).get("id")
+        except (ValueError, AttributeError):
             continue
+        if task:
+            return task, None
     return None, "hand-off created but returned no task id"
 
 
@@ -184,6 +196,12 @@ def process(monitor, rerun, lines):
             findings.setdefault(fp, {"kind": kind, "subject": subject, "detail": detail})
         elif parts[0] == "C" and len(parts) >= 2:
             checked.add(parts[1])
+        elif parts[0] == "H" and len(parts) >= 4:
+            # Self-healed by the monitor's own deterministic repair: audit row only.
+            # No alert and no repair card; the monitor emits C for the subject too.
+            kind, subject = parts[1], parts[2]
+            ledger("self_healed", f"{GROUP.get(kind, kind)}:{subject}",
+                   {"monitor": monitor, "subject": subject, "kind": kind, "detail": "\t".join(parts[3:])})
     failed = {f["subject"] for f in findings.values() if f["kind"] == "check_failed"}
     out = []
 
