@@ -1575,6 +1575,27 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
+    """Cap the child's compaction trigger at ``delegation.compression_threshold_tokens`` (lower of it
+    and any global ``compression.threshold_tokens``). The compressor applies the cap on first window
+    resolution, which happens after construction, so setting it here is exactly equivalent to config."""
+    from agent.context_compressor import ContextCompressor
+
+    cc = getattr(child, "context_compressor", None)
+    if not isinstance(cc, ContextCompressor):
+        return
+    try:
+        cap = int((delegation_cfg or {}).get("compression_threshold_tokens", 200_000) or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        return
+    existing = cc.threshold_tokens_cap
+    cc.threshold_tokens_cap = min(cap, existing) if isinstance(existing, int) and existing > 0 else cap
+    if cc._threshold_tokens is not None:  # already resolved: re-clamp now
+        cc._apply_threshold_tokens_cap()
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -2004,6 +2025,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    _apply_child_compression_cap(child, delegation_cfg)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
