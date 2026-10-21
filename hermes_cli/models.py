@@ -89,6 +89,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
     ("anthropic/claude-sonnet-5.5",            ""),
     ("anthropic/claude-sonnet-5",              ""),
+    ("anthropic/claude-haiku-5.5",             ""),
     ("anthropic/claude-haiku-4.5",             ""),
     # OpenAI
     ("openai/gpt-5.6-sol",                     ""),
@@ -266,6 +267,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5.5",
         "anthropic/claude-sonnet-5",
+        "anthropic/claude-haiku-5.5",
         "anthropic/claude-haiku-4.5",
         # OpenAI
         "openai/gpt-5.6-sol",
