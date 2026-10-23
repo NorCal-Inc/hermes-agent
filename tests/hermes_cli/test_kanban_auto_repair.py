@@ -304,6 +304,30 @@ class TestRepairLoopNoNesting:
             assert kb.specify_triage_task(conn, tid, author="claude")
             assert kb.get_task(conn, tid).status in ("todo", "ready")
 
+    def test_after_loop_repair_next_failure_gets_a_repair_card(self, kanban_home):
+        # Review finding 1: diagnosis must not switch the repair lane off for good.
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            kb._start_verifier_fail_repair(conn, first, "still broken")
+            kb.record_block_loop_repair(
+                conn, tid, root_cause="r", change="new fix", check="k", author="claude",
+            )
+            kb.specify_triage_task(conn, tid, author="claude")
+            assert kb._last_repair_brought_new_change(conn, tid)
+            nxt = kb._open_auto_repair(conn, tid, cause="fails again", trigger="t")
+            assert nxt and nxt != first
+            assert kb.get_task(conn, tid).status != "triage"
+
+    def test_no_loop_flag_when_subject_is_running(self, kanban_home):
+        # Review finding 2: a claimed subject is not routed, so no flag is left.
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+            assert kb._route_repair_loop_to_diagnosis(
+                conn, tid, cause="x", trigger="t",
+            ) is False
+            assert not kb.block_loop_repair_pending(conn, tid)
+            assert kb.get_task(conn, tid).status == "running"
+
 
 class TestRecoveryLinkageFailureLeavesSubjectUntouched:
     def test_linkage_error_emits_repair_start_failed_and_preserves_state(

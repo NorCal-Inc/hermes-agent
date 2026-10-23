@@ -8080,6 +8080,14 @@ def _last_repair_brought_new_change(
     # created_at ties within one second, so take the newest from the event log.
     started = _latest_event_payload(conn, subject_id, "repair_started") or {}
     last = started.get("repair_id") if started.get("repair_id") in ids else ids[-1]
+    # A loop-repair diagnosis recorded after the last repair started is new evidence.
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'block_loop_repaired' "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'repair_started'), 0) LIMIT 1",
+        (subject_id, subject_id),
+    ).fetchone():
+        return True
     released = _latest_event_payload(
         conn, subject_id, "verifier_released_after_repair",
     )
@@ -8096,7 +8104,7 @@ def _last_repair_brought_new_change(
 
 def _route_repair_loop_to_diagnosis(
     conn: sqlite3.Connection, subject_id: str, *, cause: str, trigger: str,
-) -> None:
+) -> bool:
     """Send a subject whose last repair changed nothing to Claude diagnosis.
 
     Christopher 2026-10-23: a repeat failure with no new change or evidence is
@@ -8111,12 +8119,15 @@ def _route_repair_loop_to_diagnosis(
         f"Latest failure: {(cause or '').strip()[:1500]}"
     )
     with write_txn(conn):
-        conn.execute(
+        cur = conn.execute(
             "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, block_kind = ? "
             "WHERE id = ? AND status NOT IN ('running', 'done', 'archived')",
             ("repair_loop", subject_id),
         )
+        if cur.rowcount != 1:
+            # Claimed or closed meanwhile: not routed, so leave no loop flag.
+            return False
         _append_event(
             conn, subject_id, "block_loop_detected",
             {
@@ -8131,6 +8142,7 @@ def _route_repair_loop_to_diagnosis(
             reason + chr(10) * 2 + f"After fixing: hermes kanban loop-repair {subject_id} "
             "--root-cause '...' --change '...' --check '...'",
         )
+    return True
 
 
 def _open_auto_repair(
