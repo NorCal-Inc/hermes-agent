@@ -218,6 +218,36 @@ def test_fail_time_candidate_lesson_carries_the_same_fingerprint(kanban_home):
         assert prov["failure_fingerprint"] == entry["fingerprint"] != ""
 
 
+def test_ceiling_message_names_the_unmet_criterion_not_just_which_verification(kanban_home):
+    """t_ae87c65e pass-1 addendum: the operator-facing block reason must name the
+    actual unmet acceptance criterion, not just a verification id + subject.
+
+    Before this fix, an ATTEMPT_BUDGET_EXHAUSTED block only said "verification N
+    on <task>" -- an operator had to open that verification's full report to find
+    out what was actually failing. Live incident (2026-10-05): Christopher hand-
+    built 9 sequential retry tasks instead of letting the system self-diagnose,
+    plausibly because the escalation message gave him a budget number rather
+    than a concrete, actionable gap.
+    """
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="objective", assignee="default", gauntlet=True)
+        _hand_off(conn, tid)
+        _fail(
+            conn, tid,
+            "- Timer enabled/active: FAIL -- could not connect to the user bus.\n"
+            "VERDICT: FAIL\n",
+        )
+        _spend_to_ceiling(conn, tid)
+
+        assert kb.claim_task(conn, tid) is None
+        reason = kb.get_task(conn, tid).last_failure_error
+        assert reason.startswith("ATTEMPT_BUDGET_EXHAUSTED:")
+        # The old behavior only surfaced "verification N on <task-id>"; the fix
+        # must additionally surface the unmet criterion label inline.
+        assert "unmet:" in reason
+        assert "Timer enabled/active" in reason
+
+
 def test_fingerprint_parses_failing_criteria_from_verifier_reports():
     """Shapes taken from the live t_69440ff2 verifier reports (t_fa3d6af3, t_8b66792e)."""
     first = kb.failure_fingerprint(

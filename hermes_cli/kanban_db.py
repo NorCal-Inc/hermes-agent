@@ -8037,11 +8037,19 @@ def auto_repair_gate(conn: sqlite3.Connection, subject_id: str) -> tuple:
     next repair card automatically (no cap).
     """
     subj = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (subject_id,),
+        "SELECT status, terminal_disposition FROM tasks WHERE id = ?",
+        (subject_id,),
     ).fetchone()
     if subj is None:
         return False, f"subject {subject_id} not found"
     if subj["status"] == "archived":
+        # A repair that reconciled its subject as overtaken by events met the
+        # objective; a red gate here only bought another paid repair (t_0adeb90a).
+        if subj["terminal_disposition"] == DISPOSITION_OVERTAKEN_BY_EVENTS:
+            return True, (
+                f"subject {subject_id} was reconciled as overtaken by events; "
+                "nothing left to repair"
+            )
         return False, f"subject {subject_id} is archived; nothing to resume"
     repair_id = open_repair_for_subject(conn, subject_id)
     if repair_id is None:
@@ -11646,8 +11654,19 @@ def _describe_failure_basis(summary: dict[str, Any]) -> str:
     m = summary.get("failed_verdicts", 0)
 
     def _where(ids: list) -> str:
-        subjects = {f["verification_id"]: f["subject"] for f in summary.get("fingerprints", [])}
-        return ", ".join(f"verification {i} on {subjects.get(i, '?')}" for i in ids)
+        fp_by_id = {f["verification_id"]: f for f in summary.get("fingerprints", [])}
+
+        def _one(i):
+            fp = fp_by_id.get(i)
+            if fp is None:
+                return f"verification {i} on ?"
+            subject = fp.get("subject", "?")
+            labels = [c for c in fp.get("criteria", []) if c]
+            if labels:
+                return f"verification {i} on {subject} (unmet: {'; '.join(labels)})"
+            return f"verification {i} on {subject}"
+
+        return ", ".join(_one(i) for i in ids)
 
     if basis == FAILURE_BASIS_REPEATED:
         return (

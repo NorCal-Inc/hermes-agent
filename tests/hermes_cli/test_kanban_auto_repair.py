@@ -304,6 +304,18 @@ class TestRepairLoopNoNesting:
             assert kb.specify_triage_task(conn, tid, author="claude")
             assert kb.get_task(conn, tid).status in ("todo", "ready")
 
+    def test_gate_green_when_subject_reconciled_overtaken(self, kanban_home):
+        # t_0adeb90a: the repair closed its subject as overtaken; gate stayed red.
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            ok, why = kb.reconcile_overtaken_by_events(
+                conn, tid, actor="claude", reason="superseded",
+                evidence="other card", superseded_by=None,
+            )
+            assert ok, why
+            ok, reason = kb.auto_repair_gate(conn, tid)
+            assert ok and "overtaken" in reason
+
     def test_after_loop_repair_next_failure_gets_a_repair_card(self, kanban_home):
         # Review finding 1: diagnosis must not switch the repair lane off for good.
         with kb.connect_closing() as conn:
