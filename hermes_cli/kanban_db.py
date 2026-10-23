@@ -8168,9 +8168,29 @@ def _open_auto_repair(
     could not be linked (``repair_start_failed`` is recorded).
     """
     row = conn.execute(
-        "SELECT title, assignee FROM tasks WHERE id = ?", (subject_id,),
+        "SELECT title, assignee, terminal_disposition FROM tasks WHERE id = ?",
+        (subject_id,),
     ).fetchone()
     if row is None:
+        return None
+    if row["terminal_disposition"] in IRREVERSIBLE_DISPOSITIONS:
+        # The subject already has a durable, evidence-backed terminal close
+        # (e.g. OVERTAKEN_BY_EVENTS) that a repair cannot and must not
+        # reopen -- repair-gate refuses to resume an archived/terminal
+        # subject by design (see the gate check further down this module),
+        # so a repair card opened here is guaranteed to end in
+        # "recovery attempts exhausted; escalated for human review" even
+        # though no human decision is actually pending: Christopher's
+        # decision already landed as the terminal disposition itself.
+        # Root-caused 2026-10-23 (t_ae87c65e) from t_0adeb90a/t_68332405,
+        # three nested zombie repair cards against an archived t_1ee44487.
+        _append_event(
+            conn, subject_id, "repair_skipped_terminal_subject",
+            {
+                "terminal_disposition": row["terminal_disposition"],
+                "trigger": trigger,
+            },
+        )
         return None
     existing = open_repair_for_subject(conn, subject_id, exclude=exclude)
     if existing is not None:

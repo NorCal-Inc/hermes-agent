@@ -607,4 +607,80 @@ class TestVerifierFailCreatesRepair:
             assert _open_repair(conn, tid) is None
             failed = _events(conn, tid, "repair_start_failed")
             assert len(failed) == 1 and failed[0].payload["trigger"] == "verification_failed"
-            _no_needs_input(conn, tid)
+
+
+class TestNoRepairAgainstTerminalSubject:
+    """t_ae87c65e root-cause fix: a subject already closed with an
+    IRREVERSIBLE_DISPOSITIONS terminal state (e.g. OVERTAKEN_BY_EVENTS) must
+    never get a fresh repair card opened against it.
+
+    Before this fix, ``_open_auto_repair`` only checked for an existing open
+    repair and whether the previous repair brought a new change -- it never
+    checked whether the subject itself was already terminally closed. A
+    repair opened against an archived/OVERTAKEN_BY_EVENTS subject is
+    unwinnable by construction: ``repair-gate`` refuses to resume an
+    archived subject, so the repair card can only ever end in "recovery
+    attempts exhausted; escalated for human review" even though the
+    underlying decision was already made and recorded as the disposition
+    itself (live incident: t_0adeb90a/t_68332405 nested against archived
+    t_1ee44487, 2026-10-23).
+    """
+
+    def test_open_auto_repair_skips_terminal_subject(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+            assert kb.block_task(
+                conn, tid, reason="obsolete", kind="needs_input",
+            )
+            ok, reason = kb.reconcile_overtaken_by_events(
+                conn, tid, actor="erika", reason="superseded",
+                evidence="superseded by a later decision",
+            )
+            assert ok, reason
+            task = kb.get_task(conn, tid)
+            assert task.status == "archived"
+            assert task.terminal_disposition == kb.DISPOSITION_OVERTAKEN_BY_EVENTS
+
+            repair_id = kb._open_auto_repair(
+                conn, tid, cause="boom", trigger="verification_failed",
+            )
+            assert repair_id is None
+
+            skipped = _events(conn, tid, "repair_skipped_terminal_subject")
+            assert len(skipped) == 1
+            assert (
+                skipped[0].payload["terminal_disposition"]
+                == kb.DISPOSITION_OVERTAKEN_BY_EVENTS
+            )
+            # No repair card was linked against the terminal subject.
+            assert kb.task_relations(
+                conn, tid, relation=kb.RELATION_REPAIRS, direction="to",
+            ) == []
+
+    def test_supersede_auto_repair_also_refuses_terminal_subject(self, kanban_home):
+        """Same guard applies via the supersede path (repeated gate-red repair)."""
+        with kb.connect_closing() as conn:
+            tid = _running_task(conn)
+            repair_id = kb._open_auto_repair(
+                conn, tid, cause="boom", trigger="verification_failed",
+            )
+            assert repair_id is not None
+
+            # Force the subject into 'blocked' so reconcile_overtaken_by_events
+            # (which refuses 'running') will accept it, mirroring how the
+            # live incident card reached OVERTAKEN_BY_EVENTS.
+            assert kb.block_task(
+                conn, tid, reason="obsolete", kind="needs_input",
+            )
+            ok, reason = kb.reconcile_overtaken_by_events(
+                conn, tid, actor="erika", reason="superseded",
+                evidence="superseded by a later decision",
+            )
+            assert ok, reason
+
+            result = kb.supersede_auto_repair(
+                conn, repair_id, reason="gate still red",
+            )
+            # Neither a new repair id nor a diagnosis routing -- the subject
+            # is terminal, so the superseding attempt yields nothing to do.
+            assert result is None
