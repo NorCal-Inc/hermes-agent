@@ -8068,6 +8068,71 @@ def auto_repair_gate(conn: sqlite3.Connection, subject_id: str) -> tuple:
     )
 
 
+def _last_repair_brought_new_change(
+    conn: sqlite3.Connection, subject_id: str,
+) -> bool:
+    """True when the subject's newest repair recorded a change that differs
+    from the one before it. No repair yet also counts as True (first attempt).
+    """
+    ids = _repair_ids_for_subject(conn, subject_id)
+    if not ids:
+        return True
+    # created_at ties within one second, so take the newest from the event log.
+    started = _latest_event_payload(conn, subject_id, "repair_started") or {}
+    last = started.get("repair_id") if started.get("repair_id") in ids else ids[-1]
+    released = _latest_event_payload(
+        conn, subject_id, "verifier_released_after_repair",
+    )
+    if released and released.get("repair_id") == last:
+        # _release_verifier_after_repair already judged its change new.
+        return True
+    rec = _latest_repair_record(conn, last)
+    change = ((rec or {}).get("change") or "").strip()
+    if not change:
+        return False
+    prev = _previous_recorded_change(conn, subject_id, last)
+    return not (prev and _norm_change(prev[1]) == _norm_change(change))
+
+
+def _route_repair_loop_to_diagnosis(
+    conn: sqlite3.Connection, subject_id: str, *, cause: str, trigger: str,
+) -> None:
+    """Send a subject whose last repair changed nothing to Claude diagnosis.
+
+    Christopher 2026-10-23: a repeat failure with no new change or evidence is
+    not handed to another paid repair card. It reuses the block-loop triage
+    path; the only exit back to work is ``hermes kanban loop-repair`` with a
+    recorded root cause, change and check. Not an attempt cap: any repair that
+    records a new change still gets its next card.
+    """
+    reason = (
+        "Repair loop: the last repair recorded no new change, so another "
+        "repair card would repeat it. Diagnose before any further attempt. "
+        f"Latest failure: {(cause or '').strip()[:1500]}"
+    )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = ? "
+            "WHERE id = ? AND status NOT IN ('running', 'done', 'archived')",
+            ("repair_loop", subject_id),
+        )
+        _append_event(
+            conn, subject_id, "block_loop_detected",
+            {
+                "reason": reason[:2000],
+                "kind": "repair_loop",
+                "trigger": trigger,
+                "source": "auto_repair",
+            },
+        )
+        add_comment(
+            conn, subject_id, "recovery-lane",
+            reason + chr(10) * 2 + f"After fixing: hermes kanban loop-repair {subject_id} "
+            "--root-cause '...' --change '...' --check '...'",
+        )
+
+
 def _open_auto_repair(
     conn: sqlite3.Connection,
     subject_id: str,
@@ -8098,6 +8163,11 @@ def _open_auto_repair(
     existing = open_repair_for_subject(conn, subject_id, exclude=exclude)
     if existing is not None:
         return existing
+    if not _last_repair_brought_new_change(conn, subject_id):
+        _route_repair_loop_to_diagnosis(
+            conn, subject_id, cause=cause, trigger=trigger,
+        )
+        return None
     attempt = len(_repair_ids_for_subject(conn, subject_id)) + 1
     cause_text = (cause or "").strip()[:4000] or "task failed"
     fingerprint = _error_fingerprint(cause_text)
@@ -8195,8 +8265,10 @@ def supersede_auto_repair(
     Decision C: no exhausted-to-human state for this failure class. The next
     repair is opened and linked to the subject BEFORE the old one is unlinked
     and archived, so the subject is never released in between. Returns the
-    new repair id, or None when ``repair_id`` is not an auto-repair card or
-    the next one could not be opened (the caller keeps its old escalation).
+    new repair id; the subject id when the subject was routed to diagnosis
+    instead (the last repair changed nothing); or None when ``repair_id`` is
+    not an auto-repair card or the next one could not be opened (the caller
+    keeps its old escalation).
     """
     row = conn.execute(
         "SELECT created_by FROM tasks WHERE id = ?", (repair_id,),
@@ -8218,7 +8290,19 @@ def supersede_auto_repair(
         exclude=(repair_id,),
     )
     if new_id is None:
-        return None
+        if not block_loop_repair_pending(conn, subject_id):
+            return None
+        # Routed to diagnosis: retire this card so it no longer holds the subject.
+        with contextlib.suppress(Exception):
+            unlink_tasks(conn, repair_id, subject_id)
+        with write_txn(conn):
+            _append_event(
+                conn, repair_id, "repair_superseded",
+                {"next_repair_id": None, "subject_id": subject_id,
+                 "routed_to": "diagnosis"},
+            )
+        archive_task(conn, repair_id)
+        return subject_id
     with contextlib.suppress(Exception):
         unlink_tasks(conn, repair_id, subject_id)
     with write_txn(conn):
@@ -8248,6 +8332,20 @@ def _start_verifier_fail_repair(
     Never ``needs_input``. Must be called outside any open write transaction.
     """
     finding_text = (findings or "").strip()[:4000] or "independent verification failed"
+    # A repair card that fails verification is replaced by the next repair on
+    # its root subject, never given a repair of its own (2026-10-23: 26 nested
+    # "Repair: Repair: ..." cards, each a fresh attempt 1, so no guard fired).
+    _subj = conn.execute(
+        "SELECT created_by FROM tasks WHERE id = ?", (subject_id,),
+    ).fetchone()
+    _roots = (
+        relation_targets(conn, subject_id, RELATION_REPAIRS)
+        if _subj is not None and _subj["created_by"] == AUTO_REPAIR_CREATED_BY
+        else []
+    )
+    if _roots:
+        nxt = supersede_auto_repair(conn, subject_id, reason=finding_text)
+        return None if nxt in (None, _roots[0]) else nxt
     evidence = (
         f"Independent verification of {subject_id} failed "
         f"{VERIFIER_REPEATED_FAIL_LIMIT}+ times in a row. Verifier finding:\n\n"

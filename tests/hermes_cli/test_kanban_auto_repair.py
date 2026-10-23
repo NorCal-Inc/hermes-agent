@@ -120,6 +120,11 @@ class TestBreakerTripCreatesRepair:
                     if r not in repair_ids
                 ]
                 repair_ids.append(repair_id)
+                # Real repair cards cannot close without a recorded change.
+                kb.record_auto_repair(
+                    conn, repair_id, root_cause="r",
+                    change=f"change {len(repair_ids)}", check="c",
+                )
                 # The repair ran and closed; the subject reran and failed again.
                 with kb.write_txn(conn):
                     conn.execute(
@@ -223,6 +228,9 @@ class TestRepairGate:
     def test_red_gate_after_both_attempts_opens_next_repair_not_human(self, kanban_home):
         with kb.connect_closing() as conn:
             tid, first = self._tripped(conn)
+            kb.record_auto_repair(
+                conn, first, root_cause="a", change="clear the lock", check="c",
+            )
             nxt = kb.supersede_auto_repair(conn, first, reason="gate still red")
             assert nxt and nxt != first
             assert kb.get_task(conn, first).status == "archived"
@@ -240,6 +248,61 @@ class TestRepairGate:
         with kb.connect_closing() as conn:
             other = kb.create_task(conn, title="plain card", assignee="default")
             assert kb.supersede_auto_repair(conn, other, reason="x") is None
+
+
+class TestRepairLoopNoNesting:
+    """2026-10-23: 26 nested "Repair: Repair: ..." cards on t_cd5937cc."""
+
+    def _tripped(self, conn):
+        tid = _running_task(conn)
+        kb._record_task_failure(conn, tid, "boom", outcome="crashed", failure_limit=1)
+        return tid, kb.open_repair_for_subject(conn, tid)
+
+    def test_failing_repair_card_is_superseded_not_repaired(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            kb.record_auto_repair(
+                conn, first, root_cause="a", change="clear the lock", check="c",
+            )
+            nxt = kb._start_verifier_fail_repair(conn, first, "verifier: still broken")
+            assert nxt and nxt != first
+            assert kb.relation_targets(conn, nxt, kb.RELATION_REPAIRS) == [tid]
+            assert kb._repair_ids_for_subject(conn, first) == []
+            assert kb.get_task(conn, first).status == "archived"
+            assert not kb.get_task(conn, nxt).title.startswith("Repair: Repair:")
+            started = _events(conn, tid, "repair_started")
+            assert [e.payload["attempt"] for e in started] == [1, 2]
+
+    def test_repair_with_no_change_goes_to_diagnosis_not_new_card(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            out = kb._start_verifier_fail_repair(conn, first, "verifier: still broken")
+            assert out is None
+            assert kb.open_repair_for_subject(conn, tid) is None
+            assert len(kb._repair_ids_for_subject(conn, tid)) == 1
+            assert kb.get_task(conn, first).status == "archived"
+            assert first not in kb.parent_ids(conn, tid)
+            subject = kb.get_task(conn, tid)
+            assert subject.status == "triage"
+            assert kb.block_loop_repair_pending(conn, tid)
+
+    def test_supersede_with_no_change_reports_routed(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            assert kb.supersede_auto_repair(conn, first, reason="gate red") == tid
+            assert kb.get_task(conn, tid).status == "triage"
+
+    def test_diagnosis_exit_is_loop_repair(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid, first = self._tripped(conn)
+            kb._start_verifier_fail_repair(conn, first, "still broken")
+            with pytest.raises(kb.BlockLoopRepairRequired):
+                kb.specify_triage_task(conn, tid, author="claude")
+            kb.record_block_loop_repair(
+                conn, tid, root_cause="r", change="c", check="k", author="claude",
+            )
+            assert kb.specify_triage_task(conn, tid, author="claude")
+            assert kb.get_task(conn, tid).status in ("todo", "ready")
 
 
 class TestRecoveryLinkageFailureLeavesSubjectUntouched:
@@ -486,12 +549,12 @@ class TestVerifierFailCreatesRepair:
             assert len(_events(conn, tid, "verifier_released_after_repair")) == 1
             assert len(_events(conn, tid, "repair_needs_new_approach")) == 1
             assert _open_verifiers(conn, tid) == []
-            third = _open_repair(conn, tid)
-            assert third is not None and third not in (first, second)
-            assert kb.get_task(conn, third).body.startswith(
-                kb._REPAIR_NEW_APPROACH_PREFIX
-            )
-            _no_needs_input(conn, tid, first, second, third)
+            # 2026-10-23: an identical change is no new evidence, so the
+            # subject goes to diagnosis (triage + loop-repair), not a third card.
+            assert _open_repair(conn, tid) is None
+            assert kb.get_task(conn, tid).status == "triage"
+            assert kb.block_loop_repair_pending(conn, tid)
+            _no_needs_input(conn, tid, first, second)
 
     def test_empty_change_starts_new_repair_not_verifier(self, kanban_home):
         with kb.connect_closing() as conn:
