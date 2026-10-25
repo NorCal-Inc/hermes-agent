@@ -13858,15 +13858,19 @@ def _resolve_lane_verifier_identity(
 ) -> Optional[str]:
     """Return ``None`` when a lane-scoped identity legitimately verifies *subject_id*.
 
-    Otherwise return the refusal detail. Two scoped forms are produced by the
-    system itself and are the only ones accepted:
+    Otherwise return the refusal detail. Scoped forms are produced by the
+    system itself and are the only ones accepted, one per lane in
+    :data:`INDEPENDENT_VERIFIER_LANES`:
 
-    * ``codex_verify:<verifier_task_id>`` — a codex_verify card, attested by
-      :func:`_attested_codex_verifier_run`, that verifies this subject: linked
-      as its child, or the single safe subject of a legacy orphan verifier
+    * ``codex_verify:<verifier_task_id>`` / ``claude_verify:<verifier_task_id>``
+      — a verifier card on that lane, attested by :func:`_attested_verifier_run`,
+      that verifies this subject: linked as its child, or the single safe
+      subject of a legacy orphan verifier
       (:func:`_historical_orphan_subject_candidate`).
     * ``codex_verify:<execution_id>`` — a completed exit-0 ``codex.verify``
       execution recorded against this subject by the execution supervisor.
+      (``claude_verify`` has no execution-supervisor launcher equivalent, so
+      this form only resolves for the ``codex_verify`` root.)
     """
     root, _, ref = identity.partition(":")
     root = root.strip().lower()
@@ -13874,36 +13878,38 @@ def _resolve_lane_verifier_identity(
     if root not in VERIFIER_LANE_IDENTITIES:
         return (
             f"{identity!r} names the {root!r} lane, which is not an independent "
-            f"verification lane; only {EXECUTOR_LANE_CODEX_VERIFY}:<verifier> may sign"
+            f"verification lane; only {'/'.join(sorted(INDEPENDENT_VERIFIER_LANES))}"
+            ":<verifier> may sign"
         )
     if not ref:
         return (
             f"bare lane name {identity!r} is not a verifier identity; an "
             f"independent verdict must be signed as "
-            f"{EXECUTOR_LANE_CODEX_VERIFY}:<attested verifier task or execution>"
+            f"{root}:<attested verifier task or execution>"
         )
     if ref == subject_id:
         return f"{identity!r} names the subject itself"
-    execution = conn.execute(
-        "SELECT task_id, command_class, status, exit_code FROM executions WHERE id = ?",
-        (ref,),
-    ).fetchone()
-    if execution is not None:
-        if (
-            execution["task_id"] == subject_id
-            and execution["command_class"] == "codex.verify"
-            and execution["status"] == "completed"
-            and execution["exit_code"] == 0
-        ):
-            return None
+    if root == EXECUTOR_LANE_CODEX_VERIFY:
+        execution = conn.execute(
+            "SELECT task_id, command_class, status, exit_code FROM executions WHERE id = ?",
+            (ref,),
+        ).fetchone()
+        if execution is not None:
+            if (
+                execution["task_id"] == subject_id
+                and execution["command_class"] == "codex.verify"
+                and execution["status"] == "completed"
+                and execution["exit_code"] == 0
+            ):
+                return None
+            return (
+                f"{identity!r} is not a completed exit-0 codex.verify execution "
+                f"recorded against {subject_id}"
+            )
+    if _attested_verifier_run(conn, ref, root) is None:
         return (
-            f"{identity!r} is not a completed exit-0 codex.verify execution "
-            f"recorded against {subject_id}"
-        )
-    if _attested_codex_verifier_run(conn, ref) is None:
-        return (
-            f"{identity!r} does not resolve to a completed codex_verify task "
-            f"whose completing run was executed by the codex_verify lane"
+            f"{identity!r} does not resolve to a completed {root} task "
+            f"whose completing run was executed by the {root} lane"
         )
     linked = conn.execute(
         "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ? "
@@ -15261,17 +15267,18 @@ def _return_verifier_verdict_to_subjects(
         row = conn.execute(
             "SELECT executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
         ).fetchone()
-        if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+        if row is None or row["executor_lane"] not in INDEPENDENT_VERIFIER_LANES:
             return
+        lane = row["executor_lane"]
         subjects = verifier_subject_ids(conn, verifier_task_id)
         if not subjects:
             return
         verdict = _parse_verifier_verdict(summary, result)
-        verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+        verifier_identity = f"{lane}:{verifier_task_id}"
         # The lane label is not proof the lane ran: on 2026-09-14 (run 2817) an
         # unscoped agent claimed a codex_verify card. Only a completing run the
-        # codex_verify launcher attested may return a verdict.
-        attested_run = _attested_codex_verifier_run(conn, verifier_task_id)
+        # task's own independent-verifier lane attested may return a verdict.
+        attested_run = _attested_verifier_run(conn, verifier_task_id, lane)
         for subject_id in subjects:
             srow = conn.execute(
                 "SELECT status, verification_state, title, body FROM tasks WHERE id = ?",
