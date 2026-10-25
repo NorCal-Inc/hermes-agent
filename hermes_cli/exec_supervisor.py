@@ -764,6 +764,29 @@ def _build_codex_verify(spec: dict) -> list[str]:
     return argv
 
 
+def _build_claude_verify(spec: dict) -> list[str]:
+    """Independent Claude verifier, headless, in a disposable writable scratch sandbox.
+
+    Mirrors ``_build_codex_verify``'s sandbox posture (scratch CWD, never the
+    source workspace under review) using the same ``claude.headless``-style
+    invocation ``_build_claude_headless`` uses for the direct executor lane.
+    Kept as its own launcher (not a thin wrapper) so
+    ``execution.allowed_command_classes`` can gate the verifier lane
+    independently of the ordinary Claude executor lane.
+    """
+    prompt = _require_str(spec, "prompt")
+    binary = shutil.which("claude") or "claude"
+    return [
+        binary,
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+
+
 def _build_codex_recovery(spec: dict) -> list[str]:
     """Codex launcher for one mechanically-authorized recovery card only."""
     prompt = _require_str(spec, "prompt")
@@ -834,6 +857,7 @@ LAUNCHERS: dict[str, Launcher] = {
     "claude.headless": Launcher("claude.headless", "claude", _build_claude_headless),
     "codex.exec": Launcher("codex.exec", "codex", _build_codex_exec),
     "codex.verify": Launcher("codex.verify", "codex", _build_codex_verify),
+    "claude.verify": Launcher("claude.verify", "claude", _build_claude_verify),
     "claude.recovery": Launcher("claude.recovery", "claude", _build_claude_recovery),
     "codex.recovery": Launcher("codex.recovery", "codex", _build_codex_recovery),
     "shell.gate": Launcher("shell.gate", "shell", _build_shell_gate),

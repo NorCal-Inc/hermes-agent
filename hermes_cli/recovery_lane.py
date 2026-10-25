@@ -412,6 +412,43 @@ def _build_codex_verifier_prompt(task: kb.Task, recovery_scope: str = "", subjec
     ])
 
 
+def _build_claude_verifier_prompt(task: kb.Task, recovery_scope: str = "", subject_context: str = "") -> str:
+    """Mirrors ``_build_codex_verifier_prompt`` for the claude_verify lane.
+
+    Same read-only posture, same deny-by-default scope guardrail, same
+    required-item framing. Only the executor name and the final anchored
+    verdict marker differ (``CLAUDE_VERDICT`` rather than ``ATLAS_VERDICT``,
+    so :func:`_claude_verifier_verdict` can never be confused by a stray
+    Atlas-formatted line in quoted/pasted evidence).
+    """
+    return "\n".join([
+        "You are the independent Claude verification executor for one Hermes Kanban task.",
+        "This is a READ-ONLY verification lane. Do not edit files, commit, deploy, or mutate services/databases.",
+        *([recovery_scope] if recovery_scope else []),
+        "Re-derive only the requested checks independently from the narrow evidence/sources named by the acceptance criteria and report falsifiable evidence.",
+        "Do not trust an implementer's self-report when the task asks you to verify it.",
+        "SCOPE GUARDRAIL — deny-by-default exploration:",
+        "- Inspect only the subject task, its attached evidence, and exact files/paths/state explicitly named by the verification brief.",
+        "- Do NOT perform schema discovery, repository/history searches, profile enumeration, broad filesystem/database inspection, or code-mode exploration unless an explicit acceptance criterion requires that exact action.",
+        "- If a preferred utility is unavailable, use the narrowest equivalent method against the same named source; do not widen scope to discover alternatives.",
+        "- Stop as soon as every explicit acceptance criterion has enough evidence for PASS/FAIL. Additional investigation after that point is out of scope.",
+        "- If an acceptance criterion cannot be checked from the authorized sources, return BLOCKER/FAIL for that criterion rather than exploring unrelated state.",
+        "",
+        f"Task ID: {task.id}",
+        f"Task title: {task.title}",
+        f"Tenant: {task.tenant or 'shared / none'}",
+        f"Target workspace/path: {task.workspace_path or '(none; use task brief paths)'}",
+        "The verifier process itself runs from a governed scratch directory. Read the target path by absolute path when the brief requires it.",
+        "",
+        "Verification brief / acceptance criteria:",
+        task.body or "(no body)",
+        *(["", subject_context] if subject_context else []),
+        "",
+        "End with a concise structured verdict: PASS/FAIL per requested item, evidence, and explicit GO/NO-GO when applicable.",
+        "The FINAL line must be exactly one of: CLAUDE_VERDICT: PASS or CLAUDE_VERDICT: FAIL.",
+    ])
+
+
 def _extract_codex_result(stdout: str) -> str:
     text = (stdout or "").strip()
     marker = "--- last message ---"
@@ -431,6 +468,19 @@ def _atlas_verdict(result: str) -> Optional[bool]:
     if final == "ATLAS_VERDICT: PASS":
         return True
     if final == "ATLAS_VERDICT: FAIL":
+        return False
+    return None
+
+
+def _claude_verifier_verdict(result: str) -> Optional[bool]:
+    """Parse the required final Claude-verifier verdict line. Mirrors ``_atlas_verdict``."""
+    lines = [line.strip() for line in (result or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    final = lines[-1]
+    if final == "CLAUDE_VERDICT: PASS":
+        return True
+    if final == "CLAUDE_VERDICT: FAIL":
         return False
     return None
 
@@ -540,6 +590,37 @@ def _claim_codex_verifier_attempt(conn, task_id: str, run_id: Optional[int]) -> 
         if prior is not None:
             return False
         kb._append_event(conn, task_id, kind, {"executor": "codex"}, run_id=run_id)
+    return True
+
+
+def _claim_claude_verifier_attempt(conn, task_id: str, run_id: Optional[int]) -> bool:
+    """Mirrors ``_claim_codex_verifier_attempt`` for the claude_verify lane.
+
+    Writes the ``claude_verifier_started`` event ``_attested_verifier_run``
+    (``hermes_cli.kanban_db``) requires before any verdict from this run can
+    be returned to the subject.
+    """
+    if run_id is None:
+        raise RuntimeError("Claude verifier task has no active run")
+    kind = "claude_verifier_started"
+    with kb.write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or current["current_run_id"] is None
+            or int(current["current_run_id"]) != int(run_id)
+        ):
+            raise RuntimeError("stale Claude verifier run")
+        prior = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? LIMIT 1",
+            (task_id, kind, run_id),
+        ).fetchone()
+        if prior is not None:
+            return False
+        kb._append_event(conn, task_id, kind, {"executor": "claude"}, run_id=run_id)
     return True
 
 
@@ -683,6 +764,66 @@ def _parse_codex_reset_at(text: str, now: Optional[float] = None) -> Optional[in
     return int(target.timestamp())
 
 
+def _capacity_exhausted_markers(text: str) -> bool:
+    """True when *text* (lowercased attempt stdout/stderr/error) names a provider
+    usage/rate limit rather than a genuine verification failure."""
+    return any(marker in text for marker in (
+        "you've hit your usage limit",
+        "you have hit your usage limit",
+        "usage limit has been reached",
+        "usage_limit_reached",
+        "rate limit",
+        "rate_limit",
+    ))
+
+
+def _handle_verifier_capacity_exhaustion(
+    conn, task_id: str, *, lane_label: str, comment_author: str,
+    expected_run_id: int, capacity_text: str, execution_id: Optional[str],
+) -> int:
+    """Shared capacity-exhaustion handling for both verifier lanes.
+
+    Christopher's 2026-10-25 authorization (t_ab80ef2a): try the deterministic
+    one-time lane swap FIRST (:func:`kb.swap_verifier_lane_once`) so a Claude
+    capacity failure falls over to Codex, and vice versa, with no human in
+    the loop and no LLM judgment call. Only when the swap itself declines
+    (already swapped once on this subject, or the other lane is also
+    unavailable to try) does this fall back to the prior behaviour: a neutral
+    ``defer_rate_limited_task`` that preserves failure counters and lets the
+    board's own cooldown/backoff retry the SAME lane later.
+    """
+    reason = f"{lane_label} provider capacity exhausted"
+    reset_at = _parse_codex_reset_at(capacity_text) if lane_label == "Codex" else None
+    if reset_at:
+        reason += time.strftime(" (provider reset %Y-%m-%d %H:%M %Z)", time.localtime(reset_at))
+    swapped_to = None
+    try:
+        swapped_to = kb.swap_verifier_lane_once(conn, task_id, reason=reason)
+    except Exception:  # pragma: no cover - defensive; never worse than no swap
+        swapped_to = None
+    if swapped_to is not None:
+        kb.add_comment(
+            conn, task_id, author=comment_author,
+            body=(
+                f"{reason}; deterministically swapped to a new verifier "
+                f"({swapped_to}) on the other independent-verifier lane."
+            ),
+        )
+        return 0
+    ok = kb.defer_rate_limited_task(
+        conn, task_id, reason=reason + "; deferred without failure credit",
+        expected_run_id=expected_run_id, execution_id=execution_id, reset_at=reset_at,
+    )
+    if ok:
+        kb.add_comment(
+            conn, task_id, author=comment_author,
+            body=reason + " and the lane swap was not available (already swapped, or no sibling"
+            " verifier could be opened); deferred without failure credit"
+            + (f" [execution {execution_id}]" if execution_id else ""),
+        )
+    return 0 if ok else 1
+
+
 def run_codex_verifier(task_id: str) -> int:
     """Run one independent verifier with writable scratch, read-only target access."""
     conn = kb.connect()
@@ -729,31 +870,12 @@ def run_codex_verifier(task_id: str) -> int:
             _capacity_text = "\n".join(
                 part for part in (attempt.stdout, attempt.stderr, attempt.error or "") if part
             ).lower()
-            _capacity_exhausted = any(marker in _capacity_text for marker in (
-                "you've hit your usage limit",
-                "you have hit your usage limit",
-                "usage limit has been reached",
-                "usage_limit_reached",
-                "rate limit",
-                "rate_limit",
-            ))
-            if _capacity_exhausted:
-                reason = "Codex provider capacity exhausted; deferred without failure credit"
-                reset_at = _parse_codex_reset_at(_capacity_text)
-                if reset_at:
-                    reason += time.strftime(
-                        " (provider reset %Y-%m-%d %H:%M %Z)", time.localtime(reset_at),
-                    )
-                ok = kb.defer_rate_limited_task(
-                    conn, task_id, reason=reason, expected_run_id=expected_run_id,
-                    execution_id=attempt.execution_id, reset_at=reset_at,
+            if _capacity_exhausted_markers(_capacity_text):
+                return _handle_verifier_capacity_exhaustion(
+                    conn, task_id, lane_label="Codex", comment_author="atlas-codex-lane",
+                    expected_run_id=expected_run_id, capacity_text=_capacity_text,
+                    execution_id=attempt.execution_id,
                 )
-                if ok:
-                    kb.add_comment(
-                        conn, task_id, author="atlas-codex-lane",
-                        body=reason + (f" [execution {attempt.execution_id}]" if attempt.execution_id else ""),
-                    )
-                return 0 if ok else 1
             reason = "Codex verifier failed or timed out.\n\n" + attempt.evidence
             ok = kb.block_task(
                 conn, task_id, reason=reason, kind="needs_input",
@@ -808,6 +930,120 @@ def run_codex_verifier(task_id: str) -> int:
             return 0 if handed_off else 1
         if ok:
             kb.add_comment(conn, task_id, author="atlas-codex-lane", body=attempt.evidence)
+        return 0 if ok else 1
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_claude_verifier(task_id: str) -> int:
+    """Run one independent Claude verifier with writable scratch, read-only target access.
+
+    Mirrors ``run_codex_verifier`` structurally. Christopher's 2026-10-25
+    authorization (t_ab80ef2a) makes Claude the DEFAULT independent-verifier
+    lane; this is the executor it dispatches to. A usage/rate-limit failure
+    here falls over to Codex deterministically via
+    ``_handle_verifier_capacity_exhaustion`` -> ``kb.swap_verifier_lane_once``.
+    """
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None or task.executor_lane != kb.EXECUTOR_LANE_CLAUDE_VERIFY:
+            return 1
+        expected_run_id = task.current_run_id
+        if expected_run_id is None:
+            return 1
+        try:
+            # Same scratch-root posture as the Codex verifier: never the
+            # target repository path, which stays read-only by omission.
+            verifier_cwd = kb.workspaces_root() / task.id / "claude-verify"
+            verifier_cwd.mkdir(parents=True, exist_ok=True)
+            cwd = str(verifier_cwd)
+        except Exception as exc:
+            return 0 if kb.block_task(
+                conn, task_id, reason=f"Claude verifier scratch workspace resolution failed: {exc}",
+                kind="needs_input", expected_run_id=expected_run_id,
+            ) else 1
+        timeout = int(task.max_runtime_seconds or DEFAULT_ATTEMPT_TIMEOUT_SECONDS)
+        started_at = time.time()
+        try:
+            should_run = _claim_claude_verifier_attempt(conn, task_id, expected_run_id)
+        except RuntimeError:
+            return 1
+        if not should_run:
+            return 1
+        attempt = _invoke_claude_verifier(
+            _build_claude_verifier_prompt(
+                task, _verifier_recovery_scope(conn, task_id), _verifier_subject_context(conn, task_id),
+            ),
+            cwd, timeout, task_id=task_id,
+        )
+        if not attempt.ok:
+            if attempt.revoked:
+                return 1
+            _capacity_text = "\n".join(
+                part for part in (attempt.stdout, attempt.stderr, attempt.error or "") if part
+            ).lower()
+            if _capacity_exhausted_markers(_capacity_text):
+                return _handle_verifier_capacity_exhaustion(
+                    conn, task_id, lane_label="Claude", comment_author="claude-verify-lane",
+                    expected_run_id=expected_run_id, capacity_text=_capacity_text,
+                    execution_id=attempt.execution_id,
+                )
+            reason = "Claude verifier failed or timed out.\n\n" + attempt.evidence
+            ok = kb.block_task(
+                conn, task_id, reason=reason, kind="needs_input",
+                expected_run_id=expected_run_id,
+                event_payload_extra={
+                    "execution_id": attempt.execution_id,
+                    "execution_status": attempt.execution_status,
+                    "failure_class": (
+                        "infrastructure" if attempt.infrastructure else "implementation"
+                    ),
+                },
+            )
+            if ok:
+                kb.add_comment(conn, task_id, author="claude-verify-lane", body=attempt.evidence)
+            return 0 if ok else 1
+        result = _extract_claude_result(attempt.stdout)
+        summary = result[:4000]
+        verdict = _claude_verifier_verdict(result)
+        if verdict is None:
+            reason = (
+                "Claude verification result is missing the required final "
+                "CLAUDE_VERDICT line.\n\n" + result
+            )
+            ok = kb.block_task(
+                conn, task_id, reason=reason, kind="needs_input",
+                expected_run_id=expected_run_id,
+            )
+            if ok:
+                kb.add_comment(conn, task_id, author="claude-verify-lane", body=result)
+            return 0 if ok else 1
+        # PASS and FAIL are both successful verifier executions -- see the
+        # matching comment in run_codex_verifier for why FAIL still completes.
+        metadata = {
+            "executor_lane": "claude_verify",
+            "executor": "claude",
+            "sandbox": "workspace-write-scratch; target-read-only",
+            "duration_seconds": round(time.time() - started_at, 1),
+        }
+        try:
+            ok = kb.complete_task(
+                conn, task_id, result=result, summary=summary, metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
+        except kb.VerificationRequiredError:
+            handed_off = _handoff_for_verification(
+                conn, task_id, summary=summary, evidence=attempt.evidence,
+                metadata=metadata, expected_run_id=expected_run_id,
+                author="claude-verify-lane",
+            )
+            return 0 if handed_off else 1
+        if ok:
+            kb.add_comment(conn, task_id, author="claude-verify-lane", body=attempt.evidence)
         return 0 if ok else 1
     finally:
         try:
@@ -1028,6 +1264,20 @@ def _invoke_codex_verifier(
     if last_message.strip():
         attempt.stdout = f"{attempt.stdout}\n--- last message ---\n{last_message}"
     return attempt
+
+
+def _invoke_claude_verifier(
+    prompt: str, cwd: str, timeout: int, *, task_id: Optional[str] = None,
+) -> AttemptResult:
+    """One bounded independent Claude attempt, disposable writable scratch.
+
+    Mirrors ``_invoke_codex_verifier``'s sandbox posture via the
+    ``claude.verify`` launcher (see ``exec_supervisor._build_claude_verify``).
+    """
+    return _supervised_attempt(
+        "claude", "claude.verify", {"prompt": prompt}, cwd, timeout,
+        task_id=task_id,
+    )
 
 
 def _invoke_recovery_claude(

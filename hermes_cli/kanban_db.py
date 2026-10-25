@@ -14957,6 +14957,82 @@ def _ensure_independent_verifier_child(
     return child_id
 
 
+def swap_verifier_lane_once(
+    conn: sqlite3.Connection, verifier_task_id: str, *, reason: str,
+) -> Optional[str]:
+    """Deterministically swap one usage/rate-limited verifier to the other lane.
+
+    Christopher's 2026-10-25 authorization (t_ab80ef2a): a ``claude_verify``
+    attempt that hits a usage/rate limit falls back to ``codex_verify`` once,
+    automatically -- and the reverse when Codex is the one that is
+    unavailable. This is a deterministic, mechanical swap (one new sibling
+    verifier card, never an LLM retry/judgment call) so the behaviour is the
+    same every time regardless of which model is reasoning about it.
+
+    Only swaps a card that is still open and has not already been swapped
+    once (a durable ``verifier_lane_swapped`` event on the card is the record
+    of that, so a second capacity failure on the SAME card, or on the sibling
+    it already swapped to, blocks for a human instead of looping forever).
+    Returns the new sibling verifier task id, or ``None`` if no swap
+    happened (already swapped, unknown lane, or the subject link is gone).
+    """
+    row = conn.execute(
+        "SELECT executor_lane, status FROM tasks WHERE id = ?",
+        (verifier_task_id,),
+    ).fetchone()
+    if row is None or row["executor_lane"] not in INDEPENDENT_VERIFIER_LANES:
+        return None
+    already_swapped = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'verifier_lane_swapped' LIMIT 1",
+        (verifier_task_id,),
+    ).fetchone()
+    if already_swapped is not None:
+        return None
+    from_lane = row["executor_lane"]
+    to_lane = (
+        EXECUTOR_LANE_CODEX_VERIFY
+        if from_lane == EXECUTOR_LANE_CLAUDE_VERIFY
+        else EXECUTOR_LANE_CLAUDE_VERIFY
+    )
+    subjects = verifier_subject_ids(conn, verifier_task_id)
+    if not subjects:
+        return None
+    implementer = None
+    try:
+        implementer = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (subjects[0],),
+        ).fetchone()
+        implementer = implementer["assignee"] if implementer else None
+    except Exception:  # pragma: no cover - defensive
+        implementer = None
+    with write_txn(conn):
+        if conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status NOT IN "
+            "('done', 'archived')",
+            (verifier_task_id,),
+        ).rowcount:
+            _append_event(
+                conn, verifier_task_id, "verifier_lane_swapped",
+                {"from_lane": from_lane, "to_lane": to_lane, "reason": reason[:500]},
+            )
+    new_child = _ensure_independent_verifier_child(
+        conn, subjects[0], implementer=implementer, preferred_lane=to_lane,
+    )
+    with write_txn(conn):
+        _append_event(
+            conn, subjects[0], "verifier_lane_swap_dispatched",
+            {
+                "previous_verifier": verifier_task_id,
+                "from_lane": from_lane,
+                "to_lane": to_lane,
+                "new_verifier": new_child,
+                "reason": reason[:500],
+            },
+        )
+    return new_child
+
+
 # An independent verifier reports its verdict in prose; the subject task needs
 # a machine-readable one. The contract is a single anchored line —
 # ``VERDICT: PASS`` / ``FAIL`` / ``BLOCKER`` — matched case-insensitively and
