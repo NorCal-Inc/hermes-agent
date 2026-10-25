@@ -436,7 +436,7 @@ class TestGauntletAtlasRoutingRegression:
             assert claimed_child is not None
             with kb.write_txn(conn):
                 kb._append_event(
-                    conn, child, "codex_verifier_started", {"executor": "codex"},
+                    conn, child, kb._attest_kind(conn, child), {"executor": "codex"},
                     run_id=claimed_child.current_run_id,
                 )
             assert kb.complete_task(
@@ -464,7 +464,7 @@ class TestGauntletAtlasRoutingRegression:
             claimed = kb.claim_task(conn, child)
             assert claimed is not None
             with kb.write_txn(conn):
-                kb._append_event(conn, child, "codex_verifier_started", {"executor": "codex"}, run_id=claimed.current_run_id)
+                kb._append_event(conn, child, kb._attest_kind(conn, child), {"executor": "codex"}, run_id=claimed.current_run_id)
             assert kb.complete_task(
                 conn, child,
                 result=f"VERDICT: {verdict}\\nATLAS_VERDICT: {verdict}",

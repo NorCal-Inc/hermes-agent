@@ -83,7 +83,7 @@ def test_grant_and_unblock_after_review_ceiling_runs_verifier_not_implementer(ka
         verifier = board.task(child)
         assert verifier.status == "running"
         with kb.write_txn(conn):
-            kb._append_event(conn, child, "codex_verifier_started", {"executor": "codex"},
+            kb._append_event(conn, child, kb._attest_kind(conn, child), {"executor": "codex"},
                              run_id=verifier.current_run_id)
         assert board.attempts(tid) == board.limit(tid), "the verifier is the one granted attempt"
         board.tick()

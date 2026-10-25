@@ -74,7 +74,7 @@ def _verifier(conn, subject):
 
 def _attest(conn, cid, run_id):
     with kb.write_txn(conn):
-        kb._append_event(conn, cid, "codex_verifier_started", {"executor": "codex"}, run_id=run_id)
+        kb._append_event(conn, cid, kb._attest_kind(conn, cid), {"executor": "codex"}, run_id=run_id)
 
 
 def _run_verifier(conn, subject, summary):

@@ -102,7 +102,7 @@ class Board:
         task = self.task(child)
         assert task.status == "running"
         with kb.write_txn(self.conn):             # what the codex_verify launcher records on start
-            kb._append_event(self.conn, child, "codex_verifier_started", {"executor": "codex"},
+            kb._append_event(self.conn, child, kb._attest_kind(self.conn, child), {"executor": "codex"},
                              run_id=task.current_run_id)
         return task.current_run_id
 

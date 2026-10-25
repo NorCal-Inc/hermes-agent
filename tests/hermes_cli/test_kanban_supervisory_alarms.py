@@ -138,7 +138,7 @@ def _attest_orphan_verifier_run(conn, tid, *, started_at, ended_at):
             (tid, started_at, ended_at),
         )
         kb._append_event(
-            conn, tid, "codex_verifier_started", {"executor": "codex"},
+            conn, tid, kb._attest_kind(conn, tid), {"executor": "codex"},
             run_id=cur.lastrowid,
         )
 

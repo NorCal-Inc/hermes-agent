@@ -204,7 +204,7 @@ class TestVerifierRouteRecovery:
             claimed = kb.claim_task(conn, child)
             assert claimed is not None
             with kb.write_txn(conn):
-                kb._append_event(conn, child, "codex_verifier_started", {"executor": "codex"},
+                kb._append_event(conn, child, kb._attest_kind(conn, child), {"executor": "codex"},
                                  run_id=claimed.current_run_id)
             assert kb.complete_task(
                 conn, child, summary="VERDICT: PASS\nACCEPTANCE: PASS\nchecked the packet",
@@ -311,7 +311,7 @@ def _return_blocker(conn, tid, note="VERDICT: BLOCKER\nboot gate READY: NO"):
     claimed = kb.claim_task(conn, child)
     assert claimed is not None
     with kb.write_txn(conn):
-        kb._append_event(conn, child, "codex_verifier_started", {"executor": "codex"},
+        kb._append_event(conn, child, kb._attest_kind(conn, child), {"executor": "codex"},
                          run_id=claimed.current_run_id)
     assert kb.complete_task(conn, child, summary=note,
                             expected_run_id=claimed.current_run_id) is True

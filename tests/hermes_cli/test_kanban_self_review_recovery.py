@@ -646,7 +646,7 @@ def _attest_codex_lane_run(conn, verifier_id, run_id):
     run without it are not attributable to the lane (2026-09-14, run 2817)."""
     with kb.write_txn(conn):
         kb._append_event(
-            conn, verifier_id, "codex_verifier_started", {"executor": "codex"},
+            conn, verifier_id, kb._attest_kind(conn, verifier_id), {"executor": "codex"},
             run_id=run_id,
         )
 

@@ -13803,6 +13803,15 @@ _VERIFIER_LANE_STARTED_EVENT_KIND: dict[str, str] = {
 }
 
 
+def _attest_kind(conn: sqlite3.Connection, verifier_task_id: str) -> str:
+    """``*_verifier_started`` event kind for the lane a verifier card is on."""
+    row = conn.execute(
+        "SELECT executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
+    ).fetchone()
+    lane = row["executor_lane"] if row else None
+    return _VERIFIER_LANE_STARTED_EVENT_KIND.get(lane, "codex_verifier_started")
+
+
 def _attested_verifier_run(
     conn: sqlite3.Connection, verifier_task_id: str, lane: str,
 ) -> Optional[int]:

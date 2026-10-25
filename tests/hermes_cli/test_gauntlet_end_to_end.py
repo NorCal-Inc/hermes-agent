@@ -98,7 +98,7 @@ def _independent_verifier_reports(conn, subject_id, report):
     # (2026-09-14, run 2817). It is written on the VERIFIER card only.
     with kb.write_txn(conn):
         kb._append_event(
-            conn, cid, "codex_verifier_started", {"executor": "codex"},
+            conn, cid, kb._attest_kind(conn, cid), {"executor": "codex"},
             run_id=claimed.current_run_id,
         )
     # The verifier's ONLY output is its report. Nothing else in this test
