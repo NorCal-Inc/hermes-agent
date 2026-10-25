@@ -2591,7 +2591,6 @@ logger = logging.getLogger(__name__)
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
-    Platform.YUANBAO: ("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY", "YUANBAO_ALLOW_ALL_USERS"),
     Platform.QQBOT: (None, None, "QQ_ALLOW_ALL_USERS"),
     Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS"),
 }
@@ -12434,7 +12433,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "WEIXIN_ALLOWED_USERS",
             "BLUEBUBBLES_ALLOWED_USERS",
             "QQ_ALLOWED_USERS",
-            "YUANBAO_ALLOWED_USERS",
             "GATEWAY_ALLOWED_USERS",
         )
         _builtin_allow_all_vars = (
@@ -12450,7 +12448,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "WEIXIN_ALLOW_ALL_USERS",
             "BLUEBUBBLES_ALLOW_ALL_USERS",
             "QQ_ALLOW_ALL_USERS",
-            "YUANBAO_ALLOW_ALL_USERS",
         )
         # Also pick up plugin-registered platforms — each entry can declare
         # its own allowed_users_env / allow_all_env, so the warning stays
@@ -15897,13 +15894,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("QQBot: aiohttp/httpx missing or QQ_APP_ID/QQ_CLIENT_SECRET not configured")
                 return None
             return QQAdapter(config)
-
-        elif platform == Platform.YUANBAO:
-            from gateway.platforms.yuanbao import YuanbaoAdapter, WEBSOCKETS_AVAILABLE
-            if not WEBSOCKETS_AVAILABLE:
-                logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
-                return None
-            return YuanbaoAdapter(config)
 
         return None
 
@@ -20667,7 +20657,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     # Attach the inbound platform message_id to the first user
                     # entry written this turn so platform-level quote-resolution
-                    # (e.g. Yuanbao QuoteContextMiddleware's transcript fallback)
                     # can find earlier @bot messages by their original message_id.
                     _user_msg_id_attached = False
                     for msg in new_messages:

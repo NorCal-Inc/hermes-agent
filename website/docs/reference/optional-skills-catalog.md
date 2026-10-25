@@ -241,14 +241,6 @@ hermes skills uninstall <skill-name>
 | [**cloudflare-temporary-deploy**](/docs/user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy) | Deploy a Worker live, no account, via wrangler --temporary. |
 | [**page-agent**](/docs/user-guide/skills/optional/web-development/web-development-page-agent) | Embed an in-page natural-language GUI copilot in web apps. |
 
-## yuanbao
-
-| Skill | Description |
-|-------|-------------|
-| [**yuanbao**](/docs/user-guide/skills/optional/yuanbao/yuanbao-yuanbao) | Yuanbao (元宝) groups: @mention users, query info/members. |
-
----
-
 ## Contributing Optional Skills
 
 To add a new optional skill to the repository:
