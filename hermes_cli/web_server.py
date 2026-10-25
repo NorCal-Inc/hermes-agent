@@ -8545,12 +8545,6 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         "description": "Talk to Hermes over SimpleX Chat via a local simplex-chat daemon.",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/simplex",
     },
-    "yuanbao": {
-        "name": "Yuanbao (元宝)",
-        "description": "Connect Hermes to Tencent Yuanbao.",
-        "docs_url": "",
-        "required_env": (),
-    },
     "api_server": {
         "name": "API server",
         "description": "Expose Hermes as an OpenAI-compatible HTTP API for tools like Open WebUI.",
@@ -8611,7 +8605,6 @@ _PLATFORM_ORDER: tuple[str, ...] = (
     "wecom_callback",
     "weixin",
     "qqbot",
-    "yuanbao",
     "api_server",
     "webhook",
 )

@@ -9297,9 +9297,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if role is 'tool' or tool_calls is present).
 
         ``platform_message_id`` is the external messaging platform's own
-        message ID (e.g. Telegram update_id, Yuanbao msg_id).  It is
+        message ID (e.g. Telegram update_id).  It is
         independent of the SQLite autoincrement primary key and is used by
-        platform-specific flows like yuanbao's recall guard to redact a
+        platform-specific flows (e.g. a recall guard) to redact a
         message by its platform-side identifier.
 
         ``api_content`` is the exact content string sent to the API for this
@@ -9777,7 +9777,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tool_calls = []
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
             # Accept either `platform_message_id` (new explicit name) or
-            # `message_id` (yuanbao's existing convention on message dicts).
+            # `message_id` (the existing convention on message dicts).
             platform_msg_id = (
                 msg.get("platform_message_id") or msg.get("message_id")
             )
@@ -10588,7 +10588,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
                     msg["tool_calls"] = []
-            # Surface the platform-side message id (e.g. yuanbao msg_id,
+            # Surface the platform-side message id (e.g.
             # telegram update_id) so platform-specific flows like recall
             # can match by external identifier instead of having to fall
             # back to content-match heuristics.  Exposed as ``message_id``

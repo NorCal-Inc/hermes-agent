@@ -442,7 +442,6 @@ Profiles 使用 `~/.hermes/profiles/<name>/`，布局相同。
 | `discord_admin` | Discord 管理/审核工具 |
 | `feishu_doc` | 飞书文档工具 |
 | `feishu_drive` | 飞书云盘工具 |
-| `yuanbao` | 元宝集成工具 |
 | `rl` | 强化学习工具（默认关闭） |
 | `moa` | Mixture of Agents（默认关闭） |
 

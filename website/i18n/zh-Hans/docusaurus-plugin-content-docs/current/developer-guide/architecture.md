@@ -121,7 +121,6 @@ hermes-agent/
 │                             #   signal、matrix、mattermost、email、sms、
 │                             #   dingtalk、feishu、wecom、wecom_callback、weixin、
 │                             #   bluebubbles、qqbot、homeassistant、webhook、api_server、
-│                             #   yuanbao
 │
 ├── acp_adapter/              # ACP 服务器（VS Code / Zed / JetBrains）
 ├── cron/                     # 调度器（jobs.py、scheduler.py）

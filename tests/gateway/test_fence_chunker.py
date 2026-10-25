@@ -1,7 +1,7 @@
 """Invariant tests for the shared fence-aware markdown chunker core.
 
-The core lives in ``gateway.platforms.helpers`` and was extracted from the
-Yuanbao ``MarkdownProcessor`` (the richest of the four formerly duplicated
+The core lives in ``gateway.platforms.helpers`` and was extracted from a
+former adapter's ``MarkdownProcessor`` (the richest of the four formerly duplicated
 implementations).  These tests assert the core's *contract* (invariants),
 not exact snapshots, so they survive internal tweaks that preserve behavior.
 """
@@ -49,7 +49,7 @@ MIXED = (
 SAMPLES = [LONG_PARAS, FENCED, UNCLOSED, TABLE, CJK, MIXED, "x" * 500]
 
 
-# ── split_text_fence_aware (paragraph mode: yuanbao-derived) ─────────────────
+# ── split_text_fence_aware (paragraph mode) ─────────────────────────────────
 
 
 @pytest.mark.parametrize("text", SAMPLES)
