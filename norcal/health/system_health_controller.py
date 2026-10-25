@@ -158,6 +158,15 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "health-controller.json"
 # ---------------------------------------------------------------------------
 
 
+#: Every independent-verifier lane (codex_verify, claude_verify), for lane-keyed SQL.
+def _vlanes(kb) -> tuple:
+    return tuple(sorted(kb.INDEPENDENT_VERIFIER_LANES))
+
+
+def _vmarks(kb) -> str:
+    return ",".join("?" for _ in kb.INDEPENDENT_VERIFIER_LANES)
+
+
 @dataclasses.dataclass(frozen=True)
 class Finding:
     """One detected unhealthy condition.
@@ -1502,7 +1511,7 @@ class VerifierRouteOpen(Invariant):
                     # triaged one is subject_review_regressed's: routing is only
                     # judged for subjects parked in the review lane.
                     continue
-                if row["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY:
+                if row["executor_lane"] in kb.INDEPENDENT_VERIFIER_LANES:
                     continue  # a verifier card is not a subject; see relabel invariant
                 requested = _review_requested_at(conn, tid)
                 if requested is None or now - requested < self.settle_seconds:
@@ -1572,14 +1581,14 @@ class SubjectLaneRelabelled(Invariant):
         with ctx.kanban() as conn:
             rows = conn.execute(
                 "SELECT t.id, t.status, t.claim_lock FROM tasks t "
-                "WHERE t.executor_lane = ? AND t.terminal_disposition IS NULL "
+                f"WHERE t.executor_lane IN ({_vmarks(kb)}) AND t.terminal_disposition IS NULL "
                 "AND t.status NOT IN ('done', 'archived') "
                 "AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.child_id = t.id) "
                 "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id "
                 "            AND e.kind = 'review_requested') "
                 "AND EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id "
                 "            AND n.kind = 'executor_lane_normalized')",
-                (kb.EXECUTOR_LANE_CODEX_VERIFY,),
+                _vlanes(kb),
             ).fetchall()
             for row in rows:
                 out.append(Finding(
@@ -1626,8 +1635,8 @@ class VerifierChildDeadlocked(Invariant):
                     "SELECT c.id, c.title, c.assignee, c.executor_lane FROM task_links l "
                     "JOIN tasks c ON c.id = l.child_id "
                     "WHERE l.parent_id = ? AND c.status = 'todo' "
-                    "AND COALESCE(c.executor_lane, '') <> ?",
-                    (sid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+                    f"AND COALESCE(c.executor_lane, '') NOT IN ({_vmarks(kb)})",
+                    (sid, *_vlanes(kb)),
                 ).fetchall()
                 for child in children:
                     cid = child["id"]
@@ -1713,7 +1722,7 @@ class VerifierOfVerifier(Invariant):
             rows = conn.execute(
                 "SELECT c.id AS child, p.id AS parent FROM task_links l "
                 "JOIN tasks c ON c.id = l.child_id JOIN tasks p ON p.id = l.parent_id "
-                "WHERE c.executor_lane = ? AND p.executor_lane = ? "
+                f"WHERE c.executor_lane IN ({_vmarks(kb)}) AND p.executor_lane IN ({_vmarks(kb)}) "
                 "AND c.status NOT IN ('done', 'archived') "
                 "AND NOT ("
                 "  NOT EXISTS (SELECT 1 FROM task_links pl WHERE pl.child_id = p.id) "
@@ -1722,7 +1731,7 @@ class VerifierOfVerifier(Invariant):
                 "  AND EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = p.id "
                 "              AND n.kind = 'executor_lane_normalized')"
                 ")",
-                (kb.EXECUTOR_LANE_CODEX_VERIFY, kb.EXECUTOR_LANE_CODEX_VERIFY),
+                (*_vlanes(kb), *_vlanes(kb)),
             ).fetchall()
             for row in rows:
                 out.append(Finding(self.name, row["child"], "verifies_a_verifier",
@@ -2236,9 +2245,9 @@ class VerdictReturnedToSubject(Invariant):
             rows = conn.execute(
                 "SELECT c.id AS child, c.completed_at, l.parent_id AS subject FROM task_links l "
                 "JOIN tasks c ON c.id = l.child_id JOIN tasks s ON s.id = l.parent_id "
-                "WHERE c.executor_lane = ? AND c.status = 'done' "
+                f"WHERE c.executor_lane IN ({_vmarks(kb)}) AND c.status = 'done' "
                 "AND s.verification_state = ? AND s.terminal_disposition IS NULL",
-                (kb.EXECUTOR_LANE_CODEX_VERIFY, kb.VERIFICATION_PENDING),
+                (*_vlanes(kb), kb.VERIFICATION_PENDING),
             ).fetchall()
             for row in rows:
                 if row["completed_at"] is not None and now - int(row["completed_at"]) < self.settle_seconds:
@@ -2280,9 +2289,9 @@ class VerifierChildStalledInTodo(Invariant):
             for row in conn.execute(
                 "SELECT c.id, c.created_at, l.parent_id FROM tasks c "
                 "JOIN task_links l ON l.child_id = c.id JOIN tasks s ON s.id = l.parent_id "
-                "WHERE c.executor_lane = ? AND c.status = 'todo' AND c.terminal_disposition IS NULL "
+                f"WHERE c.executor_lane IN ({_vmarks(kb)}) AND c.status = 'todo' AND c.terminal_disposition IS NULL "
                 "AND s.verification_state = ?",
-                (kb.EXECUTOR_LANE_CODEX_VERIFY, kb.VERIFICATION_PENDING),
+                (*_vlanes(kb), kb.VERIFICATION_PENDING),
             ).fetchall():
                 if now - int(row["created_at"] or now) > stall:
                     out.append(Finding(self.name, row["id"], "codex_verifier_child_stalled_in_todo",
