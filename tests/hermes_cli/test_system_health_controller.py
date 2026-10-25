@@ -196,7 +196,7 @@ class TestVerifierRouteRecovery:
             child = kb._open_verifier_child(conn, tid)
             assert child is not None
             child_task = kb.get_task(conn, child)
-            assert child_task.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert child_task.executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             assert child_task.status == "ready"
             assert _health_cards(conn) == []
 
@@ -527,7 +527,7 @@ class TestSubjectDamageRecovery:
             subject = _subject_with_route(conn)
             child = kb._open_verifier_child(conn, subject)
             assert kb.restore_relabelled_subject_lane(conn, child, actor="test") == (False, None)
-            assert kb.get_task(conn, child).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.get_task(conn, child).executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
 
     def test_review_to_triage_regression_escalates_without_touching_status(self, kanban_home):
         with kb.connect_closing() as conn:

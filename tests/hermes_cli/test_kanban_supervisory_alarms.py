@@ -987,7 +987,7 @@ class TestStaleDispositionActuator:
                 "FROM tasks WHERE id = ?",
                 (verifier,),
             ).fetchone()
-            assert vrow["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert vrow["executor_lane"] == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             assert bool(vrow["gauntlet_enforced"]) is True
             assert vrow["max_runtime_seconds"] == 300
             assert vrow["status"] in ("ready", "todo")
