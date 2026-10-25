@@ -7068,6 +7068,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         if gauntlet_required(conn, task_id):
             _ensure_independent_verifier_child(
                 conn, task_id, implementer=preserved_subject_implementer or None,
+                # assignee='atlas' is an explicit Codex-lane request.
+                preferred_lane=EXECUTOR_LANE_CODEX_VERIFY,
             )
         return True
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
@@ -14762,6 +14764,25 @@ def _ensure_independent_verifier_child(
                         "gauntlet_runtime_inherited",
                         {
                             "max_runtime_seconds": MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+                            "subject": subject_id,
+                        },
+                    )
+        if preferred_lane == EXECUTOR_LANE_CODEX_VERIFY:
+            # An explicit "ask Atlas" request names the Codex lane: an unclaimed
+            # default-lane (Claude) child is retargeted, never reused as-is.
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET executor_lane = ? WHERE id = ? "
+                    "AND executor_lane = ? AND status IN ('todo', 'ready')",
+                    (EXECUTOR_LANE_CODEX_VERIFY, existing, EXECUTOR_LANE_CLAUDE_VERIFY),
+                )
+                if cur.rowcount:
+                    _append_event(
+                        conn, existing, "verifier_lane_retargeted",
+                        {
+                            "from": EXECUTOR_LANE_CLAUDE_VERIFY,
+                            "to": EXECUTOR_LANE_CODEX_VERIFY,
+                            "reason": "explicit_atlas_request",
                             "subject": subject_id,
                         },
                     )
