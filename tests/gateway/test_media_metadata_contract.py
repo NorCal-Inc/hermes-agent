@@ -62,7 +62,6 @@ _ALL_ADAPTERS = [
     ("plugins.platforms.wecom.adapter", "WeComAdapter"),
     ("gateway.platforms.weixin", "WeixinAdapter"),
     ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter"),
-    ("gateway.platforms.yuanbao", "YuanbaoAdapter"),
 ]
 
 
