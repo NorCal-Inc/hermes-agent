@@ -80,7 +80,7 @@ class Board:
         return [r[0] for r in self.conn.execute(
             "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
             "WHERE l.parent_id = ? AND c.executor_lane = ? AND c.status = 'running'",
-            (subject, kb.EXECUTOR_LANE_CODEX_VERIFY))]
+            (subject, kb.DEFAULT_INDEPENDENT_VERIFIER_LANE))]
 
     # --- worker-side actions -------------------------------------------------------------
 

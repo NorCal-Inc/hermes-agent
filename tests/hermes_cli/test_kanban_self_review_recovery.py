@@ -684,7 +684,7 @@ class TestVerifiedReplayFinalization:
                 conn, subject, "verifier fixture run without a verdict line",
             )
             ok, detail = kb.record_verification(
-                conn, subject, passed=True, verifier=f"codex_verify:{verifier}",
+                conn, subject, passed=True, verifier=f"{kb.DEFAULT_INDEPENDENT_VERIFIER_LANE}:{verifier}",
                 evidence={"source": "restart-boundary-fixture"},
                 route_on_failure=False,
             )
@@ -1653,7 +1653,7 @@ class TestInstalledSelfReviewerIsNotSelected:
             cid = kb._open_verifier_child(conn, tid)
             assert cid is not None
             assert required[0][1]["verifier_task"] == cid
-            assert kb.get_task(conn, cid).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.get_task(conn, cid).executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
 
     def test_an_independent_installed_reviewer_is_still_selected(self, kanban_home):
         """Control: the exemption still serves a reviewer who is not the implementer."""

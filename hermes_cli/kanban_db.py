@@ -13373,7 +13373,7 @@ def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone()
     if row is None:
         return False
-    if row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
+    if row["executor_lane"] in INDEPENDENT_VERIFIER_LANES:
         # The dependency edge is deliberately removed before dispatch so the
         # subject's completion state cannot gate its verifier.  The exemption
         # therefore keys on the append-only governance relation created while
@@ -16969,7 +16969,7 @@ def complete_task(
         ).fetchone()
         if (
             arow is not None
-            and arow["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            and arow["executor_lane"] not in INDEPENDENT_VERIFIER_LANES
             and arow["verification_state"] != VERIFICATION_VERIFIED
             and _review_run_verification(conn, task_id)[0] is None
         ):
@@ -18611,7 +18611,7 @@ def _qualifying_review_evidence(
         and upstream_row["terminal_disposition"] == DISPOSITION_COMPLETED
         and upstream_verifier is not None
         and upstream_verifier["status"] in ("done", "archived")
-        and upstream_verifier["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY
+        and upstream_verifier["executor_lane"] in INDEPENDENT_VERIFIER_LANES
         and impl_row is not None
         and impl_row["executor_lane"] == EXECUTOR_LANE_CLAUDE
         and bool(impl_row["gauntlet_enforced"])
