@@ -118,7 +118,6 @@ hermes-agent/
 │   ├── status.py             # Token locks, profile-scoped process tracking
 │   ├── builtin_hooks/        # Extension point for always-registered hooks (none shipped)
 │   └── platforms/            # Built-in adapters: signal, weixin, bluebubbles,
-│                             #   qqbot, whatsapp_cloud, yuanbao, webhook, api_server
 │
 ├── plugins/platforms/        # Bundled platform plugins: telegram, discord, slack,
 │                             #   whatsapp, matrix, mattermost, email, sms, dingtalk,

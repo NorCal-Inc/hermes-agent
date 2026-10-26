@@ -526,13 +526,13 @@ def compile_mention_patterns(
 
 # ─── Fence-Aware Markdown Chunking ───────────────────────────────────────────
 # Shared core for the fence-aware markdown chunkers that previously lived as
-# near-duplicates in gateway/stream_consumer.py, gateway/platforms/yuanbao.py
-# (MarkdownProcessor — the richest version, which this core is derived from),
+# near-duplicates in gateway/stream_consumer.py, a since-removed platform
+# adapter's MarkdownProcessor (the richest version, which this core is derived from),
 # and gateway/platforms/weixin.py.  Each caller keeps its own knobs:
 #
 #   * stream_consumer: newline-preferred splitting + close/reopen fence
 #     balancing (``prefer_paragraphs=False, balance_fences=True``)
-#   * yuanbao: atomic-block extraction + paragraph-boundary splitting, fences
+#   * paragraph mode: atomic-block extraction + paragraph-boundary splitting, fences
 #     kept intact as atoms (``prefer_paragraphs=True, balance_fences=False``)
 #   * weixin: keeps its own block splitter (anchored ``_FENCE_RE``, per-line
 #     rstrip semantics) but reuses ``greedy_pack_blocks`` for packing.
@@ -799,7 +799,7 @@ def split_text_fence_aware(
 
     Two strategies, selected by ``prefer_paragraphs``:
 
-    ``prefer_paragraphs=True`` (yuanbao-derived, the richest):
+    ``prefer_paragraphs=True`` (the richest):
       Extract atomic blocks (code fences, tables, paragraphs), greedily merge
       them up to *limit*, split still-oversized non-atomic chunks at
       paragraph boundaries, then re-merge small neighbours.  Code blocks and
@@ -831,7 +831,7 @@ def split_text_fence_aware(
 
 
 def _chunk_markdown_paragraphs(text, max_chars, len_fn=None):
-    """Yuanbao-derived paragraph/atom chunking pipeline (see module docs)."""
+    """Paragraph/atom chunking pipeline (see module docs)."""
     _len = len_fn or len
 
     if _len(text) <= max_chars:

@@ -284,7 +284,7 @@ hermes-agent/
 │   ├── platforms/        # Adapter per platform (telegram, discord, slack, whatsapp,
 │   │                     #   homeassistant, signal, matrix, mattermost, email, sms,
 │   │                     #   dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,
-│   │                     #   yuanbao, webhook, api_server, ...). See ADDING_A_PLATFORM.md.
+│   │                     #   webhook, api_server, ...). See ADDING_A_PLATFORM.md.
 │   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
 ├── plugins/              # Plugin system (see "Plugins" section below)
 │   ├── memory/           # Memory-provider plugins (honcho, mem0, supermemory, ...)
@@ -1044,7 +1044,7 @@ Current toolset keys: `browser`, `clarify`, `code_execution`, `cronjob`,
 `debugging`, `delegation`, `discord`, `discord_admin`, `feishu_doc`,
 `feishu_drive`, `file`, `homeassistant`, `image_gen`, `kanban`, `memory`,
 `messaging`, `moa`, `rl`, `safe`, `search`, `session_search`, `skills`,
-`spotify`, `terminal`, `todo`, `tts`, `video`, `vision`, `web`, `yuanbao`.
+`spotify`, `terminal`, `todo`, `tts`, `video`, `vision`, `web`.
 
 Enable/disable per platform via `hermes tools` (the curses UI) or the
 `tools.<platform>.enabled` / `tools.<platform>.disabled` lists in

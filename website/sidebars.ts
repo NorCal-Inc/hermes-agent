@@ -614,15 +614,6 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/web-development/web-development-page-agent',
                   ],
                 },
-                {
-                  type: 'category',
-                  label: 'yuanbao',
-                  key: 'skills-optional-yuanbao',
-                  collapsed: true,
-                  items: [
-                    'user-guide/skills/optional/yuanbao/yuanbao-yuanbao',
-                  ],
-                },
               ],
             },
           ],
@@ -668,7 +659,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/wecom-callback',
             'user-guide/messaging/weixin',
             'user-guide/messaging/qqbot',
-            'user-guide/messaging/yuanbao',
           ],
         },
         {
