@@ -1017,6 +1017,80 @@ class TestStaleDispositionActuator:
             assert row["verification_state"] == kb.VERIFICATION_PENDING
             assert "independent_verification_unroutable" in _kinds(conn, tid)
 
+    def test_stale_pending_with_blocked_verifier_child_does_not_duplicate(
+        self, kanban_home,
+    ):
+        """Regression: t_1a9d52ed duplicate-verifier timer.
+
+        A subject already carrying a BLOCKED verifier child for its current
+        verification leg must not get a second one on a stale tick -- the
+        live defect created 22 verifier children on one subject in ~2 hours
+        (t_ab80ef2a, one every 5-6 minutes). The correct disposition is one
+        visible event surfacing the stuck child, not a new child.
+        """
+        with kb.connect_closing() as conn:
+            tid = self._review_pending_subject(conn)
+            kb.store_attachment_bytes(
+                conn,
+                tid,
+                "evidence.txt",
+                b"commit abc123\nfocused tests: pass\n",
+                content_type="text/plain",
+                uploaded_by="test",
+            )
+            verifier = kb._ensure_independent_verifier_child(
+                conn, tid, implementer="default",
+            )
+            assert verifier is not None
+            kb.recompute_ready(conn)
+            assert kb.claim_task(conn, verifier)
+            assert kb.block_task(
+                conn, verifier, reason="verifier stuck", kind="needs_input",
+            )
+            vrow = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (verifier,),
+            ).fetchone()
+            assert vrow["status"] == "blocked"
+
+            # First stale tick: no live child (the only one is blocked), so
+            # the naive path would have minted a brand-new verifier here.
+            result = kb.resolve_stale_gauntlet_dispositions(
+                conn, [self._entry(tid)], now=1_700_000_300,
+            )
+            assert result["verifier_routed"] == []
+            assert result["verifier_stuck_alarmed"] == [tid]
+            assert result["unresolved"] == [tid]
+
+            # No new child was created.
+            children = conn.execute(
+                "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
+                "WHERE l.parent_id = ? AND c.executor_lane = ?",
+                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+            ).fetchall()
+            assert [c["id"] for c in children] == [verifier]
+
+            events = _events(conn, tid, "gauntlet_stale_disposition")
+            assert len(events) == 1
+            assert events[0][1]["action"] == "verifier_stuck_surfaced"
+            assert events[0][1]["verifier_task"] == verifier
+
+            # A second stale tick against the SAME stuck child must not
+            # re-alarm (once per stuck child, not once per tick).
+            result2 = kb.resolve_stale_gauntlet_dispositions(
+                conn, [self._entry(tid)], now=1_700_000_600,
+            )
+            assert result2["verifier_stuck_alarmed"] == []
+            assert result2["unresolved"] == [tid]
+            events_after = _events(conn, tid, "gauntlet_stale_disposition")
+            assert len(events_after) == 1
+
+            children_after = conn.execute(
+                "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
+                "WHERE l.parent_id = ? AND c.executor_lane = ?",
+                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+            ).fetchall()
+            assert [c["id"] for c in children_after] == [verifier]
+
     def test_stale_subject_with_verified_completed_repair_is_reconciled(self, kanban_home):
         with kb.connect_closing() as conn:
             subject = kb.create_task(

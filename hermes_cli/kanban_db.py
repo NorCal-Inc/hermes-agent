@@ -14297,6 +14297,65 @@ def _open_verifier_child(
     return None
 
 
+def _blocked_verifier_child(
+    conn: sqlite3.Connection, subject_id: str
+) -> Optional[str]:
+    """Return a BLOCKED ``codex_verify`` child still tied to ``subject_id``.
+
+    Mirrors :func:`_open_verifier_child`'s linkage/relation scoping exactly,
+    but looks for a stuck verifier (``status == 'blocked'``) instead of a
+    live one. A blocked verifier is not dispatchable -- it is NOT a route to
+    a verdict -- but it IS evidence that this leg already has an open
+    verification episode. Treating "no live child" as "no child" let the
+    stale-disposition actuator mint a fresh verifier every 5-6 minutes
+    against a subject whose existing verifier was simply stuck (blocked),
+    producing 22 independent-verifier children on one subject in two hours
+    (t_ab80ef2a, 2026-10-25 19:47-21:52). The correct disposition for a
+    stuck verifier is to surface it, not multiply it.
+    """
+    row = conn.execute(
+        "SELECT c.id FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? AND c.executor_lane = ? "
+        "AND c.status = 'blocked' "
+        "AND EXISTS ("
+        "  SELECT 1 FROM task_relations r "
+        "  WHERE r.from_task_id = c.id AND r.to_task_id = ?"
+        "    AND r.relation = ?"
+        ") "
+        "ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+        (
+            subject_id,
+            EXECUTOR_LANE_CODEX_VERIFY,
+            subject_id,
+            RELATION_VERIFIES,
+        ),
+    ).fetchone()
+    return row["id"] if row is not None else None
+
+
+def _verifier_stuck_alarm_is_owed(
+    conn: sqlite3.Connection, subject_id: str, verifier_task_id: str
+) -> bool:
+    """True when ``verifier_stuck_surfaced`` has not yet fired for THIS exact
+    blocked verifier child.
+
+    Scoped to the verifier's id rather than just the subject: a NEW blocked
+    child (after an old one was superseded, retired, or unblocked) is a new
+    episode and must be audible again, while repeated stale ticks against
+    the SAME stuck child must not re-alarm every cycle -- that per-tick
+    re-alarming is the same failure shape as the duplicate-verifier defect,
+    just in the notification channel instead of task creation.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'gauntlet_stale_disposition' "
+        "AND json_extract(payload, '$.action') = 'verifier_stuck_surfaced' "
+        "AND json_extract(payload, '$.verifier_task') = ? LIMIT 1",
+        (subject_id, verifier_task_id),
+    ).fetchone() is None
+
+
 def _subject_evidence_is_dispatchable(
     conn: sqlite3.Connection, subject_id: str
 ) -> bool:
@@ -14913,6 +14972,19 @@ def _ensure_independent_verifier_child(
         "checked; missing acceptance confirmation fails closed. "
         if subject_needs_acceptance else ""
     )
+    # A verifier child is the mandatory check for ITS subject's Gauntlet
+    # requirement -- the same fact the "existing" branch above already uses
+    # to decide whether to raise the runtime cap. Compute it once and apply
+    # it consistently to both knobs: a newly-created child for a
+    # Gauntlet-enforced subject must itself be gauntlet_enforced, or the
+    # verifier can complete with a bare PASS/FAIL summary instead of the
+    # VERIFIED chain the subject's own enforcement demands. Previously this
+    # call omitted ``gauntlet=`` entirely, so the new child fell back to
+    # title/body classification -- "Independent verification: <id>" never
+    # matches that classifier, so every freshly created verifier child for a
+    # Gauntlet subject came up gauntlet_enforced=0 (observed on live board;
+    # regression test: TestStaleDispositionActuator).
+    verifier_gauntlet_required = gauntlet_required(conn, subject_id)
     try:
         child_id = create_task(
             conn,
@@ -14949,9 +15021,10 @@ def _ensure_independent_verifier_child(
                 run_id=None,
                 cause=CREATION_CAUSE_AUTOMATED,
             ),
+            gauntlet=verifier_gauntlet_required,
             max_runtime_seconds=(
                 MANDATORY_OBSERVATION_INTERVAL_SECONDS
-                if gauntlet_required(conn, subject_id)
+                if verifier_gauntlet_required
                 else None
             ),
             control_plane_authority=verifier_control_plane_authority,
@@ -16401,6 +16474,7 @@ def resolve_stale_gauntlet_dispositions(
     reconciled: list[str] = []
     infrastructure_released: list[str] = []
     self_review_released: list[str] = []
+    verifier_stuck_alarmed: list[str] = []
     unresolved: list[str] = []
 
     for entry in stale:
@@ -16670,6 +16744,41 @@ def resolve_stale_gauntlet_dispositions(
             entry.status == "review"
             and entry.verification_state == VERIFICATION_PENDING
         ):
+            # A blocked verifier child already open for this leg is an
+            # existing verification episode, not an absence of one. Minting
+            # another would be unreachable anyway (creation runs through the
+            # same evidence-dispatchable gate the blocked child already
+            # passed), so the correct disposition is to surface the stuck
+            # child once, not multiply it. Checked BEFORE
+            # _ensure_independent_verifier_child, which only ever sees LIVE
+            # children via _open_verifier_child and would otherwise mint a
+            # fresh one on every stale tick (t_ab80ef2a: 22 children in
+            # ~2 hours, one every 5-6 minutes). Deterministic, no LLM retry.
+            stuck_verifier = _blocked_verifier_child(conn, task_id)
+            if stuck_verifier is not None:
+                if _verifier_stuck_alarm_is_owed(conn, task_id, stuck_verifier):
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            task_id,
+                            "gauntlet_stale_disposition",
+                            {
+                                "action": "verifier_stuck_surfaced",
+                                "verifier_task": stuck_verifier,
+                                "detected_at": now_ts,
+                                "source": "stale_supervision",
+                                "detail": (
+                                    "an independent verifier child is "
+                                    "already open for this verification leg "
+                                    "but is blocked; no new verifier was "
+                                    "created -- unblock or repair the "
+                                    "existing one"
+                                ),
+                            },
+                        )
+                    verifier_stuck_alarmed.append(task_id)
+                unresolved.append(task_id)
+                continue
             row = conn.execute(
                 "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -16703,6 +16812,7 @@ def resolve_stale_gauntlet_dispositions(
         "infrastructure_released": infrastructure_released,
         "self_review_released": self_review_released,
         "verifier_routed": routed,
+        "verifier_stuck_alarmed": verifier_stuck_alarmed,
         "unresolved": unresolved,
     }
 
