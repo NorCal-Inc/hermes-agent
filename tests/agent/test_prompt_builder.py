@@ -525,13 +525,21 @@ class TestBuildContextFilesPrompt:
         (sub / "AGENTS.md").write_text("Only file.")
         assert _load_agents_md(sub) == "## AGENTS.md\n\nOnly file."
 
-    def test_agents_md_no_git_root_stays_cwd_only(self, tmp_path):
+    def test_agents_md_no_git_root_stays_cwd_only(self, tmp_path, monkeypatch):
         # Without a git root, parents are never consulted (no picking up an
-        # AGENTS.md planted in /tmp or $HOME).
+        # AGENTS.md planted in /tmp or $HOME).  Pin "no git root" so a stray
+        # .git in an ancestor of the pytest basetemp (e.g. /tmp/.git) cannot
+        # turn the ambient filesystem into a repository.
+        from agent.prompt_builder import _load_agents_md
+
+        # Patch through the function's own globals: other test modules reload
+        # agent.prompt_builder, so a module-attribute patch can miss it.
+        monkeypatch.setitem(
+            _load_agents_md.__globals__, "_find_git_root", lambda start: None
+        )
         (tmp_path / "AGENTS.md").write_text("Planted in parent.")
         sub = tmp_path / "sub"
         sub.mkdir()
-        from agent.prompt_builder import _load_agents_md
 
         assert _load_agents_md(sub) == ""
 
