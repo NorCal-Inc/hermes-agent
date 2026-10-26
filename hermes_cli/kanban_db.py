@@ -15000,24 +15000,20 @@ def swap_verifier_lane_once(
     same every time regardless of which model is reasoning about it.
 
     Only swaps a card that is still open and has not already been swapped
-    once (a durable ``verifier_lane_swapped`` event on the card is the record
-    of that, so a second capacity failure on the SAME card, or on the sibling
-    it already swapped to, blocks for a human instead of looping forever).
-    Returns the new sibling verifier task id, or ``None`` if no swap
-    happened (already swapped, unknown lane, or the subject link is gone).
+    once. The "once" scope is the SUBJECT's whole fallback chain, not just
+    this one verifier card: a durable ``verifier_lane_swap_dispatched`` event
+    on the subject is the record that a fallback already happened somewhere
+    in this chain, so a second capacity failure -- whether it recurs on the
+    original card or lands on the sibling it already swapped to -- declines
+    instead of swapping back and forth indefinitely. Returns the new sibling
+    verifier task id, or ``None`` if no swap happened (already swapped
+    anywhere in the chain, unknown lane, or the subject link is gone).
     """
     row = conn.execute(
         "SELECT executor_lane, status FROM tasks WHERE id = ?",
         (verifier_task_id,),
     ).fetchone()
     if row is None or row["executor_lane"] not in INDEPENDENT_VERIFIER_LANES:
-        return None
-    already_swapped = conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? "
-        "AND kind = 'verifier_lane_swapped' LIMIT 1",
-        (verifier_task_id,),
-    ).fetchone()
-    if already_swapped is not None:
         return None
     from_lane = row["executor_lane"]
     to_lane = (
@@ -15027,6 +15023,19 @@ def swap_verifier_lane_once(
     )
     subjects = verifier_subject_ids(conn, verifier_task_id)
     if not subjects:
+        return None
+    # Chain-wide guard: once ANY verifier card for this subject has
+    # dispatched a fallback sibling, decline every further swap attempt for
+    # the subject, regardless of which card (original or sibling) hit the
+    # next capacity failure. This is what makes the fallback a single
+    # one-shot per subject rather than a per-card allowance that can
+    # alternate Claude<->Codex indefinitely.
+    already_swapped_in_chain = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'verifier_lane_swap_dispatched' LIMIT 1",
+        (subjects[0],),
+    ).fetchone()
+    if already_swapped_in_chain is not None:
         return None
     implementer = None
     try:
