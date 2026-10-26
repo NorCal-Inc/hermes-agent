@@ -1548,6 +1548,14 @@ def init_agent(
     from agent.prompt_builder import KANBAN_GUIDANCE
     _kanban_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     agent._kanban_worker_guidance = KANBAN_GUIDANCE if _kanban_task_id else ""
+    # A Kanban worker dispatched under the shared `default` profile runs in
+    # the root HERMES_HOME, whose SOUL.md is the executive persona (Erika).
+    # Loading it made workers believe they were Erika in chat and refuse the
+    # dispatcher's lifecycle prompt (t_f7d75bb7 runs 5088/5100). Named profiles
+    # keep their own SOUL.md; only this pairing gets the worker identity.
+    agent._kanban_shared_worker = bool(_kanban_task_id) and (
+        (os.environ.get("HERMES_PROFILE") or "").strip().lower() == "default"
+    )
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
