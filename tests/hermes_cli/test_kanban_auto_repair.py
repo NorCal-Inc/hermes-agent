@@ -490,7 +490,7 @@ def _open_verifiers(conn, tid):
             "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
             "WHERE l.parent_id = ? AND c.executor_lane = ? "
             "AND c.status NOT IN ('done', 'archived')",
-            (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+            (tid, kb.DEFAULT_INDEPENDENT_VERIFIER_LANE),
         ).fetchall()
     ]
 

@@ -20696,6 +20696,11 @@ def main(
 
                         _lane_rc = run_codex_verifier(_kanban_task_id)
                         sys.exit(_lane_rc)
+                    if _lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE_VERIFY:
+                        from hermes_cli.recovery_lane import run_claude_verifier
+
+                        _lane_rc = run_claude_verifier(_kanban_task_id)
+                        sys.exit(_lane_rc)
                     if _lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE_RECOVERY:
                         from hermes_cli.recovery_lane import run_claude_first_recovery
 

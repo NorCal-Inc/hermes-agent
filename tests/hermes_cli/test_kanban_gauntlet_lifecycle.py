@@ -1325,7 +1325,7 @@ class TestEvidenceReadyVerifierDependency:
         assert claimed is not None and claimed.status == "running"
         with kb.write_txn(conn):
             kb._append_event(
-                conn, cid, "codex_verifier_started", {"executor": "codex"},
+                conn, cid, kb._attest_kind(conn, cid), {"executor": "codex"},
                 run_id=claimed.current_run_id,
             )
         assert kb.complete_task(

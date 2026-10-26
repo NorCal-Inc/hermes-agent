@@ -554,9 +554,21 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # * "claude" runs one ordinary Kanban task directly through Claude Code,
 #   bypassing the Hermes model/tool loop. It is the deterministic technical
 #   executor lane used by Erika for normal Claude-owned work.
+# * "claude_verify" runs one independent verification task through the Claude
+#   Code headless executor in a read-only sandbox. This is the DEFAULT
+#   independent-verifier lane (2026-10-25: Christopher authorized Claude as
+#   the default independent verifier, Codex as the deterministic fallback —
+#   see t_ab80ef2a). It signs verdicts as ``claude_verify:<verifier_task_id>``,
+#   mirroring ``codex_verify:<verifier_task_id>``.
 # * "codex_verify" runs one independent verification task through Codex in a
 #   read-only sandbox. The compatibility shorthand assignee="atlas" maps here;
-#   Atlas is a verifier lane, not a persistent Hermes profile.
+#   Atlas is a verifier lane, not a persistent Hermes profile. It is now the
+#   FALLBACK independent-verifier lane: used when an explicit "ask Atlas"
+#   request is made, when the subject itself was implemented on
+#   EXECUTOR_LANE_CLAUDE (a Claude verifier cannot be independent of
+#   Claude-implemented work), or when a claude_verify attempt hits a
+#   usage/rate limit and is deterministically swapped over once (see
+#   ``swap_verifier_lane_once``).
 # * "claude_recovery" is the stricter boot/gate repair lane: Claude gets one
 #   bounded attempt, then Codex gets one bounded attempt only if the same
 #   mechanical recovery_gate_cmd is still red.
@@ -567,8 +579,33 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # enough to enter cli.py's pre-agent executor bypass.
 EXECUTOR_LANE_CLAUDE = "claude"
 EXECUTOR_LANE_CODEX_VERIFY = "codex_verify"
+EXECUTOR_LANE_CLAUDE_VERIFY = "claude_verify"
 EXECUTOR_LANE_CLAUDE_RECOVERY = "claude_recovery"
-VALID_EXECUTOR_LANES = {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_RECOVERY}
+VALID_EXECUTOR_LANES = {
+    EXECUTOR_LANE_CLAUDE,
+    EXECUTOR_LANE_CODEX_VERIFY,
+    EXECUTOR_LANE_CLAUDE_VERIFY,
+    EXECUTOR_LANE_CLAUDE_RECOVERY,
+}
+
+#: Every executor lane that renders an INDEPENDENT verification verdict.
+#: Both lanes are legitimate signing roots for a verifier identity
+#: (``_verifier_identity_status`` / ``_resolve_lane_verifier_identity``), and
+#: both are legitimate "evidence-ready" verifier children for dependency
+#: gating (``_EVIDENCE_READY_PARENT_SQL``) and objective-attempt-budget
+#: lineage walks. Kept as ONE frozenset so a future third verifier lane is
+#: added in one place rather than drifting between call sites the way
+#: EXECUTOR_LANE_CODEX_VERIFY alone used to.
+INDEPENDENT_VERIFIER_LANES: frozenset[str] = frozenset(
+    {EXECUTOR_LANE_CLAUDE_VERIFY, EXECUTOR_LANE_CODEX_VERIFY}
+)
+
+#: Default lane for a newly created independent verifier child when no
+#: explicit lane is requested (2026-10-25 authorization, t_ab80ef2a). Callers
+#: that need the Codex-specific fallback/explicit-Atlas lane pass
+#: ``preferred_lane=EXECUTOR_LANE_CODEX_VERIFY`` to
+#: :func:`_ensure_independent_verifier_child` explicitly.
+DEFAULT_INDEPENDENT_VERIFIER_LANE = EXECUTOR_LANE_CLAUDE_VERIFY
 
 # ---------------------------------------------------------------------------
 # ACTOR PROVENANCE — who created this card, structurally
@@ -5644,9 +5681,11 @@ def _normalize_shorthand_lane(
     if lane is not None and executor_lane is None:
         from_token = assignee
         executor_lane = lane
-    if executor_lane in {EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY}:
-        # Both lanes ride the spawnable default profile as a carrier, only far
-        # enough to reach cli.py's pre-agent executor bypass.
+    if executor_lane in {
+        EXECUTOR_LANE_CLAUDE, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_VERIFY,
+    }:
+        # All direct-executor lanes ride the spawnable default profile as a
+        # carrier, only far enough to reach cli.py's pre-agent executor bypass.
         if assignee != "default":
             from_token = from_token or assignee
             assignee = "default"
@@ -6212,7 +6251,7 @@ def create_task(
     explicit_verification_required = False
     if (
         not gauntlet_enforced
-        and executor_lane != EXECUTOR_LANE_CODEX_VERIFY
+        and executor_lane not in INDEPENDENT_VERIFIER_LANES
         and explicit_verification_requirement(title, body)
     ):
         gauntlet_enforced = True
@@ -6247,13 +6286,13 @@ def create_task(
     # already learned the hard way: a rule only ``create_repair_task`` honoured
     # was bypassed by the first independent review that called ``create_task``
     # directly. Every door, or it is not a rule.
-    if executor_lane == EXECUTOR_LANE_CODEX_VERIFY and not [
+    if executor_lane in INDEPENDENT_VERIFIER_LANES and not [
         p for p in parents if p
     ]:
         raise VerifierLinkageError(
             "an independent verifier task requires at least one parent naming "
             "the subject it verifies; refusing to create an orphan "
-            f"{EXECUTOR_LANE_CODEX_VERIFY!r} card whose verdict could not be "
+            f"{executor_lane!r} card whose verdict could not be "
             "returned to anyone"
         )
     # D8: the same gate ``assign_task`` has always applied. Deliberately AFTER
@@ -6615,7 +6654,7 @@ def create_task(
                         conn, task_id, kind=VALIDATION_LOOP_TIMER_KIND,
                         owner=recovery_owner, now=now,
                     )
-                if executor_lane == EXECUTOR_LANE_CODEX_VERIFY:
+                if executor_lane in INDEPENDENT_VERIFIER_LANES:
                     # Read the linkage back from ``task_links``, in the same
                     # transaction that wrote it and before it can commit. The
                     # early refusal above checked the caller's ARGUMENT; this
@@ -7029,6 +7068,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         if gauntlet_required(conn, task_id):
             _ensure_independent_verifier_child(
                 conn, task_id, implementer=preserved_subject_implementer or None,
+                # assignee='atlas' is an explicit Codex-lane request.
+                preferred_lane=EXECUTOR_LANE_CODEX_VERIFY,
             )
         return True
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
@@ -7282,7 +7323,7 @@ def _refuse_stranding_live_verifier(
         "SELECT executor_lane, status, terminal_disposition FROM tasks WHERE id = ?",
         (child_id,),
     ).fetchone()
-    if child is None or child["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+    if child is None or child["executor_lane"] not in INDEPENDENT_VERIFIER_LANES:
         return
     if child["status"] in ("done", "archived") or child["terminal_disposition"] is not None:
         return
@@ -7826,8 +7867,8 @@ def orphaned_verifier_tasks(conn: sqlite3.Connection) -> list[str]:
     which closed a production deployment with a verdict nothing consumed.
     """
     rows = conn.execute(
-        "SELECT id FROM tasks WHERE executor_lane = ? ORDER BY created_at, id",
-        (EXECUTOR_LANE_CODEX_VERIFY,),
+        "SELECT id FROM tasks WHERE executor_lane IN (?, ?) ORDER BY created_at, id",
+        tuple(INDEPENDENT_VERIFIER_LANES),
     ).fetchall()
     return [r["id"] for r in rows if not verifier_subject_ids(conn, r["id"])]
 
@@ -10708,7 +10749,7 @@ def subject_has_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
 
 _EVIDENCE_READY_PARENT_SQL = f"""
     (
-        (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) = :verify_lane
+        (SELECT c.executor_lane FROM tasks c WHERE c.id = :child) IN (:verify_lane, :verify_lane2)
         -- A registered-profile verifier declared by the typed relation. Never
         -- the subject's implementer: that identity cannot verify its own work,
         -- so it is not released to try (selection and verdict must agree).
@@ -10879,6 +10920,7 @@ _UNSATISFIED_PARENTS_SQL = f"""
 _PARENT_GATE_PARAMS = {
     "verifies_rel": RELATION_VERIFIES,
     "verify_lane": EXECUTOR_LANE_CODEX_VERIFY,
+    "verify_lane2": EXECUTOR_LANE_CLAUDE_VERIFY,
     "implement_lane": EXECUTOR_LANE_CLAUDE,
     "pending": VERIFICATION_PENDING,
     "verdict_kind": LEDGER_KIND_VERDICT,
@@ -10976,7 +11018,7 @@ def _objective_lineage_root(conn: sqlite3.Connection, task_id: str) -> str:
         row = conn.execute(
             "SELECT executor_lane FROM tasks WHERE id = ?", (current,)
         ).fetchone()
-        if row is not None and row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
+        if row is not None and row["executor_lane"] in INDEPENDENT_VERIFIER_LANES:
             parent = conn.execute(
                 "SELECT l.parent_id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
                 "WHERE l.child_id=? ORDER BY p.created_at ASC LIMIT 1", (current,)
@@ -11015,11 +11057,11 @@ def _objective_lineage_members(conn: sqlite3.Connection, root: str) -> set:
             rows = conn.execute(
                 f"SELECT l.child_id AS id FROM task_links l "
                 f"JOIN tasks c ON c.id = l.child_id "
-                f"WHERE l.parent_id IN ({marks}) AND c.executor_lane = ? "
+                f"WHERE l.parent_id IN ({marks}) AND c.executor_lane IN (?, ?) "
                 f"UNION "
                 f"SELECT r.from_task_id AS id FROM task_relations r "
                 f"WHERE r.to_task_id IN ({marks}) AND r.relation = ?",
-                (*batch, EXECUTOR_LANE_CODEX_VERIFY, *batch, RELATION_REPAIRS),
+                (*batch, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_VERIFY, *batch, RELATION_REPAIRS),
             ).fetchall()
             found.extend(str(r["id"]) for r in rows)
         nxt = [i for i in dict.fromkeys(found) if i not in members]
@@ -11503,8 +11545,9 @@ def _failed_verdict_report(conn: sqlite3.Connection, verdict: sqlite3.Row) -> st
         verifier_task = (json.loads(verdict["evidence"] or "{}") or {}).get("verifier_task")
     except (TypeError, ValueError, AttributeError):
         verifier_task = None
-    if not verifier_task and str(verdict["verifier"] or "").startswith(
-        f"{EXECUTOR_LANE_CODEX_VERIFY}:"
+    if not verifier_task and any(
+        str(verdict["verifier"] or "").startswith(f"{lane}:")
+        for lane in INDEPENDENT_VERIFIER_LANES
     ):
         verifier_task = str(verdict["verifier"]).split(":", 1)[1]
     if verifier_task:
@@ -11733,7 +11776,7 @@ def _in_flight_verifier_for_subject(
     ).fetchone()
     if (
         srow is None
-        or srow["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY
+        or srow["executor_lane"] in INDEPENDENT_VERIFIER_LANES
         or srow["status"] != "review"
         or srow["verification_state"] != VERIFICATION_PENDING
     ):
@@ -11749,10 +11792,10 @@ def _in_flight_verifier_for_subject(
         "SELECT c.id AS id, r.id AS run_id FROM task_links l "
         "JOIN tasks c ON c.id = l.child_id "
         "JOIN task_runs r ON r.id = c.current_run_id "
-        "WHERE l.parent_id = ? AND c.executor_lane = ? AND c.status = 'running' "
+        "WHERE l.parent_id = ? AND c.executor_lane IN (?, ?) AND c.status = 'running' "
         "AND r.ended_at IS NULL AND r.started_at >= ? "
         "ORDER BY r.started_at ASC, r.id ASC LIMIT 1",
-        (subject_id, EXECUTOR_LANE_CODEX_VERIFY, int(phase["at"])),
+        (subject_id, EXECUTOR_LANE_CODEX_VERIFY, EXECUTOR_LANE_CLAUDE_VERIFY, int(phase["at"])),
     ).fetchone()
     if row is None:
         return None
@@ -11822,7 +11865,7 @@ def _runtime_cap_ladder_ceiling(conn: sqlite3.Connection, task_id: str) -> int:
         "SELECT executor_lane FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     lane = (row["executor_lane"] if row is not None else None) or ""
-    if lane == EXECUTOR_LANE_CODEX_VERIFY:
+    if lane in INDEPENDENT_VERIFIER_LANES:
         return RUNTIME_CAP_LADDER_VERIFIER_CEILING
     return RUNTIME_CAP_LADDER[-1]
 
@@ -13330,7 +13373,7 @@ def gauntlet_required(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone()
     if row is None:
         return False
-    if row["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY:
+    if row["executor_lane"] in INDEPENDENT_VERIFIER_LANES:
         # The dependency edge is deliberately removed before dispatch so the
         # subject's completion state cannot gate its verifier.  The exemption
         # therefore keys on the append-only governance relation created while
@@ -13739,7 +13782,7 @@ def _review_requested_implementer(
 # independent verification lane can sign, and only as a scoped identity that
 # resolves to board state bound to the subject — see
 # :func:`_resolve_lane_verifier_identity`.
-VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset({EXECUTOR_LANE_CODEX_VERIFY})
+VERIFIER_LANE_IDENTITIES: frozenset[str] = frozenset(INDEPENDENT_VERIFIER_LANES)
 
 #: Every lane name (and the ``atlas`` shorthand). Recognized so a bare or
 #: foreign-lane signature gets a precise refusal instead of a profile lookup.
@@ -13752,23 +13795,44 @@ VERIFIER_IDENTITY_UNKNOWN = "unknown"
 VERIFIER_IDENTITY_UNCHECKED = "unchecked"
 
 
-def _attested_codex_verifier_run(
-    conn: sqlite3.Connection, verifier_task_id: str,
-) -> Optional[int]:
-    """Return the completing run id of a codex_verify task the real lane ran.
+#: Event kind each independent-verifier lane's own launcher writes for the
+#: run it executes (``recovery_lane._claim_codex_verifier_attempt`` /
+#: ``recovery_lane._claim_claude_verifier_attempt``). Keyed by lane so
+#: :func:`_attested_verifier_run` can attest either lane with one function.
+_VERIFIER_LANE_STARTED_EVENT_KIND: dict[str, str] = {
+    EXECUTOR_LANE_CODEX_VERIFY: "codex_verifier_started",
+    EXECUTOR_LANE_CLAUDE_VERIFY: "claude_verifier_started",
+}
 
-    ``executor_lane`` is only a label: an unscoped agent that happens to claim a
-    codex_verify card (2026-09-14, run 2817) can complete it too. The lane's
-    own launcher writes ``codex_verifier_started`` for the run it executes
-    (``recovery_lane._claim_codex_verifier_attempt``), so the attestation is
-    that event on the run that completed the card. ``None`` when the card is
-    not a completed codex_verify task or its completing run carries no such
-    event.
+
+def _attest_kind(conn: sqlite3.Connection, verifier_task_id: str) -> str:
+    """``*_verifier_started`` event kind for the lane a verifier card is on."""
+    row = conn.execute(
+        "SELECT executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
+    ).fetchone()
+    lane = row["executor_lane"] if row else None
+    return _VERIFIER_LANE_STARTED_EVENT_KIND.get(lane, "codex_verifier_started")
+
+
+def _attested_verifier_run(
+    conn: sqlite3.Connection, verifier_task_id: str, lane: str,
+) -> Optional[int]:
+    """Return the completing run id of a *lane* verifier task the real lane ran.
+
+    ``executor_lane`` is only a label: an unscoped agent that happens to claim
+    a verifier card (2026-09-14, run 2817, codex_verify) can complete it too.
+    Each lane's own launcher writes its own ``*_verifier_started`` event for
+    the run it executes, so the attestation is that event on the run that
+    completed the card. ``None`` when the card is not a completed task on
+    *lane* or its completing run carries no such event.
     """
+    started_kind = _VERIFIER_LANE_STARTED_EVENT_KIND.get(lane)
+    if started_kind is None:
+        return None
     row = conn.execute(
         "SELECT status, executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
     ).fetchone()
-    if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+    if row is None or row["executor_lane"] != lane:
         return None
     if row["status"] != "done":
         return None
@@ -13781,10 +13845,23 @@ def _attested_codex_verifier_run(
         return None
     started = conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? "
-        "AND kind = 'codex_verifier_started' AND run_id = ? LIMIT 1",
-        (verifier_task_id, run["id"]),
+        "AND kind = ? AND run_id = ? LIMIT 1",
+        (verifier_task_id, started_kind, run["id"]),
     ).fetchone()
     return int(run["id"]) if started is not None else None
+
+
+def _attested_codex_verifier_run(
+    conn: sqlite3.Connection, verifier_task_id: str,
+) -> Optional[int]:
+    """Return the completing run id of a codex_verify task the real lane ran.
+
+    Thin, backward-compatible wrapper over :func:`_attested_verifier_run`
+    pinned to ``EXECUTOR_LANE_CODEX_VERIFY`` -- kept because call sites that
+    are specifically about the Codex fallback lane (never about whichever
+    lane actually ran) read clearer naming it explicitly.
+    """
+    return _attested_verifier_run(conn, verifier_task_id, EXECUTOR_LANE_CODEX_VERIFY)
 
 
 def _resolve_lane_verifier_identity(
@@ -13792,15 +13869,19 @@ def _resolve_lane_verifier_identity(
 ) -> Optional[str]:
     """Return ``None`` when a lane-scoped identity legitimately verifies *subject_id*.
 
-    Otherwise return the refusal detail. Two scoped forms are produced by the
-    system itself and are the only ones accepted:
+    Otherwise return the refusal detail. Scoped forms are produced by the
+    system itself and are the only ones accepted, one per lane in
+    :data:`INDEPENDENT_VERIFIER_LANES`:
 
-    * ``codex_verify:<verifier_task_id>`` — a codex_verify card, attested by
-      :func:`_attested_codex_verifier_run`, that verifies this subject: linked
-      as its child, or the single safe subject of a legacy orphan verifier
+    * ``codex_verify:<verifier_task_id>`` / ``claude_verify:<verifier_task_id>``
+      — a verifier card on that lane, attested by :func:`_attested_verifier_run`,
+      that verifies this subject: linked as its child, or the single safe
+      subject of a legacy orphan verifier
       (:func:`_historical_orphan_subject_candidate`).
     * ``codex_verify:<execution_id>`` — a completed exit-0 ``codex.verify``
       execution recorded against this subject by the execution supervisor.
+      (``claude_verify`` has no execution-supervisor launcher equivalent, so
+      this form only resolves for the ``codex_verify`` root.)
     """
     root, _, ref = identity.partition(":")
     root = root.strip().lower()
@@ -13808,36 +13889,38 @@ def _resolve_lane_verifier_identity(
     if root not in VERIFIER_LANE_IDENTITIES:
         return (
             f"{identity!r} names the {root!r} lane, which is not an independent "
-            f"verification lane; only {EXECUTOR_LANE_CODEX_VERIFY}:<verifier> may sign"
+            f"verification lane; only {'/'.join(sorted(INDEPENDENT_VERIFIER_LANES))}"
+            ":<verifier> may sign"
         )
     if not ref:
         return (
             f"bare lane name {identity!r} is not a verifier identity; an "
             f"independent verdict must be signed as "
-            f"{EXECUTOR_LANE_CODEX_VERIFY}:<attested verifier task or execution>"
+            f"{root}:<attested verifier task or execution>"
         )
     if ref == subject_id:
         return f"{identity!r} names the subject itself"
-    execution = conn.execute(
-        "SELECT task_id, command_class, status, exit_code FROM executions WHERE id = ?",
-        (ref,),
-    ).fetchone()
-    if execution is not None:
-        if (
-            execution["task_id"] == subject_id
-            and execution["command_class"] == "codex.verify"
-            and execution["status"] == "completed"
-            and execution["exit_code"] == 0
-        ):
-            return None
+    if root == EXECUTOR_LANE_CODEX_VERIFY:
+        execution = conn.execute(
+            "SELECT task_id, command_class, status, exit_code FROM executions WHERE id = ?",
+            (ref,),
+        ).fetchone()
+        if execution is not None:
+            if (
+                execution["task_id"] == subject_id
+                and execution["command_class"] == "codex.verify"
+                and execution["status"] == "completed"
+                and execution["exit_code"] == 0
+            ):
+                return None
+            return (
+                f"{identity!r} is not a completed exit-0 codex.verify execution "
+                f"recorded against {subject_id}"
+            )
+    if _attested_verifier_run(conn, ref, root) is None:
         return (
-            f"{identity!r} is not a completed exit-0 codex.verify execution "
-            f"recorded against {subject_id}"
-        )
-    if _attested_codex_verifier_run(conn, ref) is None:
-        return (
-            f"{identity!r} does not resolve to a completed codex_verify task "
-            f"whose completing run was executed by the codex_verify lane"
+            f"{identity!r} does not resolve to a completed {root} task "
+            f"whose completing run was executed by the {root} lane"
         )
     linked = conn.execute(
         "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ? "
@@ -14192,7 +14275,7 @@ def _open_verifier_child(
     rows = conn.execute(
         "SELECT c.id FROM task_links l "
         "JOIN tasks c ON c.id = l.child_id "
-        "WHERE l.parent_id = ? AND c.executor_lane = ? "
+        "WHERE l.parent_id = ? AND c.executor_lane IN (?, ?) "
         "AND c.status NOT IN ('blocked', 'done', 'archived') "
         "AND EXISTS ("
         "  SELECT 1 FROM task_relations r "
@@ -14203,6 +14286,7 @@ def _open_verifier_child(
         (
             subject_id,
             EXECUTOR_LANE_CODEX_VERIFY,
+            EXECUTOR_LANE_CLAUDE_VERIFY,
             subject_id,
             RELATION_VERIFIES,
         ),
@@ -14532,20 +14616,74 @@ def _verifier_respawn_unchanged(conn: sqlite3.Connection, subject_id: str) -> bo
     return True
 
 
+def _subject_implemented_on_claude(conn: sqlite3.Connection, subject_id: str) -> bool:
+    """True when *subject_id* (or its still-open implementation child) ran on
+    :data:`EXECUTOR_LANE_CLAUDE`.
+
+    A ``claude_verify`` verdict cannot be independent of Claude-implemented
+    work, so the default-lane selection in
+    :func:`_ensure_independent_verifier_child` checks this before honouring
+    ``claude_verify``. The common case is direct: the subject card itself
+    carries ``executor_lane == EXECUTOR_LANE_CLAUDE``. The repair-leg case is
+    indirect: the subject is a governance wrapper (e.g. the card a
+    ``RELATION_REPAIRS`` edge points at) whose actual implementation happened
+    on a still-open direct child instead of the wrapper card. Only an open
+    child counts — a child that has already reached a terminal state
+    (``done``/``archived``, or any ``terminal_disposition``) already went
+    through its own independent verification and is not what is "currently
+    being verified" here.
+    """
+    row = conn.execute(
+        "SELECT executor_lane FROM tasks WHERE id = ?", (subject_id,),
+    ).fetchone()
+    if row is not None and row["executor_lane"] == EXECUTOR_LANE_CLAUDE:
+        return True
+    children = conn.execute(
+        "SELECT c.executor_lane AS executor_lane, c.status AS status, "
+        "c.terminal_disposition AS terminal_disposition "
+        "FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ?",
+        (subject_id,),
+    ).fetchall()
+    for child in children:
+        if (
+            child["executor_lane"] == EXECUTOR_LANE_CLAUDE
+            and child["status"] not in ("done", "archived")
+            and child["terminal_disposition"] is None
+        ):
+            return True
+    return False
+
+
 def _ensure_independent_verifier_child(
-    conn: sqlite3.Connection, subject_id: str, *, implementer: Optional[str]
+    conn: sqlite3.Connection, subject_id: str, *, implementer: Optional[str],
+    preferred_lane: Optional[str] = None,
 ) -> Optional[str]:
     """Open the independent verification route for a parked Gauntlet subject.
 
     Returns the verifier child's id — the pre-existing one when there is one,
-    otherwise a newly created ``codex_verify`` card parented to the subject.
+    otherwise a newly created verifier card parented to the subject, on
+    ``preferred_lane`` (any lane in :data:`INDEPENDENT_VERIFIER_LANES`).
 
-    The child is created through the sanctioned ``assignee='atlas'`` shorthand
-    so :func:`_normalize_shorthand_lane` installs the (``default``,
-    ``codex_verify``) carrier pair exactly as every other lane write does, and
-    it inherits the dependency carve-out in ``_EVIDENCE_READY_PARENT_SQL``: it
-    becomes claimable off the subject's evidence packet rather than waiting for
-    the subject to reach ``done``, which it never can without this verdict.
+    ``preferred_lane`` defaults to :data:`DEFAULT_INDEPENDENT_VERIFIER_LANE`
+    (``claude_verify`` — Christopher's 2026-10-25 authorization, t_ab80ef2a:
+    Claude is the default independent verifier, Codex the deterministic
+    fallback). It is forced to ``codex_verify`` regardless of the caller's
+    request whenever a Claude verifier could not be independent of the work
+    under verification: the subject (or its still-open implementation child)
+    was itself implemented on ``EXECUTOR_LANE_CLAUDE``. An explicit "ask
+    Atlas" request (``preferred_lane=EXECUTOR_LANE_CODEX_VERIFY``, e.g. from
+    ``reviewer='atlas'``) is honoured as-is; it was already codex_verify
+    before this lane became configurable and continues unchanged.
+
+    The child is created directly on the chosen lane via ``create_task``'s
+    ``executor_lane`` parameter (NOT the ``assignee='atlas'`` shorthand,
+    which only ever resolves to ``codex_verify``), carried on the
+    ``default`` profile exactly as every other direct-executor-lane write.
+    It inherits the dependency carve-out in ``_EVIDENCE_READY_PARENT_SQL``
+    (keyed on the shared ``INDEPENDENT_VERIFIER_LANES`` set): it becomes
+    claimable off the subject's evidence packet rather than waiting for the
+    subject to reach ``done``, which it never can without this verdict.
     Its PASS/FAIL then returns through :func:`_return_verifier_verdict_to_subjects`.
 
     Best-effort by construction, and called post-commit: the review handoff it
@@ -14572,6 +14710,18 @@ def _ensure_independent_verifier_child(
     durable evidence changes what "falsifiable" means for delegation cards,
     and that is a governance decision, not a code bypass.
     """
+    lane = preferred_lane or DEFAULT_INDEPENDENT_VERIFIER_LANE
+    if lane not in INDEPENDENT_VERIFIER_LANES:
+        lane = DEFAULT_INDEPENDENT_VERIFIER_LANE
+    # A Claude verifier cannot be independent of Claude-implemented work. If
+    # the subject itself (or its still-open implementation child, for the
+    # repair-leg case where the subject card is a governance wrapper) was
+    # implemented on EXECUTOR_LANE_CLAUDE, force the deterministic Codex
+    # fallback regardless of what the caller asked for.
+    if lane == EXECUTOR_LANE_CLAUDE_VERIFY and _subject_implemented_on_claude(
+        conn, subject_id,
+    ):
+        lane = EXECUTOR_LANE_CODEX_VERIFY
     # Same board-scoped policy as worker and review admission. In advisory mode
     # the count remains visible but does not prevent independent verification.
     reached, _attempts, _limit, _root = _objective_attempt_ceiling_reached(conn, subject_id)
@@ -14614,6 +14764,25 @@ def _ensure_independent_verifier_child(
                         "gauntlet_runtime_inherited",
                         {
                             "max_runtime_seconds": MANDATORY_OBSERVATION_INTERVAL_SECONDS,
+                            "subject": subject_id,
+                        },
+                    )
+        if preferred_lane == EXECUTOR_LANE_CODEX_VERIFY:
+            # An explicit "ask Atlas" request names the Codex lane: an unclaimed
+            # default-lane (Claude) child is retargeted, never reused as-is.
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET executor_lane = ? WHERE id = ? "
+                    "AND executor_lane = ? AND status IN ('todo', 'ready')",
+                    (EXECUTOR_LANE_CODEX_VERIFY, existing, EXECUTOR_LANE_CLAUDE_VERIFY),
+                )
+                if cur.rowcount:
+                    _append_event(
+                        conn, existing, "verifier_lane_retargeted",
+                        {
+                            "from": EXECUTOR_LANE_CLAUDE_VERIFY,
+                            "to": EXECUTOR_LANE_CODEX_VERIFY,
+                            "reason": "explicit_atlas_request",
                             "subject": subject_id,
                         },
                     )
@@ -14758,7 +14927,14 @@ def _ensure_independent_verifier_child(
                 f"on its own anchored line; the verdict is returned automatically."
                 f"{regression_brief}"
             ),
-            assignee="atlas",
+            # Created directly on the chosen lane (see function docstring):
+            # NOT the assignee="atlas" shorthand, which _normalize_shorthand_lane
+            # only ever maps to EXECUTOR_LANE_CODEX_VERIFY. Passing executor_lane
+            # explicitly lets `lane` (claude_verify or codex_verify, resolved
+            # above) actually take effect; assignee="default" is the spawnable
+            # carrier every direct-executor lane rides.
+            assignee="default",
+            executor_lane=lane,
             parents=[subject_id],
             created_by="kanban:request_review",
             # The verification gate creates this card, never a person. The env
@@ -14784,7 +14960,7 @@ def _ensure_independent_verifier_child(
         with write_txn(conn):
             _append_event(
                 conn, subject_id, "independent_verifier_child_failed",
-                {"error": str(exc)[:500], "lane": EXECUTOR_LANE_CODEX_VERIFY},
+                {"error": str(exc)[:500], "lane": lane},
             )
         return None
     try:
@@ -14804,11 +14980,96 @@ def _ensure_independent_verifier_child(
             conn, subject_id, "independent_verifier_child_created",
             {
                 "verifier_task": child_id,
-                "lane": EXECUTOR_LANE_CODEX_VERIFY,
+                "lane": lane,
                 "implementer": implementer,
             },
         )
     return child_id
+
+
+def swap_verifier_lane_once(
+    conn: sqlite3.Connection, verifier_task_id: str, *, reason: str,
+) -> Optional[str]:
+    """Deterministically swap one usage/rate-limited verifier to the other lane.
+
+    Christopher's 2026-10-25 authorization (t_ab80ef2a): a ``claude_verify``
+    attempt that hits a usage/rate limit falls back to ``codex_verify`` once,
+    automatically -- and the reverse when Codex is the one that is
+    unavailable. This is a deterministic, mechanical swap (one new sibling
+    verifier card, never an LLM retry/judgment call) so the behaviour is the
+    same every time regardless of which model is reasoning about it.
+
+    Only swaps a card that is still open and has not already been swapped
+    once. The "once" scope is the SUBJECT's whole fallback chain, not just
+    this one verifier card: a durable ``verifier_lane_swap_dispatched`` event
+    on the subject is the record that a fallback already happened somewhere
+    in this chain, so a second capacity failure -- whether it recurs on the
+    original card or lands on the sibling it already swapped to -- declines
+    instead of swapping back and forth indefinitely. Returns the new sibling
+    verifier task id, or ``None`` if no swap happened (already swapped
+    anywhere in the chain, unknown lane, or the subject link is gone).
+    """
+    row = conn.execute(
+        "SELECT executor_lane, status FROM tasks WHERE id = ?",
+        (verifier_task_id,),
+    ).fetchone()
+    if row is None or row["executor_lane"] not in INDEPENDENT_VERIFIER_LANES:
+        return None
+    from_lane = row["executor_lane"]
+    to_lane = (
+        EXECUTOR_LANE_CODEX_VERIFY
+        if from_lane == EXECUTOR_LANE_CLAUDE_VERIFY
+        else EXECUTOR_LANE_CLAUDE_VERIFY
+    )
+    subjects = verifier_subject_ids(conn, verifier_task_id)
+    if not subjects:
+        return None
+    # Chain-wide guard: once ANY verifier card for this subject has
+    # dispatched a fallback sibling, decline every further swap attempt for
+    # the subject, regardless of which card (original or sibling) hit the
+    # next capacity failure. This is what makes the fallback a single
+    # one-shot per subject rather than a per-card allowance that can
+    # alternate Claude<->Codex indefinitely.
+    already_swapped_in_chain = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'verifier_lane_swap_dispatched' LIMIT 1",
+        (subjects[0],),
+    ).fetchone()
+    if already_swapped_in_chain is not None:
+        return None
+    implementer = None
+    try:
+        implementer = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (subjects[0],),
+        ).fetchone()
+        implementer = implementer["assignee"] if implementer else None
+    except Exception:  # pragma: no cover - defensive
+        implementer = None
+    with write_txn(conn):
+        if conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status NOT IN "
+            "('done', 'archived')",
+            (verifier_task_id,),
+        ).rowcount:
+            _append_event(
+                conn, verifier_task_id, "verifier_lane_swapped",
+                {"from_lane": from_lane, "to_lane": to_lane, "reason": reason[:500]},
+            )
+    new_child = _ensure_independent_verifier_child(
+        conn, subjects[0], implementer=implementer, preferred_lane=to_lane,
+    )
+    with write_txn(conn):
+        _append_event(
+            conn, subjects[0], "verifier_lane_swap_dispatched",
+            {
+                "previous_verifier": verifier_task_id,
+                "from_lane": from_lane,
+                "to_lane": to_lane,
+                "new_verifier": new_child,
+                "reason": reason[:500],
+            },
+        )
+    return new_child
 
 
 # An independent verifier reports its verdict in prose; the subject task needs
@@ -15121,17 +15382,18 @@ def _return_verifier_verdict_to_subjects(
         row = conn.execute(
             "SELECT executor_lane FROM tasks WHERE id = ?", (verifier_task_id,),
         ).fetchone()
-        if row is None or row["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY:
+        if row is None or row["executor_lane"] not in INDEPENDENT_VERIFIER_LANES:
             return
+        lane = row["executor_lane"]
         subjects = verifier_subject_ids(conn, verifier_task_id)
         if not subjects:
             return
         verdict = _parse_verifier_verdict(summary, result)
-        verifier_identity = f"{EXECUTOR_LANE_CODEX_VERIFY}:{verifier_task_id}"
+        verifier_identity = f"{lane}:{verifier_task_id}"
         # The lane label is not proof the lane ran: on 2026-09-14 (run 2817) an
         # unscoped agent claimed a codex_verify card. Only a completing run the
-        # codex_verify launcher attested may return a verdict.
-        attested_run = _attested_codex_verifier_run(conn, verifier_task_id)
+        # task's own independent-verifier lane attested may return a verdict.
+        attested_run = _attested_verifier_run(conn, verifier_task_id, lane)
         for subject_id in subjects:
             srow = conn.execute(
                 "SELECT status, verification_state, title, body FROM tasks WHERE id = ?",
@@ -16716,7 +16978,7 @@ def complete_task(
         ).fetchone()
         if (
             arow is not None
-            and arow["executor_lane"] != EXECUTOR_LANE_CODEX_VERIFY
+            and arow["executor_lane"] not in INDEPENDENT_VERIFIER_LANES
             and arow["verification_state"] != VERIFICATION_VERIFIED
             and _review_run_verification(conn, task_id)[0] is None
         ):
@@ -18358,7 +18620,7 @@ def _qualifying_review_evidence(
         and upstream_row["terminal_disposition"] == DISPOSITION_COMPLETED
         and upstream_verifier is not None
         and upstream_verifier["status"] in ("done", "archived")
-        and upstream_verifier["executor_lane"] == EXECUTOR_LANE_CODEX_VERIFY
+        and upstream_verifier["executor_lane"] in INDEPENDENT_VERIFIER_LANES
         and impl_row is not None
         and impl_row["executor_lane"] == EXECUTOR_LANE_CLAUDE
         and bool(impl_row["gauntlet_enforced"])
@@ -18773,6 +19035,14 @@ def request_review(
                 conflict_identity, conflict_source = implementer or effective, "explicit_codex_lane"
             child_id = _ensure_independent_verifier_child(
                 conn, task_id, implementer=implementer,
+                # An explicit reviewer='atlas' request names the Codex lane
+                # specifically (acceptance: "ask Atlas" still routes to
+                # codex_verify/atlas exactly as now). A plain conflict-based
+                # route (no explicit lane named) falls through to the
+                # function's own default-lane resolution.
+                preferred_lane=(
+                    EXECUTOR_LANE_CODEX_VERIFY if requested_independent_lane else None
+                ),
             )
             with write_txn(conn):
                 _emit_once_this_phase(

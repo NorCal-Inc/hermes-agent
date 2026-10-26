@@ -149,7 +149,7 @@ def test_automatic_card_requires_independent_verdict_and_fail_returns_repair(iso
         assert verifier_run is not None
         with kb.write_txn(conn):
             kb._append_event(
-                conn, verifier, "codex_verifier_started", {"executor": "codex"},
+                conn, verifier, kb._attest_kind(conn, verifier), {"executor": "codex"},
                 run_id=verifier_run.current_run_id,
             )
         assert kb.complete_task(

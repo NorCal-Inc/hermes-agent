@@ -225,7 +225,7 @@ class TestRoutingAtHandoff:
             # subject's evidence packet rather than waiting for a 'done' parent
             # the subject cannot reach without this verdict.
             child = kb.get_task(conn, cid)
-            assert child.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert child.executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             assert child.assignee == "default"
             assert kb.parent_ids(conn, cid) == [tid]
             assert child.status == "ready"
@@ -646,7 +646,7 @@ def _attest_codex_lane_run(conn, verifier_id, run_id):
     run without it are not attributable to the lane (2026-09-14, run 2817)."""
     with kb.write_txn(conn):
         kb._append_event(
-            conn, verifier_id, "codex_verifier_started", {"executor": "codex"},
+            conn, verifier_id, kb._attest_kind(conn, verifier_id), {"executor": "codex"},
             run_id=run_id,
         )
 
@@ -684,7 +684,7 @@ class TestVerifiedReplayFinalization:
                 conn, subject, "verifier fixture run without a verdict line",
             )
             ok, detail = kb.record_verification(
-                conn, subject, passed=True, verifier=f"codex_verify:{verifier}",
+                conn, subject, passed=True, verifier=f"{kb.DEFAULT_INDEPENDENT_VERIFIER_LANE}:{verifier}",
                 evidence={"source": "restart-boundary-fixture"},
                 route_on_failure=False,
             )
@@ -730,7 +730,7 @@ class TestIndependentVerifierReturnPath:
                 "AND state = ? ORDER BY id DESC LIMIT 1",
                 (tid, kb.VERIFICATION_VERIFIED),
             ).fetchone()
-            assert row["verifier"] == f"{kb.EXECUTOR_LANE_CODEX_VERIFY}:{cid}"
+            assert row["verifier"] == f"{kb.DEFAULT_INDEPENDENT_VERIFIER_LANE}:{cid}"
             assert row["verifier"] != "default"
 
     def test_control_plane_pass_requires_explicit_acceptance_confirmation(
@@ -1013,7 +1013,7 @@ class TestRefusedClaimOpensTheRoute:
             assert cid is not None
 
             child = kb.get_task(conn, cid)
-            assert child.executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert child.executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             assert kb.parent_ids(conn, cid) == [tid]
             # actionable on this tick, not merely recorded
             assert child.status == "ready"
@@ -1653,7 +1653,7 @@ class TestInstalledSelfReviewerIsNotSelected:
             cid = kb._open_verifier_child(conn, tid)
             assert cid is not None
             assert required[0][1]["verifier_task"] == cid
-            assert kb.get_task(conn, cid).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.get_task(conn, cid).executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
 
     def test_an_independent_installed_reviewer_is_still_selected(self, kanban_home):
         """Control: the exemption still serves a reviewer who is not the implementer."""
@@ -1793,7 +1793,7 @@ class TestVerifierChildReuseIntegrity:
 
             fresh = kb._open_verifier_child(conn, subject)
             assert fresh is not None and fresh != invalid
-            assert kb.get_task(conn, fresh).executor_lane == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert kb.get_task(conn, fresh).executor_lane == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             assert kb.verifier_subject_ids(conn, fresh) == [subject]
             assert kb.missing_verifier_linkage(conn, fresh) == []
             assert conn.execute(

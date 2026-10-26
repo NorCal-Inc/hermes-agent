@@ -627,8 +627,19 @@ class TestVerifierIdentityStatus:
         assert status == kb.VERIFIER_IDENTITY_UNCHECKED
         assert "registry offline" in detail
 
-    def test_only_the_independent_verification_lane_may_sign(self):
-        """Implementation and recovery lanes are never verifier identities."""
-        assert kb.VERIFIER_LANE_IDENTITIES == frozenset({kb.EXECUTOR_LANE_CODEX_VERIFY})
+    def test_only_the_independent_verification_lanes_may_sign(self):
+        """Implementation and recovery lanes are never verifier identities.
+
+        2026-10-25 (t_ab80ef2a, Christopher's authorization): Claude became a
+        second independent-verifier lane alongside Codex, so the exact set
+        this test pins now has two members instead of one. The invariant the
+        test name describes is unchanged -- only INDEPENDENT_VERIFIER_LANES
+        members may ever sign a verdict; the implementation lane (``claude``)
+        and the recovery lane (``claude_recovery``) still never do.
+        """
+        assert kb.VERIFIER_LANE_IDENTITIES == kb.INDEPENDENT_VERIFIER_LANES
+        assert kb.VERIFIER_LANE_IDENTITIES == frozenset(
+            {kb.EXECUTOR_LANE_CODEX_VERIFY, kb.EXECUTOR_LANE_CLAUDE_VERIFY}
+        )
         assert kb.EXECUTOR_LANE_CLAUDE not in kb.VERIFIER_LANE_IDENTITIES
         assert kb.EXECUTOR_LANE_CLAUDE_RECOVERY not in kb.VERIFIER_LANE_IDENTITIES

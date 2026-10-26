@@ -138,7 +138,7 @@ def _attest_orphan_verifier_run(conn, tid, *, started_at, ended_at):
             (tid, started_at, ended_at),
         )
         kb._append_event(
-            conn, tid, "codex_verifier_started", {"executor": "codex"},
+            conn, tid, kb._attest_kind(conn, tid), {"executor": "codex"},
             run_id=cur.lastrowid,
         )
 
@@ -987,7 +987,7 @@ class TestStaleDispositionActuator:
                 "FROM tasks WHERE id = ?",
                 (verifier,),
             ).fetchone()
-            assert vrow["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert vrow["executor_lane"] == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             assert bool(vrow["gauntlet_enforced"]) is True
             assert vrow["max_runtime_seconds"] == 300
             assert vrow["status"] in ("ready", "todo")

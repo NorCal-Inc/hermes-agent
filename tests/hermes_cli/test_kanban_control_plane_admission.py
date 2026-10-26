@@ -174,7 +174,7 @@ class TestControlPlaneAdmission:
             assert row["control_plane_authority"] == (
                 f"operator:human-interactive-parent:{tid}"
             )
-            assert row["executor_lane"] == kb.EXECUTOR_LANE_CODEX_VERIFY
+            assert row["executor_lane"] == kb.DEFAULT_INDEPENDENT_VERIFIER_LANE
             failed = conn.execute(
                 "SELECT COUNT(*) FROM task_events "
                 "WHERE task_id=? AND kind='independent_verifier_child_failed'",

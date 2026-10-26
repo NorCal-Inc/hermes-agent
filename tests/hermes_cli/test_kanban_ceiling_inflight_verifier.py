@@ -80,7 +80,7 @@ class Board:
         return [r[0] for r in self.conn.execute(
             "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
             "WHERE l.parent_id = ? AND c.executor_lane = ? AND c.status = 'running'",
-            (subject, kb.EXECUTOR_LANE_CODEX_VERIFY))]
+            (subject, kb.DEFAULT_INDEPENDENT_VERIFIER_LANE))]
 
     # --- worker-side actions -------------------------------------------------------------
 
@@ -102,7 +102,7 @@ class Board:
         task = self.task(child)
         assert task.status == "running"
         with kb.write_txn(self.conn):             # what the codex_verify launcher records on start
-            kb._append_event(self.conn, child, "codex_verifier_started", {"executor": "codex"},
+            kb._append_event(self.conn, child, kb._attest_kind(self.conn, child), {"executor": "codex"},
                              run_id=task.current_run_id)
         return task.current_run_id
 
