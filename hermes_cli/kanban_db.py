@@ -319,6 +319,11 @@ LESSON_MAX_CHARS = 4000
 # ``archived`` are terminal and never flagged.
 GAUNTLET_STALE_STATUSES = ("review", "ready", "todo", "blocked")
 
+# Block reason a worker uses while parked on the yt_source delivery queue.
+# Such a wait is neither a loop (block_task) nor stale work (gauntlet scan);
+# the workstation agent heartbeat and yt_source deliver/fail own its liveness.
+YT_SOURCE_WAIT_PREFIX = "waiting for yt_source delivery of "
+
 # The audit event this scan emits. One per stale episode/window.
 GAUNTLET_STALE_EVENT = "gauntlet_stale"
 
@@ -18517,6 +18522,12 @@ def block_task(
         # a subject awaiting verification into triage, where nothing resumes it.
         if (event_payload_extra or {}).get("failure_class") == "infrastructure":
             recurrences = prev_recurrences
+        # A worker parked on the yt_source delivery queue re-blocks after each
+        # failed capture + re-request. Each is a fresh wait on an external
+        # queue, not the same loop; counting it sent t_56f5852d to triage on
+        # 2026-10-26 with the transcript arriving 1 minute later.
+        if (reason or "").startswith(YT_SOURCE_WAIT_PREFIX):
+            recurrences = prev_recurrences
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -24029,6 +24040,16 @@ def detect_stale_gauntlet_work(
             continue
 
         status = str(row["status"])
+        if status == "blocked" and last_event_kind == "blocked":
+            try:
+                _p = json.loads(conn.execute(
+                    "SELECT payload FROM task_events WHERE id = ?",
+                    (last_event_id,),
+                ).fetchone()["payload"] or "{}")
+            except Exception:
+                _p = {}
+            if str(_p.get("reason") or "").startswith(YT_SOURCE_WAIT_PREFIX):
+                continue
         verification_state = row["verification_state"]
         regression_required = bool(row["regression_required"])
         reasons = _gauntlet_stale_reasons(
