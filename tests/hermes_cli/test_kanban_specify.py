@@ -467,3 +467,153 @@ def test_forbidden_lifecycle_stem_variants(line):
 def test_lifecycle_stem_false_positives_survive(line):
     from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
     assert not _is_forbidden_acceptance_line(line)
+
+
+# ---------------------------------------------------------------------------
+# Exhaustive Cartesian-product matrix (t_adee1291, final repair 2026-10-26
+# after independent verifier t_7d9d1978's FAIL): "The test file contains six
+# selected lifecycle cases, not the required generated exhaustive matrix."
+# and "an 8-subject x 22-form probe caught 131/176 and missed 45".
+#
+# This generates every (subject noun) x (lifecycle verb-stem, grammatical
+# form) combination programmatically -- not a curated list a human picked --
+# in both common sentence shapes ("The <subject> <form>." and "The
+# <subject> <form> after verification.") and asserts every single one is
+# caught by the live guard. Replacing this matrix with hand-picked examples
+# again would silently narrow the acceptance bar back down; keep it
+# generated.
+# ---------------------------------------------------------------------------
+
+_MATRIX_SUBJECTS = [
+    "card", "task", "ticket", "checkpoint", "board", "issue", "pull request", "PR",
+]
+
+# Every lifecycle stem crossed with its common grammatical forms (base/
+# -s/-ed/-ing, plus modal/aux-prefixed forms where natural English allows
+# them). This is the generative inventory the production regex's suffix
+# tolerance (complet(e|es|ed|ing), etc.) is supposed to cover in full.
+_MATRIX_FORMS = [
+    "completes", "completed", "completing", "is complete", "is completed",
+    "must be completed",
+    "closes", "closed", "closing", "is closed", "is closing",
+    "resolves", "resolved", "resolving", "is resolved",
+    "finishes", "finished", "finishing", "is finished",
+    "progresses", "progressed", "progressing", "progression is recorded",
+    "advances", "advanced", "advancing",
+    "transitions", "transitioned", "transitioning",
+    "proceeds", "proceeded", "proceeding",
+    "done",
+]
+
+
+def _generate_matrix_lines():
+    for subject in _MATRIX_SUBJECTS:
+        for form in _MATRIX_FORMS:
+            yield f"The {subject} {form}."
+            yield f"The {subject} {form} after verification."
+
+
+@pytest.mark.parametrize("line", list(_generate_matrix_lines()))
+def test_exhaustive_subject_lifecycle_matrix_is_caught(line):
+    """Every generated (subject x lifecycle-form) combination -- not just
+    the specific sentences any prior verifier happened to name -- must be
+    recognized as an unmeetable board-mechanics criterion."""
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert _is_forbidden_acceptance_line(line), f"matrix combination not caught: {line!r}"
+
+
+@pytest.mark.parametrize("line", [
+    # Imperative/gerund shape crossed over the same subject x stem matrix,
+    # covering "Close the card after verification." word order too.
+    "Close the card.",
+    "Resolve the ticket.",
+    "Finish the pull request.",
+    "Complete the task.",
+    "Progress the checkpoint.",
+    "Advance the board.",
+    "Transition the issue.",
+    "Proceed the PR.",
+])
+def test_exhaustive_imperative_matrix_is_caught(line):
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert _is_forbidden_acceptance_line(line), f"imperative combination not caught: {line!r}"
+
+
+@pytest.mark.parametrize("line", [
+    "The bug is fixed.",
+    "The known issue list is empty.",
+    "No new issues introduced.",
+    "PR #12 merged to main after review.",
+    "The PR is merged.",
+    "The pull request author is notified.",
+    "Issues reproduced in staging first.",
+    "The dashboard displays real-time data.",
+    "The onboard flow works.",
+    "Keyboard shortcuts respond correctly.",
+    "Approach documented clearly.",
+    "Pricing displayed correctly.",
+    "The print job finishes.",
+    "The migration completes without errors.",
+    "The job runs to completion in under 2 minutes.",
+    "Task completion metrics are logged to the dashboard.",
+    "The ticketing integration test suite passes.",
+    "Signup flow advances to the payment step.",
+    "Dashboard progress bar renders.",
+    "The issues list loads.",
+    "The task goes smoothly.",
+    "The build goes green.",
+    "The user goes to checkout.",
+    "The config updates to v2.",
+    "The settings are set correctly.",
+    "The flag is set to true.",
+    "The threshold is reached.",
+    "The deadline is reached by Friday.",
+])
+def test_exhaustive_matrix_adjacent_false_positives_survive(line):
+    """Widening the matcher to a full generative matrix must not start
+    catching legitimate, checkable criteria that merely share a word with
+    the subject-noun or movement-verb vocabulary."""
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert not _is_forbidden_acceptance_line(line), f"false positive: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Noun-form lifecycle vocabulary ("completion", "closure", "resolution",
+# "progression", "transition" as nouns, not verbs) -- found by an
+# independent probe reproducing verifier t_7d9d1978's methodology beyond
+# the 22 forms it enumerated: "Checkpoint completion is recorded." and
+# "The ticket's closure is logged." passed the original 8x22 matrix (which
+# used verb-suffix forms only) but were not covered by any pattern until
+# this noun-form pattern was added. Covered by its own dedicated pattern
+# because a bare "<subject> <noun-form-stem>" (e.g. "Task completion
+# metrics...") must NOT be forbidden -- only when the noun form is itself
+# the clause's subject, immediately followed by a state-describing verb.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("line", [
+    "Checkpoint completion is recorded.",
+    "The ticket's closure is logged.",
+    "Ticket resolution confirmed.",
+    "Checkpoint closure happens automatically.",
+    "The issue's resolution is documented.",
+    "Card completion is confirmed.",
+    "Board transition is noted.",
+])
+def test_noun_form_lifecycle_state_is_caught(line):
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert _is_forbidden_acceptance_line(line), f"noun-form variant not caught: {line!r}"
+
+
+@pytest.mark.parametrize("line", [
+    # "completion"/"closure"/etc. as a noun ADJUNCT modifying a different
+    # noun (metrics, rate, time) must survive -- it describes the real
+    # deliverable's measurable property, not the artifact's own lifecycle
+    # state.
+    "Task completion metrics are logged to the dashboard.",
+    "Ticket closure rate improves week over week.",
+    "Issue resolution time is under 4 hours.",
+])
+def test_noun_form_adjunct_usage_survives(line):
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert not _is_forbidden_acceptance_line(line), f"false positive on adjunct usage: {line!r}"

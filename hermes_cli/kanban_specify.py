@@ -147,92 +147,134 @@ _SECTION_HEADING_RE = re.compile(r"^\s*\*\*(.+?)\*\*\s*:?\s*$")
 # criterion describing the act of marking the card/task/ticket done, or the
 # checkpoint advancing, is unmeetable and gets stripped.
 #
-# Subject-noun vocabulary for the board-artifact itself (as opposed to the
-# real-world deliverable the artifact tracks). Matched with \b...\b so
-# generic prose is never caught: "dashboard"/"keyboard"/"aboard" don't
-# contain a word-bounded "board", and plural "issues" doesn't contain a
-# word-bounded "issue" (the trailing "s" blocks the boundary). Concept-based
-# by design (subject noun x lifecycle verb) rather than a growing literal
-# phrase list -- per Christopher/Erika direction 2026-10-26 after two
-# whack-a-mole repair cycles, and widened to cover "board", "issue", "pull
-# request" and "PR" after verifier t_df958275 found those four subjects
-# missing from the original card|task|ticket-only set.
-_SUBJECT_NOUNS = r"(?:card|task|ticket|board|issue|pull request|PR)"
+# ---------------------------------------------------------------------------
+# True Cartesian-product matcher (t_adee1291, final repair 2026-10-26 after
+# five whack-a-mole verifier cycles each closing only the specific
+# sentences a verifier happened to name). Per Christopher/Erika direction:
+# this must be ONE matcher built from an exhaustive subject-noun x
+# lifecycle-verb-stem cross product with grammatical-suffix tolerance, not
+# another curated sentence list. Verifier t_7d9d1978's final FAIL named 45
+# of 176 probed combinations as unmatched -- all traceable to specific
+# grammatical forms (bare gerund "completing"/"closing"/"resolving"/
+# "finishing" with no "is"/modal in front, and "progression is recorded"
+# word-order) that the old per-pattern approach never generalized across.
+#
+# Design:
+#   SUBJECT_NOUNS: the board-artifact itself, never the real deliverable.
+#     card | task | ticket | checkpoint | board | issue | pull request | PR
+#     Matched with \b...\b so "dashboard"/"keyboard"/"onboard" and plural
+#     "issues" never match the bare noun.
+#   LIFECYCLE_VERB_STEM: every grammatical form (base/-s/-ed/-ing, plus the
+#     bare adjective "done") of every lifecycle stem, via suffix-tolerant
+#     regex groups instead of enumerating full words per form:
+#     complet-, clos-, resolv-, finish-, progress-, advanc-, transition-,
+#     proceed-, increment-, done.
+#   GLUE: a bounded whitelist of connector words (modal/aux/adverb/
+#     determiner/"after X"/"once X") that may sit between subject and verb
+#     in either order, so a verifier cannot find a new adjacency variant --
+#     "<subject> GLUE? <stem>" and "<stem> GLUE? <subject>" both fire,
+#     covering "The task must be completed." and "Close the card after
+#     verification." with the same two regexes.
+#   Movement-to-terminal-state: "move/go/update" are only forbidden when
+#     paired with BOTH a subject noun AND a terminal-state word (done,
+#     complete[d], closed, resolved, finished, forward, ahead, "to the
+#     next") in the same line -- catches "The PR moves to done." and "Move
+#     the checkpoint forward." without flagging ordinary prose like "The
+#     task goes smoothly." or "The config updates to v2." which contain the
+#     verb but no terminal-state word.
+#
+# This generalizes by construction: any future subject noun or stem added
+# to the two sets is automatically crossed against the other set and both
+# word orders, with every grammatical suffix already tolerated -- there is
+# no per-sentence-shape pattern left to miss a verifier can find by trying
+# a new tense or word order on an already-covered subject/stem pair.
+_SUBJECT_NOUNS = r"(?:card|task|ticket|checkpoint|board|issue|pull request|PR)"
+
+_LIFECYCLE_VERB_STEM = (
+    r"(?:"
+    r"complet(?:e|es|ed|ing)|"
+    r"clos(?:e|es|ed|ing)|"
+    r"resolv(?:e|es|ed|ing)|"
+    r"finish(?:|es|ed|ing)|"
+    r"progress\w*|"
+    r"advanc\w*|"
+    r"transition\w*|"
+    r"proceed\w*|"
+    r"increment\w*|"
+    r"done"
+    r")"
+)
+
+_TERMINAL_STATE = (
+    r"(?:done|complete[d]?|closed?|resolved?|finished|forward|ahead|on|to\s+the\s+next)"
+)
+
+_GLUE = (
+    r"(?:\s+(?:must|should|shall|will|can|is|are|be|been|being|get|gets|then|also|"
+    r"finally|successfully|automatically|has|have|had|as|the|a|status|state|lifecycle|"
+    r"out|this|that|its|each|after\s+\w+|once\s+\w+)\b){0,6}"
+)
+
+# Verbs describing externally-driven state transitions of the artifact:
+# moving/going/updating it, or someone marking/flagging/setting/reaching
+# it into a terminal state. These only fire when paired with BOTH a
+# subject noun AND a terminal-state word in the same line (see the two
+# patterns below), so ordinary prose like "the task goes smoothly" or "the
+# deadline is reached" never matches on its own.
+_MOVE_VERB = (
+    r"(?:mov(?:e|es|ed|ing)|go(?:es|ing)?|updat(?:e|es|ed|ing)|"
+    r"mark(?:ed|ing|s)?|flag(?:ged|ging|s)?|reach(?:es|ed|ing)?|sets?)"
+)
+
+# Noun forms of the lifecycle stems ("Checkpoint completion is recorded.",
+# "The ticket's closure is logged.") -- only forbidden when the noun form
+# is immediately followed by a state-describing verb (is/are/happens/
+# confirmed/documented/recorded/logged/...), so a noun-adjunct modifier
+# before an unrelated noun ("Task completion metrics are logged to the
+# dashboard.") still survives: "completion" there modifies "metrics", not
+# the subject's own state.
+_NOUN_FORM_STEM = r"(?:completion|closure|resolution|progression|transition)"
+_NOUN_FORM_STATE_VERB = (
+    r"(?:is|are|was|were|happens?|occurs?|confirmed|documented|recorded|logged|noted)"
+)
 
 _FORBIDDEN_ACCEPTANCE_LINE_PATTERNS = [
+    # <subject> GLUE? <lifecycle stem>  e.g. "The task must be completed.",
+    # "Card done.", "The checkpoint progresses.", "The PR advanced after
+    # review.", "Checkpoint progression is recorded."
     re.compile(
-        r"\b" + _SUBJECT_NOUNS + r"\b[^\n]{0,40}\b(marked|flagged|set)\b[^\n]{0,20}\b(done|complete[d]?)\b",
+        r"\b" + _SUBJECT_NOUNS + r"\b" + _GLUE + r"\s*\b" + _LIFECYCLE_VERB_STEM + r"\b",
         re.IGNORECASE,
     ),
+    # <lifecycle stem> GLUE? <subject>  e.g. "Close the card after
+    # verification.", "Resolve the ticket.", "Finish the pull request after
+    # review.", "Progress the checkpoint."
     re.compile(
-        r"\b(mark|marking)\b[^\n]{0,40}\b" + _SUBJECT_NOUNS + r"\b[^\n]{0,20}\b(done|complete[d]?)\b",
+        r"\b" + _LIFECYCLE_VERB_STEM + r"\b" + _GLUE + r"\s*\b" + _SUBJECT_NOUNS + r"\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\bcheckpoint\b[^\n]{0,40}\badvance", re.IGNORECASE),
-    re.compile(r"\badvance[sd]?\b[^\n]{0,40}\bcheckpoint\b", re.IGNORECASE),
-    # "<subject> reaches/moves to/transitions to/advances to/becomes/goes
-    # to/is done-or-complete[d]-or-closed-or-resolved-or-finished" -- the
-    # ending set was widened beyond done/complete[d] to also catch "The
-    # board transitions to closed." (verifier t_df958275).
+    # <subject> GLUE? move/go/update GLUE? <terminal state>  e.g. "The PR
+    # moves to done.", "The board moves to done."
     re.compile(
-        r"\b" + _SUBJECT_NOUNS + r"\b[^\n]{0,40}"
-        r"\b(reaches|moves to|transitions to|advances to|becomes|goes to|is)\b"
-        r"[^\n]{0,20}\b(done|complete[d]?|closed?|resolved?|finished)\b",
+        r"\b" + _SUBJECT_NOUNS + r"\b" + _GLUE + r"\s*\b" + _MOVE_VERB + r"\b(?:\s+to)?"
+        + _GLUE + r"\s*\b" + _TERMINAL_STATE + r"\b",
         re.IGNORECASE,
     ),
-    # Direct adjacency, no connector word at all (e.g. "Task completed.",
-    # "Card done.") -- catches the LLM dropping the connector entirely,
-    # which the prior attempt's patterns all required one to be present.
+    # move/go/update GLUE? <subject> GLUE? <terminal state>  e.g. "Move the
+    # checkpoint forward."
     re.compile(
-        r"\b" + _SUBJECT_NOUNS + r"\b\s*(?:is\s+)?(?:done|complete[d]?)\b",
+        r"\b" + _MOVE_VERB + r"\b" + _GLUE + r"\s*\b" + _SUBJECT_NOUNS + r"\b" + _GLUE
+        + r"\s*\b" + _TERMINAL_STATE + r"\b",
         re.IGNORECASE,
     ),
-    # Modal / auxiliary completion: "The task must be completed.", "The
-    # ticket is closed.", "Card should be resolved.", "The issue is
-    # resolved." Only a whitelist of glue words may sit between subject and
-    # verb so ordinary criteria like "Task runner script completes in 2
-    # minutes" are not caught.
+    # <subject>('s)? ... <noun-form stem> <state verb>  e.g. "Checkpoint
+    # completion is recorded.", "The ticket's closure is logged.",
+    # "Ticket resolution confirmed." Does NOT fire on "Task completion
+    # metrics are logged to the dashboard." because "metrics" sits between
+    # the noun form and the verb there, breaking the required adjacency.
     re.compile(
-        r"\b" + _SUBJECT_NOUNS + r"\b(?:\s+(?:must|should|shall|will|can|is|are|be|been|being|"
-        r"get|gets|then|also|finally|successfully|automatically|has|have|had|as|"
-        r"marked|set|flagged|to|the|a)\b){0,6}"
-        r"\s+(?:done|complete[sd]?|closed?|closes|resolved?|resolves|finished|finishes)\b",
-        re.IGNORECASE,
-    ),
-    # Imperative / gerund close-out of the artifact: "Close the card after
-    # verification.", "Resolve this ticket.", "Complete the task.",
-    # "Finish the pull request after review." (verifier t_df958275).
-    re.compile(
-        r"\b(?:close|closing|resolve|resolving|finish|finishing|complete|completing)\b"
-        r"\s+(?:out\s+)?(?:the|this|that|a|its|each)?\s*" + _SUBJECT_NOUNS + r"\b",
-        re.IGNORECASE,
-    ),
-    # General artifact-subject x lifecycle-stem match: "The task progresses.",
-    # "The board advances.", "The issue transitions after verification.",
-    # "The pull request progression is recorded.", "The PR advanced after
-    # review." Only whitelisted glue words may sit between subject and stem.
-    re.compile(
-        r"\b" + _SUBJECT_NOUNS + r"\b(?:\s+(?:must|should|shall|will|can|is|are|be|been|being|"
-        r"get|gets|then|also|finally|successfully|automatically|has|have|had|as|"
-        r"the|a|status|state|lifecycle)\b){0,6}"
-        r"\s+(?:progress\w*|advanc\w*|transition\w*|proceed\w*|"
-        r"(?:moves?|moved|moving)\s+(?:forward|ahead|on|to\s+the\s+next))\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:progress\w*|advanc\w*|transition\w*|proceed\w*)\b\s+(?:of\s+)?(?:the|this|that|a|its|each)?\s*"
-        + _SUBJECT_NOUNS + r"\b",
-        re.IGNORECASE,
-    ),
-    # Checkpoint progress/progression: "The checkpoint progresses.",
-    # "Checkpoint progression is recorded.", "Move the checkpoint forward."
-    re.compile(
-        r"\bcheckpoint\b[^\n]{0,40}\b(?:progress\w*|moves?|moved|proceeds?|increments?|"
-        r"updates? (?:to|forward)|goes forward)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:progress\w*|moves?|moved|proceeds?|increments?)\b[^\n]{0,40}\bcheckpoint\b",
+        r"\b" + _SUBJECT_NOUNS + r"'?s?\b(?:\s+\w+){0,2}?\s*\b" + _NOUN_FORM_STEM
+        + r"\b\s*\b" + _NOUN_FORM_STATE_VERB + r"\b",
         re.IGNORECASE,
     ),
 ]
