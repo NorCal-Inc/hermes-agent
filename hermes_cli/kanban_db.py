@@ -14316,7 +14316,7 @@ def _blocked_verifier_child(
     row = conn.execute(
         "SELECT c.id FROM task_links l "
         "JOIN tasks c ON c.id = l.child_id "
-        "WHERE l.parent_id = ? AND c.executor_lane = ? "
+        "WHERE l.parent_id = ? AND c.executor_lane IN (?, ?) "
         "AND c.status = 'blocked' "
         "AND EXISTS ("
         "  SELECT 1 FROM task_relations r "
@@ -14327,6 +14327,7 @@ def _blocked_verifier_child(
         (
             subject_id,
             EXECUTOR_LANE_CODEX_VERIFY,
+            EXECUTOR_LANE_CLAUDE_VERIFY,
             subject_id,
             RELATION_VERIFIES,
         ),

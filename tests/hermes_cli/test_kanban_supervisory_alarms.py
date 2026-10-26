@@ -1061,11 +1061,11 @@ class TestStaleDispositionActuator:
             assert result["verifier_stuck_alarmed"] == [tid]
             assert result["unresolved"] == [tid]
 
-            # No new child was created.
+            # No new child was created (in either verifier lane).
             children = conn.execute(
                 "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
-                "WHERE l.parent_id = ? AND c.executor_lane = ?",
-                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+                "WHERE l.parent_id = ? AND c.executor_lane IN (?, ?)",
+                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY, kb.EXECUTOR_LANE_CLAUDE_VERIFY),
             ).fetchall()
             assert [c["id"] for c in children] == [verifier]
 
@@ -1086,8 +1086,8 @@ class TestStaleDispositionActuator:
 
             children_after = conn.execute(
                 "SELECT c.id FROM task_links l JOIN tasks c ON c.id = l.child_id "
-                "WHERE l.parent_id = ? AND c.executor_lane = ?",
-                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY),
+                "WHERE l.parent_id = ? AND c.executor_lane IN (?, ?)",
+                (tid, kb.EXECUTOR_LANE_CODEX_VERIFY, kb.EXECUTOR_LANE_CLAUDE_VERIFY),
             ).fetchall()
             assert [c["id"] for c in children_after] == [verifier]
 
