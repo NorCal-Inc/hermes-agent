@@ -74,49 +74,29 @@ browser_exec(code=<snippet above, with the real selector and secret path>)
    **separate** `browser_exec` call that does not reference the secret at
    all — keep the secret-handling call minimal and single-purpose.
 
-## Test result (dummy secret only — never a real credential)
+## Test result (dummy secrets only — never real credentials)
 
-Dummy value used: `DUMMY-9c41-not-a-secret` (23 characters). Never a real
-password; committed to a disposable one-time file and deleted immediately
-after each run, exactly as the real flow does.
+Procedure, run twice on kanban task `t_f7d75bb7` (current session):
 
-Procedure, run twice on kanban task `t_f7d75bb7` (session
-`20261026_033244_519e3c`):
-
-1. Wrote the dummy string to a one-time file in the task workspace.
+1. Generated a fresh, random dummy value inside a Python process and wrote it
+   directly to a one-time file plus a temporary witness file. The value was
+   never included in a command string, tool argument, or printed output.
 2. `browser_exec` opened a `data:` URL with a single
    `<input type="password">`, ran the snippet above, and printed the field's
    value length plus whether the one-time file still existed.
-3. Grepped this session's `state.db` (`messages` table, both `content` and
-   `tool_calls` columns, full session scope) for the literal string
-   `DUMMY-9c41` after each run.
+3. Queried this session's `state.db` (`messages` table, both `content` and
+   `tool_calls` columns, full session scope) for the unprinted random witness,
+   then deleted the witness and temporary directory.
 
-| Run | Result | File deleted after | `DUMMY-9c41` in `browser_exec` tool_call args | `DUMMY-9c41` in `browser_exec` tool result |
-|---|---|---|---|---|
-| 1 | `{'length': 23, 'file_exists_after': False}` | yes | 0 occurrences | 0 occurrences |
-| 2 | `{'length': 23, 'file_exists_after': False}` | yes | 0 occurrences | 0 occurrences |
+| Run | Result | File deleted after |
+|---|---|---|---|
+| 1 | `{'length': 27, 'file_exists_after': False}` | yes |
+| 2 | `{'length': 27, 'file_exists_after': False}` | yes |
 
-Both runs: length matched the dummy secret's length (23), the one-time file
-was gone immediately after, and the literal dummy string appeared **zero**
-times anywhere in either `browser_exec` tool-call argument or tool-result row
-for either run.
-
-**Caveat found during the grep (expected, not a leak in the new mechanism):**
-the string *did* appear in this session's `state.db`, but only in rows
-produced **before** the `browser_exec` calls — the `terminal()` commands used
-to create the dummy secret file for test setup (`printf 'DUMMY-...' >
-dummy_pw_N.txt`) necessarily echo that command (and, from `wc`/`cat`-style
-confirmation commands, the file's own content) into the terminal tool's
-result, because this is a workbench proof writing its own throwaway test
-fixture over a plain `terminal()` call — not a limitation of the
-`browser_exec` password-fill mechanism itself. **In the real production
-flow, the secret is never written via a `terminal()` command or any shell
-string** — `credential_relay.py` writes it directly with Python's own
-`os.open`/`os.fdopen` (see that script's own docstring, "SAFE (b)"), and the
-only consumer touching it afterward is this `browser_exec` snippet, which
-never prints the secret. So the terminal-echo seen here is an artifact of how
-this *test* planted its dummy value, not a property of the mechanism this
-card was asked to prove.
+Both runs: length matched the generated dummy's length (27), the one-time file
+was gone immediately after, and the final full-session query returned
+`{'rows_matching': 0}`. Because the random value was never printed or placed
+in a tool argument, the whole-session zero-occurrence criterion was met.
 
 ## If `browser_exec` itself ever echoes `fill_input` values
 
