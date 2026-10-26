@@ -617,3 +617,68 @@ def test_noun_form_lifecycle_state_is_caught(line):
 def test_noun_form_adjunct_usage_survives(line):
     from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
     assert not _is_forbidden_acceptance_line(line), f"false positive on adjunct usage: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Trailing-checkable-outcome guard (t_5683eec1, follow-up to t_adee1291): a
+# Claude Code spot check found "The issue is resolved: login works on
+# Safari." getting stripped even though it carries a real, observable
+# result. A lifecycle-mechanics match must survive when the line adds a
+# concrete outcome after a colon/dash/and/so/with connector; pure board-
+# mechanics narration with no concrete follow-on must still be stripped.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("line", [
+    "The issue is resolved: login works on Safari.",
+    "The bug is fixed and the regression test passes.",
+    "PR #12 merged to main after review.",
+])
+def test_lifecycle_match_with_checkable_outcome_survives(line):
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert not _is_forbidden_acceptance_line(line), f"false positive: {line!r}"
+
+
+@pytest.mark.parametrize("line", [
+    "Card marked done and checkpoint advances.",
+    "Task completed.",
+    "The card is complete.",
+    "The PR moves to done.",
+    "Ticket transitions to complete.",
+    "Board updated to closed.",
+])
+def test_lifecycle_match_without_checkable_outcome_still_stripped(line):
+    from hermes_cli.kanban_specify import _is_forbidden_acceptance_line
+    assert _is_forbidden_acceptance_line(line), f"should still be stripped: {line!r}"
+
+
+def test_specify_task_keeps_safari_line_but_strips_pure_mechanics(
+    kanban_home, monkeypatch
+):
+    """End-to-end: the Safari line (real finding from t_5683eec1) must
+    survive into the persisted card while pure board-mechanics lines in
+    the same body are still stripped."""
+    import agent.auxiliary_client as aux
+
+    body = (
+        "**Goal**\nDo the thing.\n\n"
+        "**Acceptance criteria**\n"
+        "- The issue is resolved: login works on Safari.\n"
+        "- The bug is fixed and the regression test passes.\n"
+        "- Card marked done and checkpoint advances.\n"
+        "- Task completed.\n"
+    )
+    for reply in (json.dumps({"title": "Do the thing", "body": body}), body):
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="rough idea", triage=True)
+        monkeypatch.setattr(aux, "call_llm", lambda *a, **k: _fake_llm_response(reply))
+        out = spec.specify_task(tid, author="claude")
+        assert out.ok is True
+        assert len(out.stripped_criteria) == 2
+        with kb.connect_closing() as conn:
+            persisted = kb.get_task(conn, tid)
+        body_text = persisted.body or ""
+        assert "The issue is resolved: login works on Safari." in body_text
+        assert "The bug is fixed and the regression test passes." in body_text
+        assert "card marked done" not in body_text.lower()
+        assert "task completed" not in body_text.lower()

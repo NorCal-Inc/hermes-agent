@@ -280,11 +280,62 @@ _FORBIDDEN_ACCEPTANCE_LINE_PATTERNS = [
 ]
 
 
+# False-positive guard (t_5683eec1, follow-up to t_adee1291): a line that
+# matches the lifecycle-mechanics vocabulary above is only unmeetable when
+# it describes NOTHING but the board-artifact's own state transition. If
+# the author tacked on a real, observable outcome -- "The issue is
+# resolved: login works on Safari." -- the line is a legitimate, checkable
+# criterion and must survive even though "issue ... resolved" matches the
+# bare lifecycle pattern.
+#
+# Detection is two-part and deliberately narrow: (1) a connector token
+# (colon, dash, "and", "so", "with") must appear after the matched
+# lifecycle phrase, AND (2) the text after that connector must itself name
+# something concretely checkable (a number, a URL, a file-looking token, or
+# a named test/behaviour word) -- not just more lifecycle narration. Both
+# parts are required so "Card marked done and checkpoint advances." still
+# gets stripped: it has the connector "and", but what follows ("checkpoint
+# advances") is itself bare lifecycle narration with no concrete marker, so
+# the line stays forbidden.
+_CHECKABLE_CONNECTOR_RE = re.compile(
+    r":|(?<=\s)-(?=\s)|[\u2013\u2014]|\band\b|\bso\b|\bwith\b",
+    re.IGNORECASE,
+)
+
+_CHECKABLE_MARKER_RE = re.compile(
+    r"https?://|www\.|\d|\.\w{2,4}\b|\bfile\b|\burl\b|"
+    r"\btest(?:s|ed|ing)?\b|\bworks?\b|\bpasses\b|\bfails?\b|\breturns?\b|"
+    r"\brenders?\b|\bresponds?\b|\bloads?\b|\bdisplays?\b|\bcontains?\b|"
+    r"\bmatches\b|\bbehaviou?r\b",
+    re.IGNORECASE,
+)
+
+
+def _has_trailing_checkable_outcome(line: str, match_end: int) -> bool:
+    """True if real, observable content follows a lifecycle-phrase match.
+
+    Requires a connector (colon/dash/and/so/with) after the match AND a
+    concrete marker (number, URL, file, named test, or behaviour word)
+    after that connector. Either alone is not enough -- see module note
+    above the regexes for why ("and checkpoint advances" has the connector
+    but no concrete marker, so it does not qualify).
+    """
+    remainder = line[match_end:]
+    conn_match = _CHECKABLE_CONNECTOR_RE.search(remainder)
+    if not conn_match:
+        return False
+    return bool(_CHECKABLE_MARKER_RE.search(remainder[conn_match.end():]))
+
+
 def _is_forbidden_acceptance_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
-    return any(p.search(stripped) for p in _FORBIDDEN_ACCEPTANCE_LINE_PATTERNS)
+    for pattern in _FORBIDDEN_ACCEPTANCE_LINE_PATTERNS:
+        match = pattern.search(stripped)
+        if match and not _has_trailing_checkable_outcome(stripped, match.end()):
+            return True
+    return False
 
 
 def _strip_unmeetable_acceptance_criteria(
