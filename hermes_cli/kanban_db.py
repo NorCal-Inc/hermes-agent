@@ -23214,6 +23214,58 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
+_WORKER_SCOPE_RE = re.compile(r"^hermes-kanban-(?P<task>.+)-(?P<run>\d+)-[0-9a-f]{8}\.scope$")
+
+
+def stop_finished_worker_scopes(conn: sqlite3.Connection) -> "list[str]":
+    """Stop transient worker scopes whose run has ended and whose worker is gone.
+
+    A ``systemd-run --scope`` unit lives until every process in it exits, so
+    anything a worker started and never closed (headless Chrome, browser
+    harness daemons, Xvfb, ad-hoc servers) outlives the card and holds
+    memory indefinitely. Once the run row is ended and the worker PID is
+    dead, stopping the scope terminates those leftovers. Running runs and
+    units that do not match a run on this board are left alone.
+    """
+    if os.name == "nt":
+        return []
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return []
+    try:
+        listing = subprocess.run(
+            [systemctl, "--user", "list-units", "--type=scope", "--all",
+             "--no-legend", "--plain", "hermes-kanban-*"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return []
+    stopped: "list[str]" = []
+    for line in listing.splitlines():
+        fields = line.split()
+        m = _WORKER_SCOPE_RE.match(fields[0]) if fields else None
+        if not m:
+            continue
+        try:
+            row = conn.execute(
+                "SELECT ended_at, worker_pid FROM task_runs WHERE id = ? AND task_id = ?",
+                (int(m.group("run")), m.group("task")),
+            ).fetchone()
+        except Exception:
+            continue
+        if row is None or row[0] is None or _pid_alive(row[1]):
+            continue
+        unit = fields[0]
+        for action in ("stop", "reset-failed"):
+            try:
+                subprocess.run([systemctl, "--user", action, unit],
+                               capture_output=True, timeout=30)
+            except Exception:
+                pass
+        stopped.append(unit)
+    return stopped
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap worker exits and preserve scoped-worker exit attribution.
 
@@ -25583,6 +25635,11 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # Close out leftover processes of finished runs (see stop_finished_worker_scopes).
+    try:
+        stop_finished_worker_scopes(conn)
+    except Exception:
+        pass
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
