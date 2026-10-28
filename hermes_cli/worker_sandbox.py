@@ -122,6 +122,11 @@ LANE_CREDS_RELPATH = Path(".hermes") / "security" / "worker-sandbox" / "creds"
 # (outside the sandbox) files into the vault as new files, never overwriting.
 SUBMISSIONS_RELPATH = Path(".hermes") / "company-submissions"
 SANDBOX_NO_REFRESH_ENV = "HERMES_SANDBOX_NO_REFRESH"
+# The lane's OWN company 1Password service account (creds/<lane>/op.env, 0600, chris-owned).
+# Bound read-only as a file, never put in argv or the environment: the worker runs
+# ``lane-op`` (lane home .local/bin), which reads it per call. OP_SERVICE_ACCOUNT_TOKEN
+# itself stays absent from the sandbox env (probe ``op_service_account_token_absent``).
+LANE_OP_ENV_VAR = "HERMES_LANE_OP_ENV"
 
 _warned_missing_manifest = False
 
@@ -361,6 +366,11 @@ def lane_creds_file(lane: str, home: Path) -> str:
     return _norm(home / LANE_CREDS_RELPATH / str(lane).strip().casefold() / "auth.json")
 
 
+def lane_op_env_file(lane: str, home: Path) -> str:
+    """The lane's own company 1Password service-account file (optional)."""
+    return _norm(home / LANE_CREDS_RELPATH / str(lane).strip().casefold() / "op.env")
+
+
 def runtime_code_paths(home: Path) -> List[str]:
     """Read-only code the worker needs: repo checkout + venv, node, ~/.local/bin, playwright browsers."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -451,6 +461,12 @@ def build_bwrap_argv(
             )
         _check_allowed(trimmed, home)
         argv += ["--ro-bind", trimmed, root_auth]
+
+    op_env = lane_op_env_file(lane, home)
+    if exists(op_env) and not os.path.isdir(op_env):
+        _check_allowed(op_env, home)
+        argv += ["--ro-bind", op_env, op_env]
+        argv += ["--setenv", LANE_OP_ENV_VAR, op_env]
 
     argv += ["--bind", profile_home_s, profile_home_s]
     argv += ["--bind", workspace_s, workspace_s]
