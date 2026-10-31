@@ -100,13 +100,20 @@ class ScanResult:
 
 THREAT_PATTERNS = [
     # ── Exfiltration: shell commands leaking secrets ──
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)',
+    # Anchor env var name end with \b to avoid false positives on legitimate
+    # env vars like $TRILLIUM_ETAPI_URL that contain KEY/TOKEN/API as
+    # substrings. API is dropped from the alternation outright: mid-name API
+    # is ubiquitous in benign var names, and every real secret shape it
+    # caught ($OPENAI_API_KEY) already ends in KEY/TOKEN. Same bug class as
+    # the salvaged terminal-scanner fix (tools/threat_patterns.py exfil_curl
+    # / exfil_wget).
+    (r'curl\s+[^\n]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b',
      "env_exfil_curl", "critical", "exfiltration",
      "curl command interpolating secret environment variable"),
-    (r'wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)',
+    (r'wget\s+[^\n]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b',
      "env_exfil_wget", "critical", "exfiltration",
      "wget command interpolating secret environment variable"),
-    (r'fetch\s*\([^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|API)',
+    (r'fetch\s*\([^\n]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD)S?\b',
      "env_exfil_fetch", "critical", "exfiltration",
      "fetch() call interpolating secret environment variable"),
     (r'httpx?\.(get|post|put|patch)\s*\([^\n]*(KEY|TOKEN|SECRET|PASSWORD)',
