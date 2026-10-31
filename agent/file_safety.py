@@ -59,6 +59,17 @@ def build_write_denied_paths(home: str) -> set[str]:
             # Bitwarden Secrets Manager encrypted disk cache.
             str(hermes_home / "cache" / "bws_cache.enc.json"),
             str(hermes_root / "cache" / "bws_cache.enc.json"),
+            # Bitwarden Secrets Manager PLAINTEXT disk cache (introduced after the
+            # encrypted cache above; the read guard already blocks it).
+            str(hermes_home / "cache" / "bws_cache.json"),
+            str(hermes_root / "cache" / "bws_cache.json"),
+            # Google OAuth token store. auth.json, auth.lock, config.yaml and
+            # webhook_subscriptions.json are deliberately NOT here: true
+            # containment belongs in Docker/remote backends and OS permissions,
+            # not an expanding hardcoded denylist, so those control files stay
+            # read-denied (get_read_block_error) but writable.
+            str(hermes_home / "auth" / "google_oauth.json"),
+            str(hermes_root / "auth" / "google_oauth.json"),
             os.path.join(home, ".netrc"),
             os.path.join(home, ".pgpass"),
             os.path.join(home, ".npmrc"),
@@ -129,6 +140,13 @@ def build_write_approval_paths(home: str) -> set[str]:
     }
 
 
+# Read-denied directories that are also secret material, so writes must be
+# blocked too. Kept as its own tuple (not derived from the read-only
+# convenience lists elsewhere) so a future read-only addition cannot
+# silently become a write deny.
+_WRITE_DENIED_SECRET_DIRS = ("vault", "browser-profile")
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
@@ -183,6 +201,19 @@ def _classify_write_denial(path: str) -> Optional[str]:
                 return "credential"
         except Exception:
             pass
+        # vault/ (key + ciphertext side by side) and browser-profile/ (copied
+        # cookies / Login Data) are secret stores read-denied by
+        # get_read_block_error-adjacent guards; writes must be blocked too.
+        # Kept as its own tuple (not derived from any read-only convenience
+        # list) so a future read-only addition cannot silently become a
+        # write deny.
+        for secret_dir in _WRITE_DENIED_SECRET_DIRS:
+            try:
+                secret_real = os.path.realpath(os.path.join(base_real, secret_dir))
+                if resolved == secret_real or resolved.startswith(secret_real + os.sep):
+                    return "credential"
+            except Exception:
+                pass
 
     safe_roots = get_safe_write_roots()
     if safe_roots:
