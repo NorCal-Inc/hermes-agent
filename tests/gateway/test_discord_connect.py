@@ -958,3 +958,65 @@ class TestPrivilegedIntentsRequiredFatal:
         assert "discord.com/developers/applications" in (adapter.fatal_error_message or "")
         assert adapter._bot_task is None
 
+
+@pytest.mark.asyncio
+async def test_slash_registration_scan_runs_off_the_event_loop(monkeypatch):
+    """Regression (upstream 9c311038fa, #110707): connect() must not run the
+    skill-catalog disk scan (inside _register_slash_commands ->
+    _register_skill_group -> _refresh_skill_catalog_state) synchronously on
+    the event loop. On a large skill install the scan can hold the loop past
+    the liveness watchdog. Verified by proving the loop keeps ticking while
+    the (blocking-looking) scan is in flight.
+    """
+    import threading
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(
+        message_content=False, dm_messages=False, guild_messages=False,
+        members=False, voice_states=False,
+    )
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    monkeypatch.setattr(
+        discord_platform.commands,
+        "Bot",
+        lambda **kwargs: FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    scan_started = threading.Event()
+    loop_ticked = threading.Event()
+
+    def _blocking_scan(*, reserved_names):
+        scan_started.set()
+        # Only a free event loop can set loop_ticked while this thread waits —
+        # if the scan ran inline on the loop, nothing could ever set it and
+        # this would time out, proving the loop was blocked.
+        loop_ticked.wait(timeout=1)
+        return ({}, [("x", "desc", "/x")], 0)
+
+    monkeypatch.setattr(
+        "hermes_cli.commands.discord_skill_commands_by_category",
+        _blocking_scan,
+    )
+
+    connect_task = asyncio.create_task(adapter.connect())
+    await asyncio.to_thread(scan_started.wait, 1)
+    assert scan_started.is_set(), "scan never started"
+    # Prove the loop is free: run a few ticks, then flip the thread-side event.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    loop_ticked.set()
+
+    assert await connect_task is True
+    assert [n for n, _d, _k in adapter._skill_entries] == ["x"]
+
+    await adapter.disconnect()
+

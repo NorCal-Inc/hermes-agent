@@ -1515,7 +1515,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Register slash commands
             if self._slash_commands:
-                self._register_slash_commands()
+                # Registration walks the skill catalog on disk (#110707); keep the loop free.
+                await asyncio.to_thread(self._register_slash_commands)
 
             # Start the bot in background
             self._disconnecting = False
@@ -6640,7 +6641,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._skill_lookup = {n: (d, k) for n, d, k in entries}
         self._skill_group_hidden_count = hidden
 
-    def refresh_skill_group(self) -> tuple[int, int]:
+    async def refresh_skill_group(self) -> tuple[int, int]:
         """Rescan skills and update the live ``/skill`` autocomplete state.
 
         Invoked by :meth:`gateway.run.GatewayOrchestrator._handle_reload_skills_command`
@@ -6657,7 +6658,10 @@ class DiscordAdapter(BasePlatformAdapter):
         Returns ``(new_count, hidden_count)``.
         """
         try:
-            self._refresh_skill_catalog_state()
+            # Scan runs off the event loop (#110707): the same disk walk
+            # paid at startup can hold the loop past the liveness watchdog
+            # on a large skill install.
+            await asyncio.to_thread(self._refresh_skill_catalog_state)
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to refresh /skill autocomplete after reload: %s",
