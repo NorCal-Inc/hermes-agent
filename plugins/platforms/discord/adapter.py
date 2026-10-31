@@ -9664,6 +9664,16 @@ def _define_discord_view_classes() -> None:
             )
 
         async def _on_cancel(self, interaction: discord.Interaction):
+            # Every other callback (_on_provider_selected, _on_model_selected,
+            # _on_expensive_confirm, _on_back) gates on _check_auth; this one
+            # didn't, so a non-allowlisted member could tap Cancel on the
+            # owner's picker. No model switch is possible via Cancel, but the
+            # gate should be uniform (upstream a2ce2da095).
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
             self.resolved = True
             self.clear_items()
             await interaction.response.edit_message(

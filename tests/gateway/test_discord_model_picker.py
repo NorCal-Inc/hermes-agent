@@ -83,3 +83,89 @@ async def test_model_picker_clears_controls_before_running_switch_callback():
     interaction.edit_original_response.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_model_picker_cancel_rejects_non_allowlisted_user():
+    """Every ModelPickerView callback gates on _check_auth except _on_cancel
+    previously didn't (upstream a2ce2da095): a non-allowlisted member could
+    tap Cancel on the owner's picker, resolving/clearing it. No model switch
+    is reachable via Cancel, but the gate must still be uniform."""
+
+    async def on_model_selected(chat_id: str, model_id: str, provider_slug: str) -> str:
+        raise AssertionError("on_model_selected must not run from a cancel")
+
+    view = ModelPickerView(
+        providers=[
+            {
+                "slug": "copilot",
+                "name": "GitHub Copilot",
+                "models": ["gpt-5.4"],
+                "total_models": 1,
+                "is_current": True,
+            }
+        ],
+        current_model="gpt-5-mini",
+        current_provider="copilot",
+        session_key="session-1",
+        on_model_selected=on_model_selected,
+        allowed_user_ids={"123"},  # interaction user below is "999" — not allowed
+    )
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        channel_id=456,
+        response=SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+            edit_message=AsyncMock(),
+        ),
+    )
+
+    await view._on_cancel(interaction)
+
+    interaction.response.send_message.assert_awaited_once()
+    assert "not authorized" in interaction.response.send_message.await_args.args[0]
+    interaction.response.edit_message.assert_not_called()
+    assert view.resolved is False
+
+
+@pytest.mark.asyncio
+async def test_model_picker_cancel_allows_owner():
+    """The owner (allowlisted user) can still cancel after the auth gate."""
+
+    async def on_model_selected(chat_id: str, model_id: str, provider_slug: str) -> str:
+        raise AssertionError("on_model_selected must not run from a cancel")
+
+    view = ModelPickerView(
+        providers=[
+            {
+                "slug": "copilot",
+                "name": "GitHub Copilot",
+                "models": ["gpt-5.4"],
+                "total_models": 1,
+                "is_current": True,
+            }
+        ],
+        current_model="gpt-5-mini",
+        current_provider="copilot",
+        session_key="session-1",
+        on_model_selected=on_model_selected,
+        allowed_user_ids={"123"},
+    )
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123),
+        channel_id=456,
+        response=SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+            edit_message=AsyncMock(),
+        ),
+    )
+
+    await view._on_cancel(interaction)
+
+    interaction.response.send_message.assert_not_called()
+    interaction.response.edit_message.assert_awaited_once()
+    assert view.resolved is True
+
+
