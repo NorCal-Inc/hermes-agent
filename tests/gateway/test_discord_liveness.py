@@ -351,6 +351,45 @@ async def test_socket_closed_first_strike_forces_reconnect(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_client_closed_first_strike_forces_reconnect(monkeypatch, caplog):
+    """``client_closed`` is the same transport-dead state as ``socket_closed`` (upstream
+    fe225b20b1): ``Bot.is_closed()`` reading true means the transport is gone, so strike 1
+    must escalate too, not wait on the two-strike confirmation path reserved for soft signals.
+    """
+    adapter = _make_adapter(monkeypatch, interval=0.01, threshold=2)
+    handler = AsyncMock()
+    adapter.set_fatal_error_handler(handler)
+
+    calls = 0
+
+    def factory(**kwargs):
+        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
+        bot.fetch_user = AsyncMock()
+        return bot
+
+    def _probe(client):
+        nonlocal calls
+        calls += 1
+        return False, "client_closed"
+
+    monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
+
+    with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
+        await _connect(adapter, monkeypatch, factory)
+        await _wait_until(
+            lambda: handler.called,
+            "fatal handler not called after first client_closed strike",
+        )
+
+    assert calls == 1, "first client_closed strike must escalate without a confirming strike"
+    assert adapter._disconnecting is True
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("transport closed (client_closed, 1/2)" in m for m in errors)
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_soft_unhealthy_signal_still_requires_threshold_strikes(monkeypatch):
     """Soft signals (ack staleness, latency, silence) keep the confirmation threshold.
 

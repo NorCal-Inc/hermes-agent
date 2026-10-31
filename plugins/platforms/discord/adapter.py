@@ -2083,13 +2083,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 failures,
                 threshold,
             )
-            # A closed transport (``socket_closed``) is a confirmed death, not a suspicion: the
-            # resume path replaces the socket, the next sample reads healthy, and this counter
-            # silently resets — while a resumed-but-deaf session stays event-starved until the
-            # multi-hour event-silence default elapses (upstream b1a69d8178, #118487). Escalate
-            # the first ``socket_closed`` strike; soft signals (ack staleness, latency, silence)
-            # keep the confirmation threshold.
-            if failures < threshold and reason != "socket_closed":
+            # A closed transport (``socket_closed`` / ``client_closed``) is a confirmed death,
+            # not a suspicion: the resume path replaces the socket, the next sample reads
+            # healthy, and this counter silently resets — while a resumed-but-deaf session
+            # stays event-starved until the multi-hour event-silence default elapses (upstream
+            # b1a69d8178, #118487). ``client_closed`` is the same transport-dead state
+            # (upstream fe225b20b1): Bot.is_closed() reads true for the identical reason, so it
+            # must escalate on the first strike too instead of waiting on the two-strike
+            # confirmation path soft signals (ack staleness, latency, silence) keep.
+            terminal = reason in ("socket_closed", "client_closed")
+            if failures < threshold and not terminal:
                 continue
             # Mark intentional recovery before closing the client. Closing a
             # healthy-looking but stale transport can complete Bot.start(); its
@@ -2098,7 +2101,7 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error(
                 "[%s] Discord Gateway WebSocket %s (%s, %d/%d); forcing reconnect",
                 self.name,
-                "transport closed" if reason == "socket_closed" else "remained unhealthy",
+                "transport closed" if terminal else "remained unhealthy",
                 reason, failures, threshold,
             )
             self._set_fatal_error(
