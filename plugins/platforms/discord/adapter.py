@@ -3593,6 +3593,14 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        # Ledger anchor for the recovery backfill table: prefer the explicit
+        # reply_to kwarg, but fall back to metadata's reply_to_message_id.
+        # A reply_to_mode="off" send, a streamed final delivered via
+        # edit_message(finalize=True), or a fresh-final send (stream_consumer's
+        # empty-fallback-final path) never passes reply_to directly — without
+        # this fallback the row is never recorded and backfill re-sends the
+        # reply on every reconnect (upstream dd7af8e765).
+        ledger_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
         if not (content or "").strip():
             logger.warning(
                 "[%s] Dropped empty message to chat=%s (caller bug). Call site:\n%s",
@@ -3610,7 +3618,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # both never sent and never retried.
             await asyncio.to_thread(
                 self._record_discord_response,
-                reply_to=reply_to,
+                reply_to=ledger_reply_to,
                 result=result,
                 content=content,
                 final=bool(metadata and metadata.get("notify")),
@@ -3645,7 +3653,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 result = await self._send_to_forum(channel, content)
                 await asyncio.to_thread(
                     self._record_discord_response,
-                    reply_to=reply_to,
+                    reply_to=ledger_reply_to,
                     result=result,
                     content=content,
                     final=final_delivery,
@@ -3714,7 +3722,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             await asyncio.to_thread(
                 self._record_discord_response,
-                reply_to=reply_to,
+                reply_to=ledger_reply_to,
                 result=result,
                 content=content,
                 final=final_delivery,
@@ -3726,7 +3734,7 @@ class DiscordAdapter(BasePlatformAdapter):
             result = SendResult(success=False, error=str(e))
             await asyncio.to_thread(
                 self._record_discord_response,
-                reply_to=reply_to,
+                reply_to=ledger_reply_to,
                 result=result,
                 content=content,
                 final=bool(metadata and metadata.get("notify")),

@@ -459,6 +459,36 @@ async def test_iter_candidates_keeps_latest_messages_when_window_exceeds_limit(a
     assert got == [2, 3, 4]
 
 
+@pytest.mark.asyncio
+async def test_unthreaded_final_reply_records_recovery_completion(adapter):
+    """The ledger anchor must survive reply_to_mode="off"'s visual suppression
+    (upstream dd7af8e765): send() only receives reply_to via metadata in that
+    mode, so _record_discord_response must fall back to
+    metadata["reply_to_message_id"] or the row never completes and backfill
+    re-dispatches it forever."""
+    adapter._reply_to_mode = "off"
+    channel = FakeChannel(channel_id=123)
+    sent_message = SimpleNamespace(id=9005)
+
+    async def _send(*, content, reference):
+        assert reference is None
+        return sent_message
+
+    channel.send = _send
+    adapter._client.get_channel = lambda _channel_id: channel
+    message = make_message(message_id=92, channel=channel)
+    adapter._record_discord_message_seen(message, status="processing")
+
+    result = await adapter.send(
+        "123",
+        "Done",
+        metadata={"notify": True, "reply_to_message_id": "92"},
+    )
+
+    assert result.success is True
+    assert adapter._discord_message_is_persistently_complete("92") is True
+
+
 def test_success_outcome_completes_row_without_reply_anchor(adapter):
     """A delivered final with no Discord reply anchor (reply_to_mode=off, streamed edit,
     media-only reply) must still complete the ledger row, or backfill re-dispatches it on
