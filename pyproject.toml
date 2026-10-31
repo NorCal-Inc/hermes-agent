@@ -38,7 +38,12 @@ dependencies = [
   # user picks that backend. Smaller `dependencies` = smaller blast
   # radius for the next supply-chain attack.
   "openai==2.24.0",
-  "certifi==2026.5.20",
+  # certifi 2026.10.19 drops the emSign roots whose intermediate CA keys
+  # were compromised (GHSA-6q48-6c7w-9gw2, critical). No prior release
+  # carries the removal. Exempted from the 14-day exclude-newer
+  # quarantine below (CA trust stores get a per-package exemption so a
+  # root revocation reaches the lock immediately, not 2+ weeks late).
+  "certifi==2026.10.19",
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
@@ -410,17 +415,18 @@ exclude-newer = "14 days"
 # risk — their newest releases are years old — and unbricks resolvers that
 # cannot see upload dates.
 #
-# setuptools, pillow, mcp: exact-pinned bricks (#78227, #75992, #76020). uv
-# applies exclude-newer to build-system.requires and core deps too; when a
-# resolver cannot see an upload date (old uv, mirror index, stale HTTP cache)
-# it filters the pinned version and the package cannot even BUILD
-# ("No solution found when resolving: setuptools==83.0.0"). These deps are
-# exact-pinned (==X.Y.Z), so exclude-newer adds zero float protection for
-# them — the version cannot move without a reviewed pin bump — while the
-# cutoff can still brick installs. Exempting exact pins is pure brick-risk
-# removal at no supply-chain cost. Guarded by
+# setuptools, pillow, mcp, certifi: exact-pinned bricks (#78227, #75992,
+# #76020). uv applies exclude-newer to build-system.requires and core deps
+# too; when a resolver cannot see an upload date (old uv, mirror index,
+# stale HTTP cache) it filters the pinned version and the package cannot
+# even BUILD ("No solution found when resolving: setuptools==83.0.0").
+# These deps are exact-pinned (==X.Y.Z), so exclude-newer adds zero float
+# protection for them — the version cannot move without a reviewed pin
+# bump — while the cutoff can still brick installs or (for certifi) delay
+# a CA-trust revocation fix landing in the lock. Exempting exact pins is
+# pure brick-risk removal at no supply-chain cost. Guarded by
 # tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, certifi = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
