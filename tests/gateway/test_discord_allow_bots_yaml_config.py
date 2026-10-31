@@ -7,7 +7,6 @@ ignored and bot-to-bot handoffs stayed blocked.
 """
 
 import importlib
-import sys
 import types
 
 import pytest
@@ -15,7 +14,8 @@ import pytest
 
 @pytest.fixture
 def adapter_mod():
-    sys.modules.pop("plugins.platforms.discord.adapter", None)
+    # Reuse the loaded module: re-importing it breaks later tests that hold
+    # references to the original module object (attachment download tests).
     return importlib.import_module("plugins.platforms.discord.adapter")
 
 
