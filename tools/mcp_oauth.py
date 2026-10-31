@@ -448,6 +448,28 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+def _describe_corrupt_record(exc: Exception) -> Exception | str:
+    """Return a log-safe description of a failed ``model_validate`` call.
+
+    A pydantic ``ValidationError``'s ``str()`` echoes the failing field's raw
+    input -- for a corrupt token/client-info/metadata file that input IS the
+    secret material (access token, client secret, ...), so logging ``exc``
+    directly puts the credential into the warning log. Pydantic's
+    ``errors(include_input=False)`` gives the failing field locations
+    without the values; fall back to the exception itself when the object
+    isn't a pydantic ValidationError (e.g. a plain ``KeyError``/``TypeError``
+    from malformed JSON shape), which carries no secret-bearing input echo.
+    """
+    if hasattr(exc, "errors"):  # pydantic ValidationError
+        try:
+            return "validation failed for " + ", ".join(
+                ".".join(map(str, e.get("loc", ()))) for e in exc.errors(include_input=False)
+            )
+        except Exception:
+            pass
+    return exc
+
+
 # ---------------------------------------------------------------------------
 # HermesTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
@@ -520,7 +542,10 @@ class HermesTokenStorage:
         try:
             return OAuthToken.model_validate(data)
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Corrupt tokens at %s -- ignoring: %s", self._tokens_path(), exc)
+            logger.warning(
+                "Corrupt tokens at %s -- ignoring: %s",
+                self._tokens_path(), _describe_corrupt_record(exc),
+            )
             return None
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
@@ -565,7 +590,10 @@ class HermesTokenStorage:
                 _write_json(self._client_info_path(), info.model_dump(mode="json", exclude_none=True))
             return info
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Corrupt client info at %s -- ignoring: %s", self._client_info_path(), exc)
+            logger.warning(
+                "Corrupt client info at %s -- ignoring: %s",
+                self._client_info_path(), _describe_corrupt_record(exc),
+            )
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
@@ -601,7 +629,10 @@ class HermesTokenStorage:
         try:
             return OAuthMetadata.model_validate(data)
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Corrupt OAuth metadata at %s -- ignoring: %s", self._meta_path(), exc)
+            logger.warning(
+                "Corrupt OAuth metadata at %s -- ignoring: %s",
+                self._meta_path(), _describe_corrupt_record(exc),
+            )
             return None
 
     # -- CIMD refusal ------------------------------------------------------
