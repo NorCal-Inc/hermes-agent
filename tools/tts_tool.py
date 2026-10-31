@@ -3648,6 +3648,13 @@ def text_to_speech_tool(
                 chunk_path = base_path.with_name(
                     f"{base_path.stem}.chunk{index:03d}{base_path.suffix}"
                 )
+            if os.path.lexists(chunk_path):
+                # A file we didn't create: synthesize beside it so a failed attempt can
+                # neither truncate nor sweep it; the delivery step below os.replace()s
+                # the finished audio over it on success (overwrite contract kept).
+                chunk_path = chunk_path.with_name(
+                    f".{chunk_path.stem}.{uuid.uuid4().hex}{chunk_path.suffix}"
+                )
             generated_artifacts.add(str(chunk_path))
             raw_result = _text_to_speech_single(
                 text=chunk,
