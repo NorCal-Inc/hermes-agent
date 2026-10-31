@@ -6897,7 +6897,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _get_allow_bots(self) -> str:
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
-        return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
+        raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
+        return str(raw or "none").lower().strip() or "none"
 
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs/names where no bot mention is required.
@@ -10709,6 +10710,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allow_all_users"] = str(allow_all_cfg).lower()
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOW_ALL_USERS"):
             os.environ["DISCORD_ALLOW_ALL_USERS"] = str(allow_all_cfg).lower()
+    allow_bots_cfg = (
+        discord_cfg["allow_bots"] if "allow_bots" in discord_cfg
+        else platform_extra_cfg.get("allow_bots")
+    )
+    if allow_bots_cfg is not None:
+        seeded_extra["allow_bots"] = str(allow_bots_cfg).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_ALLOW_BOTS"):
+            os.environ["DISCORD_ALLOW_BOTS"] = str(allow_bots_cfg).lower()
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
