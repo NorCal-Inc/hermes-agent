@@ -243,6 +243,33 @@ async def test_role_member_passes(adapter):
     assert await adapter._check_slash_authorization(interaction, "/help") is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("builder", ["slash", "thread_starter"])
+@pytest.mark.parametrize("actor_roles,gateway_admits", [
+    ([1234], True),   # role-only member the slash gate admits
+    ([7], False),     # unrelated role: the builder must not mint a grant for this actor
+])
+async def test_native_event_carries_this_actors_role_grant(adapter, builder, actor_roles, gateway_admits):
+    """Regression for upstream #118958 (39f0da8b2f): a role-only member passes
+    the slash gate, and the event a native builder (``_build_slash_event`` or
+    ``_dispatch_thread_session``) dispatches must carry that verdict for THIS
+    actor, never a grant trusted from caller order."""
+    adapter._allowed_role_ids = {1234}
+    interaction = _make_interaction("999999999")
+    interaction.user.roles = [SimpleNamespace(id=r) for r in actor_roles]
+    interaction.user.display_name = "member"
+    interaction.guild.name = "guild"
+
+    if builder == "slash":
+        event = adapter._build_slash_event(interaction, "/reset")
+        assert event.source.role_authorized is gateway_admits
+    else:
+        dispatched = []
+        adapter.handle_message = AsyncMock(side_effect=dispatched.append)
+        await adapter._dispatch_thread_session(interaction, "555", "topic", "hello")
+        assert [event.source.role_authorized for event in dispatched] == [gateway_admits]
+
+
 # ---------------------------------------------------------------------------
 # Channel allowlist (DISCORD_ALLOWED_CHANNELS) parity — the gate prajer used
 # ---------------------------------------------------------------------------

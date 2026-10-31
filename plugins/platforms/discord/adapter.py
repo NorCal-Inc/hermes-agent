@@ -5413,6 +5413,20 @@ class DiscordAdapter(BasePlatformAdapter):
 
         return (True, None)
 
+    def _slash_role_grant(self, interaction: "discord.Interaction") -> bool:
+        """``role_authorized`` for an event built from *interaction*, with the
+        message path's meaning (``_discord_message_admission``): a role
+        allowlist is configured AND this actor passes the slash gate.
+
+        Re-evaluated from the interaction instead of trusted from caller
+        order, so a builder can never stamp the grant for an actor the slash
+        gate would refuse — even if it's ever called before (or without) that
+        gate running first (upstream 39f0da8b2f).
+        """
+        return bool(
+            getattr(self, "_allowed_role_ids", set()),
+        ) and self._evaluate_slash_authorization(interaction)[0]
+
     async def _check_slash_authorization(
         self, interaction: "discord.Interaction", command_text: str,
     ) -> bool:
@@ -6607,6 +6621,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
 
+        # Without the role grant the gateway refuses a role-only member the
+        # slash gate admitted (upstream 39f0da8b2f). Re-evaluated for this
+        # actor, not trusted from caller order.
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -6615,6 +6632,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            role_authorized=self._slash_role_grant(interaction),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -6701,6 +6719,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
 
+        # Without the role grant the gateway refuses a role-only member the
+        # slash gate admitted (upstream 39f0da8b2f). Re-evaluated for this
+        # actor, not trusted from caller order.
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -6709,6 +6730,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            role_authorized=self._slash_role_grant(interaction),
         )
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
