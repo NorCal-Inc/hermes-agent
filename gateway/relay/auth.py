@@ -58,6 +58,16 @@ def sign(payload: str, secret: str) -> str:
     return _hmac_hex(payload, secret)
 
 
+def is_usable_secret(secret: object) -> bool:
+    """True when ``secret`` is a string with at least one non-space character.
+
+    A whitespace-only value is what an unset key looks like in config. It is
+    falsy to a person and truthy to ``if not secret``, so a bare falsy check
+    lets it through. Non-strings are rejected for the same reason.
+    """
+    return isinstance(secret, str) and bool(secret.strip())
+
+
 def verify_signature(payload: str, sig_hex: str, secrets: Sequence[str]) -> bool:
     """Constant-time check that ``sig_hex`` is a valid HMAC of ``payload`` under
     ANY of ``secrets`` (rotation window). Length-mismatched candidates are

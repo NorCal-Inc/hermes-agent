@@ -53,6 +53,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.relay.auth import is_usable_secret
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -252,7 +253,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
             secret = route.get("secret", self._global_secret)
-            if not secret:
+            if not is_usable_secret(secret):
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
                     f"Set 'secret' on the route or globally. "
@@ -528,7 +529,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if k in self._static_routes:
                     continue
                 effective_secret = v.get("secret", self._global_secret)
-                if not effective_secret:
+                if not is_usable_secret(effective_secret):
                     logger.warning(
                         "[webhook] Dynamic route '%s' skipped: 'secret' is "
                         "missing or empty. Set a valid HMAC secret, or use "
@@ -693,7 +694,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
         secret = route_config.get("secret", self._global_secret)
-        if not secret:
+        if not is_usable_secret(secret):
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",
                 route_name,

@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from gateway.relay.auth import (
     DELIVERY_SIG_HEADER,
     DELIVERY_TS_HEADER,
+    is_usable_secret,
     make_token,
     make_upgrade_token,
     sign,
@@ -101,5 +104,15 @@ def test_delivery_signature_skew_rejected():
 
 def test_python_make_token_matches_connector_byte_for_byte():
     assert make_token("gw-instance-1", _SECRET, 0) == _CONN_TOKEN
+
+
+@pytest.mark.parametrize(
+    "value,usable",
+    [(_SECRET, True), ("x", True), (" x ", True),
+     ("", False), ("   ", False), ("\t\n", False),
+     (None, False), (b"bytes", False), (123, False)],
+)
+def test_is_usable_secret_classifies_configured_secrets(value, usable):
+    assert is_usable_secret(value) is usable
 
 

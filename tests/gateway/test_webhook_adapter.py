@@ -499,7 +499,7 @@ class TestHTTPHandling:
     @pytest.mark.asyncio
     async def test_route_without_secret_rejects_unsigned_request(self):
         """Missing HMAC secret must fail closed even if connect() was bypassed."""
-        routes = {"test": {"prompt": "hi"}}
+        routes = {"test": {"prompt": "hi"}, "blank": {"prompt": "hi", "secret": "   "}}
         adapter = _make_adapter(routes=routes, secret="")
         adapter.handle_message = AsyncMock()
 
@@ -509,6 +509,12 @@ class TestHTTPHandling:
             assert resp.status == 403
             data = await resp.json()
             assert data["error"] == "Webhook route is missing an HMAC secret"
+
+            # A whitespace-only secret is unset too, even when the request is signed with it.
+            body = b'{"data": "value"}'
+            resp = await cli.post("/webhooks/blank", data=body, headers={
+                "Content-Type": "application/json", "X-Hub-Signature-256": _github_signature(body, "   ")})
+            assert resp.status == 403
 
         adapter.handle_message.assert_not_called()
 
@@ -1024,3 +1030,11 @@ def test_route_profile_validation_fails_closed():
         assert WebhookAdapter._route_allows_profile(
             {"profile": malformed}, "worker"
         ) is False
+
+
+class TestBlankRouteSecretFailsClosed:
+    @pytest.mark.parametrize("blank", ["   ", "\t", "\n"])
+    def test_connect_rejects_a_whitespace_only_route_secret(self, blank):
+        adapter = _make_adapter(routes={"hook": {"secret": blank}})
+        with pytest.raises(ValueError, match="HMAC secret"):
+            asyncio.run(adapter.connect())
