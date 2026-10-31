@@ -85,6 +85,13 @@ _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 _DISCORD_MAX_APP_COMMANDS = 100
 _DISCORD_SELECT_FIELD_LIMIT = 100
 _DISCORD_BUTTON_LABEL_LIMIT = 80
+# Default Discord attachment cap for DMs / channels without a guild boost
+# context. 20 MiB since the Sep 3 2026 API change (10 MiB before); guild
+# channels expose a boost-raised limit via ``guild.filesize_limit``, but
+# discord.py's fallback constant can lag the platform default, so the
+# effective limit is never taken below this floor. See upstream issue
+# #50846 and https://docs.discord.com/developers/change-log (Sep 3, 2026).
+_DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 _DISCORD_ELLIPSIS = "\u2026"
 _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
@@ -4114,6 +4121,52 @@ class DiscordAdapter(BasePlatformAdapter):
             continuation_message_ids=tuple(continuation_ids),
         )
 
+    @staticmethod
+    def _discord_upload_limit_bytes(channel: Any) -> int:
+        """Return the effective Discord attachment size limit for *channel*.
+
+        Prefer the guild's boost-aware ``filesize_limit`` when present; fall
+        back to the platform default for DMs / group DMs without a guild.
+        The guild value is floored at the platform default: discord.py's
+        unboosted-tier constant can lag a platform-wide raise (10 MiB in
+        2.7.1 vs the 20 MiB default since Sep 3 2026), and under-reporting
+        makes the preflight reject files Discord would accept.
+        """
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            limit = getattr(guild, "filesize_limit", None)
+            if isinstance(limit, int) and limit > 0:
+                return max(limit, _DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES)
+        return _DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
+
+    async def _reject_oversized_upload(
+        self, channel: Any, file_path: str, filename: str
+    ) -> Optional[SendResult]:
+        """Preflight ``file_path`` against the channel's upload cap (#50846): a doomed
+        ``413`` round-trip is skipped and the user gets a notice naming the size and the
+        limit. Returns the failed result, or ``None`` when the file may be uploaded."""
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError as exc:
+            return SendResult(success=False, error=f"Cannot stat file {filename}: {exc}")
+        limit = self._discord_upload_limit_bytes(channel)
+        if file_size <= limit:
+            return None
+        size_mb = file_size / (1024 * 1024)
+        limit_mb = limit / (1024 * 1024)
+        error = f"File too large for Discord upload: {filename} is {size_mb:.1f} MB (limit {limit_mb:.0f} MB)"
+        logger.warning("[%s] %s", self.name, error)
+        notice = (
+            f"⚠️ Could not attach `{filename}` — {size_mb:.1f} MB exceeds Discord's "
+            f"{limit_mb:.0f} MB upload limit for this channel. Compress the file or share a link instead."
+        )
+        try:
+            if not self._is_forum_parent(channel):
+                await channel.send(content=notice)
+        except Exception:
+            logger.debug("[%s] Failed to send oversized-file notice for %s", self.name, filename, exc_info=True)
+        return SendResult(success=False, error=error)
+
     async def _send_file_attachment(
         self,
         chat_id: str,
@@ -4146,6 +4199,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
+        rejected = await self._reject_oversized_upload(channel, file_path, filename)
+        if rejected is not None:
+            return rejected
         logger.info(
             "[%s] Sending file attachment %s (%s) to %s",
             self.name,
@@ -4358,6 +4414,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
 
             filename = os.path.basename(audio_path)
+
+            # Same preflight as _send_file_attachment (#50846): without it an
+            # oversized audio attachment still burns the doomed 413 round-trip
+            # this gate exists to avoid.
+            rejected = await self._reject_oversized_upload(channel, audio_path, filename)
+            if rejected is not None:
+                return rejected
 
             # ids-only reference — same no-fetch rationale as the text path.
             reference = self._reply_reference_for_send(reply_to, channel)
