@@ -2151,6 +2151,7 @@ DEFAULT_CONFIG = {
             "window_seconds": 21600,      # Only inspect messages from the last 6 hours
             "limit": 100,                 # Global cap on messages scanned per reconnect
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
+            "max_attempts": 3,            # Lifetime re-dispatch cap for one message, whatever its outcome
         },
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         # Discord Gateway transport health. These settings inspect the active
