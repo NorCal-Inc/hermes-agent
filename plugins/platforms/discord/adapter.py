@@ -5951,6 +5951,21 @@ class DiscordAdapter(BasePlatformAdapter):
         resolved = getattr(self, "_username_resolved_ids", None) or set()
         return {str(uid) for uid in resolved if str(uid).isdigit()}
 
+    def _component_live_auth(self, interaction) -> Optional[bool]:
+        """The gateway's live allowlist verdict for a component click, or None when no check is wired.
+
+        Component views hold the connect-time ``_allowed_user_ids`` snapshot; a revoke run in another
+        process (``hermes pairing revoke`` from the CLI or dashboard, a hand edit of .env) never reaches
+        it. This re-checks the gateway's per-call authorization (``_is_sender_authorized``, which is
+        wired by ``gateway/run.py`` to ``GatewayAuthorizationMixin._is_user_authorized`` and re-reads
+        the allowlist live), the same mechanism Matrix approval reactions use (#130920).
+        """
+        user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+        channel_id = getattr(interaction, "channel_id", None)
+        chat_type = "dm" if getattr(interaction, "guild", None) is None else "group"
+        return self._is_sender_authorized(
+            user_id, chat_type, str(channel_id) if channel_id is not None else None)
+
     def format_message(self, content: str) -> str:
         """Format message for Discord.
 
@@ -7768,6 +7783,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 allow_session=allow_session,
                 smart_denied=smart_denied,
             )
+            # Re-check a connect-time-snapshot user against the gateway's
+            # live allowlist on every click, so `hermes pairing revoke` (or
+            # a .env edit) in another process takes effect without a
+            # gateway restart (upstream 502df01d54).
+            view.live_auth = self._component_live_auth
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
             if mention_content:
@@ -7823,6 +7843,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
+            # Re-check a connect-time-snapshot user against the gateway's
+            # live allowlist on every click (upstream 502df01d54).
+            view.live_auth = self._component_live_auth
 
             msg = await channel.send(content=content, embed=embed, view=view)
             view._message = msg  # store for on_timeout expiration editing
@@ -7930,6 +7953,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
                 )
+                # Re-check a connect-time-snapshot user against the gateway's
+                # live allowlist on every click (upstream 502df01d54).
+                view.live_auth = self._component_live_auth
             else:
                 embed.add_field(
                     name="Reply",
@@ -7986,6 +8012,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
+            # Re-check a connect-time-snapshot user against the gateway's
+            # live allowlist on every click (upstream 502df01d54).
+            view.live_auth = self._component_live_auth
             # Mirror the prompt in plain content — embeds are invisible on
             # some clients (see send_exec_approval).
             content = self._self_contained_prompt_content(
@@ -8052,6 +8081,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
+            # Re-check a connect-time-snapshot user against the gateway's
+            # live allowlist on every click (upstream 502df01d54).
+            view.live_auth = self._component_live_auth
 
             msg = await channel.send(embed=embed, view=view)
             view._message = msg  # store for on_timeout expiration editing
@@ -8100,6 +8132,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
+            # Re-check a connect-time-snapshot user against the gateway's
+            # live allowlist on every click (upstream 502df01d54).
+            view.live_auth = self._component_live_auth
 
             msg = await channel.send(embed=embed, view=view)
             view._message = msg  # store for on_timeout expiration editing
@@ -8882,6 +8917,7 @@ def _component_check_auth(
     interaction,
     allowed_user_ids: Optional[set],
     allowed_role_ids: Optional[set],
+    live_auth: Optional[Callable[[Any], Optional[bool]]] = None,
 ) -> bool:
     """Shared user-or-role OR semantics for component view button clicks.
 
@@ -8893,13 +8929,23 @@ def _component_check_auth(
     Behavior:
 
       - DISCORD_ALLOW_ALL_USERS or GATEWAY_ALLOW_ALL_USERS -> allow
-      - user is in DISCORD_ALLOWED_USERS or GATEWAY_ALLOWED_USERS -> allow
+      - user is in DISCORD_ALLOWED_USERS or GATEWAY_ALLOWED_USERS -> allow,
+        UNLESS ``live_auth`` is wired and returns an explicit False (the user
+        was removed from the live allowlist after this view's connect-time
+        snapshot was taken — e.g. ``hermes pairing revoke``), in which case
+        fall through to the role and pairing checks below.
       - role allowlist set + user has a role in it -> allow
       - role allowlist set + interaction.user has no resolvable
         ``roles`` attribute (e.g. DM context with a role policy active)
         -> reject (fail closed)
       - user is approved in the pairing store -> allow
       - otherwise -> reject
+
+    ``allowed_user_ids`` is the view's connect-time snapshot (``_allowed_user_ids``
+    at the time the prompt was sent). ``live_auth``, when provided, re-checks the
+    gateway's current authorization for a user found only in that snapshot, so a
+    revoke in another process takes effect without a gateway restart (upstream
+    502df01d54).
     """
     user = getattr(interaction, "user", None)
     if user is None or getattr(user, "id", None) is None:
@@ -8933,7 +8979,9 @@ def _component_check_auth(
         uid = ""
 
     if has_users:
-        if "*" in user_set or (uid and uid in user_set):
+        if "*" in user_set:
+            return True
+        if uid and uid in user_set and (live_auth is None or live_auth(interaction) is not False):
             return True
 
     if has_roles:
@@ -9047,6 +9095,9 @@ def _define_discord_view_classes() -> None:
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
             self.resolved = False
+            # The adapter's live allowlist check, bound by the caller after
+            # construction (``_component_live_auth``). None when unwired.
+            self.live_auth = None
             if smart_denied or not allow_session:
                 self.remove_item(self.allow_session)
                 self.remove_item(self.allow_always)
@@ -9065,6 +9116,7 @@ def _define_discord_view_classes() -> None:
             """
             if not _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
+                live_auth=self.live_auth,
             ):
                 return False
             if not self.require_admin:
@@ -9208,10 +9260,14 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
+            # The adapter's live allowlist check, bound by the caller after
+            # construction (``_component_live_auth``). None when unwired.
+            self.live_auth = None
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
+                live_auth=self.live_auth,
             )
 
         async def _resolve(
@@ -9312,10 +9368,14 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
+            # The adapter's live allowlist check, bound by the caller after
+            # construction (``_component_live_auth``). None when unwired.
+            self.live_auth = None
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
+                live_auth=self.live_auth,
             )
 
         async def _respond(
@@ -9417,12 +9477,16 @@ def _define_discord_view_classes() -> None:
             self.resolved = False
             self._selected_provider: str = ""
             self._pending_expensive_model: str = ""
+            # The adapter's live allowlist check, bound by the caller after
+            # construction (``_component_live_auth``). None when unwired.
+            self.live_auth = None
 
             self._build_provider_select()
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
+                live_auth=self.live_auth,
             )
 
         def _build_provider_select(self):
@@ -9750,6 +9814,9 @@ def _define_discord_view_classes() -> None:
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
             self._message = None
+            # The adapter's live allowlist check, bound by the caller after
+            # construction (``_component_live_auth``). None when unwired.
+            self.live_auth = None
 
             options = []
             for choice in self.choices:
@@ -9773,6 +9840,7 @@ def _define_discord_view_classes() -> None:
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
+                live_auth=self.live_auth,
             )
 
         async def _on_select(self, interaction: discord.Interaction):
@@ -9847,6 +9915,9 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
+            # The adapter's live allowlist check, bound by the caller after
+            # construction (``_component_live_auth``). None when unwired.
+            self.live_auth = None
 
             for index, choice in enumerate(self.choices):
                 # Discord button labels are capped at 80 chars. On mobile the
@@ -9910,6 +9981,7 @@ def _define_discord_view_classes() -> None:
         def _check_auth(self, interaction: "discord.Interaction") -> bool:
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
+                live_auth=self.live_auth,
             )
 
         def _make_choice_callback(self, index: int, choice: str):

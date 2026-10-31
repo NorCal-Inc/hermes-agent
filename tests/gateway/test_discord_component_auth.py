@@ -13,13 +13,18 @@ handling, and fail-closed behavior so the parity cannot regress.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+
+from gateway.config import PlatformConfig
 
 # Trigger the shared discord mock from tests/gateway/conftest.py before
 # importing the production module.
 from plugins.platforms.discord.adapter import (  # noqa: E402
+    ChoicePickerView,
     ClarifyChoiceView,
+    DiscordAdapter,
     ExecApprovalView,
     ModelPickerView,
     SlashConfirmView,
@@ -277,4 +282,109 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
+
+
+# ---------------------------------------------------------------------------
+# Live re-authorization of a connect-time snapshot user (upstream 502df01d54).
+# A user found in the view's ``allowed_user_ids`` snapshot is confirmed
+# against ``live_auth`` (the gateway's per-call authorization check) so a
+# revoke made in another process (``hermes pairing revoke``, a .env edit)
+# takes effect without a gateway restart. ``live_auth is None`` (unwired)
+# preserves the pre-fix snapshot-only behavior.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("verdict", "expected"), [(None, True), (True, True), (False, False)])
+def test_snapshot_user_is_confirmed_with_the_live_check(verdict, expected):
+    seen = []
+
+    def live_auth(interaction):
+        seen.append(interaction.user.id)
+        return verdict
+
+    assert _component_check_auth(_interaction(11111), {"11111"}, set(), live_auth=live_auth) is expected
+    assert seen == [11111]
+
+
+def test_unwired_live_auth_keeps_snapshot_only_behavior():
+    """``live_auth=None`` (the default on every view) preserves prior behavior."""
+    assert _component_check_auth(_interaction(11111), {"11111"}, set(), live_auth=None) is True
+
+
+def test_live_revoke_keeps_the_role_grant():
+    """A live-revoked snapshot user still gets in on a role grant (OR semantics)."""
+    interaction = _interaction(11111, role_ids=[42])
+    assert _component_check_auth(interaction, {"11111"}, {42}, live_auth=lambda _i: False) is True
+
+
+def test_exec_approval_view_defaults_live_auth_to_none():
+    """Every view defaults ``live_auth`` to None until the adapter wires it."""
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"11111"})
+    assert view.live_auth is None
+    assert view._check_auth(_interaction(11111)) is True
+
+
+@pytest.mark.parametrize(
+    "view_factory",
+    [
+        lambda: SlashConfirmView(session_key="s", confirm_id="c", allowed_user_ids={"11111"}),
+        lambda: UpdatePromptView(session_key="s", allowed_user_ids={"11111"}),
+        lambda: ClarifyChoiceView(choices=["one"], clarify_id="c", allowed_user_ids={"11111"}),
+    ],
+)
+def test_every_view_type_honors_a_wired_live_auth(view_factory):
+    """Fix 3 of 6 covers every component view, not just ExecApprovalView:
+    each view defaults live_auth to None, and setting it to a callable that
+    returns False for a snapshot-only user denies that user (upstream 502df01d54)."""
+    view = view_factory()
+    assert view.live_auth is None
+    assert view._check_auth(_interaction(11111)) is True
+    view.live_auth = lambda _i: False
+    assert view._check_auth(_interaction(11111)) is False
+
+
+def test_model_picker_view_honors_a_wired_live_auth(monkeypatch):
+    async def _noop(*_a, **_k):
+        return ""
+
+    view = ModelPickerView(
+        providers=[], current_model="m", current_provider="p", session_key="s",
+        on_model_selected=_noop, allowed_user_ids={"11111"},
+    )
+    assert view.live_auth is None
+    assert view._check_auth(_interaction(11111)) is True
+    view.live_auth = lambda _i: False
+    assert view._check_auth(_interaction(11111)) is False
+
+
+def test_choice_picker_view_honors_a_wired_live_auth():
+    view = ChoicePickerView(
+        choices=[{"label": "a", "value": "a"}], on_choice_selected=lambda *_a, **_k: None,
+        allowed_user_ids={"11111"},
+    )
+    assert view.live_auth is None
+    assert view._check_auth(_interaction(11111)) is True
+    view.live_auth = lambda _i: False
+    assert view._check_auth(_interaction(11111)) is False
+
+
+@pytest.mark.asyncio
+async def test_approval_buttons_follow_a_revoke_made_after_connect():
+    """send_exec_approval wires view.live_auth to the adapter's live check;
+    a revoke made after the prompt was sent (another process) takes effect
+    on the next click without a gateway restart (upstream 502df01d54)."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"11111"}
+    live = {"11111": True}
+    adapter.set_authorization_check(lambda user_id, chat_type=None, chat_id=None, **_: live.get(user_id, False))
+    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=1)))
+    adapter._client = SimpleNamespace(get_channel=lambda _chat_id: channel, fetch_channel=AsyncMock())
+
+    result = await adapter.send_exec_approval(chat_id="555", command="make deploy", session_key="discord:555")
+    assert result.success is True
+    view = channel.send.call_args.kwargs["view"]
+    assert view._check_auth(_interaction(11111)) is True
+    live["11111"] = False
+    assert view._check_auth(_interaction(11111)) is False
+
 
