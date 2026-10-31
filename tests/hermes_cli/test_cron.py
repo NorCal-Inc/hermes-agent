@@ -130,6 +130,63 @@ class TestCronCommandLifecycle:
 
 
 
+class TestCronDoctor:
+    """Read-only fleet health check (`hermes cron doctor`)."""
+
+    def test_doctor_reports_no_issues_on_healthy_fleet(self, tmp_cron_dir, capsys):
+        create_job(prompt="Hourly ping", schedule="every 1h")
+
+        rc = cron_command(Namespace(cron_command="doctor"))
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Cron doctor found no issues" in out
+
+    def test_doctor_flags_overdue_next_run(self, tmp_cron_dir, capsys):
+        from datetime import datetime, timedelta, timezone
+
+        from cron.jobs import update_job
+
+        job = create_job(prompt="Hourly ping", schedule="every 1h")
+        stale = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        update_job(job["id"], {"next_run_at": stale})
+
+        rc = cron_command(Namespace(cron_command="doctor"))
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "overdue" in out
+        assert "not firing" in out
+
+    def test_doctor_tolerates_slightly_late_next_run(self, tmp_cron_dir, capsys):
+        from datetime import datetime, timedelta, timezone
+
+        from cron.jobs import update_job
+
+        job = create_job(prompt="Hourly ping", schedule="every 1h")
+        # 5 minutes late is within the ticker grace window — healthy.
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        update_job(job["id"], {"next_run_at": recent})
+
+        rc = cron_command(Namespace(cron_command="doctor"))
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Cron doctor found no issues" in out
+
+    def test_doctor_flags_last_run_failure(self, tmp_cron_dir, capsys):
+        from cron.jobs import update_job
+
+        job = create_job(prompt="Daily report", schedule="every 1h")
+        update_job(job["id"], {"last_status": "error", "last_error": "boom"})
+
+        rc = cron_command(Namespace(cron_command="doctor"))
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "last run failed: boom" in out
+
+
 class TestGatewayNotRunningWarning:
     """`cron create` / `cron list` must warn when the gateway (and thus the
     cron ticker) isn't running, since jobs only fire inside the gateway.

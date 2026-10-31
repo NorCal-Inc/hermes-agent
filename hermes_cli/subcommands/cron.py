@@ -290,6 +290,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
+    # cron doctor — read-only fleet health check
+    cron_subparsers.add_parser(
+        "doctor",
+        help="Read-only fleet health check: failed runs, failed deliveries, overdue/missing next_run_at, missing scripts or workdirs.",
+    )
+
     cron_runs = cron_subparsers.add_parser(
         "runs", aliases=["history"], help="Show durable execution attempts"
     )
