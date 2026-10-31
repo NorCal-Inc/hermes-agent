@@ -1028,9 +1028,76 @@ _FILE_READ_COMMANDS = frozenset({
     "zcat", "tac", "view", "batcat",
 })
 
+# Standard shell startup-file basenames: these routinely carry exported
+# secrets (``export SERVICE_TOKEN=...``) the same way ``.env`` does, but are
+# not caught by ``_ENV_FILE_BASENAMES`` (they are not dotenv-shaped files).
+_SECRET_BEARING_FILE_BASENAMES = frozenset({
+    ".bashrc", ".bash_profile", ".bash_login", ".profile",
+    ".zshrc", ".zprofile", ".zlogin", ".zshenv",
+})
+
+# grep/awk/sed commonly target the same shell startup files or
+# ``~/.hermes/config.yaml`` to pull one line/field out — their first
+# positional argument is the pattern/script, not the file, so the file
+# argument(s) start one position later than for _FILE_READ_COMMANDS.
+_TEXT_FILE_READ_COMMANDS = frozenset({"grep", "awk", "sed"})
+
 # Basenames that are treated as ``.env`` files for redaction purposes are
 # imported at module top as ``_ENV_FILE_BASENAMES`` (see the
 # ``agent.file_safety`` import).
+
+
+def _is_secret_bearing_file_arg(arg: str) -> bool:
+    """Recognize explicit Hermes config and standard shell startup paths.
+
+    Only a literal basename match — a shell-variable-expanded path
+    (``"$HERMES_HOME/config.yaml"``) is deliberately NOT detected here, same
+    fail-open precedent as ``_command_reads_env_file``: we cannot resolve the
+    variable statically, so we do not guess.
+    """
+    path = arg.strip("\"'").replace("\\", "/")
+    if "$" in path:
+        return False
+    parts = [part.lower() for part in path.split("/") if part]
+    if not parts:
+        return False
+    if parts[-1] in _SECRET_BEARING_FILE_BASENAMES:
+        return True
+    return parts[-1] == "config.yaml" and ".hermes" in parts[:-1]
+
+
+def _command_reads_secret_bearing_file(command: str | None) -> bool:
+    """True for direct stdout reads of known secret-bearing config files
+    (``~/.hermes/config.yaml`` or a profile's ``config.yaml``, and standard
+    shell startup files: ``.bashrc``, ``.zshrc``, etc.).
+
+    Unlike ``.env``, these files are not secrets-only — the fork only masked
+    ``.env`` reads, so a config.yaml or shell-rc read with an embedded token
+    reached the model unscanned. Handles both direct file-read commands
+    (``cat``, ``head``, ...) and text-extraction commands (``grep``, ``awk``,
+    ``sed``) whose first positional argument is a pattern/script rather than
+    the file itself.
+    """
+    if not command or not isinstance(command, str):
+        return False
+    segments = re.split(r"[|;&]+", command)
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        tokens = seg.split()
+        if not tokens:
+            continue
+        reader = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if reader in _FILE_READ_COMMANDS:
+            if any(_is_secret_bearing_file_arg(arg) for arg in tokens[1:] if not arg.startswith("-")):
+                return True
+            continue
+        if reader in _TEXT_FILE_READ_COMMANDS:
+            positional = [arg for arg in tokens[1:] if not arg.startswith("-")]
+            if any(_is_secret_bearing_file_arg(arg) for arg in positional[1:]):
+                return True
+    return False
 
 
 def _command_reads_env_file(command: str | None) -> bool:
@@ -1108,7 +1175,8 @@ def redact_terminal_output(
     Single redaction policy for ALL terminal-output surfaces — foreground
     ``terminal`` results AND background ``process(action=poll/log/wait)``
     output — so they can't diverge. Picks ``code_file`` based on whether
-    ``command`` is an environment dump or reads a ``.env`` file:
+    ``command`` is an environment dump or reads a ``.env``/secret-bearing
+    config file:
 
     - env-dump command (``env``/``printenv``/``set``/``export``/``declare``)
       → ``code_file=False`` so the ENV-assignment pass masks opaque tokens.
@@ -1117,6 +1185,13 @@ def redact_terminal_output(
       Per AGENTS.md, ``.env`` files contain only secrets, so the generic
       ENV pass is the right one (keys whose names carry no secret keyword
       can still slip through it — same limit as the env-dump path).
+    - file-read (or grep/awk/sed) command targeting ``~/.hermes/config.yaml``
+      (or a profile's), or a standard shell startup file (``.bashrc``,
+      ``.zshrc``, etc.) → ``code_file=False``. Unlike ``.env``, these files
+      are not secrets-only, but they routinely carry one (``api_key:`` in
+      config.yaml, ``export TOKEN=...`` in a shell rc) and were previously
+      only masked by the generic vendor-prefix pass, not the ENV-assignment
+      pass.
     - anything else (or unknown command) → ``code_file=True`` to avoid
       false positives on source/config dumps.
 
@@ -1126,7 +1201,11 @@ def redact_terminal_output(
     if not output:
         return output
     cmd = command or ""
-    code_file = not (is_env_dump_command(cmd) or _command_reads_env_file(cmd))
+    code_file = not (
+        is_env_dump_command(cmd)
+        or _command_reads_env_file(cmd)
+        or _command_reads_secret_bearing_file(cmd)
+    )
     return redact_sensitive_text(output, force=force, code_file=code_file)
 
 
