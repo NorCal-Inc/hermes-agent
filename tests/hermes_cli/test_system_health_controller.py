@@ -623,6 +623,43 @@ class TestVerifierGraphEscalations:
                                 [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
         assert len(result.escalated) == 1
 
+    def _verdict_from_lane(self, conn, lane, started_kind):
+        subject = kb.create_task(conn, title="subject", assignee="default", gauntlet=True)
+        verifier = kb.create_task(conn, title="verify", assignee="atlas",
+                                  parents=[subject], gauntlet=True)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done', executor_lane = ? WHERE id = ?",
+                         (lane, verifier))
+            run_id = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
+                "VALUES (?, 'done', 1, 2, 'completed')", (verifier,)).lastrowid
+            if started_kind:
+                kb._append_event(conn, verifier, started_kind, {}, run_id=run_id)
+            kb._append_event(conn, subject, "verifier_verdict_returned",
+                             {"verifier_task": verifier, "verdict": "PASS", "recorded": True})
+
+    def test_claude_verify_attested_verdict_is_not_flagged(self, kanban_home):
+        """Regression: the check was pinned to codex_verifier_started and flagged every claude_verify verdict."""
+        with kb.connect_closing() as conn:
+            self._verdict_from_lane(conn, kb.EXECUTOR_LANE_CLAUDE_VERIFY, "claude_verifier_started")
+        result = shc.Controller(_ctx(kanban_home),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert not result.escalated
+
+    def test_claude_verify_without_started_event_is_still_flagged(self, kanban_home):
+        with kb.connect_closing() as conn:
+            self._verdict_from_lane(conn, kb.EXECUTOR_LANE_CLAUDE_VERIFY, None)
+        result = shc.Controller(_ctx(kanban_home),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert len(result.escalated) == 1
+
+    def test_claude_verify_lane_with_codex_started_event_is_still_flagged(self, kanban_home):
+        with kb.connect_closing() as conn:
+            self._verdict_from_lane(conn, kb.EXECUTOR_LANE_CLAUDE_VERIFY, "codex_verifier_started")
+        result = shc.Controller(_ctx(kanban_home),
+                                [shc.VerifiedClosureAttributable()]).run(shc.TIER_DEEP)
+        assert len(result.escalated) == 1
+
     def test_verifier_of_verifier_is_escalated_never_recovered(self, kanban_home):
         with kb.connect_closing() as conn:
             subject = _subject_with_route(conn)
@@ -2234,6 +2271,44 @@ class TestCompanyIsolation:
         assert [f.signature for f in findings] == ([signature] if signature else [])
         assert "Orion" not in json.dumps([f.detail for f in findings])
 
+    def test_own_company_attachment_survives_archive_unassign(self, kanban_home):
+        """t_3a0407da's exact shape: a company lead's own-token attachment on its
+        own card must not become 'foreign' just because the card is later
+        archived/unassigned and the current assignee column clears to None."""
+        with kb.connect_closing() as conn:
+            orion_card = kb.create_task(conn, title="orion investigation", assignee="orion_formation_services_lead")
+            kb.add_attachment(conn, orion_card, filename="orion-stripe-readback.json",
+                              stored_path="/tmp/g", size=1, uploaded_by="agent")
+            claimed = kb.claim_task(conn, orion_card)
+            assert kb.request_review(conn, orion_card, summary="done",
+                                      expected_run_id=claimed.current_run_id) is True
+            assert kb.assign_task(conn, orion_card, None) is True
+            assert kb.archive_task(conn, orion_card) is True
+            row = conn.execute("SELECT assignee, status FROM tasks WHERE id = ?", (orion_card,)).fetchone()
+            assert row["assignee"] is None and row["status"] == "archived"
+        runner = lambda argv, timeout: (0, "")  # noqa: E731
+        findings = shc.CompanyIsolation().check(_ctx(kanban_home, config=self._config(0), run_command=runner))
+        assert findings == [], [(f.subject, f.signature, f.detail) for f in findings]
+
+    def test_foreign_company_attachment_still_flags_after_archive_unassign(self, kanban_home):
+        """A genuinely foreign-company token on a card that is later
+        archived/unassigned must still flag -- the fix narrows owner
+        resolution to historical ownership, it does not disable detection."""
+        with kb.connect_closing() as conn:
+            orion_card = kb.create_task(conn, title="orion investigation 2", assignee="orion_formation_services_lead")
+            kb.add_attachment(conn, orion_card, filename="logos-invoice-foreign.pdf",
+                              stored_path="/tmp/h", size=1, uploaded_by="agent")
+            claimed = kb.claim_task(conn, orion_card)
+            assert kb.request_review(conn, orion_card, summary="done",
+                                      expected_run_id=claimed.current_run_id) is True
+            assert kb.assign_task(conn, orion_card, None) is True
+            assert kb.archive_task(conn, orion_card) is True
+        runner = lambda argv, timeout: (0, "")  # noqa: E731
+        findings = shc.CompanyIsolation().check(_ctx(kanban_home, config=self._config(0), run_command=runner))
+        assert _signatures(findings) == [(orion_card, "boundary_attachments_on_card")]
+        assert findings[0].detail["count"] == "1"
+        assert all(f.unsafe for f in findings)
+
 
 # ---------------------------------------------------------------------------
 # F3 — bounded recovery classes (Christopher, 2026-09-14): build and test only.
@@ -3579,7 +3654,10 @@ class TestNewlyAuthorizedRecoveryReentry:
         assert "recovery_reentries" not in other_after
         with kb.connect_closing() as conn:
             assert [r["id"] for r in _health_cards(conn)] == cards_before
-        assert len(alerts.sent) == 1
+        # No new degraded alert; the recovery of the announced escalation sends one resolved notice.
+        assert len(alerts.sent) == 2
+        subject, body = alerts.sent[1]
+        assert subject == "[health] toggle_detector RESOLVED" and before["card_id"] in body
 
     def test_unchanged_authorization_never_reevaluates_again(self, kanban_home):
         # 2, 10

@@ -573,6 +573,7 @@ class Controller:
         model = state_model(self.ctx.config)
         result = PassResult(tier, "GREEN", 0, [], [], [], [], state_model=model)
         self._alert_queue: list[tuple[Finding, dict]] = []
+        self._resolved_queue: list[tuple[str, dict, str]] = []
         holds = recovery_holds(self.ctx.config)
         self._frozen = {tid for hold in holds for tid in hold["task_ids"]}
         self._pass_mutations = 0
@@ -789,6 +790,8 @@ class Controller:
             if (not self.ctx.dry_run and reason_override is None
                     and self._reenter_newly_authorized(inv, finding, rec, state, result)):
                 return
+            if not self.ctx.dry_run:
+                self._backfill_card(finding, rec)
             # Escalated exactly once. Only an undelivered alert is retried.
             self._deliver_alert(finding, rec)
             return
@@ -847,25 +850,15 @@ class Controller:
             # Company health never becomes a shared card (F2 boundary).
             card_id = None
             rec["route"] = ROUTE_COMPANY
+        elif self._should_create_card(finding):
+            try:
+                card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, reason)
+            except Exception as exc:
+                card_id, card_error = None, f"{type(exc).__name__}: {str(exc)[:200]}"
         else:
-            configured = self.ctx.config.get("kanban_card_invariants", ["company_isolation"])
-            if isinstance(configured, str):
-                configured = [configured]
-            card_invariants = {str(x) for x in (configured or [])}
-            should_create_card = (
-                finding.unsafe
-                or "*" in card_invariants
-                or finding.invariant in card_invariants
-            )
-            if should_create_card:
-                try:
-                    card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, reason)
-                except Exception as exc:
-                    card_id, card_error = None, f"{type(exc).__name__}: {str(exc)[:200]}"
-            else:
-                card_id = None
-                card_new = False
-                rec["route"] = ROUTE_SHARED
+            card_id = None
+            card_new = False
+            rec["route"] = ROUTE_SHARED
         rec["status"] = STATUS_ESCALATED
         rec["escalated_at"] = _iso(now)
         rec["escalation_reason"] = reason
@@ -882,8 +875,38 @@ class Controller:
             self._deliver_alert(finding, rec)
         result.escalated.append(finding.fingerprint)
 
+    def _should_create_card(self, finding: Finding) -> bool:
+        configured = self.ctx.config.get("kanban_card_invariants", ["company_isolation"])
+        if isinstance(configured, str):
+            configured = [configured]
+        card_invariants = {str(x) for x in (configured or [])}
+        return finding.unsafe or "*" in card_invariants or finding.invariant in card_invariants
+
+    def _backfill_card(self, finding: Finding, rec: dict) -> None:
+        """Give an escalation that never got a card (e.g. before its invariant was carded) one now.
+
+        A newly created card re-opens the alert so #alerts announces the repair that started.
+        """
+        if rec.get("card_id") or finding.route == ROUTE_COMPANY or rec.get("route") == ROUTE_COMPANY:
+            return
+        if not self._should_create_card(finding):
+            return
+        try:
+            card_id, card_new = self.ctx.create_card(self.ctx, finding, rec, rec.get("escalation_reason") or "")
+        except Exception as exc:
+            rec["card_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            return
+        rec["card_id"], rec["card_error"] = card_id, None
+        self.store.record(self.ctx.now(), "card_backfilled", fingerprint=finding.fingerprint,
+                          card_id=card_id, card_new=card_new)
+        if card_id and card_new:
+            rec["alert_delivered"], rec["alert_attempts"] = False, 0
+
     def _deliver_alert(self, finding: Finding, rec: dict) -> None:
         """Queue the fingerprint's alert; the pass sends one batched message."""
+        if rec.get("alert_target_tried") != self.ctx.config.get("alert_target"):
+            # The alert channel changed since the last failed attempts: retry on the new one.
+            rec["alert_attempts"] = 0
         if rec.get("alert_delivered") or int(rec.get("alert_attempts", 0)) >= MAX_ALERT_ATTEMPTS:
             return
         self._alert_queue.append((finding, rec))
@@ -895,6 +918,7 @@ class Controller:
         undelivered); batching keeps a backlog discovered in one pass from
         becoming a burst of separate messages.
         """
+        self._flush_resolved()
         queue, self._alert_queue = self._alert_queue, []
         if not queue:
             return
@@ -912,9 +936,43 @@ class Controller:
             rec["alert_attempts"] = int(rec.get("alert_attempts", 0)) + 1
             rec["alert_delivered"] = bool(delivered)
             rec["alert_detail"] = detail
+            rec["alert_target_tried"] = self.ctx.config.get("alert_target")
             self.store.record(self.ctx.now(), "alert", fingerprint=finding.fingerprint,
                               delivered=bool(delivered), attempt=rec["alert_attempts"],
                               batch_size=len(queue))
+
+    def _announce_resolved(self, fp: str, rec: dict, via: str) -> None:
+        """Queue one resolved notice for an escalation that was announced or carded."""
+        if self.ctx.dry_run or rec.get("route") == ROUTE_COMPANY:
+            return
+        if rec.get("alert_delivered") or rec.get("card_id"):
+            if not hasattr(self, "_resolved_queue"):
+                self._resolved_queue = []
+            self._resolved_queue.append((fp, rec, via))
+
+    def _flush_resolved(self) -> None:
+        queue, self._resolved_queue = getattr(self, "_resolved_queue", []), []
+        if not queue:
+            return
+        blocks = []
+        for fp, rec, via in queue:
+            blocks.append("\n".join([
+                f"invariant: {rec.get('invariant')}",
+                f"subject: {rec.get('subject')}",
+                f"fingerprint: {fp}",
+                f"resolved: {via} at {rec.get('resolved_at')} (first seen {rec.get('first_seen')})",
+                f"card: {rec.get('card_id') or 'none'}",
+            ]))
+        subject = (f"[health] {queue[0][1].get('invariant')} RESOLVED" if len(blocks) == 1
+                   else f"[health] {len(blocks)} conditions RESOLVED")
+        try:
+            delivered, detail = self.ctx.send_alert(subject, "\n\n".join(blocks))
+        except Exception as exc:
+            delivered, detail = False, f"{type(exc).__name__}: {str(exc)[:200]}"
+        for fp, rec, _ in queue:
+            rec["resolved_alert_delivered"] = bool(delivered)
+            self.store.record(self.ctx.now(), "resolved_alert", fingerprint=fp,
+                              delivered=bool(delivered), detail=detail)
 
     # -- F3 RECOVERY CLASSES --------------------------------------------------
 
@@ -1198,6 +1256,7 @@ class Controller:
         history[fp] = {"recovered_ts": now, "recovery_class": klass.name, "attempts": rec.get("attempts")}
         result.recovered.append(fp)
         self.store.record(now, "green", fingerprint=fp, via=via, recovery_class=klass.name)
+        self._announce_resolved(fp, rec, via)
         self._archive_resolved_health_card(fp, rec, via=via)
 
     # -- HOLD ----------------------------------------------------------------
@@ -1321,10 +1380,13 @@ class Controller:
             if rec.get("tier") not in (None, inv.tier):
                 continue  # the other pass owns it
             if rec.get("status") in (STATUS_OPEN, STATUS_ESCALATED, STATUS_HELD):
+                was_escalated = rec.get("status") == STATUS_ESCALATED
                 rec["status"] = STATUS_RESOLVED
                 rec["resolved_at"] = _iso(now)
                 result.resolved.append(fp)
                 self.store.record(now, "green", fingerprint=fp, via="condition_cleared")
+                if was_escalated:
+                    self._announce_resolved(fp, rec, "condition_cleared")
                 self._archive_resolved_health_card(fp, rec, via="condition_cleared")
 
 
@@ -1766,7 +1828,7 @@ class VerifiedClosureAttributable(Invariant):
 
     name = "verified_closure_attributable"
     tier = TIER_DEEP
-    source = "kanban.db verification_passed and verifier_verdict_returned events via kanban_db._attested_codex_verifier_run"
+    source = "kanban.db verification_passed and verifier_verdict_returned events via kanban_db._attested_verifier_run"
     failure = "a Gauntlet closure verified by a bare/missing lane identity, or a recorded verdict returned from an unattested verifier"
     evidence = "verified_by_bare_or_missing_identity; verdict_returned_from_unattested_verifier (history never rewritten)"
 
@@ -1802,7 +1864,13 @@ class VerifiedClosureAttributable(Invariant):
                 except json.JSONDecodeError:
                     continue
                 vt = payload.get("verifier_task")
-                if payload.get("recorded") and vt and kb._attested_codex_verifier_run(conn, vt) is None:
+                if not (payload.get("recorded") and vt):
+                    continue
+                lane_row = conn.execute(
+                    "SELECT executor_lane FROM tasks WHERE id = ?", (vt,),
+                ).fetchone()
+                lane = lane_row["executor_lane"] if lane_row else None
+                if lane not in kb.INDEPENDENT_VERIFIER_LANES or kb._attested_verifier_run(conn, vt, lane) is None:
                     if f"{self.name}|{row['task_id']}|verdict_returned_from_unattested_verifier" in adjudicated:
                         continue
                     out.append(Finding(self.name, row["task_id"],
@@ -3104,9 +3172,54 @@ class CompanyIsolation(Invariant):
         watch_since = int(cfg.get("isolation_watch_since") or 0)
         counts: dict[str, int] = {}
         with ctx.kanban() as conn:
+            # Historical-owner timeline per task: every ("created" | "assigned")
+            # event's assignee, ordered by the event table's own id -- the
+            # true insertion order, immune to same-second clock collisions
+            # that ``created_at`` (second resolution) cannot distinguish. An
+            # attachment is judged against whoever owned the card AT THE TIME
+            # it was uploaded, never the task's CURRENT (possibly
+            # cleared-on-archive/completion) assignee column. Without this, a
+            # company's own file attached while that company's own lead
+            # legitimately owned the card is misclassified as foreign the
+            # moment the card is later archived/unassigned, because
+            # ``None != cid`` for every real company id (t_3a0407da).
+            timelines: dict[str, list[tuple[int, Optional[str]]]] = {}
             for row in conn.execute(
-                "SELECT a.task_id, a.filename, a.created_at, t.assignee FROM task_attachments a "
-                "JOIN tasks t ON t.id = a.task_id"
+                "SELECT id, task_id, payload FROM task_events "
+                "WHERE kind IN ('created', 'assigned') ORDER BY id ASC"
+            ).fetchall():
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict) or "assignee" not in payload:
+                    continue
+                timelines.setdefault(row["task_id"], []).append((row["id"], payload.get("assignee")))
+            # Each attachment's own ``attached`` event anchors it precisely in
+            # that same id-ordered timeline. ``add_attachment`` always writes
+            # exactly one such event per attachment row, in the same
+            # transaction and in the same per-task order, so the Nth
+            # attachment (by attachment id) pairs with the Nth 'attached'
+            # event (by event id) for that task.
+            attach_event_ids: dict[str, list[int]] = {}
+            for row in conn.execute(
+                "SELECT id, task_id FROM task_events WHERE kind = 'attached' ORDER BY id ASC"
+            ).fetchall():
+                attach_event_ids.setdefault(row["task_id"], []).append(row["id"])
+            attachment_order: dict[str, list[int]] = {}
+            for row in conn.execute(
+                "SELECT id, task_id FROM task_attachments ORDER BY id ASC"
+            ).fetchall():
+                attachment_order.setdefault(row["task_id"], []).append(row["id"])
+            anchor_event_id: dict[int, int] = {}
+            for task_id, ordered_attachment_ids in attachment_order.items():
+                ordered_event_ids = attach_event_ids.get(task_id, [])
+                for pos, att_id in enumerate(ordered_attachment_ids):
+                    if pos < len(ordered_event_ids):
+                        anchor_event_id[att_id] = ordered_event_ids[pos]
+            for row in conn.execute(
+                "SELECT a.id AS attachment_id, a.task_id, a.filename, a.created_at, t.assignee "
+                "FROM task_attachments a JOIN tasks t ON t.id = a.task_id"
             ).fetchall():
                 # The watch starts at an explicit cutover. Older attachments are
                 # preserved history, not a live incident that should re-escalate
@@ -3114,7 +3227,19 @@ class CompanyIsolation(Invariant):
                 if int(row["created_at"] or 0) < watch_since:
                     continue
                 name = str(row["filename"] or "").lower()
-                owner = lead_to_company.get(row["assignee"] or "")
+                # Fall back to the task's current assignee only when no
+                # created/assigned event is on record at all (pre-dates event
+                # logging), or this attachment's own 'attached' event could
+                # not be located -- otherwise always use the owner resolved
+                # as of the attachment's own anchor event id.
+                owner_token = row["assignee"]
+                anchor = anchor_event_id.get(row["attachment_id"])
+                if anchor is not None:
+                    for event_id, assignee in timelines.get(row["task_id"], ()):
+                        if event_id > anchor:
+                            break
+                        owner_token = assignee
+                owner = lead_to_company.get(owner_token or "")
                 foreign = [cid for cid, spec in companies.items() if cid != owner
                            and any(tok in name for tok in spec.get("tokens", []))]
                 runtime = (owner is None and (name.endswith(recovery_lane._HARVEST_DENIED_SUFFIXES)
