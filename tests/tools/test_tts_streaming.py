@@ -38,6 +38,13 @@ class TestSentenceChunker:
         assert c.feed("ing</think>The actual spoken answer. ") == ["The actual spoken answer. "]
 
 
+    @pytest.mark.parametrize("tag", ["<think>", "<thinking>", "<THINK>", "<reasoning>"])
+    def test_flush_drops_unterminated_think_tail(self, tag):
+        c = ts.SentenceChunker()
+        assert c.feed(f"The spoken part. {tag}half-formed reas") == []
+        assert c.flush() == ["The spoken part."]
+
+
     def test_paragraph_break_is_a_boundary(self):
         c = ts.SentenceChunker()
         assert c.feed("A paragraph without punctuation\n\nnext one") == [

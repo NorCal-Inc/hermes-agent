@@ -58,7 +58,19 @@ from __future__ import annotations
 
 from typing import Tuple
 
-__all__ = ["StreamingThinkScrubber"]
+__all__ = ["THINK_TAG_NAMES", "StreamingThinkScrubber"]
+
+# Canonical list of reasoning/thinking tag names (case-insensitive), shared by
+# every reasoning-hiding surface. Kept at module scope -- not nested inside
+# StreamingThinkScrubber -- so other modules (e.g. tools.tts_streaming) can
+# import one source of truth instead of re-declaring their own tag list.
+THINK_TAG_NAMES: Tuple[str, ...] = (
+    "think",
+    "thinking",
+    "reasoning",
+    "thought",
+    "REASONING_SCRATCHPAD",
+)
 
 
 class StreamingThinkScrubber:
