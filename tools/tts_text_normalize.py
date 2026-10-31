@@ -33,6 +33,10 @@ _MD_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", flags=re.MULTILINE)
 _MD_HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$", flags=re.MULTILINE)
 _MD_TABLE_PIPE_RE = re.compile(r"\s*\|\s*")
 _URL_RE = re.compile(r"https?://\S+")
+# Local file links ("MEDIA:/Users/me/file.xlsx") are click targets on screen, not
+# speech: voices loop on the hyphenated slug ("eeeeee"). The token is silence; the
+# assistant's prose already says "the files are below".
+_MEDIA_PATH_RE = re.compile(r"MEDIA:\S+")
 
 # Broad emoji / pictograph cleanup.  Voice providers vary a lot here; most read
 # emojis as awkward labels, so keep the speech script calm and literal.
@@ -64,6 +68,7 @@ def strip_markdown_for_tts(text: str) -> str:
     text = _MD_IMAGE_RE.sub(lambda m: f" {m.group(1)} " if m.group(1) else " ", text)
     text = _MD_LINK_RE.sub(r"\1", text)
     text = _URL_RE.sub("", text)
+    text = _MEDIA_PATH_RE.sub(" ", text)
     text = _MD_INLINE_CODE_RE.sub(r"\1", text)
     text = _MD_BOLD_RE.sub(r"\1", text)
     text = _MD_UNDERSCORE_BOLD_RE.sub(r"\1", text)
@@ -194,8 +199,14 @@ def smooth_whitespace_for_tts(text: str) -> str:
         if pending_heading is not None:
             line = f"{pending_heading.rstrip('.:;,')}, {line}"
             pending_heading = None
-        if add_sentence_pauses and line[-1] not in ".!?;:":
-            line += "."
+        if add_sentence_pauses:
+            if line[-1] in ":;":
+                # A trailing colon promises a continuation ("the list:"); the raw
+                # token after it (file link, code fence) is already gone from
+                # speech, so the voice would hang on the open pause. Close it.
+                line = line.rstrip(":;").rstrip() + "."
+            elif line[-1] not in ".!?":
+                line += "."
         lines.append(line)
 
     flush_pending()
@@ -206,6 +217,9 @@ def smooth_whitespace_for_tts(text: str) -> str:
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     text = re.sub(r"([,.;:!?])([A-Za-z])", r"\1 \2", text)
     text = re.sub(r"\.{4,}", "...", text)
+    # Single-line text ("Here is the list:") skips the per-line pause pass, so close a
+    # final colon here too -- never a digit-preceded one ("final score 3:2" is a ratio).
+    text = re.sub(r"([^0-9])(?:[:;]\s*)+$", r"\1.", text)
     return text.strip()
 
 
@@ -255,6 +269,9 @@ def flatten_newlines_for_payload(text: str) -> str:
     text = text.replace("\n", ". ")
     text = re.sub(r"\.\s*\.", ".", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
+    # Single-line text ("Here is the list:") skips the per-line pause pass, so close a
+    # final colon here too -- never a digit-preceded one ("final score 3:2" is a ratio).
+    text = re.sub(r"([^0-9])(?:[:;]\s*)+$", r"\1.", text)
     return text.strip()
 
 
