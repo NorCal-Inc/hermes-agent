@@ -7858,18 +7858,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             content = f"{prompt_prefix}{content_cmd_display}{prompt_tail}"
 
-            # Preserve the richer embed path and its larger description budget
-            # for clients where embeds render correctly.
-            max_embed_desc = 4088
-            embed_cmd_display = str(command or "")
-            if len(embed_cmd_display) > max_embed_desc:
-                embed_cmd_display = embed_cmd_display[: max_embed_desc - 3] + "..."
+            # Preserve the richer embed path, kept purely for visual state
+            # (title/color) on clients that render embeds well. Content above
+            # is the canonical, accessible payload — the embed must not repeat
+            # either the command or the reason (upstream 5e0a1852f5): a second
+            # copy in the embed produced duplicate exec-approval details.
             embed = discord.Embed(
                 title="⚠️ Command Approval Required",
-                description=f"```\n{embed_cmd_display}\n```",
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Reason", value=reason_display, inline=False)
 
             require_admin, admin_user_ids = _resolve_exec_approval_admin_gate(
                 getattr(self.config, "extra", None)
