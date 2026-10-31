@@ -7009,13 +7009,16 @@ class DiscordAdapter(BasePlatformAdapter):
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
 
-        Off by default. When on, a bot-authored message only wakes this bot
-        if its content contains a literal ``<@thisbot>`` token. A Discord
+        On by default. A bot-authored message only wakes this bot if its
+        content contains a literal ``<@thisbot>`` token. A Discord
         reply/quote to one of our messages is NOT enough on its own, because
         Discord's reply-ping silently adds us to ``message.mentions`` even
         though the author never typed our handle — which otherwise lets two
         bots ping-pong replies at each other indefinitely. Humans are never
-        affected by this gate; it only applies to bot authors.
+        affected by this gate; it only applies to bot authors. Set the
+        option to false only for trusted relay integrations that
+        intentionally depend on reply pings or unmentioned bot messages
+        (upstream f708640561).
 
         Config: ``discord.bots_require_inline_mention`` (or env
         ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
@@ -7025,7 +7028,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
+        return os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true").lower() in {
             "true",
             "1",
             "yes",
