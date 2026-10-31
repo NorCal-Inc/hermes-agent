@@ -821,6 +821,31 @@ OPUS_VOICE_PLATFORMS = frozenset({
     "signal",
 })
 
+# MEDIA:<path> is a line-level gateway protocol. A filename containing an anchored media
+# directive forges a second attachment whenever the path is echoed into the tool result
+# (media_tag / file_path fields, error text): the collector scans producer output with a
+# bare MEDIA: matcher and cannot tell a filename from a directive.
+_MEDIA_DIRECTIVE_RE = re.compile(r"media:\s*[`'\"*_]*(?:[a-z]:[/\\]|~?/)", re.IGNORECASE)
+
+
+def _media_tag(paths: List[str], voice_compatible: bool) -> str:
+    """``MEDIA:<path>`` lines; the ``[[audio_as_voice]]`` marker asks the platform for a voice bubble.
+
+    Defense in depth: any path carrying a control character or line separator is dropped
+    here too, even though ``output_path`` validation should already have rejected it —
+    a generated/temp path should never contain one, but a silently-emitted one would
+    forge an extra MEDIA: line in the downstream collector.
+    """
+    from tools.path_security import has_unsafe_path_chars
+    safe = []
+    for path in paths:
+        if has_unsafe_path_chars(path):
+            logger.warning("TTS: dropping undeliverable media path with control characters: %r", path)
+            continue
+        safe.append(path)
+    media_tag = "\n".join(f"MEDIA:{path}" for path in safe)
+    return f"[[audio_as_voice]]\n{media_tag}" if voice_compatible else media_tag
+
 
 def _get_provider_section(tts_config: Dict[str, Any], name: str) -> Dict[str, Any]:
     """Return a provider config block if it's a dict, else an empty dict."""
@@ -3257,7 +3282,22 @@ def _text_to_speech_single(
         # ``output_path="audio/../../etc/cron.d/x"``. The terminal tool
         # can still write anywhere with approval; this just keeps the
         # unattended TTS surface from materializing files via traversal.
-        from tools.path_security import has_traversal_component
+        from tools.path_security import has_traversal_component, has_unsafe_path_chars
+        if has_unsafe_path_chars(output_path):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "output_path contains control characters or line separators; "
+                    "use a plain filesystem path"
+                ),
+            }, ensure_ascii=False)
+        # Must precede the traversal/protected checks: their error text echoes the path,
+        # and a MEDIA: substring in it would forge a delivery tag downstream.
+        if _MEDIA_DIRECTIVE_RE.search(output_path):
+            return json.dumps({
+                "success": False,
+                "error": "output_path must not contain a media directive (MEDIA:<path>)",
+            }, ensure_ascii=False)
         if has_traversal_component(output_path):
             return json.dumps({
                 "success": False,
@@ -3508,9 +3548,7 @@ def _text_to_speech_single(
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
 
         # Build response with MEDIA tag for platform delivery
-        media_tag = f"MEDIA:{file_str}"
-        if voice_compatible:
-            media_tag = f"[[audio_as_voice]]\n{media_tag}"
+        media_tag = _media_tag([file_str], voice_compatible)
 
         return json.dumps({
             "success": True,
@@ -3619,7 +3657,22 @@ def text_to_speech_tool(
 
     # Determine output path (single-chunk short-circuit uses the final path).
     if output_path:
-        from tools.path_security import has_traversal_component
+        from tools.path_security import has_traversal_component, has_unsafe_path_chars
+        if has_unsafe_path_chars(output_path):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "output_path contains control characters or line separators; "
+                    "use a plain filesystem path"
+                ),
+            }, ensure_ascii=False)
+        # Must precede the traversal/protected checks: their error text echoes the path,
+        # and a MEDIA: substring in it would forge a delivery tag downstream.
+        if _MEDIA_DIRECTIVE_RE.search(output_path):
+            return json.dumps({
+                "success": False,
+                "error": "output_path must not contain a media directive (MEDIA:<path>)",
+            }, ensure_ascii=False)
         if has_traversal_component(output_path):
             return json.dumps({
                 "success": False,
@@ -3723,9 +3776,7 @@ def text_to_speech_tool(
                 f"{os.path.getsize(path):,}",
                 provider,
             )
-        media_tag = "\n".join(f"MEDIA:{path}" for path in final_paths)
-        if voice_compatible:
-            media_tag = f"[[audio_as_voice]]\n{media_tag}"
+        media_tag = _media_tag(final_paths, voice_compatible)
 
         return json.dumps({
             "success": True,
