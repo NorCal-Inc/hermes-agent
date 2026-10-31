@@ -1076,6 +1076,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        self._username_resolved_ids: set = set()  # IDs resolved from username entries (gateway authz union)
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
         # Per-adapter snapshot of authorization gate env vars, captured inside
         # the owning profile's runtime scope during connect(). None until then;
@@ -5845,6 +5846,12 @@ class DiscordAdapter(BasePlatformAdapter):
         raw numeric IDs.  After resolution, the env var and internal set are updated
         so authorization checks work with IDs only.
         """
+        # Reset BEFORE the empty-allowlist / missing-client early return, so a
+        # reconnect after the allowlist was emptied does not keep the previous
+        # connect's resolved IDs in the set the gateway authz union reads
+        # (upstream d13d92cc82).
+        self._username_resolved_ids = set()
+
         if not self._allowed_user_ids or not self._client:
             return
 
@@ -5890,6 +5897,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if name_lower in to_resolve:
                     uid = str(member.id)
                     numeric_ids.add(uid)
+                    self._username_resolved_ids.add(uid)
                     resolved_count += 1
                     to_resolve.discard(name_lower)
                     print(f"[{self.name}] Resolved '{name_lower}' -> {uid} ({member.name}#{member.discriminator})")
@@ -5924,6 +5932,24 @@ class DiscordAdapter(BasePlatformAdapter):
             os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+
+    def resolved_allowlist_user_ids(self) -> set:
+        """Numeric IDs resolved from username entries at connect time.
+
+        The env mirror of ``_allowed_user_ids`` doesn't survive the per-turn
+        .env hot-reload (``load_hermes_dotenv(override=True)`` restores the
+        raw usernames from the file), so the gateway authz layer
+        (``GatewayAuthorizationMixin._is_user_authorized``) unions these in.
+
+        Only IDs resolved FROM username entries: numeric entries are read
+        live from the reloaded env already, so a numeric ID removed there
+        (``hermes pairing revoke``, a hand edit) must not stay authorized
+        from this connect-time snapshot until a gateway restart (upstream
+        462389ea5e + d13d92cc82). Numeric only: passing a non-numeric value
+        through would widen access.
+        """
+        resolved = getattr(self, "_username_resolved_ids", None) or set()
+        return {str(uid) for uid in resolved if str(uid).isdigit()}
 
     def format_message(self, content: str) -> str:
         """Format message for Discord.
