@@ -24,7 +24,10 @@ def _seed(adapter_mod, yaml_cfg, discord_cfg):
 
 
 def test_yaml_allow_bots_is_seeded_into_extra(adapter_mod, monkeypatch):
-    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+    # _apply_yaml_config writes os.environ directly; setenv first so monkeypatch
+    # records the original state and removes the bridged value at teardown.
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "")
+    monkeypatch.delenv("DISCORD_ALLOW_BOTS")
     seeded = _seed(adapter_mod, {}, {"allow_bots": "mentions"})
     assert seeded is not None
     assert seeded.get("allow_bots") == "mentions"
