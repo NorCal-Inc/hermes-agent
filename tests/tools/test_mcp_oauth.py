@@ -5,6 +5,7 @@ import stat
 import sys
 from io import BytesIO
 from unittest.mock import patch, MagicMock
+from urllib.parse import quote
 
 import pytest
 
@@ -471,6 +472,22 @@ class TestCallbackHandlerIsolation:
 
         assert result["auth_code"] is None
         assert result["error"] == "access_denied"
+
+    def test_handler_escapes_error_in_callback_html(self):
+        """The OAuth error query param is reflected into the callback page's
+        HTML; an unescaped value is a reflected-XSS injection point."""
+        HandlerClass, result = _make_callback_handler()
+        handler = HandlerClass.__new__(HandlerClass)
+        handler.path = "/callback?error=" + quote("<script>alert(1)</script>")
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.do_GET()
+
+        body = handler.wfile.getvalue().decode()
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
 
 
 # ---------------------------------------------------------------------------
