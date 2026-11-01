@@ -3268,7 +3268,7 @@ def _finalize_empty_gateway_response(
         platform, final_response, chat_id=chat_id,
     )
     if not final_response:
-        final_response = f"⚠️ {raw_error}" if raw_error else ""
+        final_response = t("gateway.shared.warn_passthrough", error=raw_error) if raw_error else ""
     return final_response
 
 
@@ -3721,7 +3721,7 @@ class GatewayRunner(
                 bad = {k: v for k, v in (result.get("lanes") or {}).items() if v != "ok"}
                 if result.get("refresh") == "refreshed" or bad:
                     logger.info("codex lane creds: refresh=%s lanes=%s", result.get("refresh"), bad or "ok")
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("codex lane creds: tick failed", exc_info=True)
             await asyncio.sleep(interval)
 

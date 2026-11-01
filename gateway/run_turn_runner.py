@@ -1207,7 +1207,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
+        from gateway.run import _current_max_iterations, _finalize_empty_gateway_response, _normalize_empty_agent_response, _sanitize_gateway_final_response
         ctx = self._ctx
         runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
@@ -1402,10 +1402,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 **({"warning": result["warning"]} if isinstance(result.get("warning"), str) and result["warning"] else {}),
             }
         if not final_response:
-            final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response, chat_id=ctx.source.chat_id)
-            if not final_response:
-                final_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
+            # Fork: dedupe-aware rate-limit path (kanban t_5807aa7f) before the generic wrap.
+            final_response = _finalize_empty_gateway_response(
+                result, history_len=len(agent_history), platform=ctx.source.platform, chat_id=ctx.source.chat_id)
             # NOTE: deliberately omits agent_persisted/response_reused (and last_reasoning outside a local
             # viewer's turn); the caller defaults agent_persisted differently when the key is absent.
             if local_sinks is not None:

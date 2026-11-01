@@ -24,7 +24,7 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata,
     silence_allowed,
@@ -280,7 +280,12 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                internal=bool(getattr(event, "internal", False)),
             )
+            # The final response may belong to a queued follow-up message, not to ``event``; voice
+            # is decided against the message that produced it (fork, 2026-10-25).
+            if isinstance(agent_result, dict):
+                event._followup_voice_event = agent_result.pop("_followup_voice_event", None)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -1802,6 +1807,17 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                 session_key or "?",
             )
+            # This direct send bypasses the completed-turn voice step, so an interrupted reply
+            # went out text-only (fork, 2026-10-25). Voice goes first, like the completed path.
+            if not _delivery_result.get("failed"):
+                _first_voice_event = MessageEvent(
+                    text=turn_ctx.message or "", source=turn_ctx.source, message_id=turn_ctx.event_message_id,
+                    message_type=turn_ctx.message_type or MessageType.TEXT, internal=turn_ctx.internal,
+                )
+                if self._should_send_voice_reply(
+                    _first_voice_event, first_response, _delivery_result.get("messages") or [], already_sent=True,
+                ):
+                    await self._send_voice_reply(_first_voice_event, first_response)
             try:
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
@@ -1968,6 +1984,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
+                internal=bool(getattr(pending_event, "internal", False)),
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
@@ -1985,6 +2002,12 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+        if (
+            isinstance(followup_result, dict)
+            and pending_event is not None
+            and "_followup_voice_event" not in followup_result
+        ):
+            followup_result["_followup_voice_event"] = pending_event
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
@@ -2302,6 +2325,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        internal: bool = False,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2348,6 +2372,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            message_type=message_type, internal=internal,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

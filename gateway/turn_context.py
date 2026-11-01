@@ -18,6 +18,10 @@ class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
     reply_expected: Optional[bool] = None
+    # Fork (2026-10-25 voice fix): the inbound message type and internal flag of the turn that
+    # produced this result, so queued follow-ups decide voice against the right message.
+    message_type: Any = None
+    internal: bool = False
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False

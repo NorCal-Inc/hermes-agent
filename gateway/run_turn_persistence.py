@@ -21,7 +21,7 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -570,10 +570,16 @@ class GatewayTurnPersistenceMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
+        # Fork (2026-10-25): a queued follow-up produced this response; decide voice against it.
+        _voice_event = getattr(event, "_followup_voice_event", None)
         if not _streaming_tts_done and self._should_send_voice_reply(
-            event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+            _voice_event or event, response, agent_messages,
+            already_sent=bool(agent_result.get("already_sent")) or (
+                _voice_event is not None
+                and (getattr(event, "internal", False) or event.message_type != MessageType.VOICE)
+            ),
         ):
-            await self._send_voice_reply(event, response)
+            await self._send_voice_reply(_voice_event or event, response)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.

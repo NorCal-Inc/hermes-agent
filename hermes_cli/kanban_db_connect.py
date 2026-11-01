@@ -1028,12 +1028,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # One-shot event-kind rename: old names still worked but were awkward on
     # the wire. Fires once per DB — after the UPDATE no rows match.
-    for old, new in (
+    _legacy_kinds = (
         ("ready", "promoted"),
         ("priority", "reprioritized"),
         ("spawn_auto_blocked", "gave_up"),
-    ):
-        conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
+    )
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE kind IN (?, ?, ?) LIMIT 1",
+        tuple(old for old, _ in _legacy_kinds),
+    ).fetchone() is not None:
+        # Fork: task_events is append-only (trg_task_events_append_only_update).
+        # Lift the guard for this one-shot rename and restore it verbatim.
+        _guard = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = " + Q + "trigger" + Q + " "
+            "AND name = " + Q + "trg_task_events_append_only_update" + Q
+        ).fetchone()
+        if _guard is not None:
+            conn.execute("DROP TRIGGER trg_task_events_append_only_update")
+        for old, new in _legacy_kinds:
+            conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
+        if _guard is not None and _guard[0]:
+            conn.execute(_guard[0])
 
     _rebuild_drifted_tables(conn)
 

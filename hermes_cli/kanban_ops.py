@@ -105,7 +105,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_tenant_conflict": [
+                {"task_id": tid, "assignee": who, "reason": reason}
+                for (tid, who, reason) in res.skipped_tenant_conflict
+            ],
             "auto_assigned_default": res.auto_assigned_default,
+            "observation_ticks": res.observation_ticks,
+            "unowned": res.unowned,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}
                 for (tid, reason) in res.respawn_guarded
@@ -141,6 +147,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
+    for tid, who, reason in res.skipped_tenant_conflict:
+        # Company isolation refusals: tag the profile lane or reroute the card.
+        print(f"Skipped (company lane conflict, {who}: {reason}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

@@ -27,7 +27,6 @@ from agent.plugin_live_notes import pop_plugin_notices
 from agent.skills_index_delta import stage_skills_index_note
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.model_metadata import (
-    anchored_context_tokens,
     estimate_messages_tokens_rough,
     estimate_native_anthropic_request_tokens_rough,
     estimate_request_tokens_rough,

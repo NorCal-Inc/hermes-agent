@@ -120,6 +120,13 @@ def decompose_triage_task(
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
+        # Fork: a card in block-loop repair may not be fanned out until the
+        # loop is repaired (same gate as specify_triage_task).
+        from hermes_cli.kanban_db import (
+            BlockLoopRepairRequired, _block_loop_refusal, block_loop_repair_pending,
+        )
+        if block_loop_repair_pending(conn, task_id):
+            raise BlockLoopRepairRequired(_block_loop_refusal(task_id))
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
         if conn.execute(

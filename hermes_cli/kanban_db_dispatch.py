@@ -1586,7 +1586,7 @@ def _record_task_failure(
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
             + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+            "WHERE id = ? AND status IN ('running', 'ready', 'review', 'todo')",
             (failures, error, task_id),
         )
         payload = {
@@ -3420,7 +3420,7 @@ def _default_spawn(
         )
         if scoped_pid is not None:
             return scoped_pid
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+        proc = subprocess.Popen(
             cmd,
             cwd=worker_cwd,
             stdin=subprocess.DEVNULL,
