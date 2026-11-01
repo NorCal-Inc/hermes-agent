@@ -396,8 +396,13 @@ class SessionSchemaMixin:
                 do_align()
                 cursor.execute("RELEASE SAVEPOINT fts_align_empty")
             except BaseException:
-                cursor.execute("ROLLBACK TO SAVEPOINT fts_align_empty")
-                cursor.execute("RELEASE SAVEPOINT fts_align_empty")
+                # A failure that already tore the transaction down (I/O, busy, full) also
+                # drops the savepoint; do not let that second error mask the first.
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT fts_align_empty")
+                    cursor.execute("RELEASE SAVEPOINT fts_align_empty")
+                except sqlite3.OperationalError:
+                    pass
                 raise
             return
         self._run_admitted_startup_rebuild(cursor, do_align)
