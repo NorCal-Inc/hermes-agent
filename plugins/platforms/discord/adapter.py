@@ -1414,6 +1414,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
                 allowed_mentions=_build_allowed_mentions(),
+                # discord.py only dispatches on_socket_raw_receive when debug events are on; without
+                # this the liveness clock never ticks after on_ready and every connection is forced
+                # to reconnect for "event_silence" after websocket_event_max_silence_seconds.
+                enable_debug_events=True,
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure

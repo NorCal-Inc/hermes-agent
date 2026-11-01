@@ -613,3 +613,21 @@ async def test_disconnect_cancels_liveness_task(monkeypatch):
     await adapter.disconnect()
     assert task.done()
     assert adapter._liveness_task is None
+
+
+def test_discord_client_enables_raw_frame_events_for_liveness_clock():
+    """Regression 2026-10-31: the silence probe needs on_socket_raw_receive, which discord.py only
+    dispatches with enable_debug_events=True. Without it every connection read "event_silence"
+    5 minutes after on_ready and was force-reconnected (~12/hour)."""
+    # (discord.py is mocked in this suite; the library contract -- DiscordWebSocket.log_receive is a
+    # no-op unless the client was built with enable_debug_events -- was checked against 2.7.1.)
+    import ast, inspect
+    import plugins.platforms.discord.adapter as mod
+
+    calls = [n for n in ast.walk(ast.parse(inspect.getsource(mod)))
+             if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "Bot"]
+    assert calls, "commands.Bot(...) construction not found"
+    for c in calls:
+        kw = {k.arg: k.value for k in c.keywords if k.arg}
+        assert "enable_debug_events" in kw and getattr(kw["enable_debug_events"], "value", None) is True
+
