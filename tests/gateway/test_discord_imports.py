@@ -14,6 +14,17 @@ class TestDiscordImportSafety:
                 raise ImportError("discord unavailable for test")
             return original_import(name, globals, locals, fromlist, level)
 
+        # The re-import below also rebinds package attributes
+        # (plugins.platforms.discord, plugins.platforms.discord.adapter).
+        # sys.modules is restored at teardown, but those attributes are not,
+        # so later "import plugins.platforms.discord.adapter as x" would get
+        # the discord-less copy.  Record them so monkeypatch restores them.
+        import plugins.platforms as platforms_pkg
+        import plugins.platforms.discord as discord_pkg
+        import plugins.platforms.discord.adapter  # noqa: F401
+        monkeypatch.setattr(platforms_pkg, "discord", discord_pkg)
+        monkeypatch.setattr(discord_pkg, "adapter", discord_pkg.adapter)
+
         # Purge the cached module so the import below actually re-runs the
         # module body with discord.py simulated-missing.
         monkeypatch.delitem(sys.modules, "plugins.platforms.discord.adapter", raising=False)
