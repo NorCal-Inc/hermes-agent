@@ -3820,7 +3820,37 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
+    _write_corrupt_backup_evidence(candidate)
     return candidate
+
+
+def _write_corrupt_backup_evidence(candidate: Path) -> None:
+    """Best-effort: record quick_check output for a fresh quarantine copy.
+
+    Runs against the *copy* (``immutable=1``, so no -wal/-shm is created and the
+    live file's locks are never touched) and writes ``<backup>.evidence.txt``
+    next to it. Gives every future corruption a failing-check capture taken at
+    quarantine time instead of relying on later reconstruction.
+    """
+    evidence = candidate.with_name(candidate.name + ".evidence.txt")
+    if evidence.exists():
+        return
+    lines = [f"backup={candidate.name}", f"size={candidate.stat().st_size}"]
+    try:
+        probe = sqlite3.connect(f"file:{candidate}?immutable=1", uri=True)
+        try:
+            lines.append("quick_check:")
+            lines.extend(
+                f"  {r[0]}" for r in probe.execute("PRAGMA quick_check").fetchall()[:200]
+            )
+        finally:
+            probe.close()
+    except (sqlite3.Error, OSError) as exc:
+        lines.append(f"quick_check failed: {exc}")
+    try:
+        evidence.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
 
 
 # Repairable integrity_check error classes. Both shapes are *index-scoped*:
@@ -3976,7 +4006,9 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        _clear_corrupt_latch(resolved)
         return
+    _set_corrupt_latch(resolved)
     # Quarantine FIRST — both the repair path and the fail-closed path
     # preserve the pre-touch bytes before anything mutates the file.
     backup = _backup_corrupt_db(resolved)
@@ -3996,6 +4028,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                 resolved, ", ".join(index_names),
                 backup if backup is not None else "<backup failed>",
             )
+            _clear_corrupt_latch(resolved)
             return
         reason = (
             f"{reason}; REINDEX auto-repair attempted but integrity_check "
@@ -4076,6 +4109,7 @@ def repair_db(
         except sqlite3.DatabaseError as exc:
             # Same quarantine the connect-time guard takes for a file
             # sqlite refuses to open at all (e.g. malformed page 1).
+            _set_corrupt_latch(resolved)
             return RepairResult(
                 status="corrupt",
                 db_path=resolved,
@@ -4083,7 +4117,9 @@ def repair_db(
                 backup_path=_backup_corrupt_db(resolved),
             )
         if _integrity_messages_ok(messages):
+            _clear_corrupt_latch(resolved)
             return RepairResult(status="ok", db_path=resolved, messages=messages)
+        _set_corrupt_latch(resolved)
 
         # Quarantine FIRST — identical policy to the connect-time guard.
         backup = _backup_corrupt_db(resolved)
@@ -4096,6 +4132,8 @@ def repair_db(
                 backup_path=backup,
             )
         repaired, post = _attempt_index_reindex_repair(resolved, index_names)
+        if repaired:
+            _clear_corrupt_latch(resolved)
         # The file changed on disk; force the next connect() in this process
         # to re-probe instead of trusting the stale healthy-path cache.
         with _INIT_LOCK:
@@ -4172,7 +4210,102 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     return expected <= _schema_objects(conn)
 
 
+# Containment latch. Evidence (2026-10-25): the board was first reported
+# malformed at 01:02 and was not repaired until 12:40, and the quarantine
+# copies taken in between differ (156463104 -> 156475392 -> 156479488 bytes):
+# workers and the gateway kept WRITING into the already-damaged file for ~11
+# hours, because the steady-state ``connect()`` fast path trusts the
+# per-process healthy-path cache and the dispatcher "pause" only stops
+# dispatch. Each further write re-used cross-linked pages and spread the
+# damage. Once corruption is detected the file is latched: connections still
+# open it for reading but with ``query_only=ON`` until a healthy probe (or a
+# replaced file) clears it.
+_CORRUPT_LATCH_SUFFIX = ".corrupt-latch"
+
+
+def _corrupt_latch_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + _CORRUPT_LATCH_SUFFIX)
+
+
+def _set_corrupt_latch(resolved: Path) -> None:
+    """Best-effort: mark ``resolved`` (by inode) as corrupt for all processes."""
+    try:
+        ino = resolved.stat().st_ino
+        _corrupt_latch_path(resolved).write_text(str(ino), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_corrupt_latch(resolved: Path) -> None:
+    try:
+        _corrupt_latch_path(resolved).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _corrupt_latch_active(resolved: Path) -> bool:
+    """True when a latch exists for the file currently at ``resolved``."""
+    try:
+        recorded = _corrupt_latch_path(resolved).read_text(encoding="utf-8").strip()
+        return recorded == str(resolved.stat().st_ino)
+    except OSError:
+        return False
+
+
 def connect(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open the kanban DB; ``query_only`` while it is latched corrupt.
+
+    See :func:`_connect_impl` for the open/initialise behaviour.
+    """
+    conn = _connect_impl(db_path=db_path, board=board)
+    try:
+        path = db_path if db_path is not None else kanban_db_path(board=board)
+        if _corrupt_latch_active(path.resolve()):
+            conn.execute("PRAGMA query_only=ON")
+        elif _wal_reset_writer_blocked():
+            conn.execute("PRAGMA query_only=ON")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+_WAL_RESET_WRITER_LOGGED = False
+
+
+def _wal_reset_writer_blocked() -> bool:
+    """True when this process links an SQLite with the WAL-reset bug.
+
+    The live board is a WAL database written by processes linked to a fixed
+    SQLite (3.51.3+). A writer/checkpointer linked to an affected build
+    (3.7.0-3.51.2 except the 3.50.7/3.44.6 backports, e.g. the 3.50.4
+    ``.venv`` or the system 3.45.1 python) can race those writers on WAL
+    frames and corrupt the file; ``hermes_state`` deliberately keeps WAL
+    for an already-WAL file and only warns. Make such a connection
+    read-only instead. Override: ``HERMES_KANBAN_ALLOW_WAL_RESET_WRITER=1``.
+    """
+    global _WAL_RESET_WRITER_LOGGED
+    if os.environ.get("HERMES_KANBAN_ALLOW_WAL_RESET_WRITER") == "1":
+        return False
+    from hermes_state import is_sqlite_wal_reset_vulnerable
+
+    if not is_sqlite_wal_reset_vulnerable():
+        return False
+    if not _WAL_RESET_WRITER_LOGGED:
+        _WAL_RESET_WRITER_LOGGED = True
+        _log.error(
+            "kanban.db opened query_only: linked SQLite %s has the WAL-reset "
+            "bug; writes refused to protect the shared WAL database",
+            sqlite3.sqlite_version,
+        )
+    return True
+
+
+def _connect_impl(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
@@ -8307,7 +8440,24 @@ def _open_auto_repair(
             executor_lane=EXECUTOR_LANE_CLAUDE_RECOVERY,
             recovery_gate_cmd=_auto_repair_gate_cmd(subject_id),
         )
-    except RecoveryLinkageError as exc:
+    except (RecoveryLinkageError, ControlPlaneAdmissionError) as exc:
+        # t_e9b417b0 (2026-10-25): an automated repair's title/body inherits
+        # the subject's own title verbatim ("Repair: {subject title}"), and a
+        # subject whose title merely happens to contain a control-plane
+        # keyword (e.g. an ordinary project called "... gauntlet ...", not
+        # Hermes's own Gauntlet governance machinery) trips
+        # ControlPlaneAdmissionError here. Left uncaught, that exception
+        # propagated out of this automated-repair helper, through
+        # record_verification, into _return_verifier_verdict_to_subjects'
+        # broad except -- silently losing not just this repair card but the
+        # verdict-return path's own audit event and finding comment for the
+        # subject, with only a WARNING in the log to show for it. Recording
+        # it the same way as a linkage failure keeps the held-comment's
+        # promise honest: a repair opens automatically when the admission
+        # gate allows it, and the refusal is durable and diagnosable
+        # (not silently lost) when it does not. The admission gate itself is
+        # NOT weakened or bypassed -- no control_plane_authority is invented
+        # here.
         with write_txn(conn):
             _append_event(
                 conn, subject_id, "repair_start_failed",
@@ -8315,6 +8465,9 @@ def _open_auto_repair(
                     "subject_id": subject_id,
                     "error": str(exc)[:500],
                     "trigger": trigger,
+                    "control_plane_admission_refused": isinstance(
+                        exc, ControlPlaneAdmissionError,
+                    ),
                 },
             )
         return None
@@ -12364,6 +12517,24 @@ def claim_task(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
             (task_id,),
         ).fetchone()
+        # Double-dispatch guard (kanban.db corruption RCA, 2026-10-25): never
+        # start a replacement run beside a prior worker whose PID is still
+        # alive. Two live workers held claims on one task for ~2.5 min before
+        # the stale one was reaped; refuse the claim until that PID is dead.
+        for prior in conn.execute(
+            "SELECT id, worker_pid FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NULL AND worker_pid IS NOT NULL",
+            (task_id,),
+        ).fetchall():
+            prior_pid = int(prior["worker_pid"])
+            if prior_pid != os.getpid() and _pid_alive(prior_pid):
+                _append_event(
+                    conn, task_id, "execution_refused",
+                    {"reason": "prior_worker_pid_alive",
+                     "run_id": int(prior["id"]), "worker_pid": prior_pid,
+                     "source": "claim_task"},
+                )
+                return None
         if stale and stale["current_run_id"]:
             conn.execute(
                 """
@@ -14719,6 +14890,36 @@ def _subject_implemented_on_claude(conn: sqlite3.Connection, subject_id: str) ->
             return True
     return False
 
+def _release_failed_subject_for_verifier(
+    conn: sqlite3.Connection, subject_id: str
+) -> bool:
+    """Reopen a FAILED subject's verdict as pending for one new verifier.
+
+    Called only once the respawn guard has let a new verifier through, i.e. a
+    person's "what changed" comment or a new handoff. Same ledger write as
+    :func:`_release_verifier_after_repair`; a subject that is not ``failed``
+    is left alone.
+    """
+    row = conn.execute(
+        "SELECT verification_state FROM tasks WHERE id = ?", (subject_id,)
+    ).fetchone()
+    if row is None or row["verification_state"] != VERIFICATION_FAILED:
+        return False
+    with write_txn(conn):
+        _record_verification_row(
+            conn, subject_id,
+            state=VERIFICATION_PENDING,
+            verifier="comment-release",
+            evidence={"released_by": "comment"},
+            reason="a comment saying what changed released one new "
+                   "independent verification",
+        )
+        _append_event(
+            conn, subject_id, "verifier_released_after_comment",
+            {"subject_id": subject_id},
+        )
+    return True
+
 
 def _ensure_independent_verifier_child(
     conn: sqlite3.Connection, subject_id: str, *, implementer: Optional[str],
@@ -14913,6 +15114,11 @@ def _ensure_independent_verifier_child(
     # fresh timer and a fresh first alarm instead of being suppressed by the
     # retired one.
     _retire_unroutable_recheck(conn, subject_id, reason="evidence_present")
+    # A comment saying what changed released the hold on a subject whose last
+    # verdict is FAIL. The verifier child below is only claimable off a pending
+    # subject with a pending verdict row (_EVIDENCE_READY_PARENT_SQL), so put the
+    # subject in the state _release_verifier_after_repair produces.
+    _release_failed_subject_for_verifier(conn, subject_id)
     # A mandatory verifier is a continuation of the already-admitted subject,
     # not fresh control-plane construction. Preserve structured operator
     # provenance so a human-authorized control-plane subject can open its
@@ -15160,10 +15366,23 @@ VERIFIER_VERDICT_FAIL = "FAIL"
 VERIFIER_VERDICT_BLOCKER = "BLOCKER"
 
 _VERIFIER_VERDICT_RE = re.compile(
-    r"^[\s>*_-]*(?:\*\*|__)?VERDICT(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"
+    r"^[\s>*_-]*(?:\*\*|__)?(?:ATLAS_|CLAUDE_)?VERDICT(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"
     r"(PASS|FAIL|BLOCKER)\b",
     re.IGNORECASE | re.MULTILINE,
 )
+# 2026-10-25 (t_37d677d6): the codex_verify completion gate in recovery_lane.py
+# (_atlas_verdict) only requires a final ``ATLAS_VERDICT: PASS`` / ``FAIL``
+# line -- it does not require a bare ``VERDICT:`` line too. Most verifiers
+# wrote both out of habit, so this parser's narrower pattern went unnoticed.
+# When a verifier wrote only ``ATLAS_VERDICT: FAIL`` (t_3e2e5ecf, Logos
+# review), this regex found zero matches, so _parse_verifier_verdict()
+# returned None even though the completing run HAD a real, unambiguous
+# verdict -- producing a spurious ``verifier_verdict_unreadable`` event and
+# stranding the subject needing a "governance decision" for what was really
+# a parser gap. The ``(?:ATLAS_)?`` prefix accepts the lane's own guaranteed
+# verdict line as first-class input; a bare ``VERDICT:`` line is still
+# accepted unchanged, and two disagreeing lines (of either spelling) still
+# fail closed via the ``len(found) != 1`` check below.
 
 _VERIFIER_ACCEPTANCE_RE = re.compile(
     r"^[\s>*_-]*(?:\*\*|__)?ACCEPTANCE(?:\*\*|__)?\s*[:=]\s*(?:\*\*|__)?"

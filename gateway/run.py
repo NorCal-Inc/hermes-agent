@@ -706,8 +706,95 @@ def _format_exec_approval_fallback(
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
     )
 
-def _gateway_provider_error_reply(text: str) -> str:
-    """Map raw provider/API errors to a short user-safe Telegram reply."""
+_GATEWAY_RATE_LIMIT_NOTICE_TEXT = (
+    "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+)
+
+# Cooldown window for the rate-limit notice specifically (#noise-reduction
+# 2026-10-16): a single rate-limited request can surface the same envelope
+# text through BOTH the mid-run status callback (_prepare_gateway_status_message)
+# and, if retries are exhausted, the final-response path
+# (_sanitize_gateway_final_response) — posting the identical "please wait"
+# notice twice for one logical incident. Every other error category (auth,
+# policy, connection, generic) is unaffected and always posts normally.
+_GATEWAY_RATE_LIMIT_NOTICE_COOLDOWN_SECONDS = 600
+_gateway_rate_limit_notice_last_sent: dict = {}
+
+
+def _finalize_empty_gateway_response(
+    result: dict, *, history_len: int, platform: Any, chat_id: Any = None,
+) -> str:
+    """Compute the outgoing text when the agent returned no response text.
+
+    Mirrors the ``_normalize_empty_agent_response`` -> ``_sanitize_gateway_
+    final_response`` -> raw-error-fallback chain used by the early-return
+    branch of ``GatewayRunner.run_sync``, with one narrowly-scoped addition
+    (kanban t_5807aa7f review finding, FAIL): when the failure is itself a
+    rate-limit error, ``_normalize_empty_agent_response`` always wraps it as
+    the generic "The request failed: ..." envelope, which never matches
+    ``_looks_like_gateway_provider_error``'s anchored shape check and so
+    never reaches the cooldown dedupe at all — this call site could
+    therefore post a second, differently-worded rate-limit notice for the
+    same chat even when the mid-run status callback
+    (``_prepare_gateway_status_message``) already posted (or correctly
+    suppressed) the canonical one for the identical incident. Route a
+    rate-limited raw error through the same dedupe-aware
+    ``_gateway_provider_error_reply`` BEFORE the generic wrap so one
+    incident collapses to a single notice regardless of which call site
+    handles it last. Every other category (auth, connection, generic,
+    non-failed) is byte-for-byte unchanged.
+    """
+    raw_error = result.get("error")
+    if (
+        result.get("failed")
+        and raw_error
+        and _GATEWAY_RATE_LIMIT_RE.search(str(raw_error))
+        and _looks_like_gateway_provider_error(str(raw_error))
+    ):
+        _dedupe_key = f"{getattr(platform, 'value', platform)}:{chat_id}" if chat_id else None
+        return _gateway_provider_error_reply(str(raw_error), dedupe_key=_dedupe_key)
+
+    final_response = _normalize_empty_agent_response(
+        result, "", history_len=history_len,
+    )
+    final_response = _sanitize_gateway_final_response(
+        platform, final_response, chat_id=chat_id,
+    )
+    if not final_response:
+        final_response = f"⚠️ {raw_error}" if raw_error else ""
+    return final_response
+
+
+def _gateway_rate_limit_notice_should_post(dedupe_key: Optional[str]) -> bool:
+    """True if a rate-limit notice for ``dedupe_key`` should actually post.
+
+    No key (``None``/empty) means the caller cannot identify the chat/session
+    — preserve old always-post behavior rather than guessing. When a key is
+    present, the first notice in the cooldown window posts and is recorded;
+    repeats within the window are suppressed; the window then resets so a
+    fresh rate-limit incident later still gets reported.
+    """
+    if not dedupe_key:
+        return True
+    import time as _time
+    now = _time.monotonic()
+    last = _gateway_rate_limit_notice_last_sent.get(dedupe_key)
+    if last is not None and (now - last) < _GATEWAY_RATE_LIMIT_NOTICE_COOLDOWN_SECONDS:
+        return False
+    _gateway_rate_limit_notice_last_sent[dedupe_key] = now
+    return True
+
+
+def _gateway_provider_error_reply(text: str, *, dedupe_key: Optional[str] = None) -> str:
+    """Map raw provider/API errors to a short user-safe Telegram reply.
+
+    ``dedupe_key`` (e.g. ``"<platform>:<chat_id>"``) lets callers collapse a
+    repeated rate-limit notice for the same chat into a single post within
+    ``_GATEWAY_RATE_LIMIT_NOTICE_COOLDOWN_SECONDS``. Only the rate-limit
+    category is deduped; every other category always returns its text so
+    existing behavior (and the raw-fallback safety net in callers) is
+    unaffected.
+    """
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
             "⚠️ Provider authentication failed. Check the configured credentials; "
@@ -719,7 +806,9 @@ def _gateway_provider_error_reply(text: str) -> str:
             "error out of chat; check gateway logs for details or try rephrasing."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+        if not _gateway_rate_limit_notice_should_post(dedupe_key):
+            return ""
+        return _GATEWAY_RATE_LIMIT_NOTICE_TEXT
     if _GATEWAY_CONNECTION_ERROR_RE.search(text):
         return (
             "⚠️ The model server is not responding — it looks like the configured "
@@ -778,7 +867,9 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(
+    platform: Any, text: str, *, chat_id: Any = None,
+) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -787,6 +878,10 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     bodies, request IDs, leaked credentials, or policy text. Only programmatic
     surfaces in ``_GATEWAY_RAW_TEXT_PLATFORMS`` (CLI/TUI ``local`` diagnostics,
     API JSON, webhook payloads) keep the raw text unchanged.
+
+    ``chat_id`` (when provided) feeds the rate-limit notice dedupe key so the
+    same rate-limit incident does not post the "please wait" notice twice for
+    one chat — once via the mid-run status callback, once here.
     """
     if not text:
         return text
@@ -813,15 +908,21 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
+        _dedupe_key = f"{getattr(platform, 'value', platform)}:{chat_id}" if chat_id else None
+        return _gateway_provider_error_reply(redacted, dedupe_key=_dedupe_key)
     return redacted
 
 
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+def _prepare_gateway_status_message(
+    platform: Any, event_type: str, message: str, *, chat_id: Any = None,
+) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
     surfaces should not receive transient auxiliary/compression chatter.
+
+    ``chat_id`` (when provided) feeds the rate-limit notice dedupe key — see
+    ``_gateway_provider_error_reply``.
     """
     text = str(message or "").strip()
     if not text:
@@ -843,7 +944,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         ):
             return None
     if _looks_like_gateway_provider_error(text):
-        return _gateway_provider_error_reply(text)
+        _dedupe_key = f"{getattr(platform, 'value', platform)}:{chat_id}" if chat_id else None
+        return _gateway_provider_error_reply(text, dedupe_key=_dedupe_key)
     return text
 
 
@@ -5172,6 +5274,7 @@ class TurnRunner:
             ctx.source.platform,
             event_type,
             message,
+            chat_id=getattr(ctx.source, "chat_id", None),
         )
         if prepared_message is None:
             logger.debug(
@@ -6464,12 +6567,12 @@ class TurnRunner:
         )
 
         if not final_response:
-            final_response = _normalize_empty_agent_response(
-                result, final_response or "", history_len=len(agent_history),
+            final_response = _finalize_empty_gateway_response(
+                result,
+                history_len=len(agent_history),
+                platform=ctx.source.platform,
+                chat_id=getattr(ctx.source, "chat_id", None),
             )
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
-            if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
             return {
                 "final_response": final_response,
                 "messages": result.get("messages", []),
@@ -20170,7 +20273,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                internal=bool(getattr(event, "internal", False)),
             )
+            # The final response may belong to a queued follow-up message,
+            # not to ``event``; voice is decided against the message that
+            # produced it (2026-10-25).
+            _voice_event = None
+            if isinstance(agent_result, dict):
+                _voice_event = agent_result.pop("_followup_voice_event", None)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20279,7 +20389,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_gateway_final_response(
+                    source.platform, response,
+                    chat_id=getattr(source, "chat_id", None),
+                )
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -20744,9 +20857,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if (
                 not _streaming_tts_done
-                and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
+                and self._should_send_voice_reply(
+                    _voice_event or event,
+                    response,
+                    agent_messages,
+                    already_sent=_already_sent or (
+                        _voice_event is not None
+                        and (getattr(event, "internal", False) or event.message_type != MessageType.VOICE)
+                    ),
+                )
             ):
-                await self._send_voice_reply(event, response)
+                await self._send_voice_reply(_voice_event or event, response)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -27896,6 +28017,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        internal: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27916,6 +28038,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                internal=internal,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27929,6 +28052,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                internal=internal,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28072,6 +28196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        internal: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29474,6 +29599,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
+                            # This direct send bypasses the completed-turn
+                            # voice step, so Christopher's interrupted reply
+                            # went out text-only (2026-10-25).
+                            if not _delivery_result.get("failed"):
+                                _first_voice_event = MessageEvent(
+                                    text=message,
+                                    source=source,
+                                    message_id=event_message_id,
+                                    message_type=message_type or MessageType.TEXT,
+                                    internal=internal,
+                                )
+                                if self._should_send_voice_reply(
+                                    _first_voice_event,
+                                    first_response,
+                                    _delivery_result.get("messages") or [],
+                                    already_sent=True,
+                                ):
+                                    await self._send_voice_reply(_first_voice_event, first_response)
                             await self._deliver_queued_first_response(
                                 first_response,
                                 source=source,
@@ -29611,7 +29754,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    internal=bool(getattr(pending_event, "internal", False)),
                 )
+                if (
+                    isinstance(followup_result, dict)
+                    and pending_event is not None
+                    and "_followup_voice_event" not in followup_result
+                ):
+                    followup_result["_followup_voice_event"] = pending_event
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

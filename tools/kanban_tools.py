@@ -65,9 +65,14 @@ def _profile_has_kanban_toolset() -> bool:
 
 def _is_delegated_child_context() -> bool:
     try:
-        from agent.delegation_context import is_delegated_child_context
+        from agent.delegation_context import (
+            is_delegated_child_context,
+            is_inherited_kanban_lineage,
+        )
 
-        return is_delegated_child_context()
+        # A nested hermes launched from a worker's shell inherits its
+        # HERMES_KANBAN_* env but is not the run owner (t_85883f17 run 5421).
+        return is_delegated_child_context() or is_inherited_kanban_lineage()
     except Exception:
         return False
 

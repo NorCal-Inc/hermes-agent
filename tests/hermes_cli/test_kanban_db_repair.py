@@ -287,3 +287,33 @@ def test_cli_repair_json_shape(cli_home, capsys):
     assert Path(payload["backup_path"]).exists()
 
 
+
+
+def test_wal_reset_vulnerable_sqlite_connection_is_query_only(tmp_path, monkeypatch):
+    """A writer linked to an SQLite with the WAL-reset bug must not write the shared WAL board."""
+    import sqlite3
+
+    import hermes_state
+    from hermes_cli import kanban_db
+
+    db = tmp_path / "kanban.db"
+    monkeypatch.delenv("HERMES_KANBAN_ALLOW_WAL_RESET_WRITER", raising=False)
+    kanban_db.connect(db).close()  # initialise with the real (fixed) library
+
+    monkeypatch.setattr(hermes_state, "is_sqlite_wal_reset_vulnerable", lambda *a, **k: True)
+    conn = kanban_db.connect(db)
+    try:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        import pytest
+
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("CREATE TABLE _probe(x)")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_ALLOW_WAL_RESET_WRITER", "1")
+    conn = kanban_db.connect(db)
+    try:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 0
+    finally:
+        conn.close()

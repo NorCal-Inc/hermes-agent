@@ -121,6 +121,71 @@ def exit_non_dispatcher_owned_context(token: Token[bool]) -> None:
     _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
 
 
+def _proc_environ_value(pid: int, key: str) -> str | None:
+    """Read one variable from /proc/<pid>/environ; None if unreadable/absent."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    prefix = key.encode() + b"="
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix):].decode("utf-8", "replace")
+    return None
+
+
+def _parent_pid(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        # comm may contain spaces/parens; ppid is the 2nd field after the last ')'
+        return int(data[data.rindex(b")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+_LINEAGE_CACHE: dict[tuple[int, str, str], bool] = {}
+
+
+def is_inherited_kanban_lineage() -> bool:
+    """True when this process only *inherited* HERMES_KANBAN_* from an ancestor.
+
+    The dispatcher-spawned worker is the process whose ancestors do not carry
+    its HERMES_KANBAN_RUN_ID.  A nested ``hermes`` launched from the worker's
+    terminal (e.g. a diagnostic ``hermes -z '...'``) inherits the same task/run
+    env and, without this check, is indistinguishable from the run owner: it can
+    ``kanban_block``/``kanban_complete`` the parent's run (incident t_85883f17
+    run 5421).  Unlike the delegate_task ContextVar or the
+    HERMES_DELEGATED_CHILD_CONTEXT env marker, process lineage cannot be dropped
+    by the nested command line.  Linux /proc only; fails open (False) elsewhere.
+    """
+    import os
+
+    task = os.environ.get("HERMES_KANBAN_TASK", "")
+    run = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    if not task or not run:
+        return False
+    key = (os.getpid(), task, run)
+    cached = _LINEAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    inherited = False
+    pid = _parent_pid(os.getpid())
+    for _ in range(64):
+        if pid <= 1:
+            break
+        if (
+            _proc_environ_value(pid, "HERMES_KANBAN_RUN_ID") == run
+            and _proc_environ_value(pid, "HERMES_KANBAN_TASK") == task
+        ):
+            inherited = True
+            break
+        pid = _parent_pid(pid)
+    _LINEAGE_CACHE[key] = inherited
+    return inherited
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     import os

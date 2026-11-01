@@ -92,6 +92,43 @@ class TestRepeatedFailHold:
             assert kb._repeated_fail_anchor(conn, tid) is None
             assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is not None
 
+    def test_person_comment_makes_the_new_verifier_ready(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            _run_verifier(conn, tid, FAIL)
+            _repair_and_hand_off(conn, tid)
+            _run_verifier(conn, tid, FAIL)
+            assert kb.get_task(conn, tid).verification_state == kb.VERIFICATION_FAILED
+            kb.add_comment(conn, tid, "Christopher", "Changed: workstation file pushed")
+            vid = kb._ensure_independent_verifier_child(conn, tid, implementer="default")
+            assert vid is not None
+            assert kb.get_task(conn, tid).verification_state == kb.VERIFICATION_PENDING
+            assert conn.execute(
+                "SELECT state FROM task_verifications WHERE task_id = ? "
+                "AND kind = ? ORDER BY id DESC LIMIT 1",
+                (tid, kb.LEDGER_KIND_VERDICT),
+            ).fetchone()[0] == kb.VERIFICATION_PENDING
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, vid).status == "ready"
+
+    def test_system_comment_does_not_release_or_change_state(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            _run_verifier(conn, tid, FAIL)
+            _repair_and_hand_off(conn, tid)
+            _run_verifier(conn, tid, FAIL)
+            kb.add_comment(conn, tid, "verifier-return-path", "automated note")
+            assert kb._ensure_independent_verifier_child(conn, tid, implementer="default") is None
+            assert kb.get_task(conn, tid).verification_state == kb.VERIFICATION_FAILED
+
+    def test_second_fail_opens_a_repair_card(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject_awaiting_verification(conn)
+            _run_verifier(conn, tid, FAIL)
+            _repair_and_hand_off(conn, tid)
+            _run_verifier(conn, tid, FAIL)
+            assert kb.open_repair_for_subject(conn, tid) is not None
+
     def test_pass_resets_the_count(self, kanban_home):
         with kb.connect_closing() as conn:
             tid = _subject_awaiting_verification(conn)

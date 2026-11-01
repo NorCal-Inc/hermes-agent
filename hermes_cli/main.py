@@ -703,9 +703,22 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # flags have already been stripped above, so the first remaining argument is
 # the authoritative argparse subcommand.  Dotenv/managed config still loads;
 # only external secret fetches are unnecessary for installation maintenance.
+#
+# A help-only invocation (``hermes --help``, ``hermes kanban --help``, ...)
+# is in the same boat: argparse is about to print usage and exit 0 without
+# ever reaching a subcommand handler, so eagerly resolving every configured
+# 1Password/Bitwarden reference (live `op`/network calls) only to throw the
+# result away on exit is pure waste — and, worse, a live credential read the
+# caller never asked for (#diagnosed 2026-10-31: plain `hermes kanban --help`
+# was triggering 4 live 1Password reads). ``is_help_only_argv`` is
+# conservative — see its docstring — so a real subcommand that merely
+# mentions ``--help`` as a value is never misclassified as help-only.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
+    load_external_secrets=(
+        sys.argv[1:2] != ["update"]
+        and not _startup_fast.is_help_only_argv(sys.argv[1:])
+    ),
 )
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env

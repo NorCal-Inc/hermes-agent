@@ -41,6 +41,7 @@ __all__ = [
     "read_install_method",
     "print_fast_version_info",
     "try_fast_version",
+    "is_help_only_argv",
 ]
 
 
@@ -220,3 +221,25 @@ def try_fast_version(argv: list[str] | None = None) -> bool:
 
     print_fast_version_info()
     return True
+
+
+def is_help_only_argv(argv: list[str]) -> bool:
+    """True when ``argv`` can only ever print help/usage and exit.
+
+    argparse accepts ``-h``/``--help`` after *any* number of leading
+    subcommand tokens (``hermes --help``, ``hermes kanban --help``,
+    ``hermes kanban show --help``, ...), so this checks for a trailing
+    help flag rather than a fixed-position one. A conservative,
+    stdlib-only check: only returns True when the LAST token is a help
+    flag and every token before it looks like a subcommand name (no
+    ``=``, doesn't start with ``-``) — so this never misfires on a real
+    invocation that merely mentions ``--help`` as a value elsewhere
+    (e.g. an unlikely-but-possible subcommand argument).
+    """
+    if not argv:
+        return False
+    if argv[-1] not in ("-h", "--help"):
+        return False
+    return all(
+        tok and not tok.startswith("-") for tok in argv[:-1]
+    )

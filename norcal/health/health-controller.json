@@ -1,7 +1,7 @@
 {
-  "alert_target": "telegram:-1003786882754",
-  "kanban_card_invariants": ["company_isolation", "critical_cron_jobs_healthy"],
-  "automatic_shared_repair_invariants": ["critical_cron_jobs_healthy"],
+  "alert_target": "discord:1560498522803937310",
+  "kanban_card_invariants": ["*"],
+  "automatic_shared_repair_invariants": ["critical_cron_jobs_healthy", "repository_drift", "worktree_hygiene", "gateway_platforms_connected", "gateway_heartbeat_fresh"],
   "health_repair_adoptions": {
     "critical_cron_jobs_healthy:nuclear_backup": "t_9f9e4769"
   },
@@ -151,7 +151,6 @@
   },
   "shared_probe_timeout_seconds": 5,
   "shared_health_endpoints": {
-    "hermes-gateway-8644": "http://127.0.0.1:8644/health",
     "hermes-gateway-8085": "http://127.0.0.1:8085/health",
     "command-center": "http://127.0.0.1:5130/api/status",
     "life-wiki-api": "http://127.0.0.1:5100/api/healthz",
