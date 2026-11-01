@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
-
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.plugins import get_plugin_manager
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -25,7 +25,6 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
-
 
 @pytest.fixture
 def captured_updates(monkeypatch):
@@ -61,7 +60,7 @@ def test_assign_fires_updated_with_changed_fields(
     mgr = get_plugin_manager()
     mgr._hooks.setdefault("on_kanban_task_updated", []).append(_read_assignee)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alice")
         captured_updates.clear()  # create-time bookkeeping is not under test
@@ -88,7 +87,7 @@ def test_raising_callback_does_not_break_assign(kanban_home, all_assignees_spawn
 
     mgr._hooks.setdefault("on_kanban_task_updated", []).append(_boom)
     try:
-        conn = kb.connect()
+        conn = kbc.connect()
         try:
             tid = kb.create_task(conn, title="t", assignee="alice")
             assert kb.assign_task(conn, tid, "bob") is True

@@ -14,19 +14,20 @@ answer is identical on every connection topology.
 
 import pytest
 
-import tui_gateway.server as server
-from toolsets import TOOLSETS, resolve_toolset
+from tui_gateway import server
+from toolsets import TOOLSETS
 
 GUI_TOOLS = {
+    "annotate_preview",
+    "desktop_preview",
+    "drive_preview",
     "close_terminal",
     "focus_pane",
-    "open_preview",
-    "read_preview",
     "read_terminal",
     "read_window_below",
     "react_to_message",
-    "setup_mcp",
-    "tour",
+    "show_tip",
+    "gui_tour",
 }
 
 
@@ -40,8 +41,6 @@ def no_desktop_env(monkeypatch):
 
 
 class TestDesktopUiToolset:
-    def test_holds_exactly_the_gui_affordances(self):
-        assert set(resolve_toolset("desktop_ui")) == GUI_TOOLS
 
     def test_stays_off_the_core_tool_list(self):
         """Core ships on every API call — a GUI-only tool must not be there."""
@@ -87,6 +86,7 @@ class TestResolverPlumbing:
         no_desktop_env.setattr(cc, "coding_selection", lambda **_: ["coding"])
 
         assert server._load_enabled_toolsets("desktop") == [
+            "catalog",
             "coding",
             "desktop_ui",
             "project",

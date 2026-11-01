@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import auth as auth_mod
+from hermes_cli import auth_codex as auth_codex_mod
 from hermes_cli import codex_lane_creds as clc
 
 
@@ -181,7 +182,9 @@ def test_worker_with_flag_never_calls_refresh_endpoint(root, monkeypatch):
     monkeypatch.setenv("HERMES_SANDBOX_NO_REFRESH", "1")
     calls = []
     monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", lambda *a, **k: calls.append(1) or {})
+    monkeypatch.setattr(auth_codex_mod, "refresh_codex_oauth_pure", lambda *a, **k: calls.append(1) or {})
     monkeypatch.setattr(auth_mod, "_recover_codex_tokens_from_cli", lambda reason: calls.append(1) or None)
+    monkeypatch.setattr(auth_codex_mod, "_recover_codex_tokens_from_cli", lambda reason: calls.append(1) or None)
     # inside the normal skew window (120s) -> an unsandboxed worker would refresh; this one must not
     near = _jwt(time.time() + 60)
     _profile_store(root["profile"], near)
@@ -209,6 +212,7 @@ def test_worker_with_flag_never_calls_refresh_endpoint(root, monkeypatch):
 def test_worker_without_flag_still_refreshes(root, monkeypatch):
     stub = _Stub()
     monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", lambda a, r, timeout_seconds=0: stub(a, r))
+    monkeypatch.setattr(auth_codex_mod, "refresh_codex_oauth_pure", lambda a, r, timeout_seconds=0: stub(a, r))
     _profile_store(root["profile"], _jwt(time.time() + 60))
     creds = auth_mod.resolve_codex_runtime_credentials()
     assert stub.calls == 1

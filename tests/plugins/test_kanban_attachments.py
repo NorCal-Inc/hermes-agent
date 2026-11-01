@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ def _make_task(conn, title="t") -> str:
 
 
 def test_add_list_get_delete_attachment(kanban_home, tmp_path):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = _make_task(conn)
         # Write a real blob under the per-task dir so delete can unlink it.
@@ -113,8 +114,9 @@ def test_add_list_get_delete_attachment(kanban_home, tmp_path):
         conn.close()
 
 
+
 def test_delete_attachment_missing_returns_none(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.delete_attachment(conn, 999999) is None
     finally:
@@ -140,7 +142,7 @@ def _attach_blob(conn, task_id: str, name: str = "evidence.txt") -> tuple[int, P
 
 
 def test_delete_attachment_on_live_card_is_refused_and_recorded(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = _make_task(conn, title="live card")
         att_id, blob = _attach_blob(conn, task_id)
         events_before = len(kb.list_events(conn, task_id))
@@ -173,7 +175,7 @@ def test_delete_attachment_on_live_card_is_refused_and_recorded(kanban_home):
 @pytest.mark.usefixtures("all_assignees_spawnable")
 def test_delete_attachment_refused_on_done_card_too(kanban_home):
     """``done`` is not ``archived``: a completed card still holds its evidence."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="done card", assignee="worker")
         att_id, blob = _attach_blob(conn, task_id)
         assert kb.claim_task(conn, task_id) is not None
@@ -186,7 +188,7 @@ def test_delete_attachment_refused_on_done_card_too(kanban_home):
 
 
 def test_delete_attachment_on_archived_card_is_allowed(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = _make_task(conn, title="archived card")
         att_id, blob = _attach_blob(conn, task_id)
         assert kb.archive_task(conn, task_id)
@@ -202,6 +204,36 @@ def test_delete_attachment_on_archived_card_is_allowed(kanban_home):
 
 def test_attachment_delete_refused_is_not_lifecycle_progress():
     assert "attachment_delete_refused" in kb._GAUNTLET_STALE_NONPROGRESS_EVENT_KINDS
+
+
+def test_delete_attachment_keeps_blob_referenced_by_another_row(kanban_home):
+    conn = kbc.connect()
+    try:
+        task_id = _make_task(conn)
+        blob = kb.task_attachments_dir(task_id) / "shared.txt"
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"shared attachment")
+
+        first_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename="first.txt",
+            stored_path=str(blob),
+            size=blob.stat().st_size,
+        )
+        second_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename="second.txt",
+            stored_path=str(blob),
+            size=blob.stat().st_size,
+        )
+
+        assert kb.delete_attachment(conn, first_id) is not None
+        assert blob.exists(), "a surviving attachment row must keep its shared blob"
+        assert kb.get_attachment(conn, second_id) is not None
+    finally:
+        conn.close()
 
 
 def test_attachments_root_is_per_board(kanban_home, monkeypatch):
@@ -220,7 +252,7 @@ def test_attachments_root_is_per_board(kanban_home, monkeypatch):
 
 
 def test_worker_context_lists_attachments_with_absolute_path(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = _make_task(conn, title="translate PDF")
         dest_dir = kb.task_attachments_dir(task_id)
@@ -292,7 +324,7 @@ def test_upload_list_download_delete_roundtrip(client):
     assert client.get(f"/api/plugins/kanban/attachments/{att_id}").content == content
 
     # After archiving, delete removes the row and the file
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.archive_task(conn, task_id)
     finally:
@@ -329,7 +361,7 @@ def test_download_unknown_attachment_404(client):
 
 
 def test_store_attachment_bytes_roundtrip(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = _make_task(conn)
         att_id = kb.store_attachment_bytes(
@@ -357,7 +389,7 @@ def test_store_attachment_bytes_roundtrip(kanban_home):
 def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     from hermes_cli.kanban import run_slash
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = _make_task(conn, title="cli-attach")
     finally:
@@ -369,7 +401,7 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     out = run_slash(f"attach {task_id} {src}")
     assert "Attached" in out, out
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         atts = kb.list_attachments(conn, task_id)
         assert len(atts) == 1
@@ -386,7 +418,7 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     refused = run_slash(f"attach-rm {att_id}")
     assert "refused" in refused and "archive the card first" in refused, refused
     assert "Deleted attachment" not in refused
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         atts = kb.list_attachments(conn, task_id)
         assert [a.id for a in atts] == [att_id]
@@ -400,7 +432,7 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     assert "rchived" in archived, archived
     removed = run_slash(f"attach-rm {att_id}")
     assert "Deleted attachment" in removed, removed
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.list_attachments(conn, task_id) == []
     finally:
@@ -419,7 +451,7 @@ def test_cli_attach_rm_returns_nonzero_on_live_card(kanban_home, monkeypatch, ca
     import argparse
     from hermes_cli.kanban import _cmd_attach_rm
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = _make_task(conn, title="rc check")
         att_id, blob = _attach_blob(conn, task_id)
 
@@ -429,7 +461,7 @@ def test_cli_attach_rm_returns_nonzero_on_live_card(kanban_home, monkeypatch, ca
     assert "archive the card first" in err and task_id in err
     assert blob.exists()
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         assert kb.archive_task(conn, task_id)
     rc = _cmd_attach_rm(argparse.Namespace(attachment_id=att_id))
     assert rc == 0

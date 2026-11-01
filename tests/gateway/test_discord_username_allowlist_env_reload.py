@@ -1,11 +1,10 @@
 """Gateway authz must survive the per-turn .env hot-reload when
-DISCORD_ALLOWED_USERS contains usernames (upstream a0a63a1bc2 incident).
+DISCORD_ALLOWED_USERS contains usernames (Aug 2026 incident).
 
 Sequence under test:
   1. Operator writes usernames into DISCORD_ALLOWED_USERS in ``.env``.
   2. Discord adapter connect resolves usernames -> numeric IDs into adapter
-     memory (``_allowed_user_ids`` / ``_username_resolved_ids``) and mirrors
-     them into ``os.environ``.
+     memory (``_allowed_user_ids``) and mirrors them into ``os.environ``.
   3. The gateway's per-turn env hot-reload
      (``_reload_runtime_env_preserving_config_authority`` ->
      ``load_hermes_dotenv(override=True)``) restores the RAW username strings
@@ -18,19 +17,16 @@ dropped the operator as "Unauthorized user" from the second agent turn
 onward — the bot answered exactly once per reconnect. The fix unions the
 adapter's resolved numeric IDs (``resolved_allowlist_user_ids()``) into the
 gateway-layer allowlist, so runtime resolution survives env reloads.
-
-Also covers: a numeric allowlist entry removed after connect must stop
-authorizing (upstream 462389ea5e), and a reconnect after the allowlist was
-emptied must not keep the previous connect's resolved IDs (upstream
-d13d92cc82).
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from gateway.session import Platform, SessionSource
+
 
 OPERATOR_ID = "387972437901312000"
 
@@ -149,44 +145,17 @@ class TestResolvedAllowlistSurvivesEnvReload:
         assert runner._is_user_authorized(_discord_source("666000666000666000")) is False
 
 
-class TestDiscordAdapterResolvedAccessor:
-    def _adapter(self, allowed_ids):
-        from plugins.platforms.discord.adapter import DiscordAdapter
-
-        adapter = object.__new__(DiscordAdapter)
-        adapter._allowed_user_ids = set(allowed_ids)
-        adapter._username_resolved_ids = set(allowed_ids)
-        return adapter
-
-    def test_returns_numeric_ids_as_strings(self):
-        adapter = self._adapter({OPERATOR_ID, 111222333444555666})
-        assert adapter.resolved_allowlist_user_ids() == {
-            OPERATOR_ID,
-            "111222333444555666",
-        }
-
-    def test_filters_usernames_and_wildcard(self):
-        """Unresolved usernames and the '*' wildcard must not pass through:
-        usernames can't match numeric user_ids, and '*' would widen the
-        gateway layer to allow-everyone from adapter memory alone."""
-        adapter = self._adapter({"teknium", "*", OPERATOR_ID})
-        assert adapter.resolved_allowlist_user_ids() == {OPERATOR_ID}
-
-
 PAIRED_ID = "111222333444555666"
 
 
 def _resolved_discord_adapter(entries, members):
     """A real DiscordAdapter after connect: ``_allowed_user_ids`` holds the env entries and
     ``_resolve_allowed_usernames`` runs against fake guild members."""
-    import asyncio
-
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     adapter = object.__new__(DiscordAdapter)
     adapter.platform = Platform.DISCORD
     adapter._allowed_user_ids = set(entries)
-    adapter._username_resolved_ids = set()
     guild = SimpleNamespace(name="g", members=members, member_count=len(members))
     adapter._client = SimpleNamespace(guilds=[guild])
     asyncio.run(adapter._resolve_allowed_usernames())
@@ -195,6 +164,16 @@ def _resolved_discord_adapter(entries, members):
 
 def _member(uid, name):
     return SimpleNamespace(id=int(uid), name=name, display_name=name, global_name=None, discriminator="0")
+
+
+class TestDiscordAdapterResolvedAccessor:
+    def test_returns_numeric_ids_as_strings(self):
+        """Only IDs resolved from username entries pass through, as strings: not the '*' wildcard
+        (it would widen the gateway layer to allow-everyone from adapter memory alone), not an
+        unresolved username, and not a numeric entry (the gateway reads those live from the env)."""
+        adapter = _resolved_discord_adapter(
+            {"teknium", "ghost", "*", PAIRED_ID}, [_member(OPERATOR_ID, "teknium")])
+        assert adapter.resolved_allowlist_user_ids() == {OPERATOR_ID}
 
 
 class TestRemovedNumericEntryIsNotResurrected:

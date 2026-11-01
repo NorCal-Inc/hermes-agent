@@ -1,38 +1,24 @@
-"""Secret stores under HERMES_HOME must be write-denied, control files must not.
+"""Secret stores under HERMES_HOME are write-denied; control files stay writable (#110464).
 
-``get_read_block_error`` already refuses every credential store. The write side is
-deliberately narrower: control files (``auth.json``, ``config.yaml``,
-``webhook_subscriptions.json``) are freed on purpose -- true containment belongs in
-Docker/remote backends and OS permissions, not an expanding hardcoded denylist (see
-``tests/tools/test_write_deny.py::TestWriteAllowed::test_hermes_control_files_requested_writable``).
-
-What stays write-denied is secret *material*: ``auth/google_oauth.json`` (an OAuth token
-store), both Bitwarden caches, ``vault/`` (key + ciphertext side by side) and
-``browser-profile/`` (copied cookies / Login Data). Ported from upstream e7cd1848c9 +
-1c0d95badb (NousResearch/hermes-agent) onto this fork's ``agent/file_safety.py`` layout.
+``get_read_block_error`` refuses every credential store. The write side is deliberately
+narrower — #45947 freed ``auth.json`` / ``config.yaml`` / ``webhook_subscriptions.json`` so
+the user can ask to edit them — but the secret *material* it meant to keep blocked had
+drifted: ``auth/google_oauth.json``, the plaintext Bitwarden cache, ``vault/`` and
+``browser-profile/`` were writable through ``write_file`` / ``patch``.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 import agent.file_safety as fs
 
-# Secret material: write-denied.
-SECRET_FILES = (
-    ".env",
-    ".anthropic_oauth.json",
-    "auth/google_oauth.json",
-    "cache/bws_cache.json",
-    "cache/bws_cache.enc.json",
+SECRET_STORES = (
+    "auth/google_oauth.json", "cache/bws_cache.json", "vault/vault.key", "browser-profile/Default/Cookies",
 )
-
-# Secret directories: write-denied, any file inside.
-SECRET_DIRS = fs._WRITE_DENIED_SECRET_DIRS
-
-# Control files that are read-denied but deliberately left writable.
 WRITABLE_CONTROL_FILES = ("auth.json", "config.yaml", "webhook_subscriptions.json")
 
 
@@ -54,64 +40,57 @@ def _touch(base: Path, rel: str) -> Path:
     return p
 
 
-@pytest.mark.parametrize("name", SECRET_FILES)
-def test_secret_files_are_write_denied(hermes_layout, name):
+def test_read_denied_secret_stores_are_write_denied_on_profile_and_root(hermes_layout):
     root, profile = hermes_layout
     for base in (profile, root):
-        path = _touch(base, name)
-        assert fs.is_write_denied(str(path)), f"write allowed: {path}"
+        for rel in SECRET_STORES:
+            path = _touch(base, rel)
+            assert fs.get_read_block_error(str(path)), f"fixture drift: not read-denied: {path}"
+            assert fs.is_write_denied(str(path)), f"write allowed: {path}"
 
 
-@pytest.mark.parametrize("sub", SECRET_DIRS)
-def test_secret_dirs_are_write_denied(hermes_layout, sub):
+def test_control_files_and_lookalikes_outside_home_stay_writable(hermes_layout, tmp_path):
     root, profile = hermes_layout
     for base in (profile, root):
-        path = _touch(base, f"{sub}/inside.bin")
-        assert fs.is_write_denied(str(path)), f"write allowed: {path}"
+        for rel in WRITABLE_CONTROL_FILES:
+            assert fs.is_write_denied(str(_touch(base, rel))) is False, f"#45947 regression: {rel}"
+    assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "cache/bws_cache.json"))) is False
+    assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "vault/vault.key"))) is False
 
 
-@pytest.mark.parametrize("name", WRITABLE_CONTROL_FILES)
-def test_control_files_stay_writable(hermes_layout, name):
-    _, profile = hermes_layout
-    path = _touch(profile, name)
-    assert fs.is_write_denied(str(path)) is False, f"{name} should be writable"
+class TestProfileHomeProcessHome:
+    """With the process HOME pinned to ``{HERMES_HOME}/home`` (TERMINAL_HOME_MODE=profile,
+    containers, spawned workers) the write guards must still cover every home a write can
+    land in: the OS user's real home, the profile home and ``~name`` accounts."""
 
+    @pytest.fixture()
+    def profile_home_env(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        (profile / "home").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HOME", str(profile / "home"))
+        monkeypatch.setattr(fs, "_hermes_home_path", lambda: profile)
+        monkeypatch.setattr(fs, "_hermes_root_path", lambda: profile.parent)
+        return profile
 
-def test_nested_same_basename_file_stays_writable(hermes_layout):
-    """A skill's own mock ``auth/google_oauth.json`` fixture, nested somewhere that is
-    not the HERMES_HOME credential path, must not be swept up by the guard."""
-    _, profile = hermes_layout
-    path = _touch(profile, "skills/my-skill/auth/google_oauth.json")
-    assert fs.is_write_denied(str(path)) is False
+    def test_every_home_is_guarded(self, profile_home_env):
+        import pwd
 
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for rel in (".aws/credentials", ".ssh/id_ed25519", ".netrc", ".config/gh/hosts.yml"):
+            assert fs.is_write_denied(str(real_home / rel)), rel
+            assert fs.is_write_denied(str(profile_home_env / "home" / rel)), rel
+        assert fs.is_write_denied("~/.aws/credentials")
+        assert fs.is_write_denied("~root/.ssh/authorized_keys")
+        # ``~/.ssh/config`` stays approval-gated (not hard-denied) on the real home too.
+        assert fs.is_write_approval_required(str(real_home / ".ssh" / "config"))
+        assert fs.is_write_denied(str(real_home / ".ssh" / "config")) is False
 
-def test_secret_file_outside_hermes_home_stays_writable(hermes_layout, tmp_path):
-    project = tmp_path / "myproject"
-    path = _touch(project, "auth/google_oauth.json")
-    assert fs.is_write_denied(str(path)) is False
+    def test_benign_paths_stay_writable(self, profile_home_env, tmp_path):
+        import pwd
 
-
-def test_write_file_does_not_replace_vault_contents(hermes_layout):
-    _, profile = hermes_layout
-    from tools.environments.local import LocalEnvironment
-    from tools.file_operations import ShellFileOperations
-
-    target = _touch(profile, "vault/vault.key")
-    target.write_text("not-a-real-key\n", encoding="utf-8")
-    ops = ShellFileOperations(LocalEnvironment(cwd=str(profile)), cwd=str(profile))
-    res = ops.write_file(str(target), "stolen\n")
-    assert res.error is not None
-    assert target.read_text(encoding="utf-8") == "not-a-real-key\n"
-
-
-def test_write_file_does_not_replace_browser_profile_contents(hermes_layout):
-    _, profile = hermes_layout
-    from tools.environments.local import LocalEnvironment
-    from tools.file_operations import ShellFileOperations
-
-    target = _touch(profile, "browser-profile/Default/Login Data")
-    target.write_text("sqlite-bytes\n", encoding="utf-8")
-    ops = ShellFileOperations(LocalEnvironment(cwd=str(profile)), cwd=str(profile))
-    res = ops.write_file(str(target), "stolen\n")
-    assert res.error is not None
-    assert target.read_text(encoding="utf-8") == "sqlite-bytes\n"
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for benign in (tmp_path / "scratch" / "notes.txt", real_home / "projects" / "notes.md"):
+            assert fs.is_write_denied(str(benign)) is False, benign
+            assert fs.is_write_approval_required(str(benign)) is False, benign
+        assert fs.is_write_denied("~nosuchuser-hopefully/.ssh/authorized_keys") is False

@@ -60,7 +60,7 @@ class TestRateLimitNoticeDedupe:
         auth1 = run._gateway_provider_error_reply("provider authentication failed", dedupe_key=key)
         auth2 = run._gateway_provider_error_reply("provider authentication failed", dedupe_key=key)
         assert auth1 == auth2
-        assert "authentication" in auth1.lower()
+        assert "authentication" in auth1.lower() or "sign-in" in auth1.lower()
 
         conn1 = run._gateway_provider_error_reply("Errno 111 Connection refused", dedupe_key=key)
         conn2 = run._gateway_provider_error_reply("Errno 111 Connection refused", dedupe_key=key)

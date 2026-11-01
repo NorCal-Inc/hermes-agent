@@ -37,6 +37,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_specify as spec
 from hermes_cli.kanban_specify import (
     _SYSTEM_PROMPT,
@@ -303,7 +304,7 @@ def test_specify_task_strips_violation_before_persisting(kanban_home, monkeypatc
     """The LLM "fails to follow the system prompt instruction" on purpose
     here -- the mechanical guard must still keep the violating line out of
     the persisted card."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="rough idea", triage=True)
 
     import agent.auxiliary_client as aux
@@ -321,7 +322,7 @@ def test_specify_task_strips_violation_before_persisting(kanban_home, monkeypatc
     assert out.ok is True
     assert out.stripped_criteria == ["- Card marked done and checkpoint advances."]
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         persisted = kb.get_task(conn, tid)
     assert persisted.status in ("todo", "ready")
     # The violating line must never reach the persisted body.
@@ -335,7 +336,7 @@ def test_specify_task_strips_violation_before_persisting(kanban_home, monkeypatc
 def test_specify_task_clean_response_unaffected(kanban_home, monkeypatch):
     """Guard must be a no-op (and not report any stripped criteria) when
     the LLM actually follows the prompt instruction."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="rough idea", triage=True)
 
     import agent.auxiliary_client as aux
@@ -351,7 +352,7 @@ def test_specify_task_clean_response_unaffected(kanban_home, monkeypatch):
 
     assert out.ok is True
     assert out.stripped_criteria == []
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         persisted = kb.get_task(conn, tid)
     assert persisted.body == clean_body
 
@@ -360,7 +361,7 @@ def test_specify_task_fallback_raw_body_also_guarded(kanban_home, monkeypatch):
     """When the LLM reply isn't valid JSON, specify_task falls back to
     treating the whole reply as the body (existing behavior) -- the guard
     must still apply to that fallback path."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="rough idea", triage=True)
 
     import agent.auxiliary_client as aux
@@ -372,7 +373,7 @@ def test_specify_task_fallback_raw_body_also_guarded(kanban_home, monkeypatch):
 
     assert out.ok is True
     assert out.stripped_criteria == ["- Card marked done and checkpoint advances."]
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         persisted = kb.get_task(conn, tid)
     assert "card marked done" not in (persisted.body or "").lower()
 
@@ -394,13 +395,13 @@ def test_specify_task_strips_modal_close_checkpoint_variants_before_persisting(
         "- The migration completes without errors.\n"
     )
     for reply in (json.dumps({"title": "Do the thing", "body": body}), body):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="rough idea", triage=True)
         monkeypatch.setattr(aux, "call_llm", lambda *a, **k: _fake_llm_response(reply))
         out = spec.specify_task(tid, author="claude")
         assert out.ok is True
         assert len(out.stripped_criteria) == 4
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             persisted = kb.get_task(conn, tid)
         low = (persisted.body or "").lower()
         assert "must be completed" not in low
@@ -429,13 +430,13 @@ def test_specify_task_strips_board_issue_pr_variants_before_persisting(
         "- PR #12 merged to main after review.\n"
     )
     for reply in (json.dumps({"title": "Do the thing", "body": body}), body):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="rough idea", triage=True)
         monkeypatch.setattr(aux, "call_llm", lambda *a, **k: _fake_llm_response(reply))
         out = spec.specify_task(tid, author="claude")
         assert out.ok is True
         assert len(out.stripped_criteria) == 4
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             persisted = kb.get_task(conn, tid)
         low = (persisted.body or "").lower()
         assert "issue is resolved" not in low
@@ -669,16 +670,97 @@ def test_specify_task_keeps_safari_line_but_strips_pure_mechanics(
         "- Task completed.\n"
     )
     for reply in (json.dumps({"title": "Do the thing", "body": body}), body):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="rough idea", triage=True)
         monkeypatch.setattr(aux, "call_llm", lambda *a, **k: _fake_llm_response(reply))
         out = spec.specify_task(tid, author="claude")
         assert out.ok is True
         assert len(out.stripped_criteria) == 2
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             persisted = kb.get_task(conn, tid)
         body_text = persisted.body or ""
         assert "The issue is resolved: login works on Safari." in body_text
         assert "The bug is fixed and the regression test passes." in body_text
         assert "card marked done" not in body_text.lower()
         assert "task completed" not in body_text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Upstream specifier + CLI surface tests (kept from upstream v0.22.5): happy
+# path through specify_task and the `hermes kanban specify` argparse wiring.
+# ---------------------------------------------------------------------------
+
+
+def _patch_aux_client(content: str, *, model: str = "test-model"):
+    """Patch call_llm at its source module — specify_task now routes through
+    it (#35566) instead of building a raw client. Returns (patcher, mock) so
+    callers can still assert on the call.
+    """
+    from unittest.mock import patch
+
+    mock_fn = MagicMock(return_value=_fake_llm_response(content))
+    return patch("agent.auxiliary_client.call_llm", mock_fn), mock_fn
+
+
+def test_specify_task_happy_path(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = json.dumps({
+        "title": "Refined rough",
+        "body": "**Goal**\nA concrete goal.",
+    })
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    assert outcome.task_id == tid
+    assert outcome.new_title == "Refined rough"
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    # Parent-free → recompute_ready promotes to ready.
+    assert task.status == "ready"
+    assert task.title == "Refined rough"
+    assert "**Goal**" in (task.body or "")
+
+
+def _run_cli(*argv: str) -> int:
+    """Invoke the `hermes kanban …` argparse surface directly."""
+    import argparse
+
+    from hermes_cli import kanban as kanban_cli
+
+    root = argparse.ArgumentParser()
+    subp = root.add_subparsers(dest="cmd")
+    kanban_cli.build_parser(subp)
+    ns = root.parse_args(["kanban", *argv])
+    return kanban_cli.kanban_command(ns)
+
+
+def test_cli_specify_tenant_filter(kanban_home, capsys):
+    with kbc.connect() as conn:
+        outside = kb.create_task(conn, title="outside", triage=True)
+        inside = kb.create_task(
+            conn, title="inside", triage=True, tenant="proj-a",
+        )
+
+    content = json.dumps({"title": "spec", "body": "body"})
+    p, _ = _patch_aux_client(content)
+    with p:
+        rc = _run_cli("specify", "--all", "--tenant", "proj-a", "--json")
+    assert rc == 0
+    lines = [
+        json.loads(l)
+        for l in capsys.readouterr().out.strip().splitlines()
+        if l
+    ]
+    ids = {row["task_id"] for row in lines}
+    assert ids == {inside}
+
+    # The outside task stays in triage.
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, outside).status == "triage"
+        # The inside task was promoted.
+        assert kb.get_task(conn, inside).status in {"todo", "ready"}

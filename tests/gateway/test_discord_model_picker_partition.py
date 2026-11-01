@@ -1,22 +1,21 @@
-"""Regression test (upstream ab3e2f563b): the Discord /model picker must
-surface ALL models for a provider whose list exceeds 25 entries (e.g. Nous
-curated + Portal free recommendations), not silently truncate the tail at
-25 options.
+"""Regression test: Discord /model picker must surface ALL models for a
+provider whose list exceeds 25 entries (e.g. Nous curated + Portal free
+recommendations), not silently truncate the tail at 25 options.
 
 Discord caps a single Select at 25 options and a View at 5 action rows. The
 picker keeps 2 rows for Back/Cancel, so it must partition the model list
 across up to 3 select menus. This is what makes free-tier ``:free`` Portal
 picks (appended after the curated list) appear on Discord — they previously
 fell off the 25-option cliff.
-
-Uses the shared discord mock from tests/gateway/conftest.py (installed at
-collection time via _ensure_discord_mock()), matching test_discord_model_picker.py.
 """
 
+from types import SimpleNamespace
+
+from gateway.platforms.base import utf16_len
 from plugins.platforms.discord.adapter import ModelPickerView
 
 
-def _all_options(view: "ModelPickerView"):
+def _all_options(view: ModelPickerView):
     """Flatten every model select menu's options into (label, value).
 
     Detect selects by their ``model_model_select*`` custom_id (and presence of
@@ -118,6 +117,10 @@ def test_nous_free_models_render_across_partitioned_selects():
     assert len(select_rows[0].options) == 25
     assert len(select_rows[1].options) == 12
 
+    # Each option still respects Discord's 100-char utf16 field limit.
+    for _label, value in _all_options(view):
+        assert utf16_len(value) <= 100
+
     # No single select exceeds Discord's 25-option hard cap.
     for sel in select_rows:
         assert len(sel.options) <= 25
@@ -152,3 +155,23 @@ def test_small_provider_single_select_unchanged():
     ]
     assert len(select_rows) == 1
     assert len(select_rows[0].options) == 10
+
+
+def test_a_large_row_carries_its_tag_as_the_option_description():
+    """Usage-window plans: ``model_labels`` (hermes_cli/model_switch_providers.py) becomes the option's
+    second line (Large / Free only); every other row and every other account has no description."""
+    view = ModelPickerView(
+        providers=[{
+            "slug": "nous", "name": "Nous Portal", "models": ["example/model-b", "example/model-free:free"],
+            "total_models": 2, "is_current": True,
+            "model_labels": {"example/model-b": "Large"},
+        }],
+        current_model="example/model-b", current_provider="nous", session_key="session-1",
+        on_model_selected=lambda *a, **k: None, allowed_user_ids={"123"},
+    )
+    view._selected_provider = "nous"
+    view._build_model_select("nous")
+    options = {opt.value: opt.description for child in view.children
+               if str(getattr(child, "custom_id", "")).startswith("model_model_select")
+               for opt in getattr(child, "options", [])}
+    assert options == {"example/model-b": "Large", "example/model-free:free": None}

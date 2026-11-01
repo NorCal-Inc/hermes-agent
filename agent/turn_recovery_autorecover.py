@@ -1,18 +1,14 @@
 """Bounded post-exhaustion auto-recovery ladder for a pre-delivery turn (#85426, #107307).
 
-Runs from the retry loop in ``agent/conversation_loop.py`` once ``max_retries`` is spent AND the
-fallback chain has nothing left to move to (fallback stays first). While the provider is only
-*temporarily* away (5xx, overloaded/529, connect/read timeouts) and no answer text has reached the
-user yet, the turn parks with a visible countdown instead of ending in "API failed after N
-retries", then re-enters the ordinary retry loop. Cycles: ``agent.auto_recovery_cycles`` (default
-5) with a jittered 15/30/60/60/60 s schedule; a provider ``Retry-After`` wins up to 120 s.
-Non-retryable classes (auth, format, content policy, billing, entitlement) never enter, and an
-interrupt cancels the wait cleanly. Overload-class errors use this same schedule — there is no
-separate overload backoff path.
-
-Fork note: upstream drives the wait through ``agent.turn_recovery.interruptible_backoff_sleep``;
-this fork keeps its interruptible retry wait inline in ``conversation_loop``, so the loop owns the
-wait and this module owns eligibility, schedule, bookkeeping and the user-facing notice.
+Runs from ``settle_unrecovered_error`` once ``max_retries`` is spent AND the fallback chain has
+nothing left to move to (fallback stays first). While the provider is only *temporarily* away
+(5xx, overloaded/529, connect/read timeouts) and no answer text has reached the user yet, the
+turn parks with a visible countdown instead of ending in "API failed after N retries", then
+re-enters the ordinary retry loop. Cycles: ``agent.auto_recovery_cycles`` (default 5) with a
+jittered 15/30/60/60/60 s schedule; a provider ``Retry-After`` wins up to 120 s. Non-retryable
+classes (auth, format, content policy, billing, entitlement) never enter, and an interrupt
+cancels the wait cleanly. Overload-class errors use this same schedule — there is no separate
+overload backoff path.
 """
 
 from __future__ import annotations
@@ -50,23 +46,11 @@ def auto_recovery_cycles(agent: Any) -> int:
     return max(int(getattr(agent, "_auto_recovery_cycles", 0) or 0), 0)
 
 
-def _retry_after_seconds(api_error: Any) -> Optional[float]:
-    """Provider-declared cooldown from the ``Retry-After`` header or a ``retry_after`` body field."""
-    from agent.retry_utils import parse_retry_after_seconds
-    value = parse_retry_after_seconds(getattr(getattr(api_error, "response", None), "headers", None))
-    if value is None:
-        body = getattr(api_error, "body", None)
-        if isinstance(body, dict):
-            nested = body.get("error")
-            value = parse_retry_after_seconds((nested if isinstance(nested, dict) else body).get("retry_after"))
-    return value if value is not None and value > 0 else None
-
-
 def ladder_wait_seconds(cycle: int, api_error: Any) -> float:
     """Wait before recovery ``cycle`` (1-based): jittered 15/30/60/60/60 s, or the provider's
     ``Retry-After`` when present (honoured past the 60 s cap, up to 120 s)."""
-    from agent.retry_utils import jittered_backoff
-    retry_after = _retry_after_seconds(api_error)
+    from agent.retry_utils import jittered_backoff, provider_retry_after_seconds
+    retry_after = provider_retry_after_seconds(api_error)
     if retry_after is not None:
         return min(retry_after, _RETRY_AFTER_CAP_S)
     return jittered_backoff(cycle, base_delay=_LADDER_BASE_DELAY_S, max_delay=_LADDER_CAP_S, jitter_ratio=0.2)
@@ -87,20 +71,22 @@ def ladder_notice(agent: Any, *, wait_s: float, cycle: int, total: int) -> str:
     return f"{text}; {hint}" if hint else text
 
 
-def start_recovery_cycle(agent: Any, api_error: Any, classified: Any, _retry: Any) -> Optional[Dict[str, Any]]:
-    """Begin one recovery cycle after retries + fallback are exhausted.
+def auto_recover_after_exhaustion(
+    agent: Any, api_error: Any, classified: Any, _retry: Any, *, messages: Any,
+    conversation_history: Any, api_call_count: int,
+) -> Optional[dict[str, Any]]:
+    """Run one recovery cycle after retries + fallback exhausted. Returns ``{"action": "continue"}``
+    when the wait completed (caller zeroes ``retry_count`` and re-enters the retry loop),
+    ``{"action": "break"}`` when a steering correction arrived mid-wait, ``{"action": "return",
+    "result": …}`` when the user interrupted, and ``None`` when the ladder does not apply or is spent."""
+    from agent.turn_recovery import interruptible_backoff_sleep
 
-    Returns ``{"wait_s", "cycle", "total"}`` when the caller should wait (interruptibly) and then
-    re-enter the retry loop with ``retry_count = 0``; ``None`` when the ladder does not apply or is
-    spent (the caller falls through to the terminal "API failed" path). The notice goes to the
-    status rail AND the live wait line, plus a log line for cron.
-    """
     if not ladder_eligible(agent, classified):
         return None
     total = auto_recovery_cycles(agent)
     used = int(getattr(_retry, "auto_recovery_cycles_used", 0) or 0)
     if used >= total:
-        agent._emit_status(
+        agent._emit_diagnostic_status(
             f"⏳ Automatic recovery gave up after {total} cycles — the provider is still unavailable."
         )
         return None
@@ -108,12 +94,23 @@ def start_recovery_cycle(agent: Any, api_error: Any, classified: Any, _retry: An
     _retry.auto_recovery_cycles_used = cycle
     wait_s = ladder_wait_seconds(cycle, api_error)
     notice = ladder_notice(agent, wait_s=wait_s, cycle=cycle, total=total)
-    # Durable line on every surface (CLI print, TUI status, gateway bubble) plus the live wait
-    # line (spinner / thinking.delta / activity heartbeat).
-    agent._emit_status(notice)
-    agent._emit_wait_notice(notice)
+    # Durable line on every surface (CLI print, TUI status.update, gateway bubble, api_server SSE)
+    # plus the live wait line (spinner / thinking.delta / activity heartbeat).
+    agent._emit_diagnostic_status(notice)
+    agent._emit_diagnostic_wait(notice)
     logger.warning(
         "%sProvider unavailable (%s) — auto-recovery cycle %d/%d, retrying in %.0fs %s",
         agent.log_prefix, classified.reason.value, cycle, total, wait_s, agent._client_log_context(),
     )
-    return {"wait_s": wait_s, "cycle": cycle, "total": total}
+    interrupted = interruptible_backoff_sleep(
+        agent, wait_s, _retry, messages=messages, conversation_history=conversation_history,
+        api_call_count=api_call_count,
+        abort_message="Interrupt detected during automatic recovery wait, aborting.",
+        interrupt_text=f"Operation interrupted: waiting for the provider to recover (cycle {cycle}/{total}).",
+        activity_label=f"auto-recovery wait ({cycle}/{total})",
+    )
+    if interrupted is not None:
+        return {"action": "return", "result": interrupted}
+    if _retry.restart_with_redirected_messages:
+        return {"action": "break"}
+    return {"action": "continue"}

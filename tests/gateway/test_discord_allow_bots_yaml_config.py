@@ -7,6 +7,7 @@ ignored and bot-to-bot handoffs stayed blocked.
 """
 
 import importlib
+import sys
 import types
 
 import pytest
@@ -14,8 +15,7 @@ import pytest
 
 @pytest.fixture
 def adapter_mod():
-    # Reuse the loaded module: re-importing it breaks later tests that hold
-    # references to the original module object (attachment download tests).
+    sys.modules.pop("plugins.platforms.discord.adapter", None)
     return importlib.import_module("plugins.platforms.discord.adapter")
 
 
@@ -24,10 +24,7 @@ def _seed(adapter_mod, yaml_cfg, discord_cfg):
 
 
 def test_yaml_allow_bots_is_seeded_into_extra(adapter_mod, monkeypatch):
-    # _apply_yaml_config writes os.environ directly; setenv first so monkeypatch
-    # records the original state and removes the bridged value at teardown.
-    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "")
-    monkeypatch.delenv("DISCORD_ALLOW_BOTS")
+    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
     seeded = _seed(adapter_mod, {}, {"allow_bots": "mentions"})
     assert seeded is not None
     assert seeded.get("allow_bots") == "mentions"

@@ -1,16 +1,13 @@
 """Bounded post-exhaustion auto-recovery ladder (#85426, #107307): fallback first, transient
-outages only, visible on every surface, interrupt cancels.
-
-Adapted from upstream: the fork has no ``settle_unrecovered_error`` seam, so the module is tested
-directly and the loop seam is driven end-to-end through ``run_conversation``.
-"""
+outages only, visible on every surface, interrupt cancels."""
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from agent.error_classifier import classify_api_error
-from agent.turn_recovery_autorecover import ladder_wait_seconds, start_recovery_cycle
+from agent.turn_api_error import settle_unrecovered_error
+from agent.turn_recovery_autorecover import ladder_wait_seconds
 from agent.turn_retry_state import TurnRetryState
 
 
@@ -24,68 +21,113 @@ class _Err(Exception):
 
 
 class _Agent:
+    """Real seams: fallback state, the status/wait callbacks the surfaces read, the streamed-text
+    gate and the interrupt flag; everything else the terminal path touches is a no-op."""
     log_prefix = ""
+    verbose = False
     provider = "custom"
+    platform = "cli"
+    _credential_pool = None
     _current_streamed_assistant_text = ""
+    _interrupt_requested = False
+    sleep_outcome = None  # what the (patched) interruptible wait returns
 
-    def __init__(self, *, cycles=5, platform="cli"):
-        self.statuses, self.waits = [], []
+    def __init__(self, *, fallback_left=False, cycles=5, platform="cli"):
+        self.statuses, self.waits, self.activated = [], [], []
+        self._fallback_left = fallback_left
         self._auto_recovery_cycles = cycles
         self.platform = platform
+
+    def _has_pending_fallback(self):
+        return self._fallback_left
+
+    def _try_activate_fallback(self, **kwargs):
+        self.activated.append(True)
+        return self._fallback_left
+
+    def _try_recover_primary_transport(self, *a, **k):
+        return False
 
     def _has_content_after_think_block(self, text):
         return bool(text.strip())
 
-    def _emit_status(self, text):
+    def _emit_diagnostic_status(self, text):
         self.statuses.append(str(text))
 
-    def _emit_wait_notice(self, text):
+    def _emit_diagnostic_wait(self, text):
         self.waits.append(str(text))
+
+    def _summarize_api_error(self, error):
+        return str(error)
 
     def _client_log_context(self):
         return ""
 
+    def clear_interrupt(self, **kwargs):
+        return False
 
-def _start(agent, err, retry=None):
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+def _settle(agent, err, retry=None):
     retry = retry or TurnRetryState(primary_recovery_attempted=True)
     classified = classify_api_error(err, provider=agent.provider)
-    return start_recovery_cycle(agent, err, classified, retry), retry
+    with patch("agent.conversation_loop._is_copilot_provider", lambda a: False), \
+            patch("agent.conversation_loop._arm_fallback_restart", lambda a, m, s, r: s), \
+            patch("agent.turn_recovery.interruptible_backoff_sleep", lambda agent, *a, **k: agent.sleep_outcome), \
+            patch("agent.turn_api_error.max_retries_exhausted_result", lambda *a, **k: {"failed": True}), \
+            patch("agent.turn_api_error.nonretryable_client_error_result", lambda *a, **k: {"failed": True, "nonretryable": True}):
+        return settle_unrecovered_error(
+            agent, api_error=err, classified=classified, _retry=retry, status_code=err.status_code,
+            error_msg=str(err).lower(), is_context_length_error=False, is_rate_limited=False,
+            _is_zai_coding_overload=False, _provider=agent.provider, _base="http://x", _model="m",
+            messages=[], api_messages=[], api_kwargs=None, active_system_prompt=None,
+            conversation_history=None, approx_tokens=0, retry_count=3, max_retries=3,
+            compression_attempts=0, api_call_count=1,
+        ), retry
 
 
 @pytest.mark.parametrize("status,message", [(503, "Service temporarily unavailable"), (529, "Overloaded")])
-def test_transient_exhaustion_enters_ladder(status, message):
+def test_transient_exhaustion_without_fallback_enters_ladder_and_retries(status, message):
+    """No fallback left + 5xx/overloaded + nothing delivered -> one visible cycle, then retry from 0."""
     agent = _Agent()
-    cycle, retry = _start(agent, _Err(status, message))
-    assert cycle is not None and cycle["cycle"] == 1 and cycle["total"] == 5
-    assert retry.auto_recovery_cycles_used == 1
+    verdict, retry = _settle(agent, _Err(status, message))
+    assert (verdict.action, verdict.retry_count, retry.auto_recovery_cycles_used) == ("continue", 0, 1)
     assert agent.statuses == agent.waits and len(agent.statuses) == 1
     line = agent.statuses[0]
-    assert "retrying automatically in" in line and "(cycle 1/5)" in line and "press Esc to stop" in line
+    assert "(cycle 1/5)" in line
 
 
-def test_ladder_is_bounded_and_shuns_nonretryable_and_delivered_text():
+def test_ladder_is_bounded_and_yields_to_fallback_and_shuns_nonretryable():
     agent = _Agent()
     spent = TurnRetryState(primary_recovery_attempted=True, auto_recovery_cycles_used=5)
-    cycle, _ = _start(agent, _Err(503, "down"), retry=spent)
-    assert cycle is None
+    verdict, _ = _settle(agent, _Err(503, "down"), retry=spent)
+    assert verdict.action == "return" and verdict.result == {"failed": True}
     assert any("gave up after 5 cycles" in s for s in agent.statuses)
 
-    auth = _Agent()
-    cycle, retry = _start(auth, _Err(401, "Incorrect API key provided"))
-    assert cycle is None and retry.auto_recovery_cycles_used == 0 and auth.statuses == []
+    # Fallback first: a remaining fallback engages and the ladder never runs.
+    fb = _Agent(fallback_left=True)
+    verdict, retry = _settle(fb, _Err(503, "down"))
+    assert (verdict.action, fb.activated, retry.auto_recovery_cycles_used) == ("break", [True], 0)
 
+    # Non-retryable classes never enter (401 here) and delivered text is never replayed.
+    auth = _Agent()
+    verdict, retry = _settle(auth, _Err(401, "Incorrect API key provided"))
+    assert verdict.result.get("nonretryable") and retry.auto_recovery_cycles_used == 0
     streamed = _Agent()
     streamed._current_streamed_assistant_text = "Here is the first half of the answer"
-    cycle, retry = _start(streamed, _Err(503, "down"))
-    assert cycle is None and retry.auto_recovery_cycles_used == 0
+    verdict, retry = _settle(streamed, _Err(503, "down"))
+    assert (verdict.action, retry.auto_recovery_cycles_used) == ("return", 0)
 
+    # Disabled by config.
     off = _Agent(cycles=0)
-    cycle, retry = _start(off, _Err(503, "down"))
-    assert (cycle, retry.auto_recovery_cycles_used, off.statuses) == (None, 0, [])
+    verdict, retry = _settle(off, _Err(503, "down"))
+    assert (verdict.action, retry.auto_recovery_cycles_used, off.statuses) == ("return", 0, [])
 
 
 def test_ladder_schedule_honours_retry_after_and_platform_stop_hint(monkeypatch):
-    import agent.retry_utils as retry_utils
+    from agent import retry_utils
     calls = []
 
     def _recording_backoff(attempt, *, base_delay, max_delay, jitter_ratio):
@@ -97,102 +139,21 @@ def test_ladder_schedule_honours_retry_after_and_platform_stop_hint(monkeypatch)
     assert [ladder_wait_seconds(c, plain) for c in (1, 2, 3, 4, 5)] == [15, 30, 60, 60, 60]
     assert calls[0] == (1, 15.0, 60.0)
     assert ladder_wait_seconds(1, _Err(529, "Overloaded", {"Retry-After": "4"})) == 4
+    # Past the 60 s cap the provider's own cooldown is honoured, up to 120 s.
     assert ladder_wait_seconds(1, _Err(529, "Overloaded", {"Retry-After": "90"})) == 90
     assert ladder_wait_seconds(1, _Err(529, "Overloaded", {"Retry-After": "900"})) == 120
 
     tg = _Agent(platform="telegram")
-    _start(tg, plain)
+    _settle(tg, plain)
     assert "send /stop to cancel" in tg.statuses[0]
     cron = _Agent(platform="cron")
-    _start(cron, plain)
+    _settle(cron, plain)
     assert cron.statuses[0].endswith("(cycle 1/5)")
 
 
-# ---------------------------------------------------------------- loop seam
-
-
-def _loop_agent(cycles):
-    from run_agent import AIAgent
-
-    with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
-    ):
-        agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-    agent.client = MagicMock()
-    agent._cached_system_prompt = "You are helpful."
-    agent._use_prompt_caching = False
-    agent.tool_delay = 0
-    agent.compression_enabled = False
-    agent.save_trajectories = False
-    agent._api_max_retries = 1
-    agent._auto_recovery_cycles = cycles
-    agent._fallback_chain = []
-    return agent
-
-
-def _fast_time():
-    mock_time = MagicMock()
-    _t = [1000.0]
-
-    def _advancing_time():
-        _t[0] += 500.0
-        return _t[0]
-
-    mock_time.time.side_effect = _advancing_time
-    mock_time.sleep = MagicMock()
-    mock_time.monotonic.return_value = 12345.0
-    return mock_time
-
-
-def _run(agent, side_effect):
-    from agent import conversation_loop as _conv_loop
-    from tests.run_agent.test_run_agent import _mock_response
-
-    agent.client.chat.completions.create.side_effect = [
-        _mock_response(content=s, finish_reason="stop") if isinstance(s, str) else s
-        for s in side_effect
-    ]
-    statuses = []
-    with (
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch.object(agent, "_try_recover_primary_transport", return_value=False),
-        patch.object(agent, "_emit_status", side_effect=statuses.append),
-        patch("run_agent.time", _fast_time()),
-        patch.object(_conv_loop, "time", _fast_time()),
-        patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
-    ):
-        result = agent.run_conversation("hello")
-    return result, statuses
-
-
-def test_loop_recovers_after_exhaustion_on_transient_outage():
-    agent = _loop_agent(cycles=5)
-    result, statuses = _run(agent, [_Err(503, "Service temporarily unavailable"), "recovered"])
-    assert result.get("final_response") == "recovered"
-    assert any("retrying automatically" in s and "(cycle 1/5)" in s for s in statuses)
-
-
-def test_loop_gives_up_when_ladder_spent():
-    agent = _loop_agent(cycles=1)
-    result, statuses = _run(agent, [_Err(503, "down"), _Err(503, "down")])
-    assert result.get("completed") is False
-    assert any("(cycle 1/1)" in s for s in statuses)
-    assert any("gave up after 1 cycles" in s for s in statuses)
-
-
-def test_loop_ladder_disabled_ends_turn_immediately():
-    agent = _loop_agent(cycles=0)
-    result, statuses = _run(agent, [_Err(503, "down")])
-    assert result.get("completed") is False
-    assert not any("retrying automatically" in s for s in statuses)
-    assert agent.client.chat.completions.create.call_count == 1
+def test_interrupt_during_ladder_wait_returns_interrupted_result():
+    agent = _Agent()
+    agent.sleep_outcome = {"interrupted": True, "completed": False}
+    verdict, retry = _settle(agent, _Err(503, "down"))
+    assert verdict.action == "return" and verdict.result["interrupted"] is True
+    assert retry.auto_recovery_cycles_used == 1

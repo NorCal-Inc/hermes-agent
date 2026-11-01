@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import subprocess
 from pathlib import Path
 
@@ -26,14 +27,7 @@ def _make_task(kb, *, assignee: str):
 
 
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):
-    """Manual profile assignment should keep that profile's CLI tools.
-
-    Regression guard for dispatcher-spawned workers that boot with
-    HERMES_KANBAN_TASK: the worker must not collapse to only kanban lifecycle
-    tools when the assigned profile's top-level ``toolsets`` is the default
-    composite. The spawned CLI gets an explicit --toolsets pin resolved from
-    platform_toolsets.cli; model_tools appends task-scoped kanban tools later.
-    """
+    """The transport client reaches the assigned profile with its exact run claim."""
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"
     profile.mkdir(parents=True)
@@ -61,8 +55,9 @@ agent:
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 
@@ -79,33 +74,27 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    pid = kbd._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
-    assert "--toolsets" in captured["cmd"]
-    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
-    for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
-        assert required in pinned
+    assert captured["cmd"][-2:] == ["-m", "hermes_cli.kanban_worker_client"]
+    assert captured["env"]["HERMES_KANBAN_RUN_ID"] == "7"
+    assert captured["env"]["HERMES_KANBAN_CLAIM_LOCK"] == "lock"
 
 
-def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
-    """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
-
-    This is an integration contract between Kanban's worker argv builder and
-    the real CLI parser. A parser default once erased the explicit override,
-    silently sending the worker to its profile default or fallback instead.
-    """
+def test_default_spawn_does_not_pass_mutable_launch_overrides(monkeypatch, tmp_path):
+    """Owner policy reads overrides from the claimed card, not executable argv."""
     root = tmp_path / ".hermes"
     (root / "profiles" / "elias").mkdir(parents=True)
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
-    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -121,206 +110,99 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
 
-    parser, _subparsers, _chat_parser = build_top_level_parser()
-    # Profile selection is attached by the outer CLI bootstrap rather than
-    # build_top_level_parser(); remove that already-validated prefix and parse
-    # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    # Mutable model strings are not launch authority; the owner reads the claimed card.
+    assert captured["cmd"][-2:] == ["-m", "hermes_cli.kanban_worker_client"]
+    assert task.model_override not in captured["cmd"]
 
-    assert args.command == "chat"
-    assert args.model == "gpt-5.6-sol"
-    assert args.query == "work kanban task t_spawn_tools"
-
-
-def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
+def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp_path):
+    """Under multiplex a worker spawn with ``terminal.env_passthrough`` configured must
+    forward the ASSIGNEE profile's own value, never crash on an unscoped read or leak the
+    dispatcher's ambient os.environ (#109494).
+    """
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"
     profile.mkdir(parents=True)
-    root.joinpath("config.yaml").write_text("platform_toolsets:\n  cli:\n    - kanban\n", encoding="utf-8")
-    profile.joinpath("config.yaml").write_text(
-        """
-platform_toolsets:
-  cli:
-    - terminal
-    - web
-toolsets:
-  - hermes-cli
-""".lstrip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    from hermes_cli import kanban_db as kb
-
-    resolved = kb._resolve_worker_cli_toolsets(str(profile))
-
-    assert resolved is not None
-    assert "terminal" in resolved
-    assert "web" in resolved
-    assert "kanban" in resolved  # recovered worker lifecycle surface
-    assert resolved != ["kanban"]
-
-
-def test_default_spawn_escapes_gateway_systemd_cgroup(monkeypatch, tmp_path):
-    """Gateway-owned dispatch must place workers in a sibling systemd scope."""
-    root = tmp_path / ".hermes"
-    profile = root / "profiles" / "elias"
-    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text(
+        "terminal:\n  env_passthrough:\n    - MY_PASSTHROUGH_VAR\n", encoding="utf-8")
     profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile.joinpath(".env").write_text("MY_PASSTHROUGH_VAR=elias-value\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setenv("_HERMES_GATEWAY", "1")
-    monkeypatch.setenv("INVOCATION_ID", "gateway-invocation")
+    monkeypatch.setenv("MY_PASSTHROUGH_VAR", "dispatcher-value")
 
+    from agent.secret_scope import set_multiplex_active
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
-    real_which = kb.shutil.which
-    monkeypatch.setattr(
-        kb.shutil,
-        "which",
-        lambda name: "/usr/bin/systemd-run"
-        if name == "systemd-run"
-        else real_which(name),
-    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+
     captured = {}
 
     class FakeProc:
-        pid = 7001
-
-        def poll(self):
-            return None
+        pid = 4243
 
     def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["env"] = dict(kwargs.get("env") or {})
-        sh_index = cmd.index("/bin/sh")
-        pidfile = cmd[sh_index + 4]
-        Path(pidfile).write_text("8123\n", encoding="ascii")
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
-
-    assert pid == 8123
-    assert captured["cmd"][:4] == [
-        "/usr/bin/systemd-run",
-        "--user",
-        "--scope",
-        "--quiet",
-    ]
-    assert "--unit" in captured["cmd"]
-    assert captured["env"]["_HERMES_GATEWAY"] == "1"
-    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
-
-
-def test_default_spawn_keeps_direct_popen_outside_gateway(monkeypatch, tmp_path):
-    """Non-gateway dispatchers retain the historical direct Popen path."""
-    root = tmp_path / ".hermes"
-    profile = root / "profiles" / "elias"
-    profile.mkdir(parents=True)
-    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
-    monkeypatch.delenv("INVOCATION_ID", raising=False)
-
-    from hermes_cli import kanban_db as kb
-
-    monkeypatch.setattr(kb, "_worker_hermes_argv", lambda: ["hermes"])
-    captured = {}
-
-    class FakeProc:
-        pid = 4242
-
-    def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
-
-    assert pid == 4242
-    assert captured["cmd"][0] == "hermes"
-
-
-def _spawn_capturing(monkeypatch, tmp_path, kb):
-    """Run _default_spawn outside the gateway and capture argv + env."""
-    root = tmp_path / ".hermes"
-    profile = root / "profiles" / "elias"
-    profile.mkdir(parents=True)
-    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
-    monkeypatch.delenv("INVOCATION_ID", raising=False)
-    captured = {}
-
-    class FakeProc:
-        pid = 4343
-
-    def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
-    return captured
+
+    set_multiplex_active(True)
+    try:
+        pid = kbd._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    finally:
+        set_multiplex_active(False)
+
+    assert pid == 4243
+    # The assignee's own scoped value, not the dispatcher's ambient os.environ one.
+    assert captured["env"].get("MY_PASSTHROUGH_VAR") == "elias-value"
 
 
-def _env_resetting_wrapper(tmp_path) -> Path:
-    """A `hermes` on PATH that stands in for an env-resetting sudo wrapper."""
-    bindir = tmp_path / "wrapper-bin"
-    bindir.mkdir()
-    wrapper = bindir / "hermes"
-    wrapper.write_text("#!/bin/sh\nexec env -i /bin/false \"$@\"\n", encoding="utf-8")
-    wrapper.chmod(0o755)
-    return wrapper
-
-
-def test_default_spawn_never_launches_worker_through_path_wrapper(monkeypatch, tmp_path):
-    """Regression 2026-09-14 (runs 2814/2816/2817): a PATH-resolved `hermes`
-    wrapper reset the worker env, stripping HERMES_KANBAN_TASK, so the worker
-    skipped the executor-lane bypass and ran as an unscoped default agent.
-    Workers must launch through the dispatcher's own interpreter."""
-    import sys
-
-    from hermes_cli import kanban_db as kb
-
-    wrapper = _env_resetting_wrapper(tmp_path)
-    monkeypatch.delenv("HERMES_BIN", raising=False)
-    monkeypatch.setenv("PATH", f"{wrapper.parent}:/usr/bin:/bin")
-
-    captured = _spawn_capturing(monkeypatch, tmp_path, kb)
-
-    assert captured["cmd"][:2] == [sys.executable, "-c"]
-    assert str(wrapper) not in captured["cmd"]
-    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
-    assert captured["cmd"][-2:] == ["-q", "work kanban task t_spawn_tools"]
-
-
-def test_default_spawn_ignores_hermes_bin_wrapper_for_workers(monkeypatch, tmp_path):
-    """An explicit HERMES_BIN wrapper is equally able to reset the worker env."""
-    import sys
+def test_worker_toolsets_come_from_the_assignee_profile_not_the_parent_config(tmp_path, monkeypatch):
+    """The worker's toolsets are frozen by the assignee profile's own gateway (its config), never
+    by the dispatcher's root/active profile: a root config that only lists ``kanban`` must not
+    reach a worker whose profile grants ``terminal`` and ``web``."""
+    import json
+    from contextlib import closing
+    from types import SimpleNamespace
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_contract import Principal
+    from gateway.session_kanban import build_kanban_policy
 
-    wrapper = _env_resetting_wrapper(tmp_path)
-    monkeypatch.setenv("HERMES_BIN", str(wrapper))
+    profile = tmp_path / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: str(profile))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb.create_board("owned")  # explicit creation; connect() never creates a board (#43243)
+    with closing(connect(board="owned")) as conn:
+        task_id = kb.create_task(conn, title="t", body="b", assignee="elias",
+                                 workspace_kind="dir", workspace_path=str(workspace))
+        kb.recompute_ready(conn)
+        task = kb.claim_task(conn, task_id)
+    actor = Principal("owner", str(profile), frozenset({"session:create"}), "transport")
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(profile)), actor=actor, native_owner=True)
+    params = dict(board="owned", task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
 
-    captured = _spawn_capturing(monkeypatch, tmp_path, kb)
+    assignee_config = {"model": {"default": "m", "provider": "custom"},
+                       "platform_toolsets": {"cli": ["terminal", "web"]}, "toolsets": ["hermes-cli"]}
+    policy, _ = build_kanban_policy(connection, params, assignee_config)
+    assert {"terminal", "web", "kanban"} <= set(policy.toolsets)
 
-    assert captured["cmd"][:2] == [sys.executable, "-c"]
-    assert str(wrapper) not in captured["cmd"]
+    root_only_kanban = {"model": {"default": "m", "provider": "custom"}, "platform_toolsets": {"cli": ["kanban"]}}
+    other_profile = tmp_path
+    with pytest.raises(Exception):
+        # A dispatcher acting for another profile cannot mint this worker's policy at all.
+        build_kanban_policy(SimpleNamespace(authority=SimpleNamespace(profile_id=str(other_profile)),
+                                            actor=actor, native_owner=True), params, root_only_kanban)
+    assert json.loads(policy.kanban_json)["profile"] == "elias"

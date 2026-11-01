@@ -106,8 +106,8 @@ def test_base_adapter_defaults_to_not_owning_access_policy():
     "module_path, class_name",
     [
         ("plugins.platforms.wecom.adapter", "WeComAdapter"),
-        ("gateway.platforms.weixin", "WeixinAdapter"),
-        ("gateway.platforms.qqbot.adapter", "QQAdapter"),
+        ("plugins.platforms.weixin.adapter", "WeixinAdapter"),
+        ("plugins.platforms.qqbot.adapter", "QQAdapter"),
         ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter"),
     ],
 )
@@ -240,8 +240,8 @@ def test_own_policy_open_group_not_authorized_without_allowlist(monkeypatch, pla
     [
         ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter", "_is_dm_allowed"),
         ("plugins.platforms.wecom.adapter", "WeComAdapter", "_is_dm_allowed"),
-        ("gateway.platforms.weixin", "WeixinAdapter", "_is_dm_allowed"),
-        ("gateway.platforms.qqbot.adapter", "QQAdapter", "_is_dm_allowed"),
+        ("plugins.platforms.weixin.adapter", "WeixinAdapter", "_is_dm_allowed"),
+        ("plugins.platforms.qqbot.adapter", "QQAdapter", "_is_dm_allowed"),
     ],
 )
 def test_pairing_dm_policy_strict_intake_auth_denies_unknown(

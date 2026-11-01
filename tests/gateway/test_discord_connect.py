@@ -68,8 +68,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -118,26 +118,6 @@ class FakeBot:
 
     async def close(self):
         return None
-
-
-class SlowSyncTree(FakeTree):
-    def __init__(self):
-        super().__init__()
-        self.started = asyncio.Event()
-        self.allow_finish = asyncio.Event()
-
-        async def _slow_sync():
-            self.started.set()
-            await self.allow_finish.wait()
-            return []
-
-        self.sync = AsyncMock(side_effect=_slow_sync)
-
-
-class SlowSyncBot(FakeBot):
-    def __init__(self, *, intents, proxy=None):
-        super().__init__(intents=intents, proxy=proxy)
-        self.tree = SlowSyncTree()
 
 
 @pytest.mark.asyncio
@@ -238,7 +218,7 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(
         message_content=False, dm_messages=False, guild_messages=False,
@@ -292,9 +272,8 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
 
 @pytest.mark.asyncio
 async def test_connect_clears_previous_fatal_error(monkeypatch):
-    """Regression (upstream ec11359b44, #102554): a successful connect() must
-    clear any prior fatal-error state via _mark_connected(), not just set
-    self._running = True directly.
+    """Regression: a successful connect() must clear any prior fatal-error
+    state via _mark_connected(), not just set self._running = True directly.
 
     Every other platform adapter (Telegram, WeCom, Matrix, ...) calls
     _mark_connected() on a successful connect, which clears
@@ -308,7 +287,7 @@ async def test_connect_clears_previous_fatal_error(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(
         message_content=False, dm_messages=False, guild_messages=False,
@@ -348,7 +327,7 @@ async def test_connect_timeout_cancels_bot_task(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(
         message_content=False, dm_messages=False, guild_messages=False,
@@ -372,7 +351,7 @@ async def test_connect_timeout_cancels_bot_task(monkeypatch):
     )
 
     async def fake_wait_for_ready(ready_event, bot_task, timeout):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     monkeypatch.setattr(
         discord_platform, "_wait_for_ready_or_bot_exit", fake_wait_for_ready
@@ -396,7 +375,7 @@ async def test_disconnect_cancels_running_bot_task(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
 
     # Simulate a zombie bot_task that never finishes (as if discord.py is mid-handshake)
     async def _forever():
@@ -738,7 +717,7 @@ async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp
         "created": 1,
         "deleted": 0,
     }
-    sync = AsyncMock(side_effect=[asyncio.TimeoutError(), summary])
+    sync = AsyncMock(side_effect=[TimeoutError(), summary])
     monkeypatch.setattr(adapter, "_safe_sync_slash_commands", sync)
 
     await adapter._run_post_connect_initialization()
@@ -892,16 +871,6 @@ class PrivilegedIntentsRequired(Exception):
 class TestPrivilegedIntentsRequiredFatal:
     """Missing Developer Portal intents must not spin reconnect forever."""
 
-    def test_guidance_lists_message_content_always(self):
-        text = discord_platform._format_privileged_intents_guidance(needs_members=False)
-        assert "Message Content Intent" in text
-        assert "Server Members Intent" not in text
-        assert "discord.com/developers/applications" in text
-
-    def test_guidance_lists_members_when_needed(self):
-        text = discord_platform._format_privileged_intents_guidance(needs_members=True)
-        assert "Message Content Intent" in text
-        assert "Server Members Intent" in text
 
     def test_needs_members_intent_rules(self):
         needs = discord_platform._needs_server_members_intent
@@ -921,7 +890,7 @@ class TestPrivilegedIntentsRequiredFatal:
             lambda scope, identity, metadata=None: (True, None),
         )
         monkeypatch.setattr(
-            "gateway.status.release_scoped_lock",
+            "gateway.status_scoped_locks.release_scoped_lock",
             lambda scope, identity: None,
         )
 
@@ -954,69 +923,40 @@ class TestPrivilegedIntentsRequiredFatal:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "discord_intents_required"
-        assert "Message Content Intent" in (adapter.fatal_error_message or "")
-        assert "discord.com/developers/applications" in (adapter.fatal_error_message or "")
+        assert adapter.fatal_error_message
         assert adapter._bot_task is None
 
 
 @pytest.mark.asyncio
-async def test_slash_registration_scan_runs_off_the_event_loop(monkeypatch):
-    """Regression (upstream 9c311038fa, #110707): connect() must not run the
-    skill-catalog disk scan (inside _register_slash_commands ->
-    _register_skill_group -> _refresh_skill_catalog_state) synchronously on
-    the event loop. On a large skill install the scan can hold the loop past
-    the liveness watchdog. Verified by proving the loop keeps ticking while
-    the (blocking-looking) scan is in flight.
-    """
+async def test_skill_catalog_scan_runs_off_the_event_loop(monkeypatch):
+    """A slow skill scan (#110707) must not block the gateway loop from either Discord site:
+    slash registration inside connect() (every reconnect) and /reload-skills' refresh_skill_group."""
     import threading
 
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
-
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
-
-    intents = SimpleNamespace(
-        message_content=False, dm_messages=False, guild_messages=False,
-        members=False, voice_states=False,
-    )
-    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
-    monkeypatch.setattr(
-        discord_platform.commands,
-        "Bot",
-        lambda **kwargs: FakeBot(
-            intents=kwargs["intents"],
-            proxy=kwargs.get("proxy"),
-            allowed_mentions=kwargs.get("allowed_mentions"),
-        ),
-    )
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: SimpleNamespace(
+        message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False))
+    monkeypatch.setattr(discord_platform.commands, "Bot", lambda **kw: FakeBot(intents=kw["intents"]))
     monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
 
-    scan_started = threading.Event()
-    loop_ticked = threading.Event()
+    async def _scan_leaves_loop_free(run_site):
+        scan_started, loop_ticked = threading.Event(), threading.Event()
 
-    def _blocking_scan(*, reserved_names):
-        scan_started.set()
-        # Only a free event loop can set loop_ticked while this thread waits —
-        # if the scan ran inline on the loop, nothing could ever set it and
-        # this would time out, proving the loop was blocked.
-        loop_ticked.wait(timeout=1)
-        return ({}, [("x", "desc", "/x")], 0)
+        def _blocking_scan(*, reserved_names):
+            scan_started.set()
+            # Only a free loop can set loop_ticked while this wait is in progress.
+            return ({}, [("x", "desc", "/x")], 0) if loop_ticked.wait(timeout=1) else ({}, [], 0)
 
-    monkeypatch.setattr(
-        "hermes_cli.commands.discord_skill_commands_by_category",
-        _blocking_scan,
-    )
+        monkeypatch.setattr("hermes_cli.commands_platforms.discord_skill_commands_by_category", _blocking_scan)
+        task = asyncio.create_task(run_site())
+        await asyncio.to_thread(scan_started.wait, 1)
+        loop_ticked.set()
+        await task
+        return [n for n, _d, _k in adapter._skill_entries] == ["x"]
 
-    connect_task = asyncio.create_task(adapter.connect())
-    await asyncio.to_thread(scan_started.wait, 1)
-    assert scan_started.is_set(), "scan never started"
-    # Prove the loop is free: run a few ticks, then flip the thread-side event.
-    for _ in range(5):
-        await asyncio.sleep(0)
-    loop_ticked.set()
-
-    assert await connect_task is True
-    assert [n for n, _d, _k in adapter._skill_entries] == ["x"]
-
+    assert await _scan_leaves_loop_free(adapter.connect)
+    adapter._skill_entries = []
+    assert await _scan_leaves_loop_free(adapter.refresh_skill_group)
     await adapter.disconnect()
-

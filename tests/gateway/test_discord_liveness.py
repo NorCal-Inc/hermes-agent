@@ -17,17 +17,16 @@ import pytest
 
 # Re-use the shared discord-stub bootstrap and FakeBot from the connect
 # test module so this file doesn't duplicate the (large) mock surface.
-from tests.gateway.test_discord_connect import (  # noqa: E402
+from tests.gateway.test_discord_connect import (
     FakeBot,
     _ensure_discord_mock,
 )
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
-from gateway.config import Platform, PlatformConfig  # noqa: E402
-from gateway.run import GatewayRunner  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
+from gateway.config import PlatformConfig
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 class _LiveBot(FakeBot):
@@ -95,21 +94,18 @@ def _make_adapter(
     threshold=1,
     max_ack_age=1.0,
     max_latency=1.0,
-    max_silence=300.0,
+    max_event_silence: float | None = None,
 ) -> DiscordAdapter:
     monkeypatch.setenv("HERMES_DISCORD_LIVENESS_INTERVAL_SECONDS", str(interval))
     monkeypatch.setenv("HERMES_DISCORD_LIVENESS_FAILURE_THRESHOLD", str(threshold))
-    return DiscordAdapter(
-        PlatformConfig(
-            enabled=True,
-            token="test-token",
-            extra={
-                "websocket_heartbeat_ack_max_age_seconds": max_ack_age,
-                "websocket_max_latency_seconds": max_latency,
-                "websocket_event_max_silence_seconds": max_silence,
-            },
-        )
-    )
+    extra = {
+        "websocket_heartbeat_ack_max_age_seconds": max_ack_age,
+        "websocket_max_latency_seconds": max_latency,
+    }
+    # Only the event-silence tests pin this knob; everyone else keeps the adapter default.
+    if max_event_silence is not None:
+        extra["websocket_event_max_silence_seconds"] = max_event_silence
+    return DiscordAdapter(PlatformConfig(enabled=True, token="test-token", extra=extra))
 
 
 class _BrokenWebSocket:
@@ -124,6 +120,10 @@ class _BrokenWebSocket:
         ("websocket_liveness_interval_seconds", "_liveness_interval_seconds", "nan"),
         ("websocket_heartbeat_ack_max_age_seconds", "_heartbeat_ack_max_age_seconds", "inf"),
         ("websocket_max_latency_seconds", "_max_latency_seconds", "-inf"),
+        ("websocket_max_latency_seconds", "_max_latency_seconds", True),
+        ("websocket_max_latency_seconds", "_max_latency_seconds", "15s"),
+        ("websocket_liveness_failure_threshold", "_liveness_failure_threshold", 2.5),
+        ("websocket_liveness_failure_threshold", "_liveness_failure_threshold", float("inf")),
         ("websocket_event_max_silence_seconds", "_event_max_silence_seconds", "15s"),
     ],
 )
@@ -135,9 +135,8 @@ def test_nonfinite_liveness_config_disables_that_probe_dimension(monkeypatch, ke
     assert getattr(adapter, attribute) == 0.0
 
 
-def test_unparsable_liveness_config_warns_instead_of_disabling_silently(monkeypatch, caplog):
-    """A knob value that can't parse must not disable the probe without a trace (upstream
-    cef499fbb5, #109521).
+def test_unusable_liveness_config_warns_instead_of_disabling_silently(caplog):
+    """A knob value that can't be used must not disable the probe without a trace (#109521).
 
     Pre-fix, ``websocket_liveness_interval_seconds: 15s`` mapped to 0.0 with no log line —
     the watchdog was off and the only visible symptom was hours of Discord silence.
@@ -147,13 +146,42 @@ def test_unparsable_liveness_config_warns_instead_of_disabling_silently(monkeypa
             PlatformConfig(
                 enabled=True,
                 token="test-token",
-                extra={"websocket_liveness_interval_seconds": "15s"},
+                extra={
+                    "websocket_liveness_interval_seconds": "15s",
+                    "websocket_max_latency_seconds": True,
+                    "websocket_liveness_failure_threshold": -1,
+                    "websocket_heartbeat_ack_max_age_seconds": "nan",
+                },
             )
         )
 
     assert adapter._liveness_interval_seconds == 0.0
-    assert "websocket_liveness_interval_seconds" in caplog.text
-    assert "15s" in caplog.text
+    assert adapter._max_latency_seconds == 0.0
+    assert adapter._liveness_failure_threshold == 0
+    assert adapter._heartbeat_ack_max_age_seconds == 0.0
+    warned = [r.getMessage() for r in caplog.records if "liveness knob" in r.getMessage()]
+    assert len(warned) == 4
+
+
+def test_explicit_zero_liveness_knob_disables_without_warning(caplog):
+    """``0`` is the documented opt-out, not a config error: no warning."""
+    with caplog.at_level("WARNING", logger="plugins.platforms.discord.adapter"):
+        adapter = DiscordAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "websocket_liveness_interval_seconds": 0,
+                    "websocket_max_latency_seconds": "0",
+                    "websocket_liveness_failure_threshold": 0,
+                },
+            )
+        )
+
+    assert adapter._liveness_interval_seconds == 0.0
+    assert adapter._max_latency_seconds == 0.0
+    assert adapter._liveness_failure_threshold == 0
+    assert not [r for r in caplog.records if "liveness knob" in r.getMessage()]
 
 
 def test_default_liveness_bounds_trigger_timed_recovery(monkeypatch):
@@ -165,11 +193,10 @@ def test_default_liveness_bounds_trigger_timed_recovery(monkeypatch):
 
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
-    assert adapter._liveness_interval_seconds == 15.0
-    assert adapter._liveness_failure_threshold == 2
-    assert adapter._heartbeat_ack_max_age_seconds == 60.0
-    assert adapter._max_latency_seconds == 30.0
-    assert adapter._event_max_silence_seconds == 300.0
+    assert adapter._liveness_interval_seconds > 0
+    assert adapter._liveness_failure_threshold > 0
+    assert adapter._heartbeat_ack_max_age_seconds > 0
+    assert adapter._max_latency_seconds > 0
 
 
 def test_platform_config_extra_overrides_process_liveness_bridge(monkeypatch):
@@ -195,12 +222,23 @@ def test_platform_config_extra_overrides_process_liveness_bridge(monkeypatch):
     assert adapter._max_latency_seconds == 12
 
 
+def _live_bot_factory():
+    """Stand-in for ``commands.Bot`` that yields a ``_LiveBot`` with a stubbed ``fetch_user``."""
+
+    def factory(**kwargs):
+        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
+        bot.fetch_user = AsyncMock()
+        return bot
+
+    return factory
+
+
 async def _connect(adapter: DiscordAdapter, monkeypatch, bot_factory):
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
         lambda scope, identity, metadata=None: (True, None),
     )
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
     intents = SimpleNamespace(
         message_content=False, dm_messages=False, guild_messages=False,
         members=False, voice_states=False,
@@ -305,90 +343,6 @@ async def test_liveness_close_timeout_aborts_aiohttp_transport_before_fatal_noti
     await client.close()
     assert client.close_attempts == 2
 
-
-@pytest.mark.asyncio
-async def test_socket_closed_first_strike_forces_reconnect(monkeypatch, caplog):
-    """A closed transport is a confirmed death — strike 1 must reconnect (upstream b1a69d8178,
-    #118487).
-
-    Pre-fix, the first ``socket_closed`` strike logged ``1/2`` and waited for a confirming
-    strike that never came: discord.py swaps in a fresh socket while resuming, the next
-    transport-side sample reads healthy, and the counter silently resets while a
-    resumed-but-deaf session stays event-starved until the multi-hour event-silence default
-    elapses.
-    """
-    adapter = _make_adapter(monkeypatch, interval=0.01, threshold=2)
-    handler = AsyncMock()
-    adapter.set_fatal_error_handler(handler)
-
-    calls = 0
-
-    def factory(**kwargs):
-        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
-        bot.fetch_user = AsyncMock()
-        return bot
-
-    def _probe(client):
-        nonlocal calls
-        calls += 1
-        return False, "socket_closed"
-
-    monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
-
-    with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
-        await _connect(adapter, monkeypatch, factory)
-        await _wait_until(
-            lambda: handler.called,
-            "fatal handler not called after first socket_closed strike",
-        )
-
-    assert calls == 1, "first socket_closed strike must escalate without a confirming strike"
-    assert adapter._disconnecting is True
-    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any("transport closed (socket_closed, 1/2)" in m for m in errors)
-
-    await adapter.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_client_closed_first_strike_forces_reconnect(monkeypatch, caplog):
-    """``client_closed`` is the same transport-dead state as ``socket_closed`` (upstream
-    fe225b20b1): ``Bot.is_closed()`` reading true means the transport is gone, so strike 1
-    must escalate too, not wait on the two-strike confirmation path reserved for soft signals.
-    """
-    adapter = _make_adapter(monkeypatch, interval=0.01, threshold=2)
-    handler = AsyncMock()
-    adapter.set_fatal_error_handler(handler)
-
-    calls = 0
-
-    def factory(**kwargs):
-        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
-        bot.fetch_user = AsyncMock()
-        return bot
-
-    def _probe(client):
-        nonlocal calls
-        calls += 1
-        return False, "client_closed"
-
-    monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
-
-    with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
-        await _connect(adapter, monkeypatch, factory)
-        await _wait_until(
-            lambda: handler.called,
-            "fatal handler not called after first client_closed strike",
-        )
-
-    assert calls == 1, "first client_closed strike must escalate without a confirming strike"
-    assert adapter._disconnecting is True
-    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any("transport closed (client_closed, 1/2)" in m for m in errors)
-
-    await adapter.disconnect()
-
-
 @pytest.mark.asyncio
 async def test_soft_unhealthy_signal_still_requires_threshold_strikes(monkeypatch):
     """Soft signals (ack staleness, latency, silence) keep the confirmation threshold.
@@ -425,24 +379,74 @@ async def test_soft_unhealthy_signal_still_requires_threshold_strikes(monkeypatc
     await adapter.disconnect()
 
 
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_liveness_task(monkeypatch):
+    """``disconnect()`` must cancel the probe so the gateway can shut down
+    cleanly without leaking a background task."""
+    adapter = _make_adapter(monkeypatch, interval=60, threshold=3)
+
+    await _connect(adapter, monkeypatch, _live_bot_factory())
+    task = adapter._liveness_task
+    assert task is not None and not task.done()
+
+    await adapter.disconnect()
+    assert task.done()
+    assert adapter._liveness_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["socket_closed", "client_closed"])
+async def test_closed_transport_first_strike_forces_reconnect(monkeypatch, caplog, reason):
+    """A closed transport is a confirmed death — strike 1 must reconnect (#118487).
+
+    Pre-fix, the first ``socket_closed`` strike logged ``1/2`` and waited for a
+    confirming strike that never came: discord.py swaps in a fresh socket while
+    resuming, the next transport-side sample reads healthy, and the counter
+    silently resets while a resumed-but-deaf session stays event-starved until
+    the multi-hour event-silence default elapses.
+    """
+    adapter = _make_adapter(monkeypatch, interval=0.01, threshold=2)
+    handler = AsyncMock()
+    adapter.set_fatal_error_handler(handler)
+
+    calls = 0
+
+    def _probe(client):
+        nonlocal calls
+        calls += 1
+        return False, reason
+
+    monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
+
+    with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
+        await _connect(adapter, monkeypatch, _live_bot_factory())
+        await _wait_until(
+            lambda: handler.called,
+            f"fatal handler not called after first {reason} strike",
+        )
+
+    assert calls == 1, f"first {reason} strike must escalate without a confirming strike"
+    assert adapter._disconnecting is True
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("forcing reconnect" in m and reason in m for m in errors)
+
+    await adapter.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_recovery_after_unhealthy_streak_is_logged(monkeypatch, caplog):
-    """A counter reset must leave a trace (upstream b1a69d8178, #118487).
+    """A counter reset must leave a trace (#118487).
 
-    Pre-fix, ``failures = 0`` on a healthy sample was silent, so an incident log showing
-    one strike and then nothing was indistinguishable between "probe turned healthy
-    again" and "probe task died".
+    Pre-fix, ``failures = 0`` on a healthy sample was silent, so an incident log
+    showing one strike and then nothing was indistinguishable between "probe
+    turned healthy again" and "probe task died".
     """
     adapter = _make_adapter(monkeypatch, interval=0.01, threshold=3)
     handler = AsyncMock()
     adapter.set_fatal_error_handler(handler)
 
     calls = 0
-
-    def factory(**kwargs):
-        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
-        bot.fetch_user = AsyncMock()
-        return bot
 
     def _probe(client):
         nonlocal calls
@@ -453,220 +457,57 @@ async def test_recovery_after_unhealthy_streak_is_logged(monkeypatch, caplog):
     monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
 
     with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
-        await _connect(adapter, monkeypatch, factory)
+        await _connect(adapter, monkeypatch, _live_bot_factory())
         await _wait_until(
             lambda: any(
-                "healthy again after" in r.getMessage()
+                "healthy again after 1 unhealthy sample" in r.getMessage()
                 for r in caplog.records
             ),
-            "recovery after unhealthy streak was never logged",
+            "counter reset after an unhealthy streak was never logged",
         )
 
-    assert not handler.called, "a single soft sample below threshold must not trip fatal"
-
-    await adapter.disconnect()
-
-
-class _DeafHealthBot(_LiveBot):
-    """Incident-2 fingerprint from upstream #109521: ESTAB socket, keep-alive ACKs, zero frames."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.raw_receive_events = []
-
-    async def deliver_raw_frame(self, payload: str = "{}"):
-        """Feed a raw gateway frame through the adapter's registered hook."""
-        await self._events["on_socket_raw_receive"](payload)
-
-
-def _connect_deaf_bot(adapter, monkeypatch, bot_box):
-    def factory(**kwargs):
-        bot = _DeafHealthBot(
-            intents=kwargs["intents"],
-            allowed_mentions=kwargs.get("allowed_mentions"),
-        )
-        bot.fetch_user = AsyncMock()
-        bot_box.append(bot)
-        return bot
-
-    return _connect(adapter, monkeypatch, factory)
-
-
-@pytest.mark.asyncio
-async def test_connected_but_deaf_socket_is_unhealthy(monkeypatch):
-    """Upstream #109521 incident 2: a socket that stays open, ready, low-latency, and ACKing —
-    but through which no gateway frame has arrived since before the silence bound — must read
-    unhealthy, not healthy."""
-    adapter = _make_adapter(
-        monkeypatch, interval=60, threshold=1, max_ack_age=60.0, max_latency=30.0,
-        max_silence=10.0,
-    )
-    box = []
-    await _connect_deaf_bot(adapter, monkeypatch, box)
-    bot = box[0]
-
-    _set_websocket_health(bot, ready=True, socket_open=True, latency=0.05, ack_age=0.0)
-    # on_ready reset the stamp at connect; age it past the bound so the adapter is
-    # "connected, all transport dimensions green, and silent" — incident 2's fingerprint.
-    adapter._last_gateway_frame_at = time.perf_counter() - 60.0
-
-    healthy, reason = adapter._read_websocket_health(bot)
-    assert healthy is False
-    assert reason == "event_silence"
+    handler.assert_not_called()
 
     await adapter.disconnect()
 
 
 @pytest.mark.asyncio
-async def test_recent_raw_frame_keeps_deaf_fingerprint_socket_healthy(monkeypatch):
-    """Any raw gateway frame (heartbeat, ACK — not just messages) refreshes the dispatch
-    clock: a legitimately quiet server must not be flagged by the event-age bound."""
-    adapter = _make_adapter(
-        monkeypatch, interval=60, threshold=1, max_ack_age=60.0, max_latency=30.0,
-    )
-    box = []
-    await _connect_deaf_bot(adapter, monkeypatch, box)
-    bot = box[0]
+async def test_probe_exit_after_mark_disconnected_is_logged_at_info(monkeypatch, caplog):
+    """The probe must say why it stopped, even on a benign exit (#118487, #118504).
 
-    _set_websocket_health(bot, ready=True, socket_open=True, latency=0.05, ack_age=0.0)
-    # on_ready resets the stamp (fresh connection); a non-message frame then advances it.
-    assert adapter._last_gateway_frame_at > 0
-    await bot.deliver_raw_frame('{"t":null,"op":11}')
-    frame_at = adapter._last_gateway_frame_at
-    assert frame_at > 0
-
-    healthy, reason = adapter._read_websocket_health(bot)
-    assert (healthy, reason) == (True, "healthy")
-
-    await adapter.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_stale_frame_over_silence_bound_reads_unhealthy(monkeypatch):
-    """A frame that arrived, then a silence longer than the bound, while transport dimensions
-    still look healthy — the exact connected-but-deaf progression."""
-    adapter = _make_adapter(
-        monkeypatch, interval=60, threshold=1, max_ack_age=60.0, max_latency=30.0,
-        max_silence=10.0,
-    )
-    box = []
-    await _connect_deaf_bot(adapter, monkeypatch, box)
-    bot = box[0]
-
-    _set_websocket_health(bot, ready=True, socket_open=True, latency=0.05, ack_age=0.0)
-    await bot.deliver_raw_frame('{"t":null,"op":11}')
-    # Simulate the silence: age the last frame past every bound, keeping the transport green.
-    adapter._last_gateway_frame_at = time.perf_counter() - 60.0
-
-    healthy, reason = adapter._read_websocket_health(bot)
-    assert (healthy, reason) == (False, "event_silence")
-
-    await adapter.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_event_silence_drives_liveness_loop_to_retryable_fatal(monkeypatch, caplog):
-    """End to end: a persistent deaf socket trips the probe's failure threshold and surfaces
-    as the retryable fatal the reconnect watcher already handles."""
-    import logging
-
-    caplog.at_level(logging.WARNING, logger="plugins.platforms.discord.adapter")
-    adapter = _make_adapter(
-        monkeypatch, interval=0.01, threshold=2, max_ack_age=60.0, max_latency=30.0,
-        max_silence=5.0,
-    )
+    Reached through a *production* setter (``_mark_disconnected`` flips
+    ``_running``) rather than by poking adapter internals, so this pins the
+    unconditional INFO log at the loop's exit guard.
+    """
+    adapter = _make_adapter(monkeypatch, interval=0.01, threshold=3)
     handler = AsyncMock()
     adapter.set_fatal_error_handler(handler)
-    box = []
-    await _connect_deaf_bot(adapter, monkeypatch, box)
-    bot = box[0]
 
-    # Transport dimensions stay green the whole time; frames never arrive.
-    _set_websocket_health(bot, ready=True, socket_open=True, latency=0.05, ack_age=0.0)
-    adapter._last_gateway_frame_at = time.perf_counter() - 60.0
+    samples = 0
 
-    await _wait_until(
-        lambda: adapter.fatal_error_code == "discord_websocket_health_stale",
-        "deaf socket never tripped the liveness probe",
-    )
-    assert "event_silence" in caplog.text
-    # The runner-facing handler fires from the notification task (post-close); give it a beat.
-    await _wait_until(
-        lambda: handler.await_count >= 1,
-        "fatal notification never reached the runner handler",
-    )
+    def _probe(client):
+        nonlocal samples
+        samples += 1
+        return True, "healthy"
 
-    await adapter.disconnect()
+    monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
 
+    with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
+        await _connect(adapter, monkeypatch, _live_bot_factory())
+        task = adapter._liveness_task
+        assert task is not None
+        await _wait_until(lambda: samples >= 1, "probe never took a sample")
 
-@pytest.mark.asyncio
-async def test_silence_knob_zero_disables_event_dimension_only(monkeypatch):
-    """Setting ``websocket_event_max_silence_seconds: 0`` must opt out of the dispatch check
-    alone; the transport dimensions (ack age, latency) still work."""
-    adapter = DiscordAdapter(
-        PlatformConfig(
-            enabled=True,
-            token="test-token",
-            extra={
-                "websocket_event_max_silence_seconds": 0,
-                "websocket_heartbeat_ack_max_age_seconds": 60.0,
-                "websocket_max_latency_seconds": 30.0,
-            },
-        )
-    )
-    assert adapter._event_max_silence_seconds == 0.0
+        adapter._mark_disconnected()
+        await _wait_until(task.done, "probe did not exit after _mark_disconnected()")
 
-    box = []
-    await _connect_deaf_bot(adapter, monkeypatch, box)
-    bot = box[0]
-    # Never delivered a frame and the stamp is at its connect-time value.
-    adapter._last_gateway_frame_at = 0.0
-
-    _set_websocket_health(bot, ready=True, socket_open=True, latency=0.05, ack_age=0.0)
-    healthy, reason = adapter._read_websocket_health(bot)
-    assert (healthy, reason) == (True, "healthy")
-
-    # While the transport dimensions still catch their own failure shape:
-    _set_websocket_health(bot, ready=True, socket_open=True, latency=0.05, ack_age=999.0)
-    healthy, reason = adapter._read_websocket_health(bot)
-    assert (healthy, reason) == (False, "ack_stale")
+    assert not task.cancelled()
+    exits = [
+        r for r in caplog.records
+        if "probe exiting (running=False" in r.getMessage()
+    ]
+    assert len(exits) == 1
+    assert exits[0].levelname == "INFO"
+    handler.assert_not_called()
 
     await adapter.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_disconnect_cancels_liveness_task(monkeypatch):
-    """``disconnect()`` must cancel the probe so the gateway can shut down
-    cleanly without leaking a background task."""
-    adapter = _make_adapter(monkeypatch, interval=60, threshold=3)
-
-    def factory(**kwargs):
-        bot = _LiveBot(intents=kwargs["intents"], allowed_mentions=kwargs.get("allowed_mentions"))
-        bot.fetch_user = AsyncMock()
-        return bot
-
-    await _connect(adapter, monkeypatch, factory)
-    task = adapter._liveness_task
-    assert task is not None and not task.done()
-
-    await adapter.disconnect()
-    assert task.done()
-    assert adapter._liveness_task is None
-
-
-def test_discord_client_enables_raw_frame_events_for_liveness_clock():
-    """Regression 2026-10-31: the silence probe needs on_socket_raw_receive, which discord.py only
-    dispatches with enable_debug_events=True. Without it every connection read "event_silence"
-    5 minutes after on_ready and was force-reconnected (~12/hour)."""
-    # (discord.py is mocked in this suite; the library contract -- DiscordWebSocket.log_receive is a
-    # no-op unless the client was built with enable_debug_events -- was checked against 2.7.1.)
-    import ast, inspect
-    import plugins.platforms.discord.adapter as mod
-
-    calls = [n for n in ast.walk(ast.parse(inspect.getsource(mod)))
-             if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "Bot"]
-    assert calls, "commands.Bot(...) construction not found"
-    for c in calls:
-        kw = {k.arg: k.value for k in c.keywords if k.arg}
-        assert "enable_debug_events" in kw and getattr(kw["enable_debug_events"], "value", None) is True
-

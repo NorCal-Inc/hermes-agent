@@ -41,7 +41,7 @@ def _parts(agent):
         return "" if skip_soul else PERSONA
 
     with (
-        patch("run_agent.load_soul_md", return_value=PERSONA),
+        patch("agent.prompt_builder.load_soul_md", return_value=PERSONA),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", side_effect=fake_context_files),
