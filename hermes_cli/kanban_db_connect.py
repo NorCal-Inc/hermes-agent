@@ -139,8 +139,10 @@ def _cross_process_init_lock(path: Path):
             if _key not in _kb._INIT_LOCK_UNAVAILABLE_WARNED:
                 _kb._INIT_LOCK_UNAVAILABLE_WARNED.add(_key)
                 _kb._log.warning(
-                    "kanban init lock %s unavailable (%s); proceeding without "
-                    "the cross-process lock.", lock_path, exc,
+                    "kanban init lock %s cannot be opened (%s) — proceeding without "
+                    "the cross-process lock in read-only mode (this caller cannot "
+                    "write the board, so there is nothing to serialize).",
+                    lock_path, exc.strerror or exc,
                 )
             yield True
             return
@@ -655,7 +657,9 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
+def _open_configured(
+    path: Path, under_lock, *, read_only: bool = False,
+) -> tuple[sqlite3.Connection, Any]:
     """Open ``path`` with the kanban PRAGMA set, then run ``under_lock(conn)``.
     WAL activation and ``under_lock`` share the ``_INIT_LOCK`` critical section:
     WAL setup can take an exclusive lock while SQLite creates sidecars for a
@@ -668,8 +672,11 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
         with _INIT_LOCK:
             # WAL doesn't work on network filesystems; the helper falls back to
             # DELETE with one ERROR log (see hermes_state_wal._WAL_INCOMPAT_MARKERS).
-            from hermes_state_wal import apply_wal_with_fallback
-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+            # Fork: skipped read-only — a reader cannot change the persistent
+            # journal mode, and SQLite already opened the file read-only.
+            if not read_only:
+                from hermes_state_wal import apply_wal_with_fallback
+                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
             # FULL (not NORMAL): fsync before each checkpoint to narrow the
             # crash window that can leave a b-tree page header torn.
             conn.execute("PRAGMA synchronous=FULL")
@@ -786,12 +793,31 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             path,
         )
 
-    with _cross_process_init_lock(path):
-        # Read-only file/sidecar preflight first, so a stray read-only kanban.db
-        # fails actionably instead of "attempt to write a readonly database".
-        # See #12508.
-        from hermes_state import preflight_db_writability
-        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
+    with _cross_process_init_lock(path) as lock_unavailable:
+        # Fork: ``True`` only when the board directory is not writable for this
+        # caller (read-only mount / sandbox, e.g. the Codex verifier). Such a
+        # caller can only read, so the writability preflight, WAL activation and
+        # schema/migration pass are skipped; an already-initialised board opens
+        # read-only, an uninitialised one fails with one clear line.
+        read_only = bool(lock_unavailable)
+        if read_only:
+            try:
+                db_present = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                db_present = False
+            if not db_present:
+                raise sqlite3.OperationalError(
+                    f"kanban.db ({path.name}) does not exist and {path.parent} "
+                    f"is not writable for this user, so it cannot be created "
+                    f"here. Initialise the board from a context with write "
+                    f"access (`hermes kanban init`)."
+                )
+        else:
+            # Read-only file/sidecar preflight first, so a stray read-only kanban.db
+            # fails actionably instead of "attempt to write a readonly database".
+            # See #12508.
+            from hermes_state import preflight_db_writability
+            preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
         # Cheap byte-level header check before any sqlite connection, then the
         # full integrity probe (cached per path via _INITIALIZED_PATHS).
         _validate_sqlite_header(path)
@@ -802,11 +828,23 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             # Idempotent; runs under _INIT_LOCK so same-process dispatcher
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
             if resolved not in _INITIALIZED_PATHS:
+                if read_only:
+                    # No lock, no write access: accept the board only if the
+                    # schema script and migrations would have been a no-op.
+                    if not _kb._schema_is_current(conn):
+                        raise sqlite3.OperationalError(
+                            f"kanban.db ({path.name}) schema is not current and "
+                            f"{path.parent} is not writable for this user, so "
+                            f"it cannot be migrated here. Run `hermes kanban "
+                            f"init` from a context with write access first."
+                        )
+                    _INITIALIZED_PATHS.add(resolved)
+                    return
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
-        conn, _ = _open_configured(path, _init_if_needed)
+        conn, _ = _open_configured(path, _init_if_needed, read_only=read_only)
     _fork_schema_hook(conn, resolved)
     return conn
 
@@ -1040,8 +1078,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # Fork: task_events is append-only (trg_task_events_append_only_update).
         # Lift the guard for this one-shot rename and restore it verbatim.
         _guard = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = " + Q + "trigger" + Q + " "
-            "AND name = " + Q + "trg_task_events_append_only_update" + Q
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'trg_task_events_append_only_update'"
         ).fetchone()
         if _guard is not None:
             conn.execute("DROP TRIGGER trg_task_events_append_only_update")
