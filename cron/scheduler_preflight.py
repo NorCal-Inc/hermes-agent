@@ -180,12 +180,51 @@ def _primary_profile_routes_for_current_home() -> list:
         return []
 
 
+def _satellite_shares_primary_adapters(platform_name: str | None = None) -> bool:
+    """Fork (NorCal single-bot multiplex): when the primary gateway's ``config.yaml`` exists and
+    defines NO ``profile_routes`` at all, a credentialless satellite profile delivers through the
+    primary's live adapters unrouted — every profile posts as the one Discord bot, which is what
+    this deployment did before the v0.22.5 rebase. Once any route is configured, upstream's
+    exact-route rule applies unchanged. With ``platform_name`` the primary YAML must also configure
+    ``platforms.<name>``. ``False`` when this IS the primary home, the primary config is missing,
+    or the check cannot run (fail closed, same as upstream)."""
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        primary_home = get_default_hermes_root().expanduser()
+        current_home = _sched.Path(get_hermes_home()).expanduser()
+        if primary_home.resolve(strict=False) == current_home.resolve(strict=False):
+            return False
+        if not (primary_home / "config.yaml").is_file():
+            return False
+        from gateway.config_loader import read_yaml_layers
+        layered = read_yaml_layers(primary_home)
+        gw = layered.get("gateway") if isinstance(layered.get("gateway"), dict) else {}
+        routes_raw = layered.get("profile_routes")
+        if routes_raw is None:
+            routes_raw = gw.get("profile_routes")
+        if routes_raw:
+            return False
+        if platform_name is None:
+            return True
+        platforms = layered.get("platforms")
+        if not isinstance(platforms, dict):
+            platforms = gw.get("platforms")
+        return isinstance(platforms, dict) and str(platform_name).lower() in {
+            str(k).lower() for k in platforms
+        }
+    except Exception:
+        logger.debug("satellite unrouted-share check unavailable", exc_info=True)
+        return False
+
+
 def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
     """True when the primary gateway routes this platform to the profile being served.
 
     scheduler is currently serving (preflight rescue, #97476).
     """
     platform_key = platform_name.lower()
+    if _satellite_shares_primary_adapters(platform_key):
+        return True  # fork: unrouted single-bot share (see _satellite_shares_primary_adapters)
     return any(
         str(route.platform).lower() == platform_key
         for route in _primary_profile_routes_for_current_home()

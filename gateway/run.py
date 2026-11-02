@@ -4740,6 +4740,8 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
                 routes = sched_preflight._primary_profile_routes_for_current_home()
                 if routes:
                     profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
+                elif sched_preflight._satellite_shares_primary_adapters():
+                    profile_adapters = adapters  # fork: unrouted single-bot share
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 

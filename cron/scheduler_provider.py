@@ -542,6 +542,7 @@ class InProcessCronScheduler(CronScheduler):
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
             SharedRouteAdapters, _primary_profile_routes_for_current_home,
+            _satellite_shares_primary_adapters,
         )
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
@@ -563,7 +564,10 @@ class InProcessCronScheduler(CronScheduler):
                 return adapters
             tick_adapters = (profile_adapters or {}).get(profile_name) or {}
             if not tick_adapters and adapters:
-                return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+                routes = _primary_profile_routes_for_current_home()
+                if not routes and _satellite_shares_primary_adapters():
+                    return adapters  # fork: unrouted single-bot share
+                return SharedRouteAdapters(adapters, routes)
             return tick_adapters
 
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
