@@ -568,6 +568,10 @@ class InProcessCronScheduler(CronScheduler):
                 if not routes and _satellite_shares_primary_adapters():
                     return adapters  # fork: unrouted single-bot share
                 return SharedRouteAdapters(adapters, routes)
+            if tick_adapters and adapters and _satellite_shares_primary_adapters():
+                # fork: a satellite running only non-chat adapters (e.g. ``local``) still delivers
+                # through the primary's chat adapters; its own adapters win on overlap.
+                return {**adapters, **tick_adapters}
             return tick_adapters
 
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.

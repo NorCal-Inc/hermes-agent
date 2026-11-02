@@ -180,7 +180,7 @@ def _primary_profile_routes_for_current_home() -> list:
         return []
 
 
-def _satellite_shares_primary_adapters(platform_name: str | None = None) -> bool:
+def _satellite_shares_primary_adapters_uncached(platform_name: str | None = None) -> bool:
     """Fork (NorCal single-bot multiplex): when the primary gateway's ``config.yaml`` exists and
     defines NO ``profile_routes`` at all, a credentialless satellite profile delivers through the
     primary's live adapters unrouted — every profile posts as the one Discord bot, which is what
@@ -215,6 +215,25 @@ def _satellite_shares_primary_adapters(platform_name: str | None = None) -> bool
     except Exception:
         logger.debug("satellite unrouted-share check unavailable", exc_info=True)
         return False
+
+
+_SATELLITE_SHARE_CACHE: dict = {}
+_SATELLITE_SHARE_TTL = 60.0
+
+
+def _satellite_shares_primary_adapters(platform_name: str | None = None) -> bool:
+    """Cached (60s) form of ``_satellite_shares_primary_adapters_uncached``: the ticker asks once per
+    served profile per tick, and the answer only changes when the primary config.yaml is edited."""
+    import time
+    from hermes_constants import get_hermes_home
+    key = (str(get_hermes_home()), platform_name)
+    now = time.monotonic()
+    hit = _SATELLITE_SHARE_CACHE.get(key)
+    if hit is not None and now - hit[0] < _SATELLITE_SHARE_TTL:
+        return hit[1]
+    value = _satellite_shares_primary_adapters_uncached(platform_name)
+    _SATELLITE_SHARE_CACHE[key] = (now, value)
+    return value
 
 
 def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:

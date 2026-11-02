@@ -4742,6 +4742,11 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
                     profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
                 elif sched_preflight._satellite_shares_primary_adapters():
                     profile_adapters = adapters  # fork: unrouted single-bot share
+            elif (profile_name is not None and profile_adapters and adapters
+                    and sched_preflight._satellite_shares_primary_adapters()):
+                # fork: satellite with only non-chat adapters (e.g. ``local``) borrows the primary's
+                # chat adapters; its own win on overlap.
+                profile_adapters = {**adapters, **profile_adapters}
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 
