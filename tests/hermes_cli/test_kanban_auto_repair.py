@@ -11,6 +11,7 @@ human to triage.
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import pytest
@@ -696,3 +697,147 @@ class TestNoRepairAgainstTerminalSubject:
             # Neither a new repair id nor a diagnosis routing -- the subject
             # is terminal, so the superseding attempt yields nothing to do.
             assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Christopher, 2026-11-04 (Erika desktop session): hard maximum of FIVE
+# investigation/repair attempts per failure fingerprint, counted across
+# replacement/descendant cards; a renamed child or a verifier rejection must
+# not reset the count. At the cap the loop stops and records an honest
+# "historical cause unresolved; deferred pending recurrence" disposition -- it
+# never fabricates a root cause or marks an unproven repair VERIFIED.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _enforced_budget(monkeypatch):
+    """Board attempt-budget mode = enforce (the cap is bindable)."""
+    monkeypatch.setattr(kb, "objective_attempt_budget_enforced", lambda: True)
+
+
+@pytest.fixture
+def _advisory_budget_local(monkeypatch):
+    """Board attempt-budget mode = advisory (cap recorded but not refused)."""
+    monkeypatch.setattr(kb, "objective_attempt_budget_enforced", lambda: False)
+
+
+def _subject(conn):
+    """A fresh, unclaimed subject (a running subject cannot be linked as a child)."""
+    return kb.create_task(
+        conn, title="ordinary work that keeps failing", assignee="default",
+    )
+
+
+def _open_and_close_repair(conn, tid, error, n):
+    """Open one auto-repair for the subject, record a NEW change, then close it."""
+    rid = kb._open_auto_repair(conn, tid, cause=error, trigger="five_cap_test")
+    assert rid is not None
+    kb.record_auto_repair(
+        conn, rid, root_cause=f"why {n}", change=f"distinct change {n}",
+        check=f"check {n}",
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (rid,))
+    return rid
+
+
+@pytest.mark.usefixtures("_enforced_budget")
+class TestFiveAttemptCap:
+    def test_attempts_one_to_five_permitted_sixth_refused(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject(conn)
+            ids = [
+                _open_and_close_repair(conn, tid, "identical boom", n)
+                for n in range(1, 6)
+            ]
+            assert len(set(ids)) == 5
+            started = _events(conn, tid, "repair_started")
+            assert [e.payload["attempt"] for e in started] == [1, 2, 3, 4, 5]
+
+            refused = kb._open_auto_repair(
+                conn, tid, cause="identical boom", trigger="five_cap_test",
+            )
+            assert refused is None
+            # No sixth card was opened and the five failures/evidence remain.
+            assert len(kb._repair_ids_for_subject(conn, tid)) == 5
+            for rid in ids:
+                assert kb.get_task(conn, rid) is not None
+            deferred = _events(conn, tid, "repair_deferred_pending_recurrence")
+            assert len(deferred) == 1
+            assert deferred[0].payload["attempts"] >= 5
+            assert deferred[0].payload["cap"] == kb.repair_attempt_cap()
+            assert "deferred pending recurrence" in deferred[0].payload["disposition"]
+            # Nothing fabricated and nothing waived: no VERIFIED repair, no
+            # human hold, and the subject is still open (not closed).
+            assert _events(conn, tid, "gave_up") == []
+            subject = kb.get_task(conn, tid)
+            assert subject.status not in ("done", "archived")
+            assert subject.block_kind != "needs_input"
+            assert not any(
+                kb.get_task(conn, r).terminal_disposition
+                for r in itertools.chain([tid], ids)
+            )
+
+    def test_cap_records_once_not_on_every_tick(self, kanban_home):
+        with kb.connect_closing() as conn:
+            tid = _subject(conn)
+            for n in range(1, 6):
+                _open_and_close_repair(conn, tid, "identical boom", n)
+            for _ in range(4):
+                assert kb._open_auto_repair(
+                    conn, tid, cause="identical boom", trigger="five_cap_test",
+                ) is None
+            assert len(_events(conn, tid, "repair_deferred_pending_recurrence")) == 1
+
+    def test_descendant_replacement_cannot_reset_the_count(self, kanban_home):
+        """A renamed/superseded replacement is still counted (no reset)."""
+        with kb.connect_closing() as conn:
+            tid = _subject(conn)
+            ids = [
+                _open_and_close_repair(conn, tid, "identical boom", n)
+                for n in range(1, 6)
+            ]
+            assert len(kb._repair_ids_for_subject(conn, tid)) == 5
+            # Contractually a verifier FAIL supersedes the repair with a fresh
+            # card rooted at the SAME subject -- the count must not reset, and
+            # the renamed replacement is refused too.
+            out = kb.supersede_auto_repair(conn, ids[-1], reason="gate red")
+            assert out is None
+            assert len(kb._repair_ids_for_subject(conn, tid)) == 5
+
+    def test_fresh_incident_starts_its_own_attempt_count(self, kanban_home):
+        """A fresh occurrence is a new incident: the cap does not block it."""
+        with kb.connect_closing() as conn:
+            first = _subject(conn)
+            for n in range(1, 6):
+                _open_and_close_repair(conn, first, "identical boom", n)
+            assert kb._open_auto_repair(
+                conn, first, cause="identical boom", trigger="five_cap_test",
+            ) is None
+            # A genuinely fresh occurrence arrives as a new subject card and is
+            # captured under the normal path (attempt 1), not blocked globally.
+            second = _subject(conn)
+            fresh = kb._open_auto_repair(
+                conn, second, cause="identical boom", trigger="five_cap_test",
+            )
+            assert fresh is not None
+            started = _events(conn, second, "repair_started")
+            assert [e.payload["attempt"] for e in started] == [1]
+
+
+@pytest.mark.usefixtures("_advisory_budget_local")
+class TestFiveAttemptCapStaysAdvisory:
+    def test_advisory_mode_records_nothing_blocking_and_still_opens(self, kanban_home):
+        """Unproved behavior stays advisory per operations.md gate policy."""
+        with kb.connect_closing() as conn:
+            tid = _subject(conn)
+            ids = [
+                _open_and_close_repair(conn, tid, "identical boom", n)
+                for n in range(1, 6)
+            ]
+            sixth = kb._open_auto_repair(
+                conn, tid, cause="identical boom", trigger="five_cap_test",
+            )
+            assert sixth is not None
+            assert len(kb._repair_ids_for_subject(conn, tid)) == 6
+            assert _events(conn, tid, "repair_deferred_pending_recurrence") == []

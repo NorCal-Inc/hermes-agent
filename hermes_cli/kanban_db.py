@@ -4825,6 +4825,86 @@ def _last_repair_brought_new_change(
     return not (prev and _norm_change(prev[1]) == _norm_change(change))
 
 
+#: Christopher, 2026-11-04 (Erika desktop session): a hard maximum of FIVE
+#: investigation/repair attempts per incident (subject card), counted across
+#: replacement/descendant cards. The count is the subject's own repair history
+#: (``_repair_ids_for_subject``), so a renamed replacement card or a verifier
+#: rejection cannot reset it. At the cap the loop stops opening another paid
+#: repair and records an honest "historical cause unresolved; deferred pending
+#: recurrence" disposition, then waits for a fresh occurrence. It never
+#: fabricates a root cause, marks an unproven repair VERIFIED, or disables
+#: monitoring.
+#:
+#: Enforced only while the board's attempt-budget mode is ``enforce``
+#: (``objective_attempt_budget_enforced``); while the board is in its current
+#: ``advisory`` mode the cap is recorded but does not refuse, per the
+#: operations.md gate-activation policy (unproved non-security workflow
+#: controls stay advisory until proved). This control does not set READY to NO,
+#: lock tools, or block the recovery path: a genuinely fresh occurrence is a
+#: new subject card and starts its own bounded attempt count.
+REPAIR_ATTEMPT_CAP_DEFAULT = 5
+
+
+def repair_attempt_cap() -> int:
+    """Board-scoped maximum repair attempts per incident (subject card)."""
+    try:
+        raw = _board_kanban_cfg().get(
+            "repair_attempt_cap", REPAIR_ATTEMPT_CAP_DEFAULT
+        )
+        value = int(raw)
+        return value if value >= 1 else REPAIR_ATTEMPT_CAP_DEFAULT
+    except Exception:
+        return REPAIR_ATTEMPT_CAP_DEFAULT
+
+
+def _defer_repair_pending_recurrence(
+    conn: sqlite3.Connection, subject_id: str, *,
+    fingerprint: str, attempts: int, cap: int, cause: str,
+) -> None:
+    """Record the five-attempt cap disposition and stop the paid repair loop.
+
+    Christopher, 2026-11-04: at the cap we stop digging, log
+    "not reproduced / historical cause unresolved; deferred pending
+    recurrence", and wait for the next occurrence to add evidence. The subject
+    is left exactly as it is (not closed, not fabricated, not marked VERIFIED);
+    monitoring stays active. Only the specific action this control guards is
+    refused -- opening one more paid repair for this incident. Recorded once
+    per subject, so a dispatcher that keeps re-evaluating does not spam it.
+    """
+    already = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'repair_deferred_pending_recurrence' LIMIT 1",
+        (subject_id,),
+    ).fetchone()
+    if already is not None:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn, subject_id, "repair_deferred_pending_recurrence",
+            {
+                "fingerprint": fingerprint,
+                "attempts": attempts,
+                "cap": cap,
+                "cause": (cause or "").strip()[:500],
+                "disposition":
+                    "not reproduced / historical cause unresolved; "
+                    "deferred pending recurrence",
+                "rule": "Christopher 2026-11-04 five-attempt repair cap",
+                "source": "auto_repair",
+            },
+        )
+        add_comment(
+            conn, subject_id, "recovery-lane",
+            f"Repair loop stopped at the {cap}-attempt cap for this incident "
+            f"({attempts} attempt(s) already spent). Not reproduced / "
+            "historical cause unresolved; deferred pending recurrence. No "
+            "further paid repair will open for this incident from unchanged "
+            "evidence. A fresh occurrence starts a new incident and opens a "
+            "new investigation under the normal path. Monitoring stays "
+            "active; nothing is marked fixed and nothing is waived.",
+        )
+
+
 def _route_repair_loop_to_diagnosis(
     conn: sqlite3.Connection, subject_id: str, *, cause: str, trigger: str,
 ) -> bool:
@@ -4833,8 +4913,10 @@ def _route_repair_loop_to_diagnosis(
     Christopher 2026-10-23: a repeat failure with no new change or evidence is
     not handed to another paid repair card. It reuses the block-loop triage
     path; the only exit back to work is ``hermes kanban loop-repair`` with a
-    recorded root cause, change and check. Not an attempt cap: any repair that
-    records a new change still gets its next card.
+    recorded root cause, change and check. This is not the attempt cap: a
+    repair that records a new change still gets its next card until the
+    separate five-attempt-per-fingerprint cap (Christopher, 2026-11-04) is
+    reached.
     """
     reason = (
         "Repair loop: the last repair recorded no new change, so another "
@@ -4926,6 +5008,18 @@ def _open_auto_repair(
     attempt = len(_repair_ids_for_subject(conn, subject_id)) + 1
     cause_text = (cause or "").strip()[:4000] or "task failed"
     fingerprint = _error_fingerprint(cause_text)
+    # Christopher, 2026-11-04: hard five-attempt cap per incident. `attempt`
+    # counts every repair card ever linked to the subject, so a renamed
+    # replacement or a verifier rejection cannot reset it. Bindable only while
+    # the board's attempt-budget mode is enforce; advisory mode still records
+    # the cap but opens the next card, per the operations.md gate policy.
+    _cap = repair_attempt_cap()
+    if attempt > _cap and objective_attempt_budget_enforced():
+        _defer_repair_pending_recurrence(
+            conn, subject_id, fingerprint=fingerprint,
+            attempts=attempt - 1, cap=_cap, cause=cause_text,
+        )
+        return None
     prev_start = _latest_event_payload(conn, subject_id, "repair_started")
     same_error = bool(
         prev_start and prev_start.get("fingerprint") == fingerprint
@@ -4949,7 +5043,8 @@ def _open_auto_repair(
     parts.append(evidence or cause_text)
     parts.append(f"Error fingerprint: {fingerprint}")
     parts.append(
-        f"Repair attempt {attempt} for {subject_id} (no attempt cap). Find "
+        f"Repair attempt {attempt} for {subject_id} (attempt {attempt} of a "
+        f"{_cap}-attempt cap for this error fingerprint). Find "
         "the root cause and fix it. When the fix is in place, record it: "
         f"hermes kanban repair-record {subject_id} --root-cause '<why it "
         "failed>' --change '<what you changed>' --check '<how you checked "
@@ -5088,7 +5183,8 @@ def supersede_auto_repair(
         add_comment(
             conn, repair_id, "recovery-lane",
             f"Gate still red after the bounded attempts; superseded by the "
-            f"next repair {new_id} (no attempt cap).",
+            f"next repair {new_id} (within the five-attempt-per-fingerprint "
+            f"cap).",
         )
     archive_task(conn, repair_id)
     return new_id
