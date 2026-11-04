@@ -877,6 +877,26 @@ def run_codex_verifier(task_id: str) -> int:
                     execution_id=attempt.execution_id,
                 )
             reason = "Codex verifier failed or timed out.\n\n" + attempt.evidence
+            # Bounded auto-retry FIRST (t_c645f27d/t_820c2104, 2026-11-04): the
+            # verifier's own tool crashed -- no verdict, no FAIL -- so a retry
+            # is cheap and does not touch verdict semantics at all. Only once
+            # the retry budget is exhausted does this fall back to the
+            # existing block_task escalation, unchanged.
+            retried = kb.verifier_execution_crash_retry(
+                conn, task_id, expected_run_id=expected_run_id, reason=reason,
+                infrastructure=attempt.infrastructure,
+                event_payload_extra={
+                    "execution_id": attempt.execution_id,
+                    "execution_status": attempt.execution_status,
+                },
+            )
+            if retried:
+                kb.add_comment(
+                    conn, task_id, author="atlas-codex-lane",
+                    body=attempt.evidence + "\n\n(bounded auto-retry: returned to the queue; "
+                    "no verdict produced, not a FAIL)",
+                )
+                return 0
             ok = kb.block_task(
                 conn, task_id, reason=reason, kind="needs_input",
                 expected_run_id=expected_run_id,
@@ -993,6 +1013,21 @@ def run_claude_verifier(task_id: str) -> int:
                     execution_id=attempt.execution_id,
                 )
             reason = "Claude verifier failed or timed out.\n\n" + attempt.evidence
+            retried = kb.verifier_execution_crash_retry(
+                conn, task_id, expected_run_id=expected_run_id, reason=reason,
+                infrastructure=attempt.infrastructure,
+                event_payload_extra={
+                    "execution_id": attempt.execution_id,
+                    "execution_status": attempt.execution_status,
+                },
+            )
+            if retried:
+                kb.add_comment(
+                    conn, task_id, author="claude-verify-lane",
+                    body=attempt.evidence + "\n\n(bounded auto-retry: returned to the queue; "
+                    "no verdict produced, not a FAIL)",
+                )
+                return 0
             ok = kb.block_task(
                 conn, task_id, reason=reason, kind="needs_input",
                 expected_run_id=expected_run_id,

@@ -278,6 +278,13 @@ VALID_BLOCK_KINDS = {
     "runtime_cap_exhausted",
 }
 BLOCK_RECURRENCE_LIMIT = 2
+# Bounded automatic retry for an independent verifier whose own execution tool
+# crashed (implementation/tooling-class failure -- no verdict produced, not a
+# FAIL). Total attempts allowed before the card is parked ``blocked`` for an
+# operator; see ``verifier_execution_crash_retry`` (2026-11-04, t_c645f27d /
+# t_820c2104: every crash previously went straight to ``blocked`` on the FIRST
+# attempt with zero retries).
+VERIFIER_EXECUTION_CRASH_RETRY_LIMIT = 3
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 EXECUTOR_LANE_CLAUDE = "claude"
 EXECUTOR_LANE_CODEX_VERIFY = "codex_verify"
@@ -5010,11 +5017,10 @@ def _open_auto_repair(
     fingerprint = _error_fingerprint(cause_text)
     # Christopher, 2026-11-04: hard five-attempt cap per incident. `attempt`
     # counts every repair card ever linked to the subject, so a renamed
-    # replacement or a verifier rejection cannot reset it. Bindable only while
-    # the board's attempt-budget mode is enforce; advisory mode still records
-    # the cap but opens the next card, per the operations.md gate policy.
+    # replacement or a verifier rejection cannot reset it. Applies in every
+    # attempt-budget mode (advisory included): Christopher's explicit rule.
     _cap = repair_attempt_cap()
-    if attempt > _cap and objective_attempt_budget_enforced():
+    if attempt > _cap:
         _defer_repair_pending_recurrence(
             conn, subject_id, fingerprint=fingerprint,
             attempts=attempt - 1, cap=_cap, cause=cause_text,
@@ -9055,6 +9061,93 @@ def _retry_status_for_run(
     return "review" if payload.get("source_status") == "review" else "ready"
 
 
+def verifier_execution_crash_retry(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: int,
+    reason: str, infrastructure: bool,
+    event_payload_extra: Optional[dict] = None,
+) -> bool:
+    """Bounded auto-retry for an independent verifier whose own execution tool
+    crashed -- no verdict, no FAIL, the executor itself failed to run.
+
+    Returns ``True`` when the card was returned to ``ready``/``review`` to try
+    again (the caller must NOT also call :func:`block_task`), ``False`` when
+    the retry budget (:data:`VERIFIER_EXECUTION_CRASH_RETRY_LIMIT`) is already
+    exhausted, this run is no longer the card's live run (reclaimed/cancelled
+    out from under it), or the row vanished -- in every ``False`` case the
+    caller falls back to its own existing ``block_task`` call, unchanged.
+
+    ``infrastructure=True`` (control plane ended the run -- runtime cap,
+    orphan-policy kill, operator terminate) mirrors
+    :func:`kanban_db_dispatch._record_task_failure`'s own carve-out: it never
+    counts against the retry budget and always retries, because the verifier
+    never actually got a chance to run.
+
+    Deliberately independent of ``_record_task_failure``'s trip machinery,
+    which opens an auto-repair CARD on exhaustion: a verifier is itself
+    Gauntlet work, not a subject for auto-repair. This only inserts bounded
+    retries in front of the existing "blocked, needs operator" terminal
+    state -- it never changes what blocking means or who can unblock it, and
+    it never touches verdict (PASS/FAIL/BLOCKER) handling at all, which lives
+    entirely on the ``attempt.ok`` branch this function is never called from.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT consecutive_failures, status, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+        ):
+            # Not this run's card to retry any more -- let the caller's own
+            # block_task do its normal (likely no-op/refused) handling.
+            return False
+        if infrastructure:
+            failures = int(row["consecutive_failures"])
+        else:
+            failures = int(row["consecutive_failures"]) + 1
+        if not infrastructure and failures >= VERIFIER_EXECUTION_CRASH_RETRY_LIMIT:
+            # Budget exhausted -- persist the real count so the ledger/event
+            # the caller's block_task writes next reflects it, then refuse.
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
+                (failures, task_id),
+            )
+            return False
+        retry_status = _retry_status_for_run(conn, task_id, row["current_run_id"])
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, consecutive_failures = ?, "
+            "last_failure_error = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (retry_status, failures, reason[:500], task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="crashed", status="crashed", error=reason[:500],
+            metadata={
+                "failures": failures,
+                "limit": VERIFIER_EXECUTION_CRASH_RETRY_LIMIT,
+                "retry_status": retry_status,
+                "infrastructure": infrastructure,
+            },
+        )
+        payload = {
+            "failures": failures,
+            "limit": VERIFIER_EXECUTION_CRASH_RETRY_LIMIT,
+            "retry_status": retry_status,
+            "error": reason[:500],
+            "infrastructure": infrastructure,
+        }
+        if event_payload_extra:
+            payload.update(event_payload_extra)
+        _append_event(conn, task_id, "verifier_execution_crash_retried", payload, run_id=run_id)
+    return True
+
+
 _RUN_OUTCOME_TERMINAL_STATUS = {
     "completed": "done",
     "review_requested": "review",
@@ -10362,6 +10455,46 @@ def _blocked_verifier_child(
     return row["id"] if row is not None else None
 
 
+def _blocked_verifier_in_current_episode(
+    conn: sqlite3.Connection, subject_id: str, lane: str
+) -> bool:
+    """True (refusal recorded once) when this subject's newest verifier child
+    is blocked ON THE SAME LANE and was created after the subject's latest
+    review handoff. A different lane is a real change (swap_verifier_lane_once)."""
+    stuck = _blocked_verifier_child(conn, subject_id)
+    if stuck is None:
+        return False
+    stuck_lane = conn.execute(
+        "SELECT executor_lane FROM tasks WHERE id = ?", (stuck,)
+    ).fetchone()["executor_lane"]
+    if stuck_lane != lane:
+        return False
+    last_review = conn.execute(
+        "SELECT MAX(id) AS id FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'",
+        (subject_id,),
+    ).fetchone()["id"] or 0
+    created = conn.execute(
+        "SELECT MAX(id) AS id FROM task_events WHERE task_id = ? "
+        "AND kind = 'independent_verifier_child_created' "
+        "AND json_extract(payload, '$.verifier_task') = ?",
+        (subject_id, stuck),
+    ).fetchone()["id"]
+    if created is None or created < last_review:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'verifier_respawn_refused_blocked' LIMIT 1",
+        (subject_id, created),
+    ).fetchone() is None:
+        with write_txn(conn):
+            _append_event(
+                conn, subject_id, "verifier_respawn_refused_blocked",
+                {"blocked_verifier": stuck},
+            )
+    return True
+
+
 def _verifier_stuck_alarm_is_owed(
     conn: sqlite3.Connection, subject_id: str, verifier_task_id: str
 ) -> bool:
@@ -10905,6 +11038,16 @@ def _ensure_independent_verifier_child(
         return existing
     # No identical re-verification -- see _verifier_respawn_unchanged.
     if _verifier_respawn_unchanged(conn, subject_id):
+        return None
+    # A verifier BLOCKED in the current review episode is stuck, not missing.
+    # Its block lives on the child card, so the subject-side guard above never
+    # sees it, and every dispatcher tick minted another doomed child: 9 codex
+    # verifiers in 9 minutes on t_bd45babc, 25 on t_bb79d28c (2026-11-04,
+    # Codex plan usage limit). Mirrors the stale-disposition actuator's
+    # _blocked_verifier_child rule: surface it, never multiply it. A new
+    # review handoff (new episode) or a swap to the OTHER lane releases one
+    # fresh verifier.
+    if _blocked_verifier_in_current_episode(conn, subject_id, lane):
         return None
     if not _subject_evidence_is_dispatchable(conn, subject_id):
         if not _unroutable_alarm_is_owed(conn, subject_id):
