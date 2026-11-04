@@ -691,6 +691,8 @@ class ProfileInfo:
     # appends here). Lets Bot Mode group chats re-link persisted member
     # descriptors to the renamed live profile (#110200).
     previous_names: list[str] = field(default_factory=list)
+    # NorCal company lane tag; read_profile_meta() always supplies it.
+    company: str = ""
 
 
 def _load_yaml_dict(path: Path) -> Optional[dict]:
