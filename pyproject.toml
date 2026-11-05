@@ -138,7 +138,10 @@ dependencies = [
   # wrapper over it). Pure Python, and its pins match Pillow/websockets above,
   # so it rides in the main venv and every install, Desktop bundle included,
   # ships it without a separate tool environment.
-  "browser-harness==0.1.13; python_version >= '3.14'",
+  # No python marker: production still runs 3.11, and without the engine
+  # browser_exec was missing there from about 2026-11-01 (Paris Blogger
+  # relay dark until t_49332b78). Requires-Python >=3.11, pure Python.
+  "browser-harness==0.1.13",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1; python_version >= '3.14'",
   "fastapi>=0.104.0,<1; python_version >= '3.14'",
