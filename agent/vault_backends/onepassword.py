@@ -28,6 +28,37 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = 30.0
 
 
+def _token_from_file(env_name: str, path: Optional[str]) -> str:
+    """``env_name``'s value from a dotenv-format service-account file, or "".
+
+    Parsed, never sourced. Refuses a file that group/other can read: a token file
+    anyone else can open is already a leak, not a credential source.
+    """
+    if not path:
+        return ""
+    f = Path(os.path.expanduser(str(path)))
+    try:
+        if not f.is_file():
+            return ""
+        if f.stat().st_mode & 0o077:
+            logger.warning("1Password token file %s is group/other-readable; ignoring it", f)
+            return ""
+        text = f.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == env_name:
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            return value
+    return ""
+
+
 class OnePasswordLoginBackend(LoginBackend):
     name = "onepassword"
     display_name = "1Password"
@@ -39,6 +70,17 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
+        if not self._service_token:
+            # Workers never carry the token in their env (shared profiles have no .env;
+            # the sandbox strips it on purpose), so the in-process browser_vault saw
+            # "1Password locked" forever -- Paris's Blogger publish, 2026-11-04,
+            # t_49332b78. Read it from the same 0600 file hermes-run --company or the
+            # sandbox's lane op.env already uses; it stays in this backend and only
+            # reaches op's own child env (_env), never os.environ.
+            self._service_token = _token_from_file(
+                env_name,
+                self.cfg.get("service_account_token_file") or os.environ.get("HERMES_LANE_OP_ENV"),
+            )
         self._item_vaults: dict[str, str] = {}  # item id -> vault id from the latest ``item list``
 
     # ── auth ────────────────────────────────────────────────────────────────

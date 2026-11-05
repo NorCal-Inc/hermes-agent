@@ -289,3 +289,61 @@ def test_onepassword_service_account_refusals_name_the_real_cause(fake_op_servic
     assert all(json.loads(a)[:2] != ["item", "get"] for a in log.read_text(encoding="utf-8-sig").splitlines())
     with pytest.raises(RuntimeError, match="DecodeSACredentials"):
         new_backend().resolve_password("op:item-c")
+
+
+# --- service-account token from a 0600 file (t_49332b78, 2026-11-04) ----------------------
+
+
+def _no_scoped_token(name, default=""):
+    return default
+
+
+def test_onepassword_token_file_unlocks_and_reaches_only_ops_env(tmp_path, monkeypatch):
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    f = tmp_path / "op.env"
+    f.write_text('OP_SERVICE_ACCOUNT_TOKEN="file-token"\n', encoding="utf-8")
+    f.chmod(0o600)
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("HERMES_LANE_OP_ENV", raising=False)
+    with patch("agent.secret_scope.get_secret", side_effect=_no_scoped_token):
+        backend = OnePasswordLoginBackend({"service_account_token_file": str(f)})
+    assert backend.is_unlocked()
+    assert backend._env(None)["OP_SERVICE_ACCOUNT_TOKEN"] == "file-token"
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
+
+
+def test_onepassword_lane_op_env_is_a_token_source(tmp_path, monkeypatch):
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    f = tmp_path / "op.env"
+    f.write_text("export OP_SERVICE_ACCOUNT_TOKEN=lane-token\n", encoding="utf-8")
+    f.chmod(0o600)
+    monkeypatch.setenv("HERMES_LANE_OP_ENV", str(f))
+    with patch("agent.secret_scope.get_secret", side_effect=_no_scoped_token):
+        backend = OnePasswordLoginBackend({})
+    assert backend._env(None)["OP_SERVICE_ACCOUNT_TOKEN"] == "lane-token"
+
+
+def test_onepassword_token_file_refused_when_others_can_read_it(tmp_path, monkeypatch):
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    f = tmp_path / "op.env"
+    f.write_text("OP_SERVICE_ACCOUNT_TOKEN=leaky\n", encoding="utf-8")
+    f.chmod(0o644)
+    monkeypatch.delenv("HERMES_LANE_OP_ENV", raising=False)
+    with patch("agent.secret_scope.get_secret", side_effect=_no_scoped_token):
+        backend = OnePasswordLoginBackend({"service_account_token_file": str(f)})
+    assert not backend._service_token
+
+
+def test_onepassword_scoped_token_outranks_the_file(tmp_path):
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    f = tmp_path / "op.env"
+    f.write_text("OP_SERVICE_ACCOUNT_TOKEN=file-token\n", encoding="utf-8")
+    f.chmod(0o600)
+    scoped = lambda name, default="": "scoped-token" if name == "OP_SERVICE_ACCOUNT_TOKEN" else default
+    with patch("agent.secret_scope.get_secret", side_effect=scoped):
+        backend = OnePasswordLoginBackend({"service_account_token_file": str(f)})
+    assert backend._env(None)["OP_SERVICE_ACCOUNT_TOKEN"] == "scoped-token"
