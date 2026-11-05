@@ -4149,7 +4149,7 @@ _CONTROL_PLANE_SUBJECT_RE = re.compile(
     r"|boot[ _-]?(gate|record|context|checkpoint|consumer|surface)"
     r"|shared[ _-]?boot"
     r")\b",
-    re.I,
+    re.IGNORECASE,
 )
 CONTROL_PLANE_AUTHORITY_PREFIXES = (
     "operator:",      # explicit human authorisation
@@ -4171,7 +4171,7 @@ _GAUNTLET_MUTATION_RE = re.compile(
     r"|boot[ _-]?(gate|record|context|checkpoint|consumer|surface)"
     r"|shared[ _-]?boot"
     r")\b",
-    re.I,
+    re.IGNORECASE,
 )
 _GAUNTLET_STATE_CHANGE_RE = re.compile(
     r"(?:^|[.;:!?]|\d+[.)]|[-*]"
@@ -4187,7 +4187,7 @@ _GAUNTLET_STATE_CHANGE_RE = re.compile(
     r"|mark(?:ing)?[ \t]+(?:it[ \t]+|them[ \t]+|the[ \t]+\w+[ \t]+|as[ \t]+)?"
     r"(?:verified|closed|done|complete|completed|resolved)\b"
     r")",
-    re.I | re.M,
+    re.IGNORECASE | re.MULTILINE,
 )
 _GAUNTLET_INVESTIGATION_RE = re.compile(
     r"\b("
@@ -4195,7 +4195,7 @@ _GAUNTLET_INVESTIGATION_RE = re.compile(
     r"|read[ _-]?only|information[ _-]?gathering|triage|root[ _-]?cause"
     r"|analys(is|e)|survey|inspect|reconnaissance|findings|report on"
     r")\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -4241,33 +4241,33 @@ _VERIFICATION_REQ_SUBJECT_RE = re.compile(
     r"|gauntlet[ _-]+(?:pass|verif\w*|verdict|sign[ _-]?off)"
     r"|codex[ _-]?verify[ _-]+(?:pass|verdict|sign[ _-]?off)"
     r")",
-    re.I,
+    re.IGNORECASE,
 )
 _VERIFICATION_REQ_DEMAND_RE = re.compile(
     r"\b(?:required|requires?|mandatory|must|needs?|needed|owed|owes"
     r"|before\s+(?:it|this|the\s+(?:card|task|work))?\s*"
     r"(?:closes|closing|close|closure|is\s+closed|done|completes|completion))\b",
-    re.I,
+    re.IGNORECASE,
 )
 _VERIFICATION_REQ_PENDING_RE = re.compile(
     r"\b(?:still|pending|outstanding|awaiting|awaits|not\s+yet|yet\s+to"
     r"|unverified)\b",
-    re.I,
+    re.IGNORECASE,
 )
 _VERIFICATION_REQ_NEGATION_RE = re.compile(
     r"\b(?:not|no\s+longer|never)\s+(?:be\s+)?(?:required|needed|mandatory|necessary)\b"
     r"|\b(?:does|do|did)(?:\s+not|n't)\s+(?:require|need)\b"
     r"|\boptional\b",
-    re.I,
+    re.IGNORECASE,
 )
 _VERIFICATION_REQ_PRECEDING_NEGATION_RE = re.compile(
     r"\b(?:no|not|never)\s+(?:(?:an?|any|further|additional|separate|more)\s+){0,2}$",
-    re.I,
+    re.IGNORECASE,
 )
 _VERIFICATION_REQ_SATISFIED_RE = re.compile(
     r"\b(?:was|were|has\s+been|have\s+been|already|now)\s+(?:been\s+)?"
     r"(?:satisfied|obtained|received|recorded|granted|completed|passed|returned|met)\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -4322,7 +4322,7 @@ def control_plane_subject(
 
 
 def _creating_actor_control_plane_task(
-    conn: sqlite3.Connection, provenance: "ActorProvenance"
+    conn: sqlite3.Connection, provenance: ActorProvenance
 ) -> Optional[str]:
     """The creating actor's own card, but only when it is control-plane work.
 
@@ -6667,7 +6667,7 @@ class AttachmentDeleteRefused(PermissionError):
     actionable "archive the card first" message.
     """
 
-    def __init__(self, attachment: "Attachment", status: Optional[str]):
+    def __init__(self, attachment: Attachment, status: Optional[str]):
         self.attachment = attachment
         self.status = status
         super().__init__(
@@ -12581,7 +12581,7 @@ def _record_infrastructure_release_withheld(
 
 def resolve_stale_gauntlet_dispositions(
     conn: sqlite3.Connection,
-    stale: Iterable["GauntletStaleTask"],
+    stale: Iterable[GauntletStaleTask],
     *,
     now: Optional[int] = None,
 ) -> dict[str, list[str]]:
@@ -12949,7 +12949,7 @@ def resolve_stale_gauntlet_dispositions(
 
 def sweep_lifecycle_stall_alarms(
     conn: sqlite3.Connection,
-    stale: Iterable["GauntletStaleTask"],
+    stale: Iterable[GauntletStaleTask],
     *,
     now: Optional[int] = None,
 ) -> list[str]:
@@ -15611,7 +15611,7 @@ def record_verification(
     # therefore leaves a task that is blocked from completing, never one that
     # slipped through.
     if review_run_id is not None:
-        ok, detail = request_changes(
+        ok, _detail = request_changes(
             conn, task_id, reason=reason_text or "verification failed",
             expected_run_id=review_run_id,
         )
@@ -15715,7 +15715,7 @@ _LESSON_REVIEW_REQUIRED_RE = re.compile(
     r"|cross[ _-]?(company|entity|tenant)|company[ _-]?lane|tenant[ _-]?boundary"
     r"|polic(y|ies)|always|never|every[ _-]?(task|worker|agent|profile)"
     r")\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -17700,11 +17700,11 @@ def schedule_task(
         return True
 
 
-_scoped_worker_launchers: "dict[int, tuple[int, subprocess.Popen]]" = {}
+_scoped_worker_launchers: dict[int, tuple[int, subprocess.Popen]] = {}
 _WORKER_SCOPE_RE = re.compile(r"^hermes-kanban-(?P<task>.+)-(?P<run>\d+)-[0-9a-f]{8}\.scope$")
 
 
-def stop_finished_worker_scopes(conn: sqlite3.Connection) -> "list[str]":
+def stop_finished_worker_scopes(conn: sqlite3.Connection) -> list[str]:
     """Stop transient worker scopes whose run has ended and whose worker is gone.
 
     A ``systemd-run --scope`` unit lives until every process in it exits, so
@@ -17723,11 +17723,11 @@ def stop_finished_worker_scopes(conn: sqlite3.Connection) -> "list[str]":
         listing = subprocess.run(
             [systemctl, "--user", "list-units", "--type=scope", "--all",
              "--no-legend", "--plain", "hermes-kanban-*"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         ).stdout
     except Exception:
         return []
-    stopped: "list[str]" = []
+    stopped: list[str] = []
     for line in listing.splitlines():
         fields = line.split()
         m = _WORKER_SCOPE_RE.match(fields[0]) if fields else None
@@ -17746,7 +17746,7 @@ def stop_finished_worker_scopes(conn: sqlite3.Connection) -> "list[str]":
         for action in ("stop", "reset-failed"):
             try:
                 subprocess.run([systemctl, "--user", action, unit],
-                               capture_output=True, timeout=30)
+                               capture_output=True, timeout=30, check=False)
             except Exception:
                 pass
         stopped.append(unit)
@@ -17875,7 +17875,7 @@ def detect_stale_gauntlet_work(
     realert_seconds: Optional[int] = None,
     now: Optional[int] = None,
     include_suppressed: bool = False,
-) -> list["GauntletStaleTask"]:
+) -> list[GauntletStaleTask]:
     """Find Gauntlet-enforced work that has been parked mid-chain and forgotten.
 
     A card is stale when all of the following hold:
@@ -18164,7 +18164,7 @@ def _spawn_gateway_scoped_worker(
         # argv. The shell becomes the worker via exec, so the PID written here
         # remains valid for the whole Hermes worker lifetime.
         shim = 'printf "%s\n" "$$" > "$1"; shift; exec "$@"'
-        launcher = subprocess.Popen(  # noqa: S603 -- fixed systemd-run + shell shim
+        launcher = subprocess.Popen(
             [
                 systemd_run,
                 "--user",
@@ -18256,10 +18256,10 @@ def _bwrap_version() -> str:
         import subprocess
         try:
             out = subprocess.run(
-                ["bwrap", "--version"], capture_output=True, text=True, timeout=5,
+                ["bwrap", "--version"], capture_output=True, text=True, timeout=5, check=False,
             )
             _BWRAP_VERSION = (out.stdout or out.stderr).strip() or "unknown"
-        except Exception:  # noqa: BLE001
+        except Exception:
             _BWRAP_VERSION = "unknown"
     return _BWRAP_VERSION
 
@@ -18276,7 +18276,7 @@ def _shared_openrouter_key() -> Optional[str]:
         from dotenv import dotenv_values
         from hermes_constants import get_default_hermes_root
         return dotenv_values(get_default_hermes_root() / ".env").get(_OPENROUTER_ENV) or None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -18302,7 +18302,7 @@ def _apply_worker_sandbox(
 
     try:
         sc = ws.sandbox_config()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise RuntimeError(
             f"worker sandbox: invalid kanban.worker_sandbox config, refusing to spawn: {exc}"
         ) from exc
@@ -18324,7 +18324,7 @@ def _apply_worker_sandbox(
             cmd, task=task, profile=profile, profile_home=profile_home,
             workspace=workspace, env=env, cfg=None, manifest=manifest,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise RuntimeError(f"{refuse}: {exc}") from exc
     if not wrapped or wrapped[0] != "bwrap":
         raise RuntimeError(f"{refuse}: sandbox wrapper was not applied")
@@ -19108,9 +19108,7 @@ def connect(
         path = db_path if db_path is not None else kanban_db_path(board=board)
         resolved_path = path.resolve()
         _ensure_fork_schema(conn, str(resolved_path))
-        if _corrupt_latch_active(resolved_path):
-            conn.execute("PRAGMA query_only=ON")
-        elif _wal_reset_writer_blocked():
+        if _corrupt_latch_active(resolved_path) or _wal_reset_writer_blocked():
             conn.execute("PRAGMA query_only=ON")
     except Exception:
         conn.close()
@@ -19156,7 +19154,7 @@ def _record_spawn_failure(
     task_id: str,
     error: str,
     *,
-    failure_limit: int = None,
+    failure_limit: int | None = None,
 ) -> bool:
     """Legacy alias — fork callers / tests still reference the old name."""
     return _record_task_failure(

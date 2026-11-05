@@ -545,11 +545,15 @@ class TestBlockedDependencyNotifiesGovernableParent:
             owner = kb.create_task(
                 conn, title="governance half", assignee="erika",
             )
-            assert kb.claim_task(conn, owner) is not None
+            owner_run = kb.claim_task(conn, owner)
+            assert owner_run is not None
             dep = kb.create_task(
                 conn, title="execution half", assignee="default",
             )
-            kb.link_tasks(conn, dep, owner)
+            # The owning worker links its own active run (b95513df7c guard).
+            kb.link_tasks(
+                conn, dep, owner, expected_child_run_id=owner_run.current_run_id,
+            )
             assert kb.block_task(
                 conn, owner, reason="delegated to child", kind="dependency",
             ) is True
@@ -895,11 +899,15 @@ class TestEndToEndRecovery:
             owner = kb.create_task(
                 conn, title="t_db0af7e0 shape", assignee="erika",
             )
-            assert kb.claim_task(conn, owner) is not None
+            owner_run = kb.claim_task(conn, owner)
+            assert owner_run is not None
             tid = _subject_awaiting_verification(
                 conn, assignee="erika", title="t_00690780 shape",
             )
-            kb.link_tasks(conn, tid, owner)
+            # The owning worker links its own active run (b95513df7c guard).
+            kb.link_tasks(
+                conn, tid, owner, expected_child_run_id=owner_run.current_run_id,
+            )
             assert kb.block_task(
                 conn, owner, reason="delegated", kind="dependency",
             ) is True

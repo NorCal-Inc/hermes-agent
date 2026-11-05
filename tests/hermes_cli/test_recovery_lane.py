@@ -955,43 +955,39 @@ def test_non_recovery_task_is_refused_defensively(monkeypatch):
 
 
 def test_cli_recovery_bypass_precedes_hermes_worker_loop():
+    # v0.22.5 merge moved the lane branch into _norcal_kanban_lane_dispatch;
+    # the guarantee is unchanged: every explicit lane exits before any Hermes
+    # agent, prompt or toolset is built.
     cli_path = Path(__file__).resolve().parents[2] / "cli.py"
     source = cli_path.read_text(encoding="utf-8")
 
-    anchor = source.index(
+    helper = source.index("def _norcal_kanban_lane_dispatch(query)")
+    helper_end = source.index("\ndef ", helper + 1)
+    body = source[helper:helper_end]
+    pos = body.index(
         '_kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()'
     )
-    direct_check = source.index(
-        "_lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE",
-        anchor,
-    )
-    direct_invoke = source.index("run_claude_executor(_kanban_task_id)", direct_check)
-    direct_exit = source.index("sys.exit(_lane_rc)", direct_invoke)
-    codex_check = source.index(
-        "_lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CODEX_VERIFY",
-        direct_exit,
-    )
-    codex_invoke = source.index("run_codex_verifier(_kanban_task_id)", codex_check)
-    codex_exit = source.index("sys.exit(_lane_rc)", codex_invoke)
-    lane_check = source.index(
-        "_lane_task.executor_lane == _kb_lane.EXECUTOR_LANE_CLAUDE_RECOVERY",
-        codex_exit,
-    )
-    lane_invoke = source.index("run_claude_first_recovery(_kanban_task_id)", lane_check)
-    lane_exit = source.index("sys.exit(_lane_rc)", lane_invoke)
+    for lane, runner in (
+        ("EXECUTOR_LANE_CLAUDE:", "run_claude_executor"),
+        ("EXECUTOR_LANE_CODEX_VERIFY", "run_codex_verifier"),
+        ("EXECUTOR_LANE_CLAUDE_VERIFY", "run_claude_verifier"),
+        ("EXECUTOR_LANE_CLAUDE_RECOVERY", "run_claude_first_recovery"),
+    ):
+        check = body.index(f"_lane == _kb_lane.{lane}", pos)
+        exit_ = body.index(f"sys.exit({runner}(_kanban_task_id))", check)
+        assert check < exit_, f"{runner} must exit right after its lane check"
+        pos = exit_
 
-    next_init_agent = source.index("cli._init_agent(", lane_exit)
-    next_run_conversation = source.index("cli.agent.run_conversation(", lane_exit)
-
-    assert direct_check < direct_invoke < direct_exit < lane_check, (
-        "the ordinary Claude executor must exit before the recovery/normal Hermes paths"
-    )
-    assert lane_check < lane_invoke < lane_exit < next_init_agent, (
+    call = source.index("_norcal_kanban_lane_dispatch(query)\n", helper_end)
+    build = source.index("_build_cli_from_args(model,", call)
+    next_init_agent = source.index("_run_single_query_mode(cli,", call)  # agent init lives here
+    next_run_conversation = source.index("cli.run()", call)  # interactive loop
+    assert call < build < next_init_agent, (
         "the recovery-lane bypass must mechanically exit before the worker "
         "ever calls _init_agent — no Hermes agent/system-prompt/toolset may "
         "be built for an explicit recovery task"
     )
-    assert lane_exit < next_run_conversation, (
+    assert call < next_run_conversation, (
         "the recovery-lane bypass must exit before run_conversation — no "
         "Hermes reasoning/tool loop may run for an explicit recovery task"
     )
@@ -1288,7 +1284,8 @@ def test_real_failed_verifier_finding_reaches_next_direct_launch(kanban_home, mo
             body="ORIGINAL-BODY", gauntlet=True,
             executor_lane=kb.EXECUTOR_LANE_CLAUDE,
         )
-        other = kb.create_task(conn, title="UNRELATED-CARD-TITLE", assignee="default", tenant="co-b")
+        kb.create_task(  # cross-tenant decoy; must not leak into the prompt
+            conn, title="UNRELATED-CARD-TITLE", assignee="default", tenant="co-b")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
         kb.add_attachment(

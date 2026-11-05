@@ -1385,7 +1385,7 @@ def _supervised_attempt(
             executor, None, "", "",
             error=f"refused by execution policy ({exc.code}): {exc}",
         )
-    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+    except Exception as exc:
         return AttemptResult(executor, None, "", "", error=str(exc))
     return AttemptResult(
         executor,
@@ -1473,7 +1473,7 @@ def _run_gate(
             False, None, "",
             error=f"refused by execution policy ({exc.code}): {exc}",
         )
-    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+    except Exception as exc:
         return GateResult(False, None, "", error=str(exc))
     output = (result.stdout or "") + (result.stderr or "")
     green = result.status == ex.STATUS_COMPLETED and result.exit_code == 0
